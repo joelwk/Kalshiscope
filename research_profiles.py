@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from config import SearchConfig, Settings
+from models import Market
+
+_MAX_SEARCH_DOMAINS = 5
+_MAX_SEARCH_HANDLES = 10
+
+_SPORTS_KEYWORDS = (
+    "nba",
+    "nhl",
+    "nfl",
+    "mlb",
+    "soccer",
+    "football",
+    "tennis",
+    "atp",
+    "wta",
+    "premier league",
+    "la liga",
+    "serie a",
+    "bundesliga",
+)
+_CRYPTO_KEYWORDS = (
+    "crypto",
+    "bitcoin",
+    "btc",
+    "ethereum",
+    "eth",
+    "defi",
+    "fdv",
+    "token",
+    "listing",
+    "$",
+)
+_POLITICS_KEYWORDS = (
+    "election",
+    "president",
+    "presidential",
+    "senate",
+    "house",
+    "prime minister",
+    "poll",
+    "referendum",
+)
+_LONG_HORIZON_HINTS = ("election", "presidential", "winner", "nominee")
+
+
+@dataclass(frozen=True)
+class ResearchProfile:
+    name: str
+    domains: tuple[str, ...]
+    x_handles: tuple[str, ...]
+
+
+def build_market_search_config(
+    settings: Settings,
+    market: Market,
+    now: datetime | None = None,
+) -> SearchConfig:
+    now = now or datetime.now(timezone.utc)
+    profile = profile_for_market(settings, market)
+    lookback_hours = _lookback_hours(settings, market, now)
+    from_date = now - timedelta(hours=lookback_hours)
+    return SearchConfig(
+        from_date=from_date,
+        to_date=now,
+        allowed_domains=_prioritized_trim(profile.domains, _MAX_SEARCH_DOMAINS),
+        allowed_x_handles=_prioritized_trim(profile.x_handles, _MAX_SEARCH_HANDLES),
+        multimedia_confidence_range=settings.MULTIMEDIA_CONFIDENCE_THRESHOLD,
+        profile_name=profile.name,
+        lookback_hours=lookback_hours,
+    )
+
+
+def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
+    family = market_family(market)
+    if family == "sports":
+        return ResearchProfile(
+            name=family,
+            domains=settings.SPORTS_ALLOWED_DOMAINS,
+            x_handles=settings.SPORTS_ALLOWED_X_HANDLES,
+        )
+    if family == "crypto":
+        return ResearchProfile(
+            name=family,
+            domains=settings.CRYPTO_ALLOWED_DOMAINS,
+            x_handles=settings.CRYPTO_ALLOWED_X_HANDLES,
+        )
+    if family == "politics":
+        return ResearchProfile(
+            name=family,
+            domains=settings.POLITICS_ALLOWED_DOMAINS,
+            x_handles=settings.POLITICS_ALLOWED_X_HANDLES,
+        )
+    return ResearchProfile(
+        name="generic",
+        domains=settings.GENERIC_ALLOWED_DOMAINS,
+        x_handles=settings.GENERIC_ALLOWED_X_HANDLES,
+    )
+
+
+def market_family(market: Market) -> str:
+    category = (market.category or "").lower()
+    question = market.question.lower()
+    text = f"{category} {question}"
+    if any(keyword in text for keyword in _SPORTS_KEYWORDS):
+        return "sports"
+    if any(keyword in text for keyword in _CRYPTO_KEYWORDS):
+        return "crypto"
+    if any(keyword in text for keyword in _POLITICS_KEYWORDS):
+        return "politics"
+    return "generic"
+
+
+def _lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
+    if market.close_time:
+        close_time = market.close_time
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=timezone.utc)
+        delta = close_time - now
+        if delta <= timedelta(hours=48):
+            return settings.SEARCH_LOOKBACK_SHORT_HOURS
+        if delta <= timedelta(days=7):
+            return settings.SEARCH_LOOKBACK_MEDIUM_HOURS
+    question = (market.question or "").lower()
+    if any(token in question for token in _LONG_HORIZON_HINTS):
+        return settings.SEARCH_LOOKBACK_LONG_HOURS
+    return settings.SEARCH_LOOKBACK_LONG_HOURS
+
+
+def _prioritized_trim(items: tuple[str, ...], limit: int) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(normalized)
+        if len(ordered) >= limit:
+            break
+    return ordered
+

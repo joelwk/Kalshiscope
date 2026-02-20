@@ -1,0 +1,24 @@
+{
+  "markets": [
+    {
+      "id": "mkt-1",
+      "question": "Will it rain in NYC on January 7, 2026?",
+      "outcomes": [
+        {"name": "YES", "odds": 0.55, "price": 0.55},
+        {"name": "NO", "odds": 0.45, "price": 0.45}
+      ],
+      "liquidity_usdc": 250.5,
+      "category": "weather",
+      "close_time": "2026-01-07T12:00:00Z",
+      "url": "https://predictbase.example/markets/mkt-1"
+    },
+    {
+      "market_id": "mkt-2",
+      "title": "Will Team A win the opener?",
+      "options": ["YES", "NO"],
+      "liquidity": "120",
+      "tags": ["sports"],
+      "closeTime": "2026-02-01T00:00:00"
+    }
+  ]
+}
