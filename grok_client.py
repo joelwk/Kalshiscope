@@ -26,28 +26,36 @@ _RE_NO_EXTERNAL_ODDS = re.compile(
     r"(no (?:external )?(?:betting )?odds found|implied[_ ]prob(?:ability)?\s*[:=]\s*(?:unknown|n/?a|null))",
     re.IGNORECASE,
 )
+_RE_LOW_INFORMATION = re.compile(
+    r"(no (?:search )?results|zero mentions|no mentions of|no evidence(?: found)?|"
+    r"no information(?: found)?|no data(?: available)?|could not find (?:any )?"
+    r"(?:evidence|information|data))",
+    re.IGNORECASE,
+)
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
 _XAI_CLIENT_TIMEOUT_SECONDS = 600
 _STREAM_TIMEOUT_SECONDS = 300
+_SYSTEM_PROMPT_SHARED = (
+    "Output must strictly match the response schema.\n"
+    "The `outcome` field must exactly match one of the provided market outcomes.\n"
+    "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
+    "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
+    "When search results are empty or irrelevant, reduce confidence and keep evidence quality below 0.50.\n"
+    "Absence of evidence is not evidence of absence; treat sparse evidence as lower conviction.\n"
+)
 _SYSTEM_PROMPT_ANALYZE = (
     "You are an autonomous prediction market analyst focused on finding tradable edge, not picking winners.\n"
     "Use web search and X search to gather recent, source-backed evidence.\n\n"
-    "Output must strictly match the response schema.\n"
-    "The `outcome` field must exactly match one of the provided market outcomes.\n"
-    "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
-    "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
-    "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
-    "Calibrate probabilities conservatively. For sports/esports, avoid overconfidence and generally keep confidence <=0.80.\n"
-    "Provide concise reasoning that includes implied probability, your probability, and edge."
+    + _SYSTEM_PROMPT_SHARED
+    + "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
+    + "Calibrate probabilities conservatively. For sports/esports, avoid overconfidence and generally keep confidence <=0.80.\n"
+    + "Provide concise reasoning that includes implied probability, your probability, and edge."
 )
 _SYSTEM_PROMPT_DEEP = (
     "You are performing deeper value validation on a prior market analysis.\n"
     "Do not flip outcomes unless evidence and edge are materially stronger than the prior analysis.\n"
-    "Output must strictly match the response schema.\n"
-    "The `outcome` field must exactly match one of the provided market outcomes.\n"
-    "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
-    "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
-    "If you change outcome, explain the stronger evidence and materially better edge."
+    + _SYSTEM_PROMPT_SHARED
+    + "If you change outcome, explain the stronger evidence and materially better edge."
 )
 
 
@@ -109,6 +117,27 @@ def _format_market_outcome_prices(market: Market) -> str:
             continue
         parts.append(f"{outcome.name}: N/A")
     return ", ".join(parts) if parts else "N/A"
+
+
+def _category_research_hint(profile_name: str) -> str:
+    if profile_name == "sports":
+        return (
+            "Sports guidance: prioritize current injury reports, lineup/rotation news, schedule fatigue, "
+            "home-away splits, and credible odds consensus."
+        )
+    if profile_name == "politics":
+        return (
+            "Politics guidance: prioritize reputable polling, official filings/statements, and base-rate priors; "
+            "discount unverified viral claims."
+        )
+    if profile_name == "crypto":
+        return (
+            "Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, and "
+            "time-sensitive catalysts over rumor accounts."
+        )
+    return (
+        "Generic guidance: prefer primary sources and high-credibility reporting; penalize stale or weakly corroborated claims."
+    )
 
 
 class GrokClient:
@@ -299,6 +328,7 @@ class GrokClient:
             prob_consistency_ok = False
 
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
+        low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
         prob_component = 0.0
         if implied is not None and my_prob is not None:
             prob_component = 0.55
@@ -323,6 +353,8 @@ class GrokClient:
 
         evidence_quality = prob_component + source_component + max(0.0, consistency_component)
         if no_external_odds:
+            evidence_quality = min(evidence_quality, 0.5)
+        if low_information:
             evidence_quality = min(evidence_quality, 0.5)
         if profile_name != "sports" and _RE_SPORTS_MISMATCH.search(decision.reasoning or ""):
             evidence_quality = max(0.0, evidence_quality - 0.4)
@@ -467,16 +499,24 @@ class GrokClient:
             outcome_prices = _format_market_outcome_prices(market)
             chat.append(
                 user(
-                    f"Market question: {market.question}\n"
-                    f"Outcomes: {', '.join([o.name for o in market.outcomes])}\n"
-                    f"Market outcome prices (implied prob): {outcome_prices}\n"
-                    f"Liquidity (USDC): {market.liquidity_usdc}\n"
-                    f"Betting range: ${self.min_bet_usdc:.2f} - ${self.max_bet_usdc:.2f}\n"
-                    f"Research profile: {active_config.profile_name}, lookback={active_config.lookback_hours}h\n"
-                    f"Previous analysis summary: {previous_summary}\n\n"
-                    "Outcome selection rule: output `outcome` as EXACTLY one string from the Outcomes list.\n"
-                    "In reasoning, explain why that specific outcome has edge over market pricing.\n"
-                    "In reasoning, explicitly include 'Implied prob: X, My prob: Y, Edge: Z'.\n"
+                    "<market_data>\n"
+                    f"question={market.question}\n"
+                    f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
+                    f"market_outcome_prices={outcome_prices}\n"
+                    f"liquidity_usdc={market.liquidity_usdc}\n"
+                    f"research_profile={active_config.profile_name}\n"
+                    f"lookback_hours={active_config.lookback_hours}\n"
+                    f"previous_analysis={previous_summary}\n"
+                    "</market_data>\n"
+                    "<constraints>\n"
+                    f"bet_range=${self.min_bet_usdc:.2f}-${self.max_bet_usdc:.2f}\n"
+                    f"{_category_research_hint(active_config.profile_name)}\n"
+                    "</constraints>\n"
+                    "<output_rules>\n"
+                    "outcome must EXACTLY match one provided outcome label\n"
+                    "reasoning must explain why the selected outcome has edge over market pricing\n"
+                    "reasoning must explicitly include: Implied prob: X, My prob: Y, Edge: Z\n"
+                    "</output_rules>\n"
                 )
             )
 
@@ -596,17 +636,25 @@ class GrokClient:
             outcome_prices = _format_market_outcome_prices(market)
             chat.append(
                 user(
-                    f"Market question: {market.question}\n"
-                    f"Outcomes: {', '.join([o.name for o in market.outcomes])}\n"
-                    f"Market outcome prices (implied prob): {outcome_prices}\n"
-                    f"Liquidity (USDC): {market.liquidity_usdc}\n"
-                    f"Previous analysis summary: {previous_summary}\n"
-                    f"Research profile: {active_config.profile_name}, lookback={active_config.lookback_hours}h\n\n"
-                    "Outcome selection rule: output `outcome` as EXACTLY one string from the Outcomes list.\n"
-                    "Re-check implied probability and edge from multiple sources. "
-                    "If edge < 5%, return should_trade=false and bet_size_pct=0.0. "
-                    "If you change outcome versus previous analysis, explicitly justify the stronger evidence and edge.\n"
-                    "Always include all required TradeDecision fields.\n"
+                    "<market_data>\n"
+                    f"question={market.question}\n"
+                    f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
+                    f"market_outcome_prices={outcome_prices}\n"
+                    f"liquidity_usdc={market.liquidity_usdc}\n"
+                    f"research_profile={active_config.profile_name}\n"
+                    f"lookback_hours={active_config.lookback_hours}\n"
+                    f"previous_analysis={previous_summary}\n"
+                    "</market_data>\n"
+                    "<constraints>\n"
+                    f"{_category_research_hint(active_config.profile_name)}\n"
+                    "Re-check implied probability and edge from multiple sources.\n"
+                    "If edge < 5%, return should_trade=false and bet_size_pct=0.0.\n"
+                    "</constraints>\n"
+                    "<output_rules>\n"
+                    "outcome must EXACTLY match one provided outcome label\n"
+                    "if outcome changes vs previous analysis, justify stronger evidence and materially better edge\n"
+                    "always include every required TradeDecision field\n"
+                    "</output_rules>\n"
                 )
             )
 

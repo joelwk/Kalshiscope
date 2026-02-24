@@ -47,6 +47,7 @@ _RESOLVED_MARKET_STATUS = {
     "canceled",
     "inactive",
 }
+_ADAPTIVE_SLEEP_CAP_SECONDS = 1800
 
 
 def _normalize_outcome_key(outcome: str | None) -> str:
@@ -736,7 +737,14 @@ def _should_adjust_position(
 
     # Otherwise, require minimum confidence increase over existing position
     confidence_increase = decision.confidence - existing_position.avg_confidence
-    meets_increase_threshold = confidence_increase >= settings.MIN_CONFIDENCE_INCREASE_FOR_ADD
+    position_fill_ratio = (
+        existing_position.total_amount_usdc / settings.MAX_POSITION_PER_MARKET_USDC
+    )
+    scaled_increase_threshold = settings.MIN_CONFIDENCE_INCREASE_FOR_ADD * max(
+        0.25,
+        min(1.0, position_fill_ratio),
+    )
+    meets_increase_threshold = confidence_increase >= scaled_increase_threshold
 
     if not is_high_confidence and not meets_increase_threshold:
         return False, 0.0
@@ -794,6 +802,64 @@ def _format_close_days_info(min_days, max_days) -> str:
     if max_days is not None:
         parts.append(f"max={max_days}d")
     return f", close_window=[{', '.join(parts)}]"
+
+
+def _compute_next_wakeup_seconds(
+    markets: list[Market],
+    state_manager: MarketStateManager,
+    settings: Settings,
+    now: datetime | None = None,
+) -> int | None:
+    """Compute next useful wake-up based on per-market cooldown expiry."""
+    if not markets:
+        return None
+
+    now_utc = now or datetime.now(timezone.utc)
+    earliest_remaining: float | None = None
+
+    for market in markets:
+        try:
+            state = state_manager.get_market_state(market.id)
+        except Exception as exc:
+            logger.debug(
+                "Adaptive wake-up skipped state lookup for market=%s: %s",
+                market.id,
+                exc,
+                data={"market_id": market.id, "error": str(exc)},
+            )
+            continue
+
+        if not state or not state.last_analysis:
+            continue
+
+        close_time = market.close_time
+        if close_time and close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=timezone.utc)
+        if close_time and close_time <= now_utc:
+            continue
+
+        last_analysis = state.last_analysis
+        if last_analysis.tzinfo is None:
+            last_analysis = last_analysis.replace(tzinfo=timezone.utc)
+
+        urgent_cutoff = now_utc + timedelta(days=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE)
+        is_urgent = bool(close_time and close_time <= urgent_cutoff)
+        cooldown_hours = (
+            settings.URGENT_REANALYSIS_COOLDOWN_HOURS
+            if is_urgent
+            else settings.REANALYSIS_COOLDOWN_HOURS
+        )
+        next_allowed = last_analysis + timedelta(hours=cooldown_hours)
+        remaining_seconds = (next_allowed - now_utc).total_seconds()
+        if remaining_seconds <= 0:
+            return 1
+        if earliest_remaining is None or remaining_seconds < earliest_remaining:
+            earliest_remaining = remaining_seconds
+
+    if earliest_remaining is None:
+        return None
+    capped = min(earliest_remaining, float(_ADAPTIVE_SLEEP_CAP_SECONDS))
+    return max(1, int(capped))
 
 
 def main() -> None:
@@ -897,6 +963,7 @@ def main() -> None:
         cycle_count += 1
         cycle_id = set_correlation_id()
         cycle_start = time.monotonic()
+        sleep_seconds = settings.POLL_INTERVAL_SEC
 
         logger.info("Starting bot cycle #%d", cycle_count)
 
@@ -1606,6 +1673,23 @@ def main() -> None:
                     "price_buckets": price_bucket_stats,
                 },
             )
+            if markets_analyzed == 0 and scheduler_skipped_recently > 0:
+                adaptive_seconds = _compute_next_wakeup_seconds(
+                    markets=markets,
+                    state_manager=state_manager,
+                    settings=settings,
+                )
+                if adaptive_seconds is not None:
+                    sleep_seconds = adaptive_seconds
+                    logger.debug(
+                        "Adaptive sleep selected: %ds (recently analyzed markets)",
+                        sleep_seconds,
+                        data={
+                            "sleep_seconds": sleep_seconds,
+                            "scheduler_skipped_recently_analyzed": scheduler_skipped_recently,
+                            "cap_seconds": _ADAPTIVE_SLEEP_CAP_SECONDS,
+                        },
+                    )
 
         except Exception as exc:
             logger.exception(
@@ -1617,9 +1701,10 @@ def main() -> None:
 
         logger.debug(
             "Sleeping for %d seconds before next cycle",
-            settings.POLL_INTERVAL_SEC,
+            sleep_seconds,
+            data={"sleep_seconds": sleep_seconds, "cycle_id": cycle_id},
         )
-        time.sleep(settings.POLL_INTERVAL_SEC)
+        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":

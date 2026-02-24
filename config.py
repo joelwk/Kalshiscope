@@ -43,7 +43,7 @@ class Settings:
 
     # xAI Grok
     XAI_API_KEY: str = ""
-    GROK_MODEL: str = "grok-3"
+    GROK_MODEL: str = "grok-4-1-fast-reasoning"
     SEARCH_LOOKBACK_HOURS: int = 24
     SEARCH_ALLOWED_DOMAINS: tuple[str, ...] = (
         "espn.com",

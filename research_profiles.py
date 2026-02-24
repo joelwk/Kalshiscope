@@ -61,7 +61,6 @@ _CRYPTO_KEYWORDS = (
     "fdv",
     "token",
     "listing",
-    "$",
 )
 _POLITICS_KEYWORDS = (
     "election",
