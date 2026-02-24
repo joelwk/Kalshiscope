@@ -22,7 +22,33 @@ _RE_IMPLIED = re.compile(r"implied prob(?:ability)?\s*[:=]\s*([0-9]+(?:\.[0-9]+)
 _RE_MY_PROB = re.compile(r"my prob(?:ability)?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)%?", re.IGNORECASE)
 _RE_EDGE = re.compile(r"edge\s*[:=]\s*([+-]?[0-9]+(?:\.[0-9]+)?)%?", re.IGNORECASE)
 _RE_SPORTS_MISMATCH = re.compile(r"unrelated sports content", re.IGNORECASE)
+_RE_NO_EXTERNAL_ODDS = re.compile(
+    r"(no (?:external )?(?:betting )?odds found|implied[_ ]prob(?:ability)?\s*[:=]\s*(?:unknown|n/?a|null))",
+    re.IGNORECASE,
+)
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
+_XAI_CLIENT_TIMEOUT_SECONDS = 600
+_STREAM_TIMEOUT_SECONDS = 300
+_SYSTEM_PROMPT_ANALYZE = (
+    "You are an autonomous prediction market analyst focused on finding tradable edge, not picking winners.\n"
+    "Use web search and X search to gather recent, source-backed evidence.\n\n"
+    "Output must strictly match the response schema.\n"
+    "The `outcome` field must exactly match one of the provided market outcomes.\n"
+    "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
+    "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
+    "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
+    "Calibrate probabilities conservatively. For sports/esports, avoid overconfidence and generally keep confidence <=0.80.\n"
+    "Provide concise reasoning that includes implied probability, your probability, and edge."
+)
+_SYSTEM_PROMPT_DEEP = (
+    "You are performing deeper value validation on a prior market analysis.\n"
+    "Do not flip outcomes unless evidence and edge are materially stronger than the prior analysis.\n"
+    "Output must strictly match the response schema.\n"
+    "The `outcome` field must exactly match one of the provided market outcomes.\n"
+    "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
+    "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
+    "If you change outcome, explain the stronger evidence and materially better edge."
+)
 
 
 def _default_search_config() -> SearchConfig:
@@ -71,6 +97,20 @@ def _format_previous_analysis(previous: TradeDecision | None) -> str:
     )
 
 
+def _format_market_outcome_prices(market: Market) -> str:
+    parts: list[str] = []
+    for outcome in market.outcomes or []:
+        if outcome.price is not None and 0.0 <= outcome.price <= 1.0:
+            parts.append(f"{outcome.name}: {outcome.price:.3f}")
+            continue
+        if outcome.odds is not None and outcome.odds > 0:
+            implied = 1.0 / outcome.odds
+            parts.append(f"{outcome.name}: {implied:.3f} (from odds)")
+            continue
+        parts.append(f"{outcome.name}: N/A")
+    return ", ".join(parts) if parts else "N/A"
+
+
 class GrokClient:
     """Client for interacting with xAI Grok for market analysis."""
 
@@ -82,7 +122,7 @@ class GrokClient:
         max_bet_usdc: float = 10.0,
         search_config: SearchConfig | None = None,
     ) -> None:
-        self.client = Client(api_key=api_key)
+        self.client = Client(api_key=api_key, timeout=_XAI_CLIENT_TIMEOUT_SECONDS)
         self.model = model
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
@@ -141,6 +181,31 @@ class GrokClient:
         return None
 
     @staticmethod
+    def _normalize_outcome_label(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+    @classmethod
+    def _canonical_outcome_for_market(cls, market: Market, outcome: str) -> str | None:
+        if not outcome:
+            return None
+        normalized = cls._normalize_outcome_label(outcome)
+        for market_outcome in market.outcomes or []:
+            if cls._normalize_outcome_label(market_outcome.name) == normalized:
+                return market_outcome.name
+
+        yes_aliases = {"yes", "true", "1"}
+        no_aliases = {"no", "false", "0"}
+        if normalized in yes_aliases:
+            for market_outcome in market.outcomes or []:
+                if cls._normalize_outcome_label(market_outcome.name) in yes_aliases:
+                    return market_outcome.name
+        if normalized in no_aliases:
+            for market_outcome in market.outcomes or []:
+                if cls._normalize_outcome_label(market_outcome.name) in no_aliases:
+                    return market_outcome.name
+        return None
+
+    @staticmethod
     def _extract_metric_from_reasoning(reasoning: str, regex: re.Pattern[str]) -> float | None:
         match = regex.search(reasoning or "")
         if not match:
@@ -156,6 +221,22 @@ class GrokClient:
         decision: TradeDecision,
         profile_name: str,
     ) -> TradeDecision:
+        canonical_outcome = self._canonical_outcome_for_market(market, decision.outcome)
+        if canonical_outcome is None:
+            mismatch_reason = (
+                f"[Outcome mismatch] Outcome '{decision.outcome}' does not match market outcomes "
+                f"{[outcome.name for outcome in market.outcomes]}."
+            )
+            evidence_quality = max(0.0, min(0.2, decision.evidence_quality or 0.0))
+            return decision.model_copy(
+                update={
+                    "should_trade": False,
+                    "bet_size_pct": 0.0,
+                    "evidence_quality": evidence_quality,
+                    "reasoning": f"{mismatch_reason} {decision.reasoning}",
+                }
+            )
+
         implied = decision.implied_prob_external
         my_prob = decision.my_prob
         edge = decision.edge_external
@@ -171,13 +252,27 @@ class GrokClient:
         if edge is None and implied is not None and my_prob is not None:
             edge = my_prob - implied
 
-        evidence_quality = decision.evidence_quality or 0.0
+        consistency_ok = True
+        if implied is not None and my_prob is not None and edge is not None:
+            expected_edge = my_prob - implied
+            if abs(expected_edge - edge) > 0.03:
+                consistency_ok = False
+
+        prob_consistency_ok = True
+        if my_prob is not None and abs(my_prob - decision.confidence) > 0.08:
+            prob_consistency_ok = False
+
+        evidence_quality = 0.0
         if implied is not None and my_prob is not None:
-            evidence_quality += 0.4
-        if edge is not None:
+            evidence_quality = 0.7
+        elif my_prob is not None:
+            evidence_quality = 0.3
+        if edge is not None and consistency_ok:
             evidence_quality += 0.2
         if decision.reasoning and "as of" in decision.reasoning.lower():
             evidence_quality += 0.1
+        if _RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""):
+            evidence_quality = min(evidence_quality, 0.5)
         if profile_name != "sports" and _RE_SPORTS_MISMATCH.search(decision.reasoning or ""):
             evidence_quality = max(0.0, evidence_quality - 0.4)
             logger.warning(
@@ -186,16 +281,13 @@ class GrokClient:
                 profile_name,
                 data={"market_id": market.id, "profile_name": profile_name},
             )
-
-        consistency_ok = True
-        if implied is not None and my_prob is not None and edge is not None:
-            expected_edge = my_prob - implied
-            if abs(expected_edge - edge) > 0.03:
-                consistency_ok = False
-                evidence_quality = max(0.0, evidence_quality - 0.3)
+        if not consistency_ok:
+            evidence_quality = max(0.0, evidence_quality - 0.3)
+        if not prob_consistency_ok:
+            evidence_quality = max(0.0, evidence_quality - 0.2)
 
         evidence_quality = max(0.0, min(1.0, evidence_quality))
-        market_implied = self._market_implied_probability(market, decision.outcome)
+        market_implied = self._market_implied_probability(market, canonical_outcome)
         market_edge = (
             (decision.confidence - market_implied)
             if market_implied is not None
@@ -207,10 +299,17 @@ class GrokClient:
             should_trade = False
         if should_trade and (not consistency_ok) and (market_edge is None or market_edge < 0.08):
             should_trade = False
+        if should_trade and (not prob_consistency_ok) and (market_edge is None or market_edge < 0.10):
+            should_trade = False
+        if should_trade and edge is not None and edge < 0.05:
+            should_trade = False
+        if should_trade and market_edge is not None and market_edge <= 0.0:
+            should_trade = False
 
         return decision.model_copy(
             update={
                 "should_trade": should_trade,
+                "outcome": canonical_outcome,
                 "implied_prob_external": implied,
                 "my_prob": my_prob,
                 "edge_external": edge,
@@ -269,6 +368,7 @@ class GrokClient:
     def _build_chat(self, config: SearchConfig, enable_multimedia: bool):
         return self.client.chat.create(
             model=self.model,
+            response_format=TradeDecision,
             tools=[
                 web_search(allowed_domains=config.allowed_domains),
                 x_search(
@@ -290,9 +390,11 @@ class GrokClient:
         self,
         market: Market,
         search_config: SearchConfig | None = None,
+        previous_analysis: TradeDecision | None = None,
     ) -> TradeDecision:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
+        previous_summary = _format_previous_analysis(previous_analysis)
         logger.debug(
             "Starting market analysis: id=%s",
             market.id,
@@ -306,37 +408,38 @@ class GrokClient:
             },
         )
 
-        schema = TradeDecision.model_json_schema()
         try:
             enable_multimedia = self._should_enable_multimedia(
                 market,
-                decision=None,
+                decision=previous_analysis,
                 config=active_config,
             )
             chat = self._build_chat(active_config, enable_multimedia)
             chat.append(
-                system(
-                    "You are an autonomous prediction market analyst focused on FINDING VALUE, not just picking winners. "
-                    "Use web search and X search to gather recent context.\n\n"
-                    "Return JSON only. Include implied_prob_external, my_prob, edge_external, evidence_quality.\n"
-                    "If confidence is high but edge is weak, set should_trade=false."
-                )
+                system(_SYSTEM_PROMPT_ANALYZE)
             )
+            outcome_prices = _format_market_outcome_prices(market)
             chat.append(
                 user(
                     f"Market question: {market.question}\n"
                     f"Outcomes: {', '.join([o.name for o in market.outcomes])}\n"
+                    f"Market outcome prices (implied prob): {outcome_prices}\n"
                     f"Liquidity (USDC): {market.liquidity_usdc}\n"
                     f"Betting range: ${self.min_bet_usdc:.2f} - ${self.max_bet_usdc:.2f}\n"
-                    f"Research profile: {active_config.profile_name}, lookback={active_config.lookback_hours}h\n\n"
+                    f"Research profile: {active_config.profile_name}, lookback={active_config.lookback_hours}h\n"
+                    f"Previous analysis summary: {previous_summary}\n\n"
+                    "Outcome selection rule: output `outcome` as EXACTLY one string from the Outcomes list.\n"
+                    "In reasoning, explain why that specific outcome has edge over market pricing.\n"
                     "In reasoning, explicitly include 'Implied prob: X, My prob: Y, Edge: Z'.\n"
-                    f"JSON Schema: {json.dumps(schema)}"
                 )
             )
 
             content = ""
             chunk_count = 0
+            deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
             for _, chunk in chat.stream():
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market.id}")
                 if chunk.content:
                     content += chunk.content
                     chunk_count += 1
@@ -347,6 +450,11 @@ class GrokClient:
             try:
                 data = json.loads(content)
             except json.JSONDecodeError:
+                logger.warning(
+                    "Structured response parse fallback invoked for market=%s",
+                    market.id,
+                    data={"market_id": market.id},
+                )
                 data = _extract_json(content)
 
             decision = TradeDecision.model_validate(data)
@@ -429,7 +537,6 @@ class GrokClient:
             },
         )
 
-        schema = TradeDecision.model_json_schema()
         try:
             enable_multimedia = self._should_enable_multimedia(
                 market,
@@ -438,31 +545,31 @@ class GrokClient:
             )
             chat = self._build_chat(active_config, enable_multimedia)
             chat.append(
-                system(
-                    "You are performing deeper value validation. "
-                    "Do not flip picks unless evidence and edge are materially stronger. "
-                    "Return JSON only and match the provided schema exactly, including "
-                    "should_trade, outcome, confidence, bet_size_pct, reasoning, and optional "
-                    "implied_prob_external, my_prob, edge_external, evidence_quality."
-                )
+                system(_SYSTEM_PROMPT_DEEP)
             )
+            outcome_prices = _format_market_outcome_prices(market)
             chat.append(
                 user(
                     f"Market question: {market.question}\n"
                     f"Outcomes: {', '.join([o.name for o in market.outcomes])}\n"
+                    f"Market outcome prices (implied prob): {outcome_prices}\n"
                     f"Liquidity (USDC): {market.liquidity_usdc}\n"
                     f"Previous analysis summary: {previous_summary}\n"
                     f"Research profile: {active_config.profile_name}, lookback={active_config.lookback_hours}h\n\n"
+                    "Outcome selection rule: output `outcome` as EXACTLY one string from the Outcomes list.\n"
                     "Re-check implied probability and edge from multiple sources. "
                     "If edge < 5%, return should_trade=false and bet_size_pct=0.0. "
+                    "If you change outcome versus previous analysis, explicitly justify the stronger evidence and edge.\n"
                     "Always include all required TradeDecision fields.\n"
-                    f"JSON Schema: {json.dumps(schema)}"
                 )
             )
 
             content = ""
             chunk_count = 0
+            deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
             for _, chunk in chat.stream():
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market.id}")
                 if chunk.content:
                     content += chunk.content
                     chunk_count += 1
@@ -472,6 +579,11 @@ class GrokClient:
             try:
                 data = json.loads(content)
             except json.JSONDecodeError:
+                logger.warning(
+                    "Structured response parse fallback invoked for market=%s (deep)",
+                    market.id,
+                    data={"market_id": market.id},
+                )
                 data = _extract_json(content)
 
             data = self._merge_partial_deep_response(data, previous_analysis)

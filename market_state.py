@@ -218,6 +218,46 @@ class MarketStateManager:
             last_trade=last_trade,
         )
 
+    def get_anchor_analysis(
+        self,
+        market_id: str,
+        min_confidence: float,
+    ) -> dict[str, Any] | None:
+        """Return anchor analysis row for side-stability checks.
+
+        Preference order:
+        1) Latest analysis at/above min_confidence.
+        2) Latest analysis regardless of confidence.
+        """
+        row = self._conn.execute(
+            """
+            SELECT market_id, outcome, confidence, reasoning, timestamp, is_refined, refinement_reason
+            FROM analyses
+            WHERE market_id = ?
+              AND confidence IS NOT NULL
+              AND confidence >= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (market_id, min_confidence),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+
+        fallback = self._conn.execute(
+            """
+            SELECT market_id, outcome, confidence, reasoning, timestamp, is_refined, refinement_reason
+            FROM analyses
+            WHERE market_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (market_id,),
+        ).fetchone()
+        if fallback is None:
+            return None
+        return dict(fallback)
+
     def record_analysis(
         self,
         market_id: str,

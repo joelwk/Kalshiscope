@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from config import Settings
-from main import _adjust_bet_size_for_edge, _extract_winning_outcome, _filter_markets, _passes_edge_threshold
+from main import (
+    _adjust_bet_size_for_edge,
+    _extract_winning_outcome,
+    _filter_markets,
+    _is_uniform_implied_probability,
+    _passes_edge_threshold,
+)
 from models import Market, MarketOutcome, TradeDecision
 
 
@@ -110,3 +116,37 @@ def test_filter_markets_excludes_closed_now() -> None:
         blocklist=(),
     )
     assert [market.id for market in filtered] == ["open"]
+
+
+def test_filter_markets_excludes_resolved_without_close_time() -> None:
+    markets = [
+        Market(id="open", question="Open market", close_time=None, status=0),
+        Market(
+            id="resolved",
+            question="Resolved market",
+            close_time=None,
+            status="resolved",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        ),
+    ]
+    stats: dict[str, int] = {}
+    filtered = _filter_markets(
+        markets,
+        min_liquidity=0.0,
+        allowlist=(),
+        blocklist=(),
+        stats=stats,
+    )
+    assert [market.id for market in filtered] == ["open"]
+    assert stats.get("skipped_resolved") == 1
+
+
+def test_uniform_distribution_guard_for_multi_outcome_market() -> None:
+    outcomes = [
+        MarketOutcome(name="A"),
+        MarketOutcome(name="B"),
+        MarketOutcome(name="C"),
+        MarketOutcome(name="D"),
+    ]
+    assert _is_uniform_implied_probability(0.25, outcomes) is True
+    assert _is_uniform_implied_probability(0.30, outcomes) is False

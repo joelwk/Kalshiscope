@@ -136,6 +136,25 @@ class TestConfig(unittest.TestCase):
         delta_hours = (search_config.to_date - search_config.from_date).total_seconds() / 3600
         self.assertTrue(5.9 <= delta_hours <= 6.1)
 
+    def test_flip_guard_settings_overrides(self) -> None:
+        env = {
+            "XAI_API_KEY": "xai-key",
+            "WALLET_PRIVATE_KEY": "0xabc",
+            "FLIP_GUARD_ENABLED": "false",
+            "FLIP_GUARD_MIN_ABS_CONFIDENCE": "0.70",
+            "FLIP_GUARD_MIN_CONF_GAIN": "0.10",
+            "FLIP_GUARD_MIN_EDGE_GAIN": "0.05",
+            "FLIP_GUARD_MIN_EVIDENCE_QUALITY": "0.75",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+
+        self.assertFalse(settings.FLIP_GUARD_ENABLED)
+        self.assertEqual(settings.FLIP_GUARD_MIN_ABS_CONFIDENCE, 0.70)
+        self.assertEqual(settings.FLIP_GUARD_MIN_CONF_GAIN, 0.10)
+        self.assertEqual(settings.FLIP_GUARD_MIN_EDGE_GAIN, 0.05)
+        self.assertEqual(settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY, 0.75)
+
 
 if __name__ == "__main__":
     unittest.main()

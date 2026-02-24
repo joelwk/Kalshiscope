@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta, timezone
 import re
+from typing import Any
 
 from config import Settings, load_settings
 from grok_client import GrokClient
@@ -25,13 +26,55 @@ from models import (
 )
 from predictbase_client import PredictBaseClient
 from refinement import RefinementStrategy
-from research_profiles import build_market_search_config
+from research_profiles import build_market_search_config, market_category_flags
 from score_engine import compute_final_score
 from web3_client import Web3Client
 
 logger = get_logger("predictbot")
 
 _MATCHUP_SEPARATOR = re.compile(r"\s+(?:vs\.?|v\.?|at)\s+|\s*@\s*", re.IGNORECASE)
+_OPEN_MARKET_STATUS = {"", "0", "open", "active", "trading"}
+_RESOLVED_MARKET_STATUS = {
+    "1",
+    "2",
+    "3",
+    "closed",
+    "resolved",
+    "settled",
+    "finalized",
+    "ended",
+    "cancelled",
+    "canceled",
+    "inactive",
+}
+
+
+def _normalize_outcome_key(outcome: str | None) -> str:
+    return re.sub(r"\s+", " ", (outcome or "").strip()).lower()
+
+
+def _outcomes_match(left: str | None, right: str | None) -> bool:
+    left_key = _normalize_outcome_key(left)
+    right_key = _normalize_outcome_key(right)
+    if not left_key or not right_key:
+        return False
+    return left_key == right_key
+
+
+def _status_indicates_closed(status: object) -> bool:
+    if status is None:
+        return False
+    status_text = str(status).strip().lower()
+    if status_text in _OPEN_MARKET_STATUS:
+        return False
+    if status_text in _RESOLVED_MARKET_STATUS:
+        return True
+    if status_text.lstrip("-").isdigit():
+        try:
+            return int(status_text) > 0
+        except ValueError:
+            return False
+    return False
 
 
 def _filter_markets(
@@ -51,6 +94,7 @@ def _filter_markets(
     skipped_close_too_soon = 0
     skipped_close_too_far = 0
     skipped_closed_now = 0
+    skipped_resolved = 0
 
     now = datetime.now(timezone.utc)
     min_close_date = now + timedelta(days=min_close_days) if min_close_days else None
@@ -69,6 +113,9 @@ def _filter_markets(
         if blocklist and (market.category in blocklist):
             skipped_blocklist += 1
             continue
+        if _is_market_resolved_or_closed(market):
+            skipped_resolved += 1
+            continue
         if min_close_date and close_time:
             if close_time < min_close_date:
                 skipped_close_too_soon += 1
@@ -84,11 +131,13 @@ def _filter_markets(
 
     logger.debug(
         "Market filtering complete: kept=%d, skipped_liquidity=%d, skipped_allowlist=%d, "
-        "skipped_blocklist=%d, skipped_close_too_soon=%d, skipped_close_too_far=%d, skipped_closed_now=%d",
+        "skipped_blocklist=%d, skipped_resolved=%d, skipped_close_too_soon=%d, "
+        "skipped_close_too_far=%d, skipped_closed_now=%d",
         len(filtered),
         skipped_liquidity,
         skipped_allowlist,
         skipped_blocklist,
+        skipped_resolved,
         skipped_close_too_soon,
         skipped_close_too_far,
         skipped_closed_now,
@@ -97,6 +146,7 @@ def _filter_markets(
             "skipped_liquidity": skipped_liquidity,
             "skipped_allowlist": skipped_allowlist,
             "skipped_blocklist": skipped_blocklist,
+            "skipped_resolved": skipped_resolved,
             "skipped_close_too_soon": skipped_close_too_soon,
             "skipped_close_too_far": skipped_close_too_far,
             "skipped_closed_now": skipped_closed_now,
@@ -109,6 +159,7 @@ def _filter_markets(
                 "skipped_liquidity": skipped_liquidity,
                 "skipped_allowlist": skipped_allowlist,
                 "skipped_blocklist": skipped_blocklist,
+                "skipped_resolved": skipped_resolved,
                 "skipped_close_too_soon": skipped_close_too_soon,
                 "skipped_close_too_far": skipped_close_too_far,
                 "skipped_closed_now": skipped_closed_now,
@@ -232,6 +283,7 @@ _PRICE_BUCKET_LOW = "lt_low_threshold"
 _PRICE_BUCKET_MID = "mid_range"
 _PRICE_BUCKET_HIGH = "gt_high_threshold"
 _UNRESOLVED_WINNING_TOKENS = {"", "-1", "18446744073709551615"}
+_UNIFORM_IMPLIED_EPSILON = 0.02
 
 
 def _find_market_outcome(market: Market, outcome: str) -> MarketOutcome | None:
@@ -321,13 +373,10 @@ def _adjust_bet_size_for_edge(
 def _max_confidence_for_market(market: Market | None, settings: Settings) -> float:
     if not market:
         return 1.0
-    category = (market.category or "").lower()
-    question_lower = market.question.lower()
-    sports_keywords = ("nba", "nhl", "nfl", "mlb", "soccer", "football", "tennis", "atp", "wta")
-    esports_keywords = ("cs2", "csgo", "dota", "league of legends", "valorant", "esports")
-    if any(kw in category or kw in question_lower for kw in sports_keywords):
+    is_sports, is_esports = market_category_flags(market)
+    if is_sports:
         return settings.MAX_SPORTS_CONFIDENCE
-    if any(kw in category or kw in question_lower for kw in esports_keywords):
+    if is_esports:
         return settings.MAX_ESPORTS_CONFIDENCE
     return 1.0
 
@@ -351,6 +400,16 @@ def _price_bucket(
     if implied_prob <= settings.HIGH_PRICE_THRESHOLD:
         return _PRICE_BUCKET_MID
     return _PRICE_BUCKET_HIGH
+
+
+def _is_uniform_implied_probability(
+    implied_prob: float | None,
+    outcomes: list[MarketOutcome],
+) -> bool:
+    if implied_prob is None or len(outcomes) <= 2:
+        return False
+    uniform_implied = 1.0 / len(outcomes)
+    return abs(implied_prob - uniform_implied) < _UNIFORM_IMPLIED_EPSILON
 
 
 def _extract_winning_outcome(market: Market) -> str | None:
@@ -400,6 +459,156 @@ def _is_unresolved_winning_value(value: object) -> bool:
     return False
 
 
+def _is_market_resolved_or_closed(market: Market) -> bool:
+    """Return True when market appears settled/closed based on status/winner signals."""
+    winning_outcome = _extract_winning_outcome(market)
+    if winning_outcome:
+        return True
+    return _status_indicates_closed(market.status)
+
+
+def _coerce_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decision_edge_for_outcome(
+    market: Market,
+    outcome: str,
+    confidence: float,
+) -> float | None:
+    implied = _get_implied_probability(market, outcome)
+    if implied is None:
+        return None
+    return confidence - implied
+
+
+def _apply_flip_guard(
+    market: Market,
+    decision: TradeDecision,
+    anchor_analysis: dict[str, Any] | None,
+    settings: Settings,
+) -> tuple[TradeDecision, bool, bool]:
+    """Apply strict flip guardrails against switching sides across cycles."""
+    if not settings.FLIP_GUARD_ENABLED or anchor_analysis is None:
+        return decision, False, False
+
+    anchor_outcome_raw = anchor_analysis.get("outcome")
+    anchor_outcome = str(anchor_outcome_raw).strip() if anchor_outcome_raw is not None else ""
+    if not anchor_outcome:
+        return decision, False, False
+    if _outcomes_match(decision.outcome, anchor_outcome):
+        return decision, False, False
+
+    anchor_confidence = _coerce_float(anchor_analysis.get("confidence")) or 0.0
+    if anchor_confidence < settings.MIN_CONFIDENCE:
+        logger.debug(
+            "FlipGuard bypassed due to low-confidence anchor: market=%s anchor_conf=%.3f threshold=%.3f",
+            market.id,
+            anchor_confidence,
+            settings.MIN_CONFIDENCE,
+            data={
+                "market_id": market.id,
+                "anchor_outcome": anchor_outcome,
+                "proposed_outcome": decision.outcome,
+                "anchor_confidence": anchor_confidence,
+                "min_confidence_threshold": settings.MIN_CONFIDENCE,
+            },
+        )
+        return decision, False, False
+
+    confidence_delta = decision.confidence - anchor_confidence
+    new_edge = _decision_edge_for_outcome(market, decision.outcome, decision.confidence)
+    anchor_edge = _decision_edge_for_outcome(market, anchor_outcome, anchor_confidence)
+    edge_delta = None
+    edge_gain_ok = True
+    if new_edge is not None and anchor_edge is not None:
+        edge_delta = new_edge - anchor_edge
+        edge_gain_ok = edge_delta >= settings.FLIP_GUARD_MIN_EDGE_GAIN
+
+    abs_conf_ok = decision.confidence >= settings.FLIP_GUARD_MIN_ABS_CONFIDENCE
+    conf_gain_ok = confidence_delta >= settings.FLIP_GUARD_MIN_CONF_GAIN
+    evidence_quality = decision.evidence_quality or 0.0
+    evidence_ok = evidence_quality >= settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY
+
+    payload = {
+        "market_id": market.id,
+        "anchor_outcome": anchor_outcome,
+        "proposed_outcome": decision.outcome,
+        "anchor_confidence": anchor_confidence,
+        "proposed_confidence": decision.confidence,
+        "confidence_delta": confidence_delta,
+        "anchor_edge": anchor_edge,
+        "proposed_edge": new_edge,
+        "edge_delta": edge_delta,
+        "evidence_quality": evidence_quality,
+        "abs_conf_ok": abs_conf_ok,
+        "conf_gain_ok": conf_gain_ok,
+        "edge_gain_ok": edge_gain_ok,
+        "evidence_ok": evidence_ok,
+    }
+
+    if abs_conf_ok and conf_gain_ok and edge_gain_ok and evidence_ok:
+        logger.info(
+            "FlipGuard passed: market=%s anchor=%s proposed=%s conf_delta=%.3f edge_delta=%s",
+            market.id,
+            anchor_outcome,
+            decision.outcome,
+            confidence_delta,
+            f"{edge_delta:.3f}" if edge_delta is not None else "n/a",
+            data=payload,
+        )
+        return decision, True, False
+
+    reasons: list[str] = []
+    if not abs_conf_ok:
+        reasons.append(
+            f"abs_conf {decision.confidence:.2f} < {settings.FLIP_GUARD_MIN_ABS_CONFIDENCE:.2f}"
+        )
+    if not conf_gain_ok:
+        reasons.append(
+            f"conf_gain {confidence_delta:.2f} < {settings.FLIP_GUARD_MIN_CONF_GAIN:.2f}"
+        )
+    if edge_delta is not None and not edge_gain_ok:
+        reasons.append(
+            f"edge_gain {edge_delta:.3f} < {settings.FLIP_GUARD_MIN_EDGE_GAIN:.3f}"
+        )
+    if not evidence_ok:
+        reasons.append(
+            "evidence_quality "
+            f"{evidence_quality:.2f} < {settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY:.2f}"
+        )
+    block_reason = "; ".join(reasons) if reasons else "criteria not met"
+    payload["block_reason"] = block_reason
+
+    blocked_decision = decision.model_copy(
+        update={
+            "should_trade": False,
+            "bet_size_pct": 0.0,
+            "outcome": anchor_outcome,
+            "reasoning": (
+                f"[FlipGuard blocked: {block_reason}; anchor={anchor_outcome}; "
+                f"proposed={decision.outcome}] {decision.reasoning}"
+            ),
+        }
+    )
+    logger.warning(
+        "FlipGuard blocked: market=%s anchor=%s proposed=%s conf_delta=%.3f edge_delta=%s reason=%s",
+        market.id,
+        anchor_outcome,
+        decision.outcome,
+        confidence_delta,
+        f"{edge_delta:.3f}" if edge_delta is not None else "n/a",
+        block_reason,
+        data=payload,
+    )
+    return blocked_decision, True, True
+
+
 def _update_resolved_markets(
     markets: list[Market],
     state_manager: MarketStateManager,
@@ -443,26 +652,10 @@ def _cap_confidence_for_category(
     settings: Settings,
 ) -> TradeDecision:
     """Apply confidence caps based on market category to prevent overconfidence."""
-    category = (market.category or "").lower()
-    question_lower = market.question.lower()
-    
-    # Detect sports and esports categories
-    sports_keywords = ("nba", "nhl", "nfl", "mlb", "soccer", "football", "tennis", "atp", "wta")
-    esports_keywords = ("cs2", "csgo", "dota", "league of legends", "valorant", "esports")
-    
-    is_sports = any(kw in category or kw in question_lower for kw in sports_keywords)
-    is_esports = any(kw in category or kw in question_lower for kw in esports_keywords)
-    
-    max_conf = 1.0
-    cap_reason = None
-    
-    if is_sports:
-        max_conf = settings.MAX_SPORTS_CONFIDENCE
-        cap_reason = "sports"
-    elif is_esports:
-        max_conf = settings.MAX_ESPORTS_CONFIDENCE
-        cap_reason = "esports"
-    
+    max_conf = _max_confidence_for_market(market, settings)
+    is_sports, is_esports = market_category_flags(market)
+    cap_reason = "sports" if is_sports else ("esports" if is_esports else None)
+
     if decision.confidence > max_conf:
         logger.info(
             "Capping confidence: market=%s original=%.2f capped=%.2f reason=%s",
@@ -477,15 +670,37 @@ def _cap_confidence_for_category(
                 "cap_reason": cap_reason,
             },
         )
-        return TradeDecision(
-            should_trade=decision.should_trade,
-            outcome=decision.outcome,
-            confidence=max_conf,
-            bet_size_pct=decision.bet_size_pct * (max_conf / decision.confidence),
-            reasoning=f"[Confidence capped from {decision.confidence:.2f} to {max_conf:.2f} for {cap_reason}] {decision.reasoning}",
+        return decision.model_copy(
+            update={
+                "confidence": max_conf,
+                "bet_size_pct": decision.bet_size_pct * (max_conf / decision.confidence),
+                "reasoning": (
+                    f"[Confidence capped from {decision.confidence:.2f} to {max_conf:.2f} "
+                    f"for {cap_reason}] {decision.reasoning}"
+                ),
+            }
         )
     
     return decision
+
+
+def _build_previous_analysis(anchor: dict[str, Any] | None) -> TradeDecision | None:
+    if not anchor:
+        return None
+    outcome = str(anchor.get("outcome") or "").strip()
+    confidence = _coerce_float(anchor.get("confidence"))
+    reasoning = str(anchor.get("reasoning") or "").strip()
+    if not outcome or confidence is None:
+        return None
+    if not reasoning:
+        reasoning = "Previous cycle analysis."
+    return TradeDecision(
+        should_trade=False,
+        outcome=outcome,
+        confidence=max(0.0, min(1.0, confidence)),
+        bet_size_pct=0.0,
+        reasoning=reasoning,
+    )
 
 
 def _should_adjust_position(
@@ -560,6 +775,11 @@ def _log_settings_summary(settings) -> None:
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
             "opposite_outcome_strategy": settings.OPPOSITE_OUTCOME_STRATEGY,
+            "flip_guard_enabled": settings.FLIP_GUARD_ENABLED,
+            "flip_guard_min_abs_confidence": settings.FLIP_GUARD_MIN_ABS_CONFIDENCE,
+            "flip_guard_min_conf_gain": settings.FLIP_GUARD_MIN_CONF_GAIN,
+            "flip_guard_min_edge_gain": settings.FLIP_GUARD_MIN_EDGE_GAIN,
+            "flip_guard_min_evidence_quality": settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
         },
     )
 
@@ -595,6 +815,7 @@ def main() -> None:
     scheduler = MarketScheduler(
         reanalysis_cooldown_hours=settings.REANALYSIS_COOLDOWN_HOURS,
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
+        urgent_reanalysis_cooldown_hours=settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
     )
     refinement = RefinementStrategy(
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
@@ -724,6 +945,9 @@ def main() -> None:
             markets_refined = 0
             markets_passed_edge = 0
             score_gate_blocked = 0
+            flip_guard_triggered = 0
+            flip_guard_blocked = 0
+            outcome_mismatch_blocked = 0
             analysis_only_mode = False  # Set True when balance is insufficient
             price_bucket_stats = {
                 _PRICE_BUCKET_LOW: 0,
@@ -767,10 +991,24 @@ def main() -> None:
                     continue
 
                 try:
+                    previous_analysis = _build_previous_analysis(
+                        state_manager.get_anchor_analysis(market.id, settings.MIN_CONFIDENCE)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Previous analysis lookup failed for market %s: %s",
+                        market.id,
+                        exc,
+                        data={"market_id": market.id, "error": str(exc)},
+                    )
+                    previous_analysis = None
+
+                try:
                     search_config = build_market_search_config(settings, market)
                     decision = grok_client.analyze_market(
                         market,
                         search_config=search_config,
+                        previous_analysis=previous_analysis,
                     )
                     markets_analyzed += 1
                 except Exception as exc:
@@ -781,6 +1019,24 @@ def main() -> None:
                         data={"market_id": market.id, "error": str(exc)},
                     )
                     continue
+
+                market_outcome_mismatch_counted = False
+                anchor_analysis: dict[str, Any] | None = None
+                anchor_outcome: str | None = None
+                try:
+                    anchor_analysis = state_manager.get_anchor_analysis(
+                        market.id,
+                        settings.MIN_CONFIDENCE,
+                    )
+                    if anchor_analysis and anchor_analysis.get("outcome") is not None:
+                        anchor_outcome = str(anchor_analysis["outcome"]).strip() or None
+                except Exception as exc:
+                    logger.warning(
+                        "Anchor analysis lookup failed for market %s: %s",
+                        market.id,
+                        exc,
+                        data={"market_id": market.id, "error": str(exc)},
+                    )
 
                 refinement.market = market
                 was_refined = False
@@ -797,6 +1053,20 @@ def main() -> None:
                     evidence_quality=decision.evidence_quality,
                     edge_value=edge_for_refine,
                 )
+                if anchor_outcome and not _outcomes_match(decision.outcome, anchor_outcome):
+                    if "side_flip_vs_anchor" not in refinement_reasons:
+                        refinement_reasons.append("side_flip_vs_anchor")
+                    logger.info(
+                        "Refinement forced by side flip: market=%s anchor=%s proposed=%s",
+                        market.id,
+                        anchor_outcome,
+                        decision.outcome,
+                        data={
+                            "market_id": market.id,
+                            "anchor_outcome": anchor_outcome,
+                            "proposed_outcome": decision.outcome,
+                        },
+                    )
                 refinement_reason_text = ",".join(refinement_reasons) if refinement_reasons else None
                 if refinement_reasons:
                     try:
@@ -818,6 +1088,28 @@ def main() -> None:
 
                 # Apply confidence caps for high-variance event types
                 decision = _cap_confidence_for_category(decision, market, settings)
+                decision, flip_triggered, flip_blocked = _apply_flip_guard(
+                    market,
+                    decision,
+                    anchor_analysis,
+                    settings,
+                )
+                if flip_triggered:
+                    flip_guard_triggered += 1
+                if flip_blocked:
+                    flip_guard_blocked += 1
+                if "[Outcome mismatch]" in (decision.reasoning or ""):
+                    outcome_mismatch_blocked += 1
+                    market_outcome_mismatch_counted = True
+                    logger.warning(
+                        "Outcome mismatch blocked trade path: market=%s outcome=%s",
+                        market.id,
+                        decision.outcome,
+                        data={
+                            "market_id": market.id,
+                            "outcome": decision.outcome,
+                        },
+                    )
 
                 log_trade_decision(
                     market_id=market.id,
@@ -888,6 +1180,26 @@ def main() -> None:
                         },
                     )
                     continue
+
+                if _is_uniform_implied_probability(implied_prob, market.outcomes):
+                    uniform_implied = 1.0 / len(market.outcomes)
+                    trades_skipped_edge += 1
+                    question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                    logger.info(
+                        "SKIP [%s] '%s' -> uniform implied probability detected (%d outcomes, implied=%.3f)",
+                        market.id,
+                        question_short,
+                        len(market.outcomes),
+                        implied_prob,
+                        data={
+                            "market_id": market.id,
+                            "implied_prob": implied_prob,
+                            "uniform_implied": uniform_implied,
+                            "outcomes": [outcome.name for outcome in market.outcomes],
+                        },
+                    )
+                    continue
+
                 markets_passed_edge += 1
 
                 score_result = compute_final_score(
@@ -1109,6 +1421,12 @@ def main() -> None:
                     continue  # Continue analyzing remaining markets
                 except Exception as order_exc:
                     error_msg = str(order_exc)
+                    if (
+                        "Could not map outcome" in error_msg
+                        and not market_outcome_mismatch_counted
+                    ):
+                        outcome_mismatch_blocked += 1
+                        market_outcome_mismatch_counted = True
                     logger.error(
                         "Order submission failed: market=%s, error=%s",
                         market.id,
@@ -1225,22 +1543,30 @@ def main() -> None:
                 },
             )
             logger.info(
-                "Cycle funnel: fetched=%d filtered=%d scheduler_skips=%d analyzed=%d refined=%d edge_pass=%d traded=%d",
+                "Cycle funnel: fetched=%d filtered=%d skipped_resolved=%d scheduler_skips=%d "
+                "analyzed=%d refined=%d flip_guard_triggered=%d flip_guard_blocked=%d edge_pass=%d traded=%d",
                 fetched_count,
                 len(markets),
+                filter_stats.get("skipped_resolved", 0),
                 scheduler_skipped_closed + scheduler_skipped_recently + scheduler_skipped_other,
                 markets_analyzed,
                 markets_refined,
+                flip_guard_triggered,
+                flip_guard_blocked,
                 markets_passed_edge,
                 trades_attempted,
                 data={
                     "fetched": fetched_count,
                     "filtered": len(markets),
+                    "skipped_resolved": filter_stats.get("skipped_resolved", 0),
                     "scheduler_skipped_closed": scheduler_skipped_closed,
                     "scheduler_skipped_recently_analyzed": scheduler_skipped_recently,
                     "scheduler_skipped_other": scheduler_skipped_other,
                     "analyzed": markets_analyzed,
                     "refined": markets_refined,
+                    "flip_guard_triggered": flip_guard_triggered,
+                    "flip_guard_blocked": flip_guard_blocked,
+                    "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "edge_passed": markets_passed_edge,
                     "traded": trades_attempted,
                 },
@@ -1259,11 +1585,15 @@ def main() -> None:
                     "markets_analyzed": len(markets),
                     "markets_fetched": fetched_count,
                     "filter_stats": filter_stats,
+                    "skipped_resolved": filter_stats.get("skipped_resolved", 0),
                     "scheduler_skipped_closed": scheduler_skipped_closed,
                     "scheduler_skipped_recently_analyzed": scheduler_skipped_recently,
                     "scheduler_skipped_other": scheduler_skipped_other,
                     "markets_passed_to_grok": markets_analyzed,
                     "markets_refined": markets_refined,
+                    "flip_guard_triggered": flip_guard_triggered,
+                    "flip_guard_blocked": flip_guard_blocked,
+                    "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "markets_passed_edge": markets_passed_edge,
                     "score_gate_blocked": score_gate_blocked,
                     "trades_attempted": trades_attempted,

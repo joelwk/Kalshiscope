@@ -193,6 +193,7 @@ class Settings:
     # Re-analysis controls
     REANALYSIS_COOLDOWN_HOURS: int = 6
     URGENT_REANALYSIS_DAYS_BEFORE_CLOSE: int = 1
+    URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
 
     # Resolution tracking
     RESOLUTION_SYNC_INTERVAL_CYCLES: int = 3
@@ -206,6 +207,13 @@ class Settings:
     # Score gate (phase A/B can run in shadow mode)
     SCORE_GATE_MODE: str = "shadow"  # off|shadow|active
     SCORE_GATE_THRESHOLD: float = 0.08
+
+    # Side-flip guardrails
+    FLIP_GUARD_ENABLED: bool = True
+    FLIP_GUARD_MIN_ABS_CONFIDENCE: float = 0.65
+    FLIP_GUARD_MIN_CONF_GAIN: float = 0.08
+    FLIP_GUARD_MIN_EDGE_GAIN: float = 0.03
+    FLIP_GUARD_MIN_EVIDENCE_QUALITY: float = 0.60
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -450,6 +458,10 @@ def load_settings() -> Settings:
             "URGENT_REANALYSIS_DAYS_BEFORE_CLOSE",
             Settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
         ),
+        URGENT_REANALYSIS_COOLDOWN_HOURS=_read_env_int(
+            "URGENT_REANALYSIS_COOLDOWN_HOURS",
+            Settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
+        ),
         RESOLUTION_SYNC_INTERVAL_CYCLES=_read_env_int(
             "RESOLUTION_SYNC_INTERVAL_CYCLES",
             Settings.RESOLUTION_SYNC_INTERVAL_CYCLES,
@@ -477,6 +489,26 @@ def load_settings() -> Settings:
         SCORE_GATE_THRESHOLD=_read_env_float(
             "SCORE_GATE_THRESHOLD",
             Settings.SCORE_GATE_THRESHOLD,
+        ),
+        FLIP_GUARD_ENABLED=_read_env_bool(
+            "FLIP_GUARD_ENABLED",
+            Settings.FLIP_GUARD_ENABLED,
+        ),
+        FLIP_GUARD_MIN_ABS_CONFIDENCE=_read_env_float(
+            "FLIP_GUARD_MIN_ABS_CONFIDENCE",
+            Settings.FLIP_GUARD_MIN_ABS_CONFIDENCE,
+        ),
+        FLIP_GUARD_MIN_CONF_GAIN=_read_env_float(
+            "FLIP_GUARD_MIN_CONF_GAIN",
+            Settings.FLIP_GUARD_MIN_CONF_GAIN,
+        ),
+        FLIP_GUARD_MIN_EDGE_GAIN=_read_env_float(
+            "FLIP_GUARD_MIN_EDGE_GAIN",
+            Settings.FLIP_GUARD_MIN_EDGE_GAIN,
+        ),
+        FLIP_GUARD_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "FLIP_GUARD_MIN_EVIDENCE_QUALITY",
+            Settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
         ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),

@@ -23,7 +23,34 @@ _SPORTS_KEYWORDS = (
     "la liga",
     "serie a",
     "bundesliga",
+    "hockey",
+    "ice hockey",
+    "olympics",
+    "olympic",
+    "mma",
+    "ufc",
+    "boxing",
+    "ncaa",
+    "college basketball",
+    "college football",
+    "champions league",
+    "ucl",
+    "europa league",
+    "uefa",
+    "ligue 1",
+    "eredivisie",
+    "copa",
+    "cricket",
+    "ipl",
+    "rugby",
+    "f1",
+    "formula 1",
+    "grand prix",
+    "mls",
+    "wnba",
+    "afl",
 )
+_ESPORTS_KEYWORDS = ("cs2", "csgo", "dota", "league of legends", "valorant", "esports")
 _CRYPTO_KEYWORDS = (
     "crypto",
     "bitcoin",
@@ -104,16 +131,26 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
 
 
 def market_family(market: Market) -> str:
+    is_sports, is_esports = market_category_flags(market)
+    if is_sports or is_esports:
+        return "sports"
     category = (market.category or "").lower()
     question = market.question.lower()
     text = f"{category} {question}"
-    if any(keyword in text for keyword in _SPORTS_KEYWORDS):
-        return "sports"
     if any(keyword in text for keyword in _CRYPTO_KEYWORDS):
         return "crypto"
     if any(keyword in text for keyword in _POLITICS_KEYWORDS):
         return "politics"
     return "generic"
+
+
+def market_category_flags(market: Market) -> tuple[bool, bool]:
+    category = (market.category or "").lower()
+    question = market.question.lower()
+    text = f"{category} {question}"
+    is_esports = any(keyword in text for keyword in _ESPORTS_KEYWORDS)
+    is_sports = any(keyword in text for keyword in _SPORTS_KEYWORDS)
+    return is_sports, is_esports
 
 
 def _lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
@@ -129,7 +166,7 @@ def _lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
     question = (market.question or "").lower()
     if any(token in question for token in _LONG_HORIZON_HINTS):
         return settings.SEARCH_LOOKBACK_LONG_HOURS
-    return settings.SEARCH_LOOKBACK_LONG_HOURS
+    return settings.SEARCH_LOOKBACK_MEDIUM_HOURS
 
 
 def _prioritized_trim(items: tuple[str, ...], limit: int) -> list[str]:
@@ -147,4 +184,3 @@ def _prioritized_trim(items: tuple[str, ...], limit: int) -> list[str]:
         if len(ordered) >= limit:
             break
     return ordered
-

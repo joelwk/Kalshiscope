@@ -68,6 +68,7 @@ class TestGrokClient(unittest.TestCase):
         last_kwargs = client.client.chat.create_kwargs
         self.assertEqual(last_kwargs["model"], client.model)
         self.assertEqual(len(last_kwargs["tools"]), 2)
+        self.assertIs(last_kwargs["response_format"], TradeDecision)
 
     def test_tools_use_search_config(self) -> None:
         market = Market(
@@ -228,6 +229,81 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertFalse(validated.should_trade)
         self.assertLess(validated.evidence_quality, 0.45)
+
+    def test_validate_and_enrich_caps_evidence_when_no_external_odds_found(self) -> None:
+        market = Market(
+            id="m9",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.62,
+            bet_size_pct=0.0,
+            reasoning="No external odds found. Implied prob: unknown. My prob: 62%.",
+            implied_prob_external=0.50,
+            my_prob=0.62,
+            edge_external=0.12,
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertLessEqual(validated.evidence_quality, 0.5)
+
+    def test_validate_and_enrich_normalizes_outcome_label(self) -> None:
+        market = Market(
+            id="m7",
+            question="Who wins?",
+            outcomes=[MarketOutcome(name="Team A", price=0.45), MarketOutcome(name="Team B", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome=" team   a ",
+            confidence=0.72,
+            bet_size_pct=0.5,
+            reasoning="Implied prob: 45%, My prob: 72%, Edge: 27% as of now",
+            implied_prob_external=0.45,
+            my_prob=0.72,
+            edge_external=0.27,
+            evidence_quality=0.8,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertEqual(validated.outcome, "Team A")
+        self.assertTrue(validated.should_trade)
+
+    def test_validate_and_enrich_blocks_unresolvable_outcome(self) -> None:
+        market = Market(
+            id="m8",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NOT_LISTED",
+            confidence=0.8,
+            bet_size_pct=0.6,
+            reasoning="test",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertFalse(validated.should_trade)
+        self.assertEqual(validated.bet_size_pct, 0.0)
+        self.assertIn("[Outcome mismatch]", validated.reasoning)
 
 
 if __name__ == "__main__":

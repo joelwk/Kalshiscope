@@ -8,7 +8,15 @@ class DummyGrok:
     def __init__(self, decision):
         self._decision = decision
 
-    def analyze_market(self, market):
+    def analyze_market(self, market, search_config=None):
+        return self._decision
+
+    def analyze_market_deep(
+        self,
+        market,
+        previous_analysis=None,
+        search_config=None,
+    ):
         return self._decision
 
 
