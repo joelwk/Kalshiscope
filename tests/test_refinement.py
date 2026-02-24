@@ -89,22 +89,22 @@ def test_should_skip_refinement_for_high_confidence() -> None:
 
 def test_perform_refinement_stops_when_confidence_leaves_borderline() -> None:
     market = _market("m4", None)
-    decisions = [_decision(0.6), _decision(0.9)]
+    decisions = [_decision(0.64), _decision(0.9)]
     grok = DummyGrok(decisions)
     refinement = RefinementStrategy(market=market)
 
-    result = refinement.perform_refinement(grok, market, decisions[0])
+    result = refinement.perform_refinement(grok, market, _decision(0.6))
     assert result.confidence == 0.9
     assert grok.calls == 2
 
 
 def test_perform_refinement_max_passes() -> None:
     market = _market("m5", None)
-    decisions = [_decision(0.6), _decision(0.7)]
+    decisions = [_decision(0.64), _decision(0.7)]
     grok = DummyGrok(decisions)
     refinement = RefinementStrategy(market=market)
 
-    result = refinement.perform_refinement(grok, market, decisions[0])
+    result = refinement.perform_refinement(grok, market, _decision(0.6))
     assert result.confidence == 0.7
     assert grok.calls == 2
 
@@ -123,3 +123,70 @@ def test_refinement_reasons_include_low_evidence() -> None:
     reasons = refinement.get_refinement_reasons(decision, None, implied_prob=None, evidence_quality=0.2)
     assert "missing_implied_probability" in reasons
     assert "low_evidence_quality" in reasons
+
+
+def test_perform_refinement_early_stop_when_no_material_change() -> None:
+    market = _market("m8", None)
+    initial = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.66,
+        bet_size_pct=0.3,
+        implied_prob_external=0.56,
+        my_prob=0.66,
+        edge_external=0.10,
+        evidence_quality=0.7,
+        reasoning="initial",
+    )
+    pass_one = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.669,
+        bet_size_pct=0.3,
+        implied_prob_external=0.56,
+        my_prob=0.66,
+        edge_external=0.101,
+        evidence_quality=0.72,
+        reasoning="pass one",
+    )
+    # Provide a second decision to prove second pass is skipped.
+    pass_two = _decision(0.75)
+    grok = DummyGrok([pass_one, pass_two])
+    refinement = RefinementStrategy(market=market)
+
+    result = refinement.perform_refinement(grok, market, initial)
+    assert result.confidence == pass_one.confidence
+    assert grok.calls == 1
+
+
+def test_perform_refinement_skips_second_pass_on_negative_edge() -> None:
+    market = _market("m9", None)
+    initial = TradeDecision(
+        should_trade=False,
+        outcome="YES",
+        confidence=0.62,
+        bet_size_pct=0.0,
+        implied_prob_external=0.66,
+        my_prob=0.62,
+        edge_external=-0.04,
+        evidence_quality=0.7,
+        reasoning="initial",
+    )
+    pass_one = TradeDecision(
+        should_trade=False,
+        outcome="YES",
+        confidence=0.61,
+        bet_size_pct=0.0,
+        implied_prob_external=0.66,
+        my_prob=0.61,
+        edge_external=-0.05,
+        evidence_quality=0.75,
+        reasoning="pass one",
+    )
+    pass_two = _decision(0.7)
+    grok = DummyGrok([pass_one, pass_two])
+    refinement = RefinementStrategy(market=market)
+
+    result = refinement.perform_refinement(grok, market, initial)
+    assert result.edge_external == -0.05
+    assert grok.calls == 1

@@ -255,6 +255,56 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertLessEqual(validated.evidence_quality, 0.5)
 
+    def test_validate_and_enrich_prefers_computed_edge_over_reasoning_text(self) -> None:
+        market = Market(
+            id="m10",
+            question="WTA: Jones vs Stearns",
+            outcomes=[MarketOutcome(name="Jones", price=0.278), MarketOutcome(name="Stearns", price=0.726)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="Stearns",
+            confidence=0.72,
+            bet_size_pct=0.0,
+            reasoning="Implied prob: 0.726, My prob: 0.72, Edge: 0.72 - 0.726 = -0.006",
+            implied_prob_external=0.726,
+            my_prob=0.72,
+            edge_external=None,
+            evidence_quality=0.0,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertAlmostEqual(validated.edge_external or 0.0, -0.006, places=6)
+
+    def test_validate_and_enrich_uses_fallback_edge_when_probabilities_missing(self) -> None:
+        market = Market(
+            id="m11",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.67,
+            bet_size_pct=0.2,
+            reasoning="Edge: 8%",
+            implied_prob_external=None,
+            my_prob=None,
+            edge_external=0.08,
+            evidence_quality=0.0,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertAlmostEqual(validated.edge_external or 0.0, 0.08, places=6)
+
     def test_validate_and_enrich_normalizes_outcome_label(self) -> None:
         market = Market(
             id="m7",

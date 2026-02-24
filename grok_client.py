@@ -215,6 +215,40 @@ class GrokClient:
             value = value / 100.0
         return max(0.0, min(1.0, value))
 
+    @staticmethod
+    def _extract_edge_from_reasoning(reasoning: str) -> float | None:
+        match = _RE_EDGE.search(reasoning or "")
+        if not match:
+            return None
+        value = float(match.group(1))
+        if abs(value) > 1.0:
+            value = value / 100.0
+        return max(-1.0, min(1.0, value))
+
+    def _derive_edge(
+        self,
+        implied: float | None,
+        my_prob: float | None,
+        explicit_edge: float | None,
+        reasoning: str,
+        market_id: str,
+    ) -> tuple[float | None, str]:
+        # Deterministic primary source: if both probabilities exist, edge is computed.
+        if implied is not None and my_prob is not None:
+            return max(-1.0, min(1.0, my_prob - implied)), "computed"
+
+        fallback_edge = explicit_edge
+        if fallback_edge is None:
+            fallback_edge = self._extract_edge_from_reasoning(reasoning)
+        if fallback_edge is not None:
+            logger.debug(
+                "Edge fallback used due to missing implied/my_prob: market=%s",
+                market_id,
+                data={"market_id": market_id, "edge_fallback": fallback_edge},
+            )
+            return max(-1.0, min(1.0, fallback_edge)), "fallback"
+        return None, "none"
+
     def _validate_and_enrich_decision(
         self,
         market: Market,
@@ -239,18 +273,20 @@ class GrokClient:
 
         implied = decision.implied_prob_external
         my_prob = decision.my_prob
-        edge = decision.edge_external
+        explicit_edge = decision.edge_external
 
         if implied is None:
             implied = self._extract_metric_from_reasoning(decision.reasoning, _RE_IMPLIED)
         if my_prob is None:
             my_prob = self._extract_metric_from_reasoning(decision.reasoning, _RE_MY_PROB)
-        if edge is None:
-            extracted_edge = self._extract_metric_from_reasoning(decision.reasoning, _RE_EDGE)
-            if extracted_edge is not None:
-                edge = extracted_edge
-        if edge is None and implied is not None and my_prob is not None:
-            edge = my_prob - implied
+
+        edge, edge_source = self._derive_edge(
+            implied=implied,
+            my_prob=my_prob,
+            explicit_edge=explicit_edge,
+            reasoning=decision.reasoning,
+            market_id=market.id,
+        )
 
         consistency_ok = True
         if implied is not None and my_prob is not None and edge is not None:
@@ -262,16 +298,31 @@ class GrokClient:
         if my_prob is not None and abs(my_prob - decision.confidence) > 0.08:
             prob_consistency_ok = False
 
-        evidence_quality = 0.0
+        no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
+        prob_component = 0.0
         if implied is not None and my_prob is not None:
-            evidence_quality = 0.7
+            prob_component = 0.55
         elif my_prob is not None:
-            evidence_quality = 0.3
-        if edge is not None and consistency_ok:
-            evidence_quality += 0.2
+            prob_component = 0.25
+
+        source_component = 0.0
+        if implied is not None:
+            source_component += 0.25
         if decision.reasoning and "as of" in decision.reasoning.lower():
-            evidence_quality += 0.1
-        if _RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""):
+            source_component += 0.05
+        if no_external_odds:
+            source_component = min(source_component, 0.05)
+
+        consistency_component = 0.2
+        if edge_source == "fallback":
+            consistency_component -= 0.05
+        if not consistency_ok:
+            consistency_component -= 0.15
+        if not prob_consistency_ok:
+            consistency_component -= 0.10
+
+        evidence_quality = prob_component + source_component + max(0.0, consistency_component)
+        if no_external_odds:
             evidence_quality = min(evidence_quality, 0.5)
         if profile_name != "sports" and _RE_SPORTS_MISMATCH.search(decision.reasoning or ""):
             evidence_quality = max(0.0, evidence_quality - 0.4)
@@ -281,11 +332,6 @@ class GrokClient:
                 profile_name,
                 data={"market_id": market.id, "profile_name": profile_name},
             )
-        if not consistency_ok:
-            evidence_quality = max(0.0, evidence_quality - 0.3)
-        if not prob_consistency_ok:
-            evidence_quality = max(0.0, evidence_quality - 0.2)
-
         evidence_quality = max(0.0, min(1.0, evidence_quality))
         market_implied = self._market_implied_probability(market, canonical_outcome)
         market_edge = (

@@ -14,6 +14,11 @@ REFINEMENT_CONFIDENCE_MAX = 0.80
 HIGH_CONFIDENCE_THRESHOLD = 0.70
 LOW_CONFIDENCE_EARLY_EXIT = 0.50
 MAX_REFINEMENT_PASSES = 2
+LOW_EVIDENCE_REFINE_THRESHOLD = 0.40
+UNCERTAIN_EDGE_BAND = 0.02
+CLEAR_NEGATIVE_EDGE_THRESHOLD = -0.03
+MATERIAL_CONFIDENCE_DELTA = 0.02
+MATERIAL_EDGE_DELTA = 0.02
 
 
 class RefinementStrategy:
@@ -57,14 +62,28 @@ class RefinementStrategy:
         edge_value: float | None = None,
     ) -> list[str]:
         reasons: list[str] = []
+        quality = decision.evidence_quality if evidence_quality is None else evidence_quality
+        edge = decision.edge_external if edge_value is None else edge_value
+
+        # Avoid expensive re-checks when the market edge is clearly negative and stable.
+        if (
+            not decision.should_trade
+            and edge is not None
+            and edge <= CLEAR_NEGATIVE_EDGE_THRESHOLD
+            and quality >= LOW_EVIDENCE_REFINE_THRESHOLD
+        ):
+            return reasons
+
         if decision.should_trade and 0.60 <= decision.confidence <= 0.78:
             reasons.append("borderline_trade_confidence")
-        if implied_prob is None:
+        if implied_prob is None and (decision.should_trade or quality < LOW_EVIDENCE_REFINE_THRESHOLD):
             reasons.append("missing_implied_probability")
-        quality = decision.evidence_quality if evidence_quality is None else evidence_quality
-        if quality < 0.60:
+        if quality < LOW_EVIDENCE_REFINE_THRESHOLD and (
+            decision.should_trade
+            or edge is None
+            or abs(edge) <= UNCERTAIN_EDGE_BAND
+        ):
             reasons.append("low_evidence_quality")
-        edge = decision.edge_external if edge_value is None else edge_value
         if decision.should_trade and decision.confidence >= 0.78 and edge is not None and edge < 0.08:
             reasons.append("high_conf_small_edge")
 
@@ -82,7 +101,11 @@ class RefinementStrategy:
             previous_high_confidence = (
                 state.last_confidence >= self.high_confidence_threshold
             )
-        if borderline and (urgent_close or previous_high_confidence):
+        if borderline and (urgent_close or previous_high_confidence) and (
+            decision.should_trade
+            or edge is None
+            or abs(edge) <= UNCERTAIN_EDGE_BAND
+        ):
             reasons.append("legacy_borderline_urgent")
         logger.debug(
             "Refinement check: reasons=%s urgent_close=%s previous_high=%s",
@@ -181,6 +204,48 @@ class RefinementStrategy:
                     )
                     return decision
             
+            confidence_delta_abs = abs(new_decision.confidence - decision.confidence)
+            current_edge = decision.edge_external
+            new_edge = new_decision.edge_external
+            edge_delta_abs = (
+                abs(new_edge - current_edge)
+                if current_edge is not None and new_edge is not None
+                else None
+            )
+
+            if (
+                pass_index == 1
+                and new_decision.outcome == decision.outcome
+                and confidence_delta_abs < MATERIAL_CONFIDENCE_DELTA
+                and (edge_delta_abs is None or edge_delta_abs < MATERIAL_EDGE_DELTA)
+            ):
+                logger.debug(
+                    "Refinement stopping after pass 1: no material confidence/edge change",
+                    data={
+                        "market_id": market.id,
+                        "confidence_delta_abs": confidence_delta_abs,
+                        "edge_delta_abs": edge_delta_abs,
+                    },
+                )
+                decision = new_decision
+                break
+
+            if (
+                pass_index == 1
+                and not new_decision.should_trade
+                and new_edge is not None
+                and new_edge <= 0.0
+            ):
+                logger.debug(
+                    "Refinement stopping after pass 1: persistent negative edge",
+                    data={
+                        "market_id": market.id,
+                        "new_edge": new_edge,
+                    },
+                )
+                decision = new_decision
+                break
+
             decision = new_decision
             
             if pass_index == 1 and decision.confidence < LOW_CONFIDENCE_EARLY_EXIT:

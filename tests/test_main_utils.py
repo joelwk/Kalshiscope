@@ -62,6 +62,29 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_calculate_bet(100, -1), 0)
         self.assertEqual(_calculate_bet(100, 2), 100)
 
+    def test_filter_markets_populates_skip_counters(self) -> None:
+        now = datetime.now(timezone.utc)
+        markets = [
+            Market(id="open", question="Open market", category="sports", liquidity_usdc=200, close_time=now + timedelta(days=2)),
+            Market(id="low", question="Low liquidity", category="sports", liquidity_usdc=10, close_time=now + timedelta(days=2)),
+            Market(id="blocked", question="Blocked category", category="politics", liquidity_usdc=200, close_time=now + timedelta(days=2)),
+            Market(id="soon", question="Closing soon", category="sports", liquidity_usdc=200, close_time=now + timedelta(hours=4)),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=("politics",),
+            min_close_days=1,
+            stats=stats,
+        )
+        self.assertEqual([m.id for m in filtered], ["open"])
+        self.assertEqual(stats["kept"], 1)
+        self.assertEqual(stats["skipped_liquidity"], 1)
+        self.assertEqual(stats["skipped_blocklist"], 1)
+        self.assertEqual(stats["skipped_close_too_soon"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
