@@ -69,13 +69,38 @@ def test_should_skip_recently_analyzed_non_urgent() -> None:
     assert reason == "recently analyzed"
 
 
-def test_should_not_skip_if_urgent() -> None:
+def test_should_skip_if_urgent_within_urgent_cooldown() -> None:
     now = datetime.now(timezone.utc)
-    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    scheduler = MarketScheduler(
+        reanalysis_cooldown_hours=6,
+        urgent_days_before_close=2,
+        urgent_reanalysis_cooldown_hours=2,
+    )
     market = _market("m6", now + timedelta(days=1))
     state = MarketState(
         market_id="m6",
         last_analysis=now - timedelta(hours=1),
+        analysis_count=1,
+        last_confidence=0.7,
+        confidence_trend=[0.7],
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is True
+    assert reason == "recently analyzed"
+
+
+def test_should_not_skip_if_urgent_outside_urgent_cooldown() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(
+        reanalysis_cooldown_hours=6,
+        urgent_days_before_close=2,
+        urgent_reanalysis_cooldown_hours=1,
+    )
+    market = _market("m7", now + timedelta(days=1))
+    state = MarketState(
+        market_id="m7",
+        last_analysis=now - timedelta(hours=2),
         analysis_count=1,
         last_confidence=0.7,
         confidence_trend=[0.7],

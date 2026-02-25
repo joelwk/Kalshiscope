@@ -136,6 +136,48 @@ class TestConfig(unittest.TestCase):
         delta_hours = (search_config.to_date - search_config.from_date).total_seconds() / 3600
         self.assertTrue(5.9 <= delta_hours <= 6.1)
 
+    def test_flip_guard_settings_overrides(self) -> None:
+        env = {
+            "XAI_API_KEY": "xai-key",
+            "WALLET_PRIVATE_KEY": "0xabc",
+            "FLIP_GUARD_ENABLED": "false",
+            "FLIP_GUARD_MIN_ABS_CONFIDENCE": "0.70",
+            "FLIP_GUARD_MIN_CONF_GAIN": "0.10",
+            "FLIP_GUARD_MIN_EDGE_GAIN": "0.05",
+            "FLIP_GUARD_MIN_EVIDENCE_QUALITY": "0.75",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+
+        self.assertFalse(settings.FLIP_GUARD_ENABLED)
+        self.assertEqual(settings.FLIP_GUARD_MIN_ABS_CONFIDENCE, 0.70)
+        self.assertEqual(settings.FLIP_GUARD_MIN_CONF_GAIN, 0.10)
+        self.assertEqual(settings.FLIP_GUARD_MIN_EDGE_GAIN, 0.05)
+        self.assertEqual(settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY, 0.75)
+
+    def test_parallel_and_execution_guard_settings_overrides(self) -> None:
+        env = {
+            "XAI_API_KEY": "xai-key",
+            "WALLET_PRIVATE_KEY": "0xabc",
+            "PARALLEL_ANALYSIS_ENABLED": "true",
+            "ANALYSIS_MAX_WORKERS": "4",
+            "PRE_ORDER_MARKET_REFRESH": "true",
+            "ORDERBOOK_PRECHECK_ENABLED": "true",
+            "ORDERBOOK_PRECHECK_MIN_CONFIDENCE": "0.8",
+            "CALIBRATION_MODE_ENABLED": "true",
+            "CALIBRATION_MIN_SAMPLES": "25",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+
+        self.assertTrue(settings.PARALLEL_ANALYSIS_ENABLED)
+        self.assertEqual(settings.ANALYSIS_MAX_WORKERS, 4)
+        self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
+        self.assertTrue(settings.ORDERBOOK_PRECHECK_ENABLED)
+        self.assertEqual(settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE, 0.8)
+        self.assertTrue(settings.CALIBRATION_MODE_ENABLED)
+        self.assertEqual(settings.CALIBRATION_MIN_SAMPLES, 25)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,5 @@
 import unittest
 from datetime import datetime
-from types import SimpleNamespace
 
 from models import Market, MarketOutcome, OrderRequest
 from predictbase_client import PredictBaseClient, _parse_market, _parse_onchain_payload
@@ -63,6 +62,16 @@ class TestPredictBaseClient(unittest.TestCase):
         # volume is in 1e6 precision per docs
         self.assertAlmostEqual(market.liquidity_usdc, 123.0)
 
+    def test_parse_market_category_from_categories_payload(self) -> None:
+        raw = {
+            "id": "999",
+            "question": "Who wins the matchup?",
+            "optionTitles": ["YES", "NO"],
+            "categories": [{"name": "olympics"}],
+        }
+        market = _parse_market(raw)
+        self.assertEqual(market.category, "olympics")
+
     def test_parse_onchain_payload(self) -> None:
         payload = {
             "onchain_payload": {"to": "0xabc", "data": "0x123", "value": 0}
@@ -84,6 +93,32 @@ class TestPredictBaseClient(unittest.TestCase):
         self.assertEqual(len(markets), 1)
         self.assertEqual(markets[0].id, "m1")
 
+    def test_get_market_snapshot(self) -> None:
+        client = PredictBaseClient(base_url="https://api.example")
+        payload = {
+            "id": "m42",
+            "question": "Will BTC end green?",
+            "optionTitles": ["YES", "NO"],
+            "optionPrices": ["520000", "480000"],
+        }
+        client.session.get = lambda *args, **kwargs: FakeResponse(payload)
+        market = client.get_market("m42")
+        self.assertEqual(market.id, "m42")
+        self.assertEqual(market.outcomes[0].name, "YES")
+        self.assertAlmostEqual(market.outcomes[0].price, 0.52)
+
+    def test_get_market_orderbook(self) -> None:
+        client = PredictBaseClient(base_url="https://api.example")
+        payload = {
+            "marketId": "m42",
+            "buys": [],
+            "sells": [{"optionIndex": 0, "price": 0.6}],
+        }
+        client.session.get = lambda *args, **kwargs: FakeResponse(payload)
+        orderbook = client.get_market_orderbook("m42")
+        self.assertEqual(orderbook["marketId"], "m42")
+        self.assertEqual(orderbook["sells"][0]["optionIndex"], 0)
+
     def test_submit_order_parses_payload(self) -> None:
         client = PredictBaseClient(base_url="https://api.example")
         payload = {
@@ -92,12 +127,34 @@ class TestPredictBaseClient(unittest.TestCase):
             "onchain_payload": {"to": "0xabc", "data": "0x123", "value": 0},
         }
         client.session.post = lambda *args, **kwargs: FakeResponse(payload)
+        market = Market(
+            id="m1",
+            question="Q1",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
 
         order = OrderRequest(market_id="m1", outcome="YES", amount_usdc=10)
-        response = client.submit_order(order)
+        response = client.submit_order(order, market=market)
         self.assertEqual(response.id, "order-1")
         self.assertIsNotNone(response.onchain_payload)
         self.assertEqual(response.onchain_payload.to, "0xabc")
+
+    def test_submit_order_raises_for_unmapped_outcome(self) -> None:
+        client = PredictBaseClient(base_url="https://api.example")
+        market = Market(
+            id="m2",
+            question="Q2",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        order = OrderRequest(market_id="m2", outcome="MAYBE", amount_usdc=5)
+        with self.assertRaisesRegex(ValueError, "Could not map outcome"):
+            client.submit_order(order, market=market)
+
+    def test_submit_order_requires_market_context(self) -> None:
+        client = PredictBaseClient(base_url="https://api.example")
+        order = OrderRequest(market_id="m3", outcome="YES", amount_usdc=5)
+        with self.assertRaisesRegex(ValueError, "Market context is required"):
+            client.submit_order(order)
 
     def test_submit_order_applies_slippage_for_high_confidence(self) -> None:
         client = PredictBaseClient(

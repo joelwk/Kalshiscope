@@ -138,6 +138,74 @@ class PredictBaseClient:
             )
             raise
 
+    def get_market(self, market_id: str) -> Market:
+        """Fetch a single market snapshot from PredictBase."""
+        url = f"{self.base_url}/get_market/{market_id}"
+        start_time = time.monotonic()
+        try:
+            resp = self.session.get(url, timeout=self.timeout_sec)
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                status_code=resp.status_code,
+                duration_ms=duration_ms,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            market_payload = payload
+            if isinstance(payload, dict) and "market" in payload:
+                market_payload = payload.get("market")
+            market = _parse_market(market_payload)
+            logger.debug(
+                "Fetched market snapshot: market=%s duration=%.2fms",
+                market_id,
+                duration_ms,
+                data={"market_id": market_id, "duration_ms": round(duration_ms, 2)},
+            )
+            return market
+        except requests.exceptions.RequestException as exc:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            raise
+
+    def get_market_orderbook(self, market_id: str) -> dict[str, Any]:
+        """Fetch market orderbook from PredictBase."""
+        url = f"{self.base_url}/get_market_orderbook/{market_id}"
+        start_time = time.monotonic()
+        try:
+            resp = self.session.get(url, timeout=self.timeout_sec)
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                status_code=resp.status_code,
+                duration_ms=duration_ms,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Orderbook response is not a JSON object")
+            return payload
+        except requests.exceptions.RequestException as exc:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            raise
+
     def submit_order(
         self,
         order: OrderRequest,
@@ -155,8 +223,13 @@ class PredictBaseClient:
         """
         url = f"{self.base_url}/create-order"
         start_time = time.monotonic()
-
-        option_index = _find_option_index(order.outcome, market) if market else 0
+        if market is None:
+            raise ValueError("Market context is required for safe outcome mapping")
+        option_index = _find_option_index(order.outcome, market)
+        if option_index is None:
+            raise ValueError(
+                f"Could not map outcome '{order.outcome}' to a market option for market {order.market_id}"
+            )
 
         side = order.side.lower() if order.side else "buy"
 
@@ -509,7 +582,11 @@ def _parse_market(raw: dict[str, Any]) -> Market:
     if liquidity is None:
         # PredictBase /get_active_markets returns `volume` in 1e6 precision (USDC micro-units).
         liquidity = _coerce_predictbase_amount_usdc(raw.get("volume"))
-    category = raw.get("category") or _first_tag(raw.get("tags"))
+    category = (
+        raw.get("category")
+        or _first_tag(raw.get("tags"))
+        or _first_category(raw.get("categories"))
+    )
     status = raw.get("status")
     winning_option_raw = (
         raw.get("winningOption")
@@ -559,6 +636,7 @@ def _parse_market(raw: dict[str, Any]) -> Market:
         "liquidity",
         "totalLiquidity",
         "category",
+        "categories",
         "tags",
         "endsAt",
         "close_time",
@@ -707,7 +785,24 @@ def _first_tag(tags: Any) -> str | None:
     return None
 
 
-def _find_option_index(outcome: str, market: Market) -> int:
+def _first_category(categories: Any) -> str | None:
+    """Extract a best-effort category label from categories payload."""
+    if isinstance(categories, (list, tuple)) and categories:
+        first = categories[0]
+        if isinstance(first, str):
+            value = first.strip()
+            return value or None
+        if isinstance(first, dict):
+            for key in ("name", "slug", "label", "id"):
+                value = first.get(key)
+                if value:
+                    normalized = str(value).strip()
+                    if normalized:
+                        return normalized
+    return None
+
+
+def _find_option_index(outcome: str, market: Market) -> int | None:
     """Find the index of the outcome in the market's outcomes list."""
     outcome_upper = outcome.upper()
     for idx, market_outcome in enumerate(market.outcomes):
@@ -720,23 +815,31 @@ def _find_option_index(outcome: str, market: Market) -> int:
             )
             return idx
 
-    if outcome_upper in ("YES", "TRUE", "1"):
-        logger.debug(
-            "Mapping outcome '%s' to index 0 (YES/TRUE/1) for market %s",
-            outcome,
-            market.id,
-        )
-        return 0
-    elif outcome_upper in ("NO", "FALSE", "0"):
-        logger.debug(
-            "Mapping outcome '%s' to index 1 (NO/FALSE/0) for market %s",
-            outcome,
-            market.id,
-        )
-        return 1
+    yes_aliases = {"YES", "TRUE", "1"}
+    no_aliases = {"NO", "FALSE", "0"}
+    if outcome_upper in yes_aliases:
+        for idx, market_outcome in enumerate(market.outcomes):
+            if market_outcome.name.upper() in yes_aliases:
+                logger.debug(
+                    "Mapped YES-like outcome '%s' to index %d for market %s",
+                    outcome,
+                    idx,
+                    market.id,
+                )
+                return idx
+    if outcome_upper in no_aliases:
+        for idx, market_outcome in enumerate(market.outcomes):
+            if market_outcome.name.upper() in no_aliases:
+                logger.debug(
+                    "Mapped NO-like outcome '%s' to index %d for market %s",
+                    outcome,
+                    idx,
+                    market.id,
+                )
+                return idx
 
     logger.warning(
-        "Could not find outcome '%s' in market %s, defaulting to index 0",
+        "Could not find outcome '%s' in market %s; refusing to map option index",
         outcome,
         market.id,
         data={
@@ -745,4 +848,4 @@ def _find_option_index(outcome: str, market: Market) -> int:
             "available_outcomes": [o.name for o in market.outcomes],
         },
     )
-    return 0
+    return None

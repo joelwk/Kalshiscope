@@ -154,3 +154,34 @@ def test_backfill_sentinel_resolution_to_unresolved(tmp_path) -> None:
         assert row["resolution_state"] == "unresolved"
     finally:
         manager.close()
+
+
+def test_get_anchor_analysis_prefers_high_confidence(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m7"
+        manager.record_analysis(market_id, _decision(0.55, outcome="YES"), is_refined=False)
+        manager.record_analysis(market_id, _decision(0.72, outcome="NO"), is_refined=False)
+        manager.record_analysis(market_id, _decision(0.61, outcome="YES"), is_refined=False)
+
+        anchor = manager.get_anchor_analysis(market_id, min_confidence=0.65)
+        assert anchor is not None
+        assert anchor["outcome"] == "NO"
+        assert round(float(anchor["confidence"]), 2) == 0.72
+    finally:
+        manager.close()
+
+
+def test_get_anchor_analysis_falls_back_to_latest(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m8"
+        manager.record_analysis(market_id, _decision(0.50, outcome="YES"), is_refined=False)
+        manager.record_analysis(market_id, _decision(0.58, outcome="NO"), is_refined=False)
+
+        anchor = manager.get_anchor_analysis(market_id, min_confidence=0.65)
+        assert anchor is not None
+        assert anchor["outcome"] == "NO"
+        assert round(float(anchor["confidence"]), 2) == 0.58
+    finally:
+        manager.close()

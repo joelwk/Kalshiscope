@@ -43,7 +43,7 @@ class Settings:
 
     # xAI Grok
     XAI_API_KEY: str = ""
-    GROK_MODEL: str = "grok-3"
+    GROK_MODEL: str = "grok-4-1-fast-reasoning"
     SEARCH_LOOKBACK_HOURS: int = 24
     SEARCH_ALLOWED_DOMAINS: tuple[str, ...] = (
         "espn.com",
@@ -184,6 +184,11 @@ class Settings:
     DRY_RUN: bool = True
     AUTO_APPROVE_USDC: bool = False
     EXECUTE_ONCHAIN: bool = False
+    PRE_ORDER_MARKET_REFRESH: bool = False
+    ORDERBOOK_PRECHECK_ENABLED: bool = False
+    ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
+    CALIBRATION_MODE_ENABLED: bool = False
+    CALIBRATION_MIN_SAMPLES: int = 20
 
     # State management
     STATE_DB_PATH: str = "data/market_state.db"
@@ -193,6 +198,9 @@ class Settings:
     # Re-analysis controls
     REANALYSIS_COOLDOWN_HOURS: int = 6
     URGENT_REANALYSIS_DAYS_BEFORE_CLOSE: int = 1
+    URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
+    PARALLEL_ANALYSIS_ENABLED: bool = False
+    ANALYSIS_MAX_WORKERS: int = 3
 
     # Resolution tracking
     RESOLUTION_SYNC_INTERVAL_CYCLES: int = 3
@@ -206,6 +214,13 @@ class Settings:
     # Score gate (phase A/B can run in shadow mode)
     SCORE_GATE_MODE: str = "shadow"  # off|shadow|active
     SCORE_GATE_THRESHOLD: float = 0.08
+
+    # Side-flip guardrails
+    FLIP_GUARD_ENABLED: bool = True
+    FLIP_GUARD_MIN_ABS_CONFIDENCE: float = 0.65
+    FLIP_GUARD_MIN_CONF_GAIN: float = 0.08
+    FLIP_GUARD_MIN_EDGE_GAIN: float = 0.03
+    FLIP_GUARD_MIN_EVIDENCE_QUALITY: float = 0.60
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -433,6 +448,22 @@ def load_settings() -> Settings:
         EXECUTE_ONCHAIN=_read_env_bool(
             "EXECUTE_ONCHAIN", Settings.EXECUTE_ONCHAIN
         ),
+        PRE_ORDER_MARKET_REFRESH=_read_env_bool(
+            "PRE_ORDER_MARKET_REFRESH", Settings.PRE_ORDER_MARKET_REFRESH
+        ),
+        ORDERBOOK_PRECHECK_ENABLED=_read_env_bool(
+            "ORDERBOOK_PRECHECK_ENABLED", Settings.ORDERBOOK_PRECHECK_ENABLED
+        ),
+        ORDERBOOK_PRECHECK_MIN_CONFIDENCE=_read_env_float(
+            "ORDERBOOK_PRECHECK_MIN_CONFIDENCE",
+            Settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
+        ),
+        CALIBRATION_MODE_ENABLED=_read_env_bool(
+            "CALIBRATION_MODE_ENABLED", Settings.CALIBRATION_MODE_ENABLED
+        ),
+        CALIBRATION_MIN_SAMPLES=_read_env_int(
+            "CALIBRATION_MIN_SAMPLES", Settings.CALIBRATION_MIN_SAMPLES
+        ),
         STATE_DB_PATH=_read_env_str(
             "STATE_DB_PATH", Settings.STATE_DB_PATH
         ),
@@ -449,6 +480,16 @@ def load_settings() -> Settings:
         URGENT_REANALYSIS_DAYS_BEFORE_CLOSE=_read_env_int(
             "URGENT_REANALYSIS_DAYS_BEFORE_CLOSE",
             Settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
+        ),
+        URGENT_REANALYSIS_COOLDOWN_HOURS=_read_env_int(
+            "URGENT_REANALYSIS_COOLDOWN_HOURS",
+            Settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
+        ),
+        PARALLEL_ANALYSIS_ENABLED=_read_env_bool(
+            "PARALLEL_ANALYSIS_ENABLED", Settings.PARALLEL_ANALYSIS_ENABLED
+        ),
+        ANALYSIS_MAX_WORKERS=_read_env_int(
+            "ANALYSIS_MAX_WORKERS", Settings.ANALYSIS_MAX_WORKERS
         ),
         RESOLUTION_SYNC_INTERVAL_CYCLES=_read_env_int(
             "RESOLUTION_SYNC_INTERVAL_CYCLES",
@@ -477,6 +518,26 @@ def load_settings() -> Settings:
         SCORE_GATE_THRESHOLD=_read_env_float(
             "SCORE_GATE_THRESHOLD",
             Settings.SCORE_GATE_THRESHOLD,
+        ),
+        FLIP_GUARD_ENABLED=_read_env_bool(
+            "FLIP_GUARD_ENABLED",
+            Settings.FLIP_GUARD_ENABLED,
+        ),
+        FLIP_GUARD_MIN_ABS_CONFIDENCE=_read_env_float(
+            "FLIP_GUARD_MIN_ABS_CONFIDENCE",
+            Settings.FLIP_GUARD_MIN_ABS_CONFIDENCE,
+        ),
+        FLIP_GUARD_MIN_CONF_GAIN=_read_env_float(
+            "FLIP_GUARD_MIN_CONF_GAIN",
+            Settings.FLIP_GUARD_MIN_CONF_GAIN,
+        ),
+        FLIP_GUARD_MIN_EDGE_GAIN=_read_env_float(
+            "FLIP_GUARD_MIN_EDGE_GAIN",
+            Settings.FLIP_GUARD_MIN_EDGE_GAIN,
+        ),
+        FLIP_GUARD_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "FLIP_GUARD_MIN_EVIDENCE_QUALITY",
+            Settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
         ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),

@@ -16,9 +16,11 @@ class MarketScheduler:
         self,
         reanalysis_cooldown_hours: int = 6,
         urgent_days_before_close: int = 2,
+        urgent_reanalysis_cooldown_hours: int = 1,
     ) -> None:
         self.reanalysis_cooldown_hours = reanalysis_cooldown_hours
         self.urgent_days_before_close = urgent_days_before_close
+        self.urgent_reanalysis_cooldown_hours = urgent_reanalysis_cooldown_hours
 
     def prioritize_markets(
         self,
@@ -71,8 +73,13 @@ class MarketScheduler:
             last_analysis = state.last_analysis
             if last_analysis.tzinfo is None:
                 last_analysis = last_analysis.replace(tzinfo=timezone.utc)
-            cooldown = timedelta(hours=self.reanalysis_cooldown_hours)
-            if (now - last_analysis) < cooldown and not urgent:
+            cooldown_hours = (
+                self.urgent_reanalysis_cooldown_hours
+                if urgent
+                else self.reanalysis_cooldown_hours
+            )
+            cooldown = timedelta(hours=cooldown_hours)
+            if (now - last_analysis) < cooldown:
                 return True, "recently analyzed"
 
         return False, ""
