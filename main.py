@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any
 
+from calibration import build_counterfactual_flags, compute_adaptive_thresholds
 from config import Settings, load_settings
 from grok_client import GrokClient
 from logging_config import (
@@ -48,6 +50,7 @@ _RESOLVED_MARKET_STATUS = {
     "inactive",
 }
 _ADAPTIVE_SLEEP_CAP_SECONDS = 1800
+_ORDERBOOK_SPREAD_CUTOFF_DEFAULT = 0.08
 
 
 def _normalize_outcome_key(outcome: str | None) -> str:
@@ -401,6 +404,27 @@ def _price_bucket(
     if implied_prob <= settings.HIGH_PRICE_THRESHOLD:
         return _PRICE_BUCKET_MID
     return _PRICE_BUCKET_HIGH
+
+
+def _best_orderbook_sell_price(
+    orderbook: dict[str, Any],
+    option_index: int,
+) -> float | None:
+    sells = orderbook.get("sells")
+    if not isinstance(sells, list):
+        return None
+    best_price: float | None = None
+    for entry in sells:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("optionIndex") != option_index:
+            continue
+        candidate = _coerce_float(entry.get("price"))
+        if candidate is None:
+            continue
+        if best_price is None or candidate < best_price:
+            best_price = candidate
+    return best_price
 
 
 def _is_uniform_implied_probability(
@@ -782,6 +806,13 @@ def _log_settings_summary(settings) -> None:
             "categories_blocklist": settings.MARKET_CATEGORIES_BLOCKLIST,
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
+            "parallel_analysis_enabled": settings.PARALLEL_ANALYSIS_ENABLED,
+            "analysis_max_workers": settings.ANALYSIS_MAX_WORKERS,
+            "pre_order_market_refresh": settings.PRE_ORDER_MARKET_REFRESH,
+            "orderbook_precheck_enabled": settings.ORDERBOOK_PRECHECK_ENABLED,
+            "orderbook_precheck_min_confidence": settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
+            "calibration_mode_enabled": settings.CALIBRATION_MODE_ENABLED,
+            "calibration_min_samples": settings.CALIBRATION_MIN_SAMPLES,
             "opposite_outcome_strategy": settings.OPPOSITE_OUTCOME_STRATEGY,
             "flip_guard_enabled": settings.FLIP_GUARD_ENABLED,
             "flip_guard_min_abs_confidence": settings.FLIP_GUARD_MIN_ABS_CONFIDENCE,
@@ -860,6 +891,85 @@ def _compute_next_wakeup_seconds(
         return None
     capped = min(earliest_remaining, float(_ADAPTIVE_SLEEP_CAP_SECONDS))
     return max(1, int(capped))
+
+
+def _build_grok_client_for_worker(settings: Settings) -> GrokClient:
+    """Create an isolated Grok client for threaded analysis workers."""
+    return GrokClient(
+        api_key=settings.XAI_API_KEY,
+        model=settings.GROK_MODEL,
+        min_bet_usdc=settings.MIN_BET_USDC,
+        max_bet_usdc=settings.MAX_BET_USDC,
+    )
+
+
+def _analyze_market_candidate(
+    market: Market,
+    state: MarketState | None,
+    anchor_analysis: dict[str, Any] | None,
+    settings: Settings,
+    grok_client: GrokClient,
+) -> dict[str, Any]:
+    """Run analysis/refinement/guardrails for a market candidate."""
+    previous_analysis = _build_previous_analysis(anchor_analysis)
+    search_config = build_market_search_config(settings, market)
+    decision = grok_client.analyze_market(
+        market,
+        search_config=search_config,
+        previous_analysis=previous_analysis,
+    )
+
+    anchor_outcome: str | None = None
+    if anchor_analysis and anchor_analysis.get("outcome") is not None:
+        anchor_outcome = str(anchor_analysis["outcome"]).strip() or None
+
+    refinement = RefinementStrategy(
+        market=market,
+        urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
+    )
+    was_refined = False
+    implied_prob_for_refine = _get_implied_probability(market, decision.outcome)
+    edge_for_refine = (
+        decision.confidence - implied_prob_for_refine
+        if implied_prob_for_refine is not None
+        else decision.edge_external
+    )
+    refinement_reasons = refinement.get_refinement_reasons(
+        decision,
+        state,
+        implied_prob=implied_prob_for_refine,
+        evidence_quality=decision.evidence_quality,
+        edge_value=edge_for_refine,
+    )
+    if anchor_outcome and not _outcomes_match(decision.outcome, anchor_outcome):
+        if "side_flip_vs_anchor" not in refinement_reasons:
+            refinement_reasons.append("side_flip_vs_anchor")
+    refinement_reason_text = ",".join(refinement_reasons) if refinement_reasons else None
+    if refinement_reasons:
+        decision = refinement.perform_refinement(
+            grok_client,
+            market,
+            decision,
+            search_config=search_config,
+        )
+        was_refined = True
+
+    decision = _cap_confidence_for_category(decision, market, settings)
+    decision, flip_triggered, flip_blocked = _apply_flip_guard(
+        market,
+        decision,
+        anchor_analysis,
+        settings,
+    )
+    market_outcome_mismatch_counted = "[Outcome mismatch]" in (decision.reasoning or "")
+    return {
+        "decision": decision,
+        "was_refined": was_refined,
+        "refinement_reason_text": refinement_reason_text,
+        "flip_triggered": flip_triggered,
+        "flip_blocked": flip_blocked,
+        "market_outcome_mismatch_counted": market_outcome_mismatch_counted,
+    }
 
 
 def main() -> None:
@@ -1021,15 +1131,15 @@ def main() -> None:
                 _PRICE_BUCKET_MID: 0,
                 _PRICE_BUCKET_HIGH: 0,
             }
+            calibration_samples: list[dict[str, Any]] = []
 
+            analysis_candidates: list[dict[str, Any]] = []
             for market in markets:
-                market_start = time.monotonic()
                 logger.debug(
                     "Analyzing market: id=%s, question='%s'",
                     market.id,
                     market.question[:80],
                 )
-
                 try:
                     state = state_manager.get_market_state(market.id)
                 except Exception as exc:
@@ -1057,46 +1167,12 @@ def main() -> None:
                     )
                     continue
 
-                try:
-                    previous_analysis = _build_previous_analysis(
-                        state_manager.get_anchor_analysis(market.id, settings.MIN_CONFIDENCE)
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Previous analysis lookup failed for market %s: %s",
-                        market.id,
-                        exc,
-                        data={"market_id": market.id, "error": str(exc)},
-                    )
-                    previous_analysis = None
-
-                try:
-                    search_config = build_market_search_config(settings, market)
-                    decision = grok_client.analyze_market(
-                        market,
-                        search_config=search_config,
-                        previous_analysis=previous_analysis,
-                    )
-                    markets_analyzed += 1
-                except Exception as exc:
-                    logger.error(
-                        "Failed to analyze market %s: %s",
-                        market.id,
-                        exc,
-                        data={"market_id": market.id, "error": str(exc)},
-                    )
-                    continue
-
-                market_outcome_mismatch_counted = False
                 anchor_analysis: dict[str, Any] | None = None
-                anchor_outcome: str | None = None
                 try:
                     anchor_analysis = state_manager.get_anchor_analysis(
                         market.id,
                         settings.MIN_CONFIDENCE,
                     )
-                    if anchor_analysis and anchor_analysis.get("outcome") is not None:
-                        anchor_outcome = str(anchor_analysis["outcome"]).strip() or None
                 except Exception as exc:
                     logger.warning(
                         "Anchor analysis lookup failed for market %s: %s",
@@ -1104,70 +1180,95 @@ def main() -> None:
                         exc,
                         data={"market_id": market.id, "error": str(exc)},
                     )
+                analysis_candidates.append(
+                    {
+                        "market": market,
+                        "state": state,
+                        "anchor_analysis": anchor_analysis,
+                    }
+                )
 
-                refinement.market = market
-                was_refined = False
-                implied_prob_for_refine = _get_implied_probability(market, decision.outcome)
-                edge_for_refine = (
-                    decision.confidence - implied_prob_for_refine
-                    if implied_prob_for_refine is not None
-                    else decision.edge_external
+            analysis_results: dict[str, dict[str, Any]] = {}
+            if settings.PARALLEL_ANALYSIS_ENABLED and len(analysis_candidates) > 1:
+                max_workers = max(
+                    1,
+                    min(settings.ANALYSIS_MAX_WORKERS, len(analysis_candidates)),
                 )
-                refinement_reasons = refinement.get_refinement_reasons(
-                    decision,
-                    state,
-                    implied_prob=implied_prob_for_refine,
-                    evidence_quality=decision.evidence_quality,
-                    edge_value=edge_for_refine,
+                logger.info(
+                    "Parallel analysis enabled: candidates=%d workers=%d",
+                    len(analysis_candidates),
+                    max_workers,
+                    data={
+                        "candidates": len(analysis_candidates),
+                        "workers": max_workers,
+                    },
                 )
-                if anchor_outcome and not _outcomes_match(decision.outcome, anchor_outcome):
-                    if "side_flip_vs_anchor" not in refinement_reasons:
-                        refinement_reasons.append("side_flip_vs_anchor")
-                    logger.info(
-                        "Refinement forced by side flip: market=%s anchor=%s proposed=%s",
-                        market.id,
-                        anchor_outcome,
-                        decision.outcome,
-                        data={
-                            "market_id": market.id,
-                            "anchor_outcome": anchor_outcome,
-                            "proposed_outcome": decision.outcome,
-                        },
-                    )
-                refinement_reason_text = ",".join(refinement_reasons) if refinement_reasons else None
-                if refinement_reasons:
-                    try:
-                        decision = refinement.perform_refinement(
-                            grok_client,
-                            market,
-                            decision,
-                            search_config=search_config,
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_market = {}
+                    for candidate in analysis_candidates:
+                        worker_client = _build_grok_client_for_worker(settings)
+                        future = executor.submit(
+                            _analyze_market_candidate,
+                            candidate["market"],
+                            candidate["state"],
+                            candidate["anchor_analysis"],
+                            settings,
+                            worker_client,
                         )
-                        was_refined = True
-                        markets_refined += 1
+                        future_to_market[future] = candidate["market"]
+
+                    for future in as_completed(future_to_market):
+                        market = future_to_market[future]
+                        try:
+                            analysis_results[market.id] = future.result()
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to analyze market %s: %s",
+                                market.id,
+                                exc,
+                                data={"market_id": market.id, "error": str(exc)},
+                            )
+            else:
+                for candidate in analysis_candidates:
+                    market = candidate["market"]
+                    try:
+                        analysis_results[market.id] = _analyze_market_candidate(
+                            market=market,
+                            state=candidate["state"],
+                            anchor_analysis=candidate["anchor_analysis"],
+                            settings=settings,
+                            grok_client=grok_client,
+                        )
                     except Exception as exc:
-                        logger.warning(
-                            "Refinement failed for market %s: %s",
+                        logger.error(
+                            "Failed to analyze market %s: %s",
                             market.id,
                             exc,
                             data={"market_id": market.id, "error": str(exc)},
                         )
 
-                # Apply confidence caps for high-variance event types
-                decision = _cap_confidence_for_category(decision, market, settings)
-                decision, flip_triggered, flip_blocked = _apply_flip_guard(
-                    market,
-                    decision,
-                    anchor_analysis,
-                    settings,
-                )
-                if flip_triggered:
+            for candidate in analysis_candidates:
+                market = candidate["market"]
+                state = candidate["state"]
+                market_start = time.monotonic()
+                analysis_result = analysis_results.get(market.id)
+                if analysis_result is None:
+                    continue
+                markets_analyzed += 1
+                decision = analysis_result["decision"]
+                was_refined = analysis_result["was_refined"]
+                if was_refined:
+                    markets_refined += 1
+                refinement_reason_text = analysis_result["refinement_reason_text"]
+                if analysis_result["flip_triggered"]:
                     flip_guard_triggered += 1
-                if flip_blocked:
+                if analysis_result["flip_blocked"]:
                     flip_guard_blocked += 1
-                if "[Outcome mismatch]" in (decision.reasoning or ""):
+                market_outcome_mismatch_counted = bool(
+                    analysis_result["market_outcome_mismatch_counted"]
+                )
+                if market_outcome_mismatch_counted:
                     outcome_mismatch_blocked += 1
-                    market_outcome_mismatch_counted = True
                     logger.warning(
                         "Outcome mismatch blocked trade path: market=%s outcome=%s",
                         market.id,
@@ -1230,6 +1331,27 @@ def main() -> None:
                     decision,
                     settings,
                 )
+                if settings.CALIBRATION_MODE_ENABLED:
+                    calibration_payload = {
+                        "market_id": market.id,
+                        "cycle": cycle_count,
+                        "edge_market": edge_value,
+                        "implied_prob_market": implied_prob,
+                        "confidence": decision.confidence,
+                        "evidence_quality": decision.evidence_quality,
+                        "liquidity_usdc": market.liquidity_usdc,
+                        "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
+                        "edge_gate_pass": edge_ok,
+                    }
+                    calibration_payload.update(build_counterfactual_flags(edge_value))
+                    calibration_samples.append(calibration_payload)
+                    logger.info(
+                        "Calibration sample: market=%s edge=%s edge_gate_pass=%s",
+                        market.id,
+                        f"{edge_value:.4f}" if edge_value is not None else "n/a",
+                        edge_ok,
+                        data=calibration_payload,
+                    )
                 if not edge_ok:
                     trades_skipped_edge += 1
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
@@ -1449,6 +1571,87 @@ def main() -> None:
                     continue
 
                 question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
+                active_market = market
+                if settings.PRE_ORDER_MARKET_REFRESH:
+                    try:
+                        refreshed = predictbase_client.get_market(market.id)
+                        if refreshed.outcomes:
+                            active_market = refreshed
+                            logger.debug(
+                                "Using refreshed market snapshot for execution: market=%s",
+                                market.id,
+                                data={"market_id": market.id},
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Pre-order market refresh failed; using scheduled snapshot: market=%s error=%s",
+                            market.id,
+                            exc,
+                            data={"market_id": market.id, "error": str(exc)},
+                        )
+                if active_market is not market:
+                    entry_price = _get_outcome_entry_price(active_market, decision.outcome)
+                    implied_prob = _get_implied_probability(active_market, decision.outcome)
+
+                if (
+                    settings.ORDERBOOK_PRECHECK_ENABLED
+                    and decision.confidence >= settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE
+                ):
+                    option_index = None
+                    for idx, market_outcome in enumerate(active_market.outcomes):
+                        if market_outcome.name.upper() == decision.outcome.upper():
+                            option_index = idx
+                            break
+                    if option_index is not None:
+                        try:
+                            orderbook = predictbase_client.get_market_orderbook(active_market.id)
+                            best_sell = _best_orderbook_sell_price(orderbook, option_index)
+                            entry_price_for_check = _get_outcome_entry_price(active_market, decision.outcome)
+                            if (
+                                best_sell is not None
+                                and entry_price_for_check is not None
+                                and best_sell > (
+                                    entry_price_for_check + _ORDERBOOK_SPREAD_CUTOFF_DEFAULT
+                                )
+                            ):
+                                if settings.CALIBRATION_MODE_ENABLED:
+                                    spread_abs = best_sell - entry_price_for_check
+                                    spread_payload = {
+                                        "market_id": market.id,
+                                        "best_sell_price": best_sell,
+                                        "entry_price": entry_price_for_check,
+                                        "orderbook_spread_abs": spread_abs,
+                                        "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
+                                    }
+                                    calibration_samples.append(spread_payload)
+                                    logger.info(
+                                        "Calibration orderbook sample: market=%s spread_abs=%.4f",
+                                        market.id,
+                                        spread_abs,
+                                        data=spread_payload,
+                                    )
+                                trades_skipped_edge += 1
+                                logger.info(
+                                    "SKIP [%s] '%s' -> orderbook precheck failed (best_sell=%.3f > entry=%.3f)",
+                                    market.id,
+                                    question_short,
+                                    best_sell,
+                                    entry_price_for_check,
+                                    data={
+                                        "market_id": market.id,
+                                        "best_sell_price": best_sell,
+                                        "entry_price": entry_price_for_check,
+                                        "option_index": option_index,
+                                    },
+                                )
+                                continue
+                        except Exception as exc:
+                            logger.warning(
+                                "Orderbook precheck failed open: market=%s error=%s",
+                                market.id,
+                                exc,
+                                data={"market_id": market.id, "error": str(exc)},
+                            )
                 logger.info(
                     "TRADE: [%s] '%s' -> %s @ $%.2f (conf=%.2f)",
                     market.id,
@@ -1467,7 +1670,7 @@ def main() -> None:
                 try:
                     order_response = predictbase_client.submit_order(
                         order,
-                        market=market,
+                        market=active_market,
                         slippage_pct=slippage_pct,
                     )
                 except InsufficientBalanceError as balance_exc:
@@ -1609,6 +1812,22 @@ def main() -> None:
                     "bucket_high": price_bucket_stats[_PRICE_BUCKET_HIGH],
                 },
             )
+            if settings.CALIBRATION_MODE_ENABLED and calibration_samples:
+                recommendation = compute_adaptive_thresholds(
+                    samples=calibration_samples,
+                    current_edge_threshold=settings.MIN_EDGE,
+                    current_spread_cutoff=_ORDERBOOK_SPREAD_CUTOFF_DEFAULT,
+                    current_workers=settings.ANALYSIS_MAX_WORKERS,
+                    min_samples=settings.CALIBRATION_MIN_SAMPLES,
+                )
+                logger.info(
+                    "Calibration recommendation snapshot: edge=%.4f spread_cutoff=%.4f workers=%d samples=%d",
+                    recommendation["recommended_min_market_edge_for_trade"],
+                    recommendation["recommended_orderbook_spread_cutoff"],
+                    recommendation["recommended_analysis_max_workers"],
+                    recommendation["sample_count"],
+                    data=recommendation,
+                )
             logger.info(
                 "Cycle funnel: fetched=%d filtered=%d skipped_resolved=%d scheduler_skips=%d "
                 "analyzed=%d refined=%d flip_guard_triggered=%d flip_guard_blocked=%d edge_pass=%d traded=%d",

@@ -313,6 +313,58 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertAlmostEqual(validated.edge_external or 0.0, -0.006, places=6)
 
+    def test_validate_and_enrich_uses_market_edge_for_trade_gate(self) -> None:
+        market = Market(
+            id="m14",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="Team A", price=0.58), MarketOutcome(name="Team B", price=0.42)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="Team A",
+            confidence=0.66,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 58%, My prob: 66%, Edge: 8%",
+            implied_prob_external=0.64,
+            my_prob=0.66,
+            edge_external=0.02,
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertTrue(validated.should_trade)
+        self.assertGreater(validated.bet_size_pct, 0.0)
+
+    def test_validate_and_enrich_disables_trade_when_market_implied_missing(self) -> None:
+        market = Market(
+            id="m15",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="Team A"), MarketOutcome(name="Team B")],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="Team A",
+            confidence=0.72,
+            bet_size_pct=0.5,
+            reasoning="Implied prob: unknown, My prob: 72%, Edge: 12%",
+            implied_prob_external=0.60,
+            my_prob=0.72,
+            edge_external=0.12,
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertFalse(validated.should_trade)
+        self.assertEqual(validated.bet_size_pct, 0.0)
+
     def test_validate_and_enrich_uses_fallback_edge_when_probabilities_missing(self) -> None:
         market = Market(
             id="m11",

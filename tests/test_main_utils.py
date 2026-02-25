@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from main import _calculate_bet, _filter_markets
+from main import _best_orderbook_sell_price, _calculate_bet, _filter_markets
 from models import Market
 
 
@@ -84,6 +84,18 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(stats["skipped_liquidity"], 1)
         self.assertEqual(stats["skipped_blocklist"], 1)
         self.assertEqual(stats["skipped_close_too_soon"], 1)
+
+    def test_best_orderbook_sell_price(self) -> None:
+        orderbook = {
+            "sells": [
+                {"optionIndex": 0, "price": 0.62},
+                {"optionIndex": 1, "price": 0.44},
+                {"optionIndex": 0, "price": 0.60},
+            ]
+        }
+        self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 0) or 0.0, 0.60)
+        self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 1) or 0.0, 0.44)
+        self.assertIsNone(_best_orderbook_sell_price(orderbook, 2))
 
 
 if __name__ == "__main__":

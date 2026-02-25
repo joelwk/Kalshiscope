@@ -184,6 +184,11 @@ class Settings:
     DRY_RUN: bool = True
     AUTO_APPROVE_USDC: bool = False
     EXECUTE_ONCHAIN: bool = False
+    PRE_ORDER_MARKET_REFRESH: bool = False
+    ORDERBOOK_PRECHECK_ENABLED: bool = False
+    ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
+    CALIBRATION_MODE_ENABLED: bool = False
+    CALIBRATION_MIN_SAMPLES: int = 20
 
     # State management
     STATE_DB_PATH: str = "data/market_state.db"
@@ -194,6 +199,8 @@ class Settings:
     REANALYSIS_COOLDOWN_HOURS: int = 6
     URGENT_REANALYSIS_DAYS_BEFORE_CLOSE: int = 1
     URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
+    PARALLEL_ANALYSIS_ENABLED: bool = False
+    ANALYSIS_MAX_WORKERS: int = 3
 
     # Resolution tracking
     RESOLUTION_SYNC_INTERVAL_CYCLES: int = 3
@@ -441,6 +448,22 @@ def load_settings() -> Settings:
         EXECUTE_ONCHAIN=_read_env_bool(
             "EXECUTE_ONCHAIN", Settings.EXECUTE_ONCHAIN
         ),
+        PRE_ORDER_MARKET_REFRESH=_read_env_bool(
+            "PRE_ORDER_MARKET_REFRESH", Settings.PRE_ORDER_MARKET_REFRESH
+        ),
+        ORDERBOOK_PRECHECK_ENABLED=_read_env_bool(
+            "ORDERBOOK_PRECHECK_ENABLED", Settings.ORDERBOOK_PRECHECK_ENABLED
+        ),
+        ORDERBOOK_PRECHECK_MIN_CONFIDENCE=_read_env_float(
+            "ORDERBOOK_PRECHECK_MIN_CONFIDENCE",
+            Settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
+        ),
+        CALIBRATION_MODE_ENABLED=_read_env_bool(
+            "CALIBRATION_MODE_ENABLED", Settings.CALIBRATION_MODE_ENABLED
+        ),
+        CALIBRATION_MIN_SAMPLES=_read_env_int(
+            "CALIBRATION_MIN_SAMPLES", Settings.CALIBRATION_MIN_SAMPLES
+        ),
         STATE_DB_PATH=_read_env_str(
             "STATE_DB_PATH", Settings.STATE_DB_PATH
         ),
@@ -461,6 +484,12 @@ def load_settings() -> Settings:
         URGENT_REANALYSIS_COOLDOWN_HOURS=_read_env_int(
             "URGENT_REANALYSIS_COOLDOWN_HOURS",
             Settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
+        ),
+        PARALLEL_ANALYSIS_ENABLED=_read_env_bool(
+            "PARALLEL_ANALYSIS_ENABLED", Settings.PARALLEL_ANALYSIS_ENABLED
+        ),
+        ANALYSIS_MAX_WORKERS=_read_env_int(
+            "ANALYSIS_MAX_WORKERS", Settings.ANALYSIS_MAX_WORKERS
         ),
         RESOLUTION_SYNC_INTERVAL_CYCLES=_read_env_int(
             "RESOLUTION_SYNC_INTERVAL_CYCLES",

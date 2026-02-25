@@ -36,6 +36,11 @@ _RE_LOW_INFORMATION = re.compile(
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
 _XAI_CLIENT_TIMEOUT_SECONDS = 600
 _STREAM_TIMEOUT_SECONDS = 300
+_EDGE_CONSISTENCY_TOLERANCE = 0.03
+_PROB_CONSISTENCY_TOLERANCE = 0.08
+_MIN_MARKET_EDGE_FOR_TRADE = 0.05
+_LOW_QUALITY_EDGE_BUFFER = 0.08
+_LOW_QUALITY_EVIDENCE_THRESHOLD = 0.45
 _SYSTEM_PROMPT_SHARED = (
     "Output must strictly match the response schema.\n"
     "The `outcome` field must exactly match one of the provided market outcomes.\n"
@@ -321,11 +326,11 @@ class GrokClient:
         consistency_ok = True
         if implied is not None and my_prob is not None and edge is not None:
             expected_edge = my_prob - implied
-            if abs(expected_edge - edge) > 0.03:
+            if abs(expected_edge - edge) > _EDGE_CONSISTENCY_TOLERANCE:
                 consistency_ok = False
 
         prob_consistency_ok = True
-        if my_prob is not None and abs(my_prob - decision.confidence) > 0.08:
+        if my_prob is not None and abs(my_prob - decision.confidence) > _PROB_CONSISTENCY_TOLERANCE:
             prob_consistency_ok = False
 
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
@@ -374,26 +379,51 @@ class GrokClient:
         )
 
         should_trade = decision.should_trade
-        if should_trade and evidence_quality < 0.45 and (market_edge is None or market_edge < 0.08):
-            should_trade = False
-        if should_trade and (not consistency_ok) and (market_edge is None or market_edge < 0.08):
-            should_trade = False
-        if should_trade and (not prob_consistency_ok) and (market_edge is None or market_edge < 0.10):
-            should_trade = False
-        if should_trade and edge is not None and edge < 0.05:
-            should_trade = False
-        if should_trade and market_edge is not None and market_edge <= 0.0:
-            should_trade = False
+        gate_reasons: list[str] = []
+        if should_trade:
+            if market_edge is None:
+                should_trade = False
+                gate_reasons.append("missing_market_implied")
+            elif market_edge < _MIN_MARKET_EDGE_FOR_TRADE:
+                should_trade = False
+                gate_reasons.append("market_edge_below_min")
+            if (
+                evidence_quality < _LOW_QUALITY_EVIDENCE_THRESHOLD
+                and (market_edge is None or market_edge < _LOW_QUALITY_EDGE_BUFFER)
+            ):
+                should_trade = False
+                gate_reasons.append("low_evidence_quality")
+            if (
+                not consistency_ok
+                and (market_edge is None or market_edge < _LOW_QUALITY_EDGE_BUFFER)
+            ):
+                should_trade = False
+                gate_reasons.append("edge_inconsistent")
+            if (
+                not prob_consistency_ok
+                and (market_edge is None or market_edge < _LOW_QUALITY_EDGE_BUFFER)
+            ):
+                should_trade = False
+                gate_reasons.append("probability_inconsistent")
+
+        gate_status = "allow" if should_trade else "block"
+        reason_code = ",".join(gate_reasons) if gate_reasons else "ok"
+        bet_size_pct = decision.bet_size_pct if should_trade else 0.0
 
         return decision.model_copy(
             update={
                 "should_trade": should_trade,
+                "bet_size_pct": bet_size_pct,
                 "outcome": canonical_outcome,
                 "implied_prob_external": implied,
                 "my_prob": my_prob,
                 "edge_external": edge,
                 "evidence_quality": evidence_quality,
-                "reasoning": f"[Validated eq={evidence_quality:.2f}] {decision.reasoning}",
+                "reasoning": (
+                    f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
+                    f"edge_market={market_edge if market_edge is not None else 'n/a'} "
+                    f"edge_source={edge_source}] {decision.reasoning}"
+                ),
             }
         )
 
@@ -427,11 +457,16 @@ class GrokClient:
 
         implied = merged.get("implied_prob_external")
         my_prob = merged.get("my_prob")
-        if merged.get("edge_external") is None and implied is not None and my_prob is not None:
+        if implied is not None and my_prob is not None:
             merged["edge_external"] = my_prob - implied
+        elif merged.get("edge_external") is None:
+            merged["edge_external"] = previous_analysis.edge_external
 
-        if "should_trade" not in data and merged.get("edge_external") is not None and merged["edge_external"] < 0.05:
-            merged["should_trade"] = False
+        if "should_trade" not in data:
+            edge_external = merged.get("edge_external")
+            if edge_external is not None and edge_external < _MIN_MARKET_EDGE_FOR_TRADE:
+                merged["should_trade"] = False
+        if not merged.get("should_trade", False):
             merged["bet_size_pct"] = 0.0
 
         logger.warning(
@@ -440,6 +475,11 @@ class GrokClient:
             data={
                 "missing_fields": missing_fields,
                 "provided_fields": sorted(known_updates.keys()),
+                "source_completeness": round(
+                    len(set(data).intersection(_REQUIRED_DECISION_FIELDS))
+                    / len(_REQUIRED_DECISION_FIELDS),
+                    3,
+                ),
             },
         )
         return merged

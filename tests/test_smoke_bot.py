@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 import main
@@ -8,7 +10,7 @@ class DummyGrok:
     def __init__(self, decision):
         self._decision = decision
 
-    def analyze_market(self, market, search_config=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None):
         return self._decision
 
     def analyze_market_deep(
@@ -39,6 +41,39 @@ def test_bot_smoke_dry_run(
     dummy_predictbase = DummyPredictBase([sample_market])
 
     monkeypatch.setattr(main, "load_settings", lambda: dummy_settings)
+    monkeypatch.setattr(main, "GrokClient", lambda *args, **kwargs: DummyGrok(sample_decision))
+    monkeypatch.setattr(
+        main,
+        "PredictBaseClient",
+        lambda *args, **kwargs: dummy_predictbase,
+    )
+
+    def _stop_sleep(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main.time, "sleep", _stop_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    assert dummy_predictbase.submitted is False
+
+
+def test_bot_smoke_parallel_analysis_dry_run(
+    monkeypatch, sample_market, sample_decision, dummy_settings
+) -> None:
+    second_market = sample_market.model_copy(update={"id": "m2", "question": "Will it snow?"})
+    dummy_predictbase = DummyPredictBase([sample_market, second_market])
+    tuned_settings = replace(
+        dummy_settings,
+        PARALLEL_ANALYSIS_ENABLED=True,
+        ANALYSIS_MAX_WORKERS=2,
+        PRE_ORDER_MARKET_REFRESH=True,
+        ORDERBOOK_PRECHECK_ENABLED=True,
+        ORDERBOOK_PRECHECK_MIN_CONFIDENCE=0.5,
+    )
+
+    monkeypatch.setattr(main, "load_settings", lambda: tuned_settings)
     monkeypatch.setattr(main, "GrokClient", lambda *args, **kwargs: DummyGrok(sample_decision))
     monkeypatch.setattr(
         main,

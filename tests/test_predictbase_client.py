@@ -93,6 +93,32 @@ class TestPredictBaseClient(unittest.TestCase):
         self.assertEqual(len(markets), 1)
         self.assertEqual(markets[0].id, "m1")
 
+    def test_get_market_snapshot(self) -> None:
+        client = PredictBaseClient(base_url="https://api.example")
+        payload = {
+            "id": "m42",
+            "question": "Will BTC end green?",
+            "optionTitles": ["YES", "NO"],
+            "optionPrices": ["520000", "480000"],
+        }
+        client.session.get = lambda *args, **kwargs: FakeResponse(payload)
+        market = client.get_market("m42")
+        self.assertEqual(market.id, "m42")
+        self.assertEqual(market.outcomes[0].name, "YES")
+        self.assertAlmostEqual(market.outcomes[0].price, 0.52)
+
+    def test_get_market_orderbook(self) -> None:
+        client = PredictBaseClient(base_url="https://api.example")
+        payload = {
+            "marketId": "m42",
+            "buys": [],
+            "sells": [{"optionIndex": 0, "price": 0.6}],
+        }
+        client.session.get = lambda *args, **kwargs: FakeResponse(payload)
+        orderbook = client.get_market_orderbook("m42")
+        self.assertEqual(orderbook["marketId"], "m42")
+        self.assertEqual(orderbook["sells"][0]["optionIndex"], 0)
+
     def test_submit_order_parses_payload(self) -> None:
         client = PredictBaseClient(base_url="https://api.example")
         payload = {

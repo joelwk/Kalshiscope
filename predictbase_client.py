@@ -138,6 +138,74 @@ class PredictBaseClient:
             )
             raise
 
+    def get_market(self, market_id: str) -> Market:
+        """Fetch a single market snapshot from PredictBase."""
+        url = f"{self.base_url}/get_market/{market_id}"
+        start_time = time.monotonic()
+        try:
+            resp = self.session.get(url, timeout=self.timeout_sec)
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                status_code=resp.status_code,
+                duration_ms=duration_ms,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            market_payload = payload
+            if isinstance(payload, dict) and "market" in payload:
+                market_payload = payload.get("market")
+            market = _parse_market(market_payload)
+            logger.debug(
+                "Fetched market snapshot: market=%s duration=%.2fms",
+                market_id,
+                duration_ms,
+                data={"market_id": market_id, "duration_ms": round(duration_ms, 2)},
+            )
+            return market
+        except requests.exceptions.RequestException as exc:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            raise
+
+    def get_market_orderbook(self, market_id: str) -> dict[str, Any]:
+        """Fetch market orderbook from PredictBase."""
+        url = f"{self.base_url}/get_market_orderbook/{market_id}"
+        start_time = time.monotonic()
+        try:
+            resp = self.session.get(url, timeout=self.timeout_sec)
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                status_code=resp.status_code,
+                duration_ms=duration_ms,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Orderbook response is not a JSON object")
+            return payload
+        except requests.exceptions.RequestException as exc:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method="GET",
+                url=url,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            raise
+
     def submit_order(
         self,
         order: OrderRequest,

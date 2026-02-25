@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from contextvars import ContextVar
@@ -26,6 +27,7 @@ MAX_LOG_FILE_SIZE_MB = 10
 LOG_BACKUP_COUNT = 5
 
 correlation_id: ContextVar[str] = ContextVar("correlation_id", default="")
+_RE_GATE_REASON = re.compile(r"reason=([^\]\s]+)")
 
 
 def generate_correlation_id() -> str:
@@ -102,9 +104,13 @@ class ColoredFormatter(logging.Formatter):
             record.correlation_id = "-"
 
         if self.use_colors:
+            original_level = record.levelname
             color = self.COLORS.get(record.levelname, "")
             record.levelname = f"{color}{record.levelname}{self.RESET}"
-
+            try:
+                return super().format(record)
+            finally:
+                record.levelname = original_level
         return super().format(record)
 
 
@@ -272,11 +278,26 @@ def log_trade_decision(
 ) -> None:
     """Log a trade decision to the dedicated trade log."""
     trade_logger = get_trade_logger()
+    reasoning = str(decision.get("reasoning") or "")
+    gate_reason = None
+    gate_match = _RE_GATE_REASON.search(reasoning)
+    if gate_match:
+        gate_reason = gate_match.group(1)
+    audit = {
+        "gate_reason": gate_reason,
+        "should_trade": decision.get("should_trade"),
+        "bet_size_pct": decision.get("bet_size_pct"),
+        "implied_prob_external": decision.get("implied_prob_external"),
+        "my_prob": decision.get("my_prob"),
+        "edge_external": decision.get("edge_external"),
+        "evidence_quality": decision.get("evidence_quality"),
+    }
     data = {
         "market_id": market_id,
         "question": question[:100],
         "decision": decision,
         "order": order,
+        "audit": audit,
     }
     trade_logger.info(
         "Trade decision: market=%s should_trade=%s confidence=%.2f outcome=%s",
