@@ -192,6 +192,39 @@ class TestGrokClient(unittest.TestCase):
         self.assertAlmostEqual(decision.edge_external, 0.03)
         self.assertIn("Validated", decision.reasoning)
 
+    def test_analyze_market_deep_normalizes_percent_like_fields(self) -> None:
+        market = Market(
+            id="m12",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+            liquidity_usdc=120.0,
+        )
+        content = """
+        {"should_trade": false, "outcome": "YES", "confidence": 74, "bet_size_pct": 0.0, "reasoning": "Edge: -160%", "edge_external": -1.6}
+        """
+        client = GrokClient(api_key="x")
+        client.client = DummyClient(content)
+
+        decision = client.analyze_market_deep(market)
+        self.assertAlmostEqual(decision.confidence, 0.74, places=6)
+        self.assertAlmostEqual(decision.edge_external or 0.0, -0.016, places=6)
+
+    def test_analyze_market_clamps_overscaled_confidence(self) -> None:
+        market = Market(
+            id="m13",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=150.0,
+        )
+        content = """
+        {"should_trade": false, "outcome": "YES", "confidence": 340, "bet_size_pct": 0.0, "reasoning": "Implied prob: 55%, My prob: 340%, Edge: 285%"}
+        """
+        client = GrokClient(api_key="x")
+        client.client = DummyClient(content)
+
+        decision = client.analyze_market(market)
+        self.assertAlmostEqual(decision.confidence, 1.0, places=6)
+
     def test_should_enable_multimedia_urgent_market(self) -> None:
         market = Market(
             id="m4",

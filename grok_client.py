@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -443,6 +444,70 @@ class GrokClient:
         )
         return merged
 
+    def _normalize_numeric_fields(
+        self,
+        payload: dict[str, Any],
+        market_id: str,
+    ) -> dict[str, Any]:
+        """Normalize numeric payload fields from LLM output before schema validation."""
+        normalized_payload = dict(payload)
+        probability_fields = ("confidence", "my_prob", "implied_prob_external")
+        edge_fields = ("edge_external",)
+
+        def _normalize_field(
+            field_name: str,
+            lower_bound: float,
+            upper_bound: float,
+        ) -> None:
+            if field_name not in normalized_payload:
+                return
+            raw_value = normalized_payload[field_name]
+            if raw_value is None:
+                return
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(numeric_value):
+                return
+
+            reasons: list[str] = []
+            normalized_value = numeric_value
+            if abs(normalized_value) > 1.0:
+                normalized_value = normalized_value / 100.0
+                reasons.append("percent_to_decimal")
+
+            bounded_value = max(lower_bound, min(upper_bound, normalized_value))
+            if bounded_value != normalized_value:
+                reasons.append("clamped")
+
+            if bounded_value == numeric_value:
+                return
+
+            normalized_payload[field_name] = bounded_value
+            logger.warning(
+                "Normalized model numeric field: market=%s field=%s raw=%s normalized=%s reason=%s",
+                market_id,
+                field_name,
+                raw_value,
+                bounded_value,
+                ",".join(reasons) if reasons else "normalized",
+                data={
+                    "market_id": market_id,
+                    "field": field_name,
+                    "raw_value": raw_value,
+                    "normalized_value": bounded_value,
+                    "reason": reasons,
+                },
+            )
+
+        for field_name in probability_fields:
+            _normalize_field(field_name, 0.0, 1.0)
+        for field_name in edge_fields:
+            _normalize_field(field_name, -1.0, 1.0)
+
+        return normalized_payload
+
     def _build_chat(self, config: SearchConfig, enable_multimedia: bool):
         return self.client.chat.create(
             model=self.model,
@@ -543,6 +608,7 @@ class GrokClient:
                 )
                 data = _extract_json(content)
 
+            data = self._normalize_numeric_fields(data, market.id)
             decision = TradeDecision.model_validate(data)
             decision = self._validate_and_enrich_decision(
                 market,
@@ -654,6 +720,8 @@ class GrokClient:
                     "outcome must EXACTLY match one provided outcome label\n"
                     "if outcome changes vs previous analysis, justify stronger evidence and materially better edge\n"
                     "always include every required TradeDecision field\n"
+                    "all probability fields must be decimals between 0 and 1\n"
+                    "edge_external must be a decimal between -1 and 1 (not percentages)\n"
                     "</output_rules>\n"
                 )
             )
@@ -681,6 +749,7 @@ class GrokClient:
                 data = _extract_json(content)
 
             data = self._merge_partial_deep_response(data, previous_analysis)
+            data = self._normalize_numeric_fields(data, market.id)
             decision = TradeDecision.model_validate(data)
             decision = self._validate_and_enrich_decision(
                 market,
