@@ -50,3 +50,27 @@ def test_compute_final_score_penalizes_low_liquidity() -> None:
     high_score = compute_final_score(high_liq_market, decision, implied_prob_market=0.60)
     assert high_score.final_score > low_score.final_score
 
+
+def test_compute_final_score_defaults_new_optional_fields() -> None:
+    market = Market(
+        id="m4",
+        question="Test",
+        outcomes=[MarketOutcome(name="YES", price=0.52), MarketOutcome(name="NO", price=0.48)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=2),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.60,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_external=0.04,
+        evidence_quality=0.6,
+    )
+    score = compute_final_score(market, decision, implied_prob_market=0.52)
+    assert score.bayesian_posterior is None
+    assert score.lmsr_price is None
+    assert score.inefficiency_signal is None
+    assert score.kelly_raw is None
+

@@ -1,7 +1,14 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
-from main import _best_orderbook_sell_price, _calculate_bet, _filter_markets
+from config import Settings
+from main import (
+    _best_orderbook_sell_price,
+    _calculate_bet,
+    _filter_markets,
+    _log_settings_summary,
+)
 from models import Market
 
 
@@ -96,6 +103,29 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 0) or 0.0, 0.60)
         self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 1) or 0.0, 0.44)
         self.assertIsNone(_best_orderbook_sell_price(orderbook, 2))
+
+    def test_log_settings_summary_includes_phase1_flags(self) -> None:
+        settings = Settings(
+            BAYESIAN_ENABLED=False,
+            LMSR_ENABLED=False,
+            KELLY_SIZING_ENABLED=True,
+            KELLY_FRACTION_DEFAULT=0.2,
+            KELLY_FRACTION_SHORT_HORIZON_HOURS=1,
+            KELLY_FRACTION_SHORT_HORIZON=0.1,
+            XAI_API_KEY="xai-key",
+            WALLET_PRIVATE_KEY="wallet-key",
+        )
+        with patch("main.logger.info") as info_mock:
+            _log_settings_summary(settings)
+
+        self.assertTrue(info_mock.called)
+        data = info_mock.call_args.kwargs.get("data") or {}
+        self.assertEqual(data.get("bayesian_enabled"), False)
+        self.assertEqual(data.get("lmsr_enabled"), False)
+        self.assertEqual(data.get("kelly_sizing_enabled"), True)
+        self.assertEqual(data.get("kelly_fraction_default"), 0.2)
+        self.assertEqual(data.get("kelly_fraction_short_horizon_hours"), 1)
+        self.assertEqual(data.get("kelly_fraction_short_horizon"), 0.1)
 
 
 if __name__ == "__main__":

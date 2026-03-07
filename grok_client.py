@@ -55,7 +55,10 @@ _SYSTEM_PROMPT_ANALYZE = (
     + _SYSTEM_PROMPT_SHARED
     + "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
     + "Calibrate probabilities conservatively. For sports/esports, avoid overconfidence and generally keep confidence <=0.80.\n"
-    + "Provide concise reasoning that includes implied probability, your probability, and edge."
+    + "Provide concise reasoning that includes implied probability, your probability, and edge.\n"
+    + "Include likelihood_ratio as a positive decimal equal to "
+    + "P(evidence|predicted_outcome)/P(evidence|alternative_outcome). "
+    + "Use likelihood_ratio=1.0 when evidence is neutral."
 )
 _SYSTEM_PROMPT_DEEP = (
     "You are performing deeper value validation on a prior market analysis.\n"
@@ -493,6 +496,7 @@ class GrokClient:
         normalized_payload = dict(payload)
         probability_fields = ("confidence", "my_prob", "implied_prob_external")
         edge_fields = ("edge_external",)
+        likelihood_fields = ("likelihood_ratio",)
 
         def _normalize_field(
             field_name: str,
@@ -545,6 +549,29 @@ class GrokClient:
             _normalize_field(field_name, 0.0, 1.0)
         for field_name in edge_fields:
             _normalize_field(field_name, -1.0, 1.0)
+        for field_name in likelihood_fields:
+            raw_value = normalized_payload.get(field_name)
+            if raw_value is None:
+                continue
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric_value) or numeric_value <= 0.0:
+                normalized_payload[field_name] = None
+                logger.warning(
+                    "Normalized invalid likelihood ratio to None: market=%s field=%s raw=%s",
+                    market_id,
+                    field_name,
+                    raw_value,
+                    data={
+                        "market_id": market_id,
+                        "field": field_name,
+                        "raw_value": raw_value,
+                    },
+                )
+                continue
+            normalized_payload[field_name] = numeric_value
 
         return normalized_payload
 
@@ -621,6 +648,7 @@ class GrokClient:
                     "outcome must EXACTLY match one provided outcome label\n"
                     "reasoning must explain why the selected outcome has edge over market pricing\n"
                     "reasoning must explicitly include: Implied prob: X, My prob: Y, Edge: Z\n"
+                    "include likelihood_ratio as a positive decimal; use 1.0 for neutral evidence\n"
                     "</output_rules>\n"
                 )
             )
@@ -675,6 +703,7 @@ class GrokClient:
                     "implied_prob_external": decision.implied_prob_external,
                     "my_prob": decision.my_prob,
                     "edge_external": decision.edge_external,
+                    "likelihood_ratio": decision.likelihood_ratio,
                     "evidence_quality": decision.evidence_quality,
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,
@@ -762,6 +791,7 @@ class GrokClient:
                     "always include every required TradeDecision field\n"
                     "all probability fields must be decimals between 0 and 1\n"
                     "edge_external must be a decimal between -1 and 1 (not percentages)\n"
+                    "likelihood_ratio must be a positive decimal; use 1.0 for neutral evidence\n"
                     "</output_rules>\n"
                 )
             )
@@ -816,6 +846,7 @@ class GrokClient:
                     "implied_prob_external": decision.implied_prob_external,
                     "my_prob": decision.my_prob,
                     "edge_external": decision.edge_external,
+                    "likelihood_ratio": decision.likelihood_ratio,
                     "evidence_quality": decision.evidence_quality,
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,

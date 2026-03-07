@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from bayesian_engine import BayesianState
 from logging_config import get_logger
 from models import MarketState, OrderResponse, Position, TradeDecision
 
@@ -115,6 +116,19 @@ class MarketStateManager:
                 """
             )
             self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bayesian_state (
+                    market_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    log_prior REAL NOT NULL,
+                    log_likelihood_sum REAL NOT NULL DEFAULT 0.0,
+                    update_count INTEGER NOT NULL DEFAULT 0,
+                    last_updated TEXT,
+                    PRIMARY KEY (market_id, outcome)
+                )
+                """
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_analyses_market_id ON analyses (market_id)"
             )
             self._conn.execute(
@@ -125,6 +139,9 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_outcome_events_market_id ON trade_outcome_events (market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bayesian_state_market_id ON bayesian_state (market_id)"
             )
             self._run_migrations()
             self._backfill_resolution_state()
@@ -257,6 +274,93 @@ class MarketStateManager:
         if fallback is None:
             return None
         return dict(fallback)
+
+    def get_bayesian_state(self, market_id: str) -> dict[str, BayesianState]:
+        rows = self._conn.execute(
+            """
+            SELECT outcome, log_prior, log_likelihood_sum, update_count, last_updated
+            FROM bayesian_state
+            WHERE market_id = ?
+            """,
+            (market_id,),
+        ).fetchall()
+        if not rows:
+            return {}
+
+        states: dict[str, BayesianState] = {}
+        for row in rows:
+            log_likelihood_sum = float(row["log_likelihood_sum"] or 0.0)
+            # Stored as running sum for compact persistence; materialize as one aggregate update.
+            log_likelihoods = [log_likelihood_sum] if log_likelihood_sum != 0.0 else []
+            states[str(row["outcome"])] = BayesianState(
+                log_prior=float(row["log_prior"]),
+                log_likelihoods=log_likelihoods,
+                update_count=int(row["update_count"] or 0),
+                last_updated=row["last_updated"] or datetime.now(timezone.utc).isoformat(),
+            )
+        return states
+
+    def update_bayesian_state(
+        self,
+        market_id: str,
+        outcome: str,
+        log_prior: float,
+        log_likelihood: float,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        row = self._conn.execute(
+            """
+            SELECT log_likelihood_sum, update_count
+            FROM bayesian_state
+            WHERE market_id = ? AND outcome = ?
+            """,
+            (market_id, outcome),
+        ).fetchone()
+        if row:
+            updated_sum = float(row["log_likelihood_sum"] or 0.0) + float(log_likelihood)
+            updated_count = int(row["update_count"] or 0) + 1
+            with self._conn:
+                self._conn.execute(
+                    """
+                    UPDATE bayesian_state
+                    SET log_prior = ?, log_likelihood_sum = ?, update_count = ?, last_updated = ?
+                    WHERE market_id = ? AND outcome = ?
+                    """,
+                    (
+                        float(log_prior),
+                        updated_sum,
+                        updated_count,
+                        timestamp,
+                        market_id,
+                        outcome,
+                    ),
+                )
+            return
+
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO bayesian_state (
+                    market_id, outcome, log_prior, log_likelihood_sum, update_count, last_updated
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    market_id,
+                    outcome,
+                    float(log_prior),
+                    float(log_likelihood),
+                    1,
+                    timestamp,
+                ),
+            )
+
+    def reset_bayesian_state(self, market_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM bayesian_state WHERE market_id = ?",
+                (market_id,),
+            )
 
     def record_analysis(
         self,

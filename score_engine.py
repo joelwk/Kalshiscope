@@ -14,12 +14,20 @@ class ScoreResult:
     evidence_quality: float
     liquidity_penalty: float
     staleness_penalty: float
+    bayesian_posterior: float | None = None
+    lmsr_price: float | None = None
+    inefficiency_signal: float | None = None
+    kelly_raw: float | None = None
 
 
 def compute_final_score(
     market: Market,
     decision: TradeDecision,
     implied_prob_market: float | None,
+    bayesian_posterior: float | None = None,
+    lmsr_price: float | None = None,
+    inefficiency_signal: float | None = None,
+    kelly_raw: float | None = None,
     now: datetime | None = None,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
@@ -59,5 +67,9 @@ def compute_final_score(
         evidence_quality=evidence_quality,
         liquidity_penalty=liquidity_penalty,
         staleness_penalty=staleness_penalty,
+        bayesian_posterior=bayesian_posterior,
+        lmsr_price=lmsr_price,
+        inefficiency_signal=inefficiency_signal,
+        kelly_raw=kelly_raw,
     )
 

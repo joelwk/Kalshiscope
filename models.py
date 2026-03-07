@@ -73,6 +73,14 @@ class TradeDecision(BaseModel):
         le=1.0,
         description="Optional explicit edge from external implied probability (my_prob - implied_prob_external).",
     )
+    likelihood_ratio: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Optional likelihood ratio P(evidence|predicted_outcome) / "
+            "P(evidence|alternative_outcome)."
+        ),
+    )
     evidence_quality: float = Field(
         default=0.0,
         ge=0.0,

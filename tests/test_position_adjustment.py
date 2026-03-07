@@ -24,9 +24,12 @@ def test_should_adjust_new_position() -> None:
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
     )
     decision = _decision(0.8, 0.4)
-    should_add, bet_pct = _should_adjust_position(decision, None, None, None, settings)
+    should_add, bet_pct, reason = _should_adjust_position(
+        decision, None, None, None, settings
+    )
     assert should_add is True
     assert bet_pct == 0.4
+    assert reason == "new_position"
 
 
 def test_should_adjust_blocked_at_max_position() -> None:
@@ -44,9 +47,12 @@ def test_should_adjust_blocked_at_max_position() -> None:
         first_trade=datetime.now(timezone.utc),
         last_trade=datetime.now(timezone.utc),
     )
-    should_add, bet_pct = _should_adjust_position(_decision(0.9), None, position, None, settings)
+    should_add, bet_pct, reason = _should_adjust_position(
+        _decision(0.9), None, position, None, settings
+    )
     assert should_add is False
     assert bet_pct == 0.0
+    assert reason == "max_position_reached"
 
 
 def test_should_adjust_blocked_on_confidence_increase() -> None:
@@ -64,9 +70,12 @@ def test_should_adjust_blocked_on_confidence_increase() -> None:
         first_trade=datetime.now(timezone.utc),
         last_trade=datetime.now(timezone.utc),
     )
-    should_add, bet_pct = _should_adjust_position(_decision(0.8), None, position, None, settings)
+    should_add, bet_pct, reason = _should_adjust_position(
+        _decision(0.8), None, position, None, settings
+    )
     assert should_add is False
     assert bet_pct == 0.0
+    assert reason == "insufficient_confidence_increase"
 
 
 def test_should_adjust_allows_small_position_with_scaled_threshold() -> None:
@@ -84,9 +93,12 @@ def test_should_adjust_allows_small_position_with_scaled_threshold() -> None:
         first_trade=datetime.now(timezone.utc),
         last_trade=datetime.now(timezone.utc),
     )
-    should_add, bet_pct = _should_adjust_position(_decision(0.70, 0.3), None, position, None, settings)
+    should_add, bet_pct, reason = _should_adjust_position(
+        _decision(0.70, 0.3), None, position, None, settings
+    )
     assert should_add is True
     assert bet_pct == 0.3
+    assert reason == "confidence_increase_threshold_met"
 
 
 def test_should_adjust_caps_to_remaining_room() -> None:
@@ -105,9 +117,12 @@ def test_should_adjust_caps_to_remaining_room() -> None:
         last_trade=datetime.now(timezone.utc),
     )
     decision = _decision(0.85, 0.5)
-    should_add, bet_pct = _should_adjust_position(decision, None, position, MarketState(market_id="m1"), settings)
+    should_add, bet_pct, reason = _should_adjust_position(
+        decision, None, position, MarketState(market_id="m1"), settings
+    )
     assert should_add is True
     assert round(bet_pct, 4) == 0.2
+    assert reason == "high_confidence_override"
 
 
 def test_position_override_respects_sports_cap() -> None:
@@ -129,6 +144,13 @@ def test_position_override_respects_sports_cap() -> None:
     )
     market = MarketState(market_id="m1")
     decision = _decision(0.80, 0.4)
-    should_add, bet_pct = _should_adjust_position(decision, Market(id="m1", question="NBA: Test", outcomes=[]), position, market, settings)
+    should_add, bet_pct, reason = _should_adjust_position(
+        decision,
+        Market(id="m1", question="NBA: Test", outcomes=[]),
+        position,
+        market,
+        settings,
+    )
     assert should_add is True
     assert bet_pct == 0.4
+    assert reason == "high_confidence_override"

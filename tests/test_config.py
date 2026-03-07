@@ -178,6 +178,35 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.CALIBRATION_MODE_ENABLED)
         self.assertEqual(settings.CALIBRATION_MIN_SAMPLES, 25)
 
+    def test_bayesian_lmsr_kelly_settings_overrides(self) -> None:
+        env = {
+            "XAI_API_KEY": "xai-key",
+            "WALLET_PRIVATE_KEY": "0xabc",
+            "BAYESIAN_ENABLED": "true",
+            "BAYESIAN_PRIOR_DEFAULT": "0.58",
+            "BAYESIAN_MIN_UPDATES_FOR_TRADE": "3",
+            "LMSR_ENABLED": "true",
+            "LMSR_LIQUIDITY_PARAM_B": "120000",
+            "LMSR_MIN_INEFFICIENCY": "0.04",
+            "KELLY_SIZING_ENABLED": "true",
+            "KELLY_FRACTION_DEFAULT": "0.2",
+            "KELLY_FRACTION_SHORT_HORIZON_HOURS": "2",
+            "KELLY_FRACTION_SHORT_HORIZON": "0.1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+
+        self.assertTrue(settings.BAYESIAN_ENABLED)
+        self.assertEqual(settings.BAYESIAN_PRIOR_DEFAULT, 0.58)
+        self.assertEqual(settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
+        self.assertTrue(settings.LMSR_ENABLED)
+        self.assertEqual(settings.LMSR_LIQUIDITY_PARAM_B, 120000.0)
+        self.assertEqual(settings.LMSR_MIN_INEFFICIENCY, 0.04)
+        self.assertTrue(settings.KELLY_SIZING_ENABLED)
+        self.assertEqual(settings.KELLY_FRACTION_DEFAULT, 0.2)
+        self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON_HOURS, 2)
+        self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON, 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()
