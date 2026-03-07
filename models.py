@@ -75,7 +75,7 @@ class TradeDecision(BaseModel):
     )
     likelihood_ratio: float | None = Field(
         default=None,
-        ge=0.0,
+        gt=0.0,
         description=(
             "Optional likelihood ratio P(evidence|predicted_outcome) / "
             "P(evidence|alternative_outcome)."
