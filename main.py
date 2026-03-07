@@ -20,6 +20,7 @@ from lmsr import (
     infer_quantities_from_prices,
     inefficiency_signal as lmsr_inefficiency_signal,
     lmsr_prices,
+    trade_cost as lmsr_trade_cost,
 )
 from logging_config import (
     get_logger,
@@ -448,8 +449,21 @@ def _load_or_initialize_bayesian_states(
             outcome=outcome_name,
             log_prior=state.log_prior,
             log_likelihood=0.0,
+            count_as_update=False,
         )
     return initialized
+
+
+def _applied_bayesian_posterior(
+    bayesian_posterior_raw: float | None,
+    bayesian_update_count: int,
+    min_updates_for_trade: int,
+) -> float | None:
+    if bayesian_posterior_raw is None:
+        return None
+    if bayesian_update_count < max(0, int(min_updates_for_trade)):
+        return None
+    return bayesian_posterior_raw
 
 
 def _kelly_fraction_for_market_horizon(market: Market, settings: Settings) -> float:
@@ -475,9 +489,10 @@ def _zero_bet_skip_message(sizing_mode: str) -> str:
     return "bet size reduced to zero by edge scaling"
 
 
-def _compute_lmsr_price_for_outcome(
+def _compute_lmsr_execution_price_for_outcome(
     market: Market,
     decision_outcome: str,
+    amount_usdc: float,
     settings: Settings,
 ) -> float | None:
     if not market.outcomes:
@@ -493,17 +508,35 @@ def _compute_lmsr_price_for_outcome(
 
     if len(prices) < 2:
         return None
-    if not any(_outcomes_match(name, decision_outcome) for name in outcome_names):
+    selected_idx = next(
+        (idx for idx, name in enumerate(outcome_names) if _outcomes_match(name, decision_outcome)),
+        None,
+    )
+    if selected_idx is None:
+        return None
+    if amount_usdc <= 0:
         return None
     try:
         quantities = infer_quantities_from_prices(prices, settings.LMSR_LIQUIDITY_PARAM_B)
-        recomputed_prices = lmsr_prices(quantities, settings.LMSR_LIQUIDITY_PARAM_B)
+        current_prices = lmsr_prices(quantities, settings.LMSR_LIQUIDITY_PARAM_B)
+        current_price = current_prices[selected_idx]
+        if current_price <= 0:
+            return None
+        trade_delta_shares = amount_usdc / current_price
+        if trade_delta_shares <= 0:
+            return None
+        estimated_cost = lmsr_trade_cost(
+            quantities=quantities,
+            outcome_idx=selected_idx,
+            delta=trade_delta_shares,
+            b=settings.LMSR_LIQUIDITY_PARAM_B,
+        )
     except (ValueError, OverflowError):
         return None
-    for idx, name in enumerate(outcome_names):
-        if _outcomes_match(name, decision_outcome):
-            return recomputed_prices[idx]
-    return None
+    if estimated_cost <= 0:
+        return None
+    average_execution_price = estimated_cost / trade_delta_shares
+    return average_execution_price
 
 
 def _best_orderbook_sell_price(
@@ -1436,11 +1469,13 @@ def main() -> None:
 
                 entry_price = _get_outcome_entry_price(market, decision.outcome)
                 implied_prob = _get_implied_probability(market, decision.outcome)
-                bayesian_posterior: float | None = None
+                bayesian_posterior_raw: float | None = None
+                bayesian_posterior_applied: float | None = None
                 bayesian_update_count: int = 0
-                lmsr_price: float | None = None
+                lmsr_execution_price: float | None = None
                 ineff_signal: float | None = None
                 effective_confidence = decision.confidence
+                likelihood_ratio = decision.likelihood_ratio
 
                 if settings.BAYESIAN_ENABLED and market.outcomes:
                     try:
@@ -1451,7 +1486,6 @@ def main() -> None:
                             settings=settings,
                         )
 
-                        likelihood_ratio = decision.likelihood_ratio
                         if likelihood_ratio is not None and likelihood_ratio > 0:
                             log_likelihood = log_likelihood_from_ratio(likelihood_ratio)
                             is_binary_market = len(market.outcomes) == 2
@@ -1475,6 +1509,24 @@ def main() -> None:
                                     log_likelihood=outcome_log_likelihood,
                                 )
                             bayesian_states = state_manager.get_bayesian_state(market.id)
+                        elif likelihood_ratio is None:
+                            logger.debug(
+                                "Bayesian update skipped: missing likelihood ratio for market %s",
+                                market.id,
+                                data={
+                                    "market_id": market.id,
+                                    "bayesian_enabled": settings.BAYESIAN_ENABLED,
+                                },
+                            )
+                        else:
+                            logger.warning(
+                                "Bayesian update skipped: invalid likelihood ratio for market %s",
+                                market.id,
+                                data={
+                                    "market_id": market.id,
+                                    "likelihood_ratio": likelihood_ratio,
+                                },
+                            )
 
                         ordered_states = [
                             bayesian_states[outcome.name]
@@ -1485,17 +1537,32 @@ def main() -> None:
                             posterior_values = posterior_from_state(ordered_states)
                             for idx, market_outcome in enumerate(market.outcomes):
                                 if _outcomes_match(market_outcome.name, canonical_outcome):
-                                    bayesian_posterior = posterior_values[idx]
+                                    bayesian_posterior_raw = posterior_values[idx]
                                     selected_state = bayesian_states.get(market_outcome.name)
                                     bayesian_update_count = (
                                         selected_state.update_count if selected_state else 0
                                     )
                                     break
-                            if (
-                                bayesian_posterior is not None
-                                and bayesian_update_count >= settings.BAYESIAN_MIN_UPDATES_FOR_TRADE
-                            ):
-                                effective_confidence = bayesian_posterior
+                            bayesian_posterior_applied = _applied_bayesian_posterior(
+                                bayesian_posterior_raw=bayesian_posterior_raw,
+                                bayesian_update_count=bayesian_update_count,
+                                min_updates_for_trade=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                            )
+                            if bayesian_posterior_applied is not None:
+                                effective_confidence = bayesian_posterior_applied
+                            elif bayesian_posterior_raw is not None:
+                                logger.debug(
+                                    "Bayesian posterior not applied yet: market=%s updates=%d min_updates=%d",
+                                    market.id,
+                                    bayesian_update_count,
+                                    settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                                    data={
+                                        "market_id": market.id,
+                                        "bayesian_update_count": bayesian_update_count,
+                                        "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                                        "bayesian_posterior_raw": bayesian_posterior_raw,
+                                    },
+                                )
                     except Exception as exc:
                         logger.warning(
                             "Bayesian update failed for market %s: %s",
@@ -1503,21 +1570,6 @@ def main() -> None:
                             exc,
                             data={"market_id": market.id, "error": str(exc)},
                         )
-
-                if settings.LMSR_ENABLED:
-                    lmsr_price = _compute_lmsr_price_for_outcome(
-                        market=market,
-                        decision_outcome=decision.outcome,
-                        settings=settings,
-                    )
-                    if lmsr_price is not None:
-                        posterior_for_signal = (
-                            bayesian_posterior if bayesian_posterior is not None else effective_confidence
-                        )
-                        try:
-                            ineff_signal = lmsr_inefficiency_signal(posterior_for_signal, lmsr_price)
-                        except ValueError:
-                            ineff_signal = None
 
                 decision_for_edge = (
                     decision.model_copy(update={"confidence": effective_confidence})
@@ -1589,31 +1641,6 @@ def main() -> None:
                     )
                     continue
 
-                if (
-                    settings.LMSR_ENABLED
-                    and ineff_signal is not None
-                    and abs(ineff_signal) < settings.LMSR_MIN_INEFFICIENCY
-                ):
-                    trades_skipped_edge += 1
-                    question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
-                    logger.info(
-                        "SKIP [%s] '%s' -> LMSR inefficiency too small (|%.4f| < %.4f)",
-                        market.id,
-                        question_short,
-                        ineff_signal,
-                        settings.LMSR_MIN_INEFFICIENCY,
-                        data={
-                            "market_id": market.id,
-                            "inefficiency_signal": ineff_signal,
-                            "lmsr_price": lmsr_price,
-                            "bayesian_posterior": bayesian_posterior,
-                            "bayesian_update_count": bayesian_update_count,
-                        },
-                    )
-                    continue
-
-                markets_passed_edge += 1
-
                 kelly_raw_value: float | None = None
                 kelly_fraction_value: float | None = None
                 posterior_for_kelly: float | None = None
@@ -1622,7 +1649,9 @@ def main() -> None:
                 sizing_mode = _sizing_mode_label(kelly_path_active)
                 if kelly_path_active:
                     posterior_for_kelly = (
-                        bayesian_posterior if bayesian_posterior is not None else effective_confidence
+                        bayesian_posterior_applied
+                        if bayesian_posterior_applied is not None
+                        else effective_confidence
                     )
                     kelly_raw_value = kelly_fraction(
                         posterior=posterior_for_kelly,
@@ -1634,8 +1663,8 @@ def main() -> None:
                     market=market,
                     decision=decision_for_edge,
                     implied_prob_market=implied_prob,
-                    bayesian_posterior=bayesian_posterior,
-                    lmsr_price=lmsr_price,
+                    bayesian_posterior=bayesian_posterior_applied,
+                    lmsr_price=lmsr_execution_price,
                     inefficiency_signal=ineff_signal,
                     kelly_raw=kelly_raw_value,
                 )
@@ -1655,6 +1684,12 @@ def main() -> None:
                         "lmsr_price": score_result.lmsr_price,
                         "inefficiency_signal": score_result.inefficiency_signal,
                         "kelly_raw": score_result.kelly_raw,
+                        "bayesian_posterior_raw": bayesian_posterior_raw,
+                        "bayesian_posterior_applied": bayesian_posterior_applied,
+                        "bayesian_applied": bayesian_posterior_applied is not None,
+                        "bayesian_update_count": bayesian_update_count,
+                        "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                        "likelihood_ratio": likelihood_ratio,
                     }
                     if score_mode == "shadow":
                         logger.debug(
@@ -1681,7 +1716,9 @@ def main() -> None:
                 if settings.KELLY_SIZING_ENABLED and implied_prob is not None:
                     if posterior_for_kelly is None:
                         posterior_for_kelly = (
-                            bayesian_posterior if bayesian_posterior is not None else effective_confidence
+                            bayesian_posterior_applied
+                            if bayesian_posterior_applied is not None
+                            else effective_confidence
                         )
                     if kelly_fraction_value is None:
                         kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
@@ -1735,12 +1772,93 @@ def main() -> None:
                             "kelly_raw": kelly_raw_value,
                             "kelly_fraction_value": kelly_fraction_value,
                             "posterior_for_kelly": posterior_for_kelly,
+                            "bayesian_posterior_raw": bayesian_posterior_raw,
+                            "bayesian_posterior_applied": bayesian_posterior_applied,
+                            "bayesian_applied": bayesian_posterior_applied is not None,
+                            "bayesian_update_count": bayesian_update_count,
+                            "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                            "likelihood_ratio": likelihood_ratio,
                             "implied_prob_market": implied_prob,
                             "min_edge_for_kelly": min_edge_for_kelly,
                             "edge_market": edge_value,
+                            "lmsr_execution_price": lmsr_execution_price,
+                            "lmsr_inefficiency_signal": ineff_signal,
+                            "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
                         },
                     )
                     continue
+
+                proposed_bet_amount = _calculate_bet(settings.MAX_BET_USDC, adjusted_bet_pct)
+                if settings.LMSR_ENABLED:
+                    lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
+                        market=market,
+                        decision_outcome=decision.outcome,
+                        amount_usdc=proposed_bet_amount,
+                        settings=settings,
+                    )
+                    if lmsr_execution_price is not None:
+                        posterior_for_signal = (
+                            bayesian_posterior_applied
+                            if bayesian_posterior_applied is not None
+                            else effective_confidence
+                        )
+                        try:
+                            ineff_signal = lmsr_inefficiency_signal(
+                                posterior_for_signal,
+                                lmsr_execution_price,
+                            )
+                        except ValueError:
+                            ineff_signal = None
+                    if (
+                        ineff_signal is not None
+                        and abs(ineff_signal) < settings.LMSR_MIN_INEFFICIENCY
+                    ):
+                        trades_skipped_edge += 1
+                        question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                        logger.info(
+                            "SKIP [%s] '%s' -> LMSR inefficiency too small (|%.4f| < %.4f)",
+                            market.id,
+                            question_short,
+                            ineff_signal,
+                            settings.LMSR_MIN_INEFFICIENCY,
+                            data={
+                                "market_id": market.id,
+                                "inefficiency_signal": ineff_signal,
+                                "lmsr_execution_price": lmsr_execution_price,
+                                "proposed_bet_amount_usdc": proposed_bet_amount,
+                                "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
+                                "bayesian_posterior_raw": bayesian_posterior_raw,
+                                "bayesian_posterior_applied": bayesian_posterior_applied,
+                                "bayesian_update_count": bayesian_update_count,
+                                "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                                "likelihood_ratio": likelihood_ratio,
+                            },
+                        )
+                        log_trade_decision(
+                            market_id=market.id,
+                            question=market.question,
+                            decision=decision_for_edge.model_copy(
+                                update={"bet_size_pct": adjusted_bet_pct}
+                            ).model_dump(),
+                            execution_audit={
+                                "decision_phase": "post_lmsr_gate",
+                                "lmsr_gate_decision": "blocked",
+                                "lmsr_execution_price": lmsr_execution_price,
+                                "lmsr_inefficiency_signal": ineff_signal,
+                                "lmsr_min_inefficiency": settings.LMSR_MIN_INEFFICIENCY,
+                                "proposed_bet_amount_usdc": proposed_bet_amount,
+                                "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
+                                "bayesian_posterior_raw": bayesian_posterior_raw,
+                                "bayesian_posterior_applied": bayesian_posterior_applied,
+                                "bayesian_applied": bayesian_posterior_applied is not None,
+                                "bayesian_update_count": bayesian_update_count,
+                                "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                                "likelihood_ratio": likelihood_ratio,
+                            },
+                        )
+                        continue
+
+                markets_passed_edge += 1
 
                 log_trade_decision(
                     market_id=market.id,
@@ -1754,12 +1872,22 @@ def main() -> None:
                         "position_decision": "pending",
                         "adjusted_bet_pct": adjusted_bet_pct,
                         "bet_amount_usdc": None,
+                        "proposed_bet_amount_usdc": proposed_bet_amount,
                         "kelly_raw": kelly_raw_value,
                         "kelly_fraction_value": kelly_fraction_value,
                         "posterior_for_kelly": posterior_for_kelly,
+                        "bayesian_posterior_raw": bayesian_posterior_raw,
+                        "bayesian_posterior_applied": bayesian_posterior_applied,
+                        "bayesian_applied": bayesian_posterior_applied is not None,
+                        "bayesian_update_count": bayesian_update_count,
+                        "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                        "likelihood_ratio": likelihood_ratio,
                         "implied_prob_market": implied_prob,
                         "min_edge_for_kelly": min_edge_for_kelly,
                         "edge_market": edge_value,
+                        "lmsr_execution_price": lmsr_execution_price,
+                        "lmsr_inefficiency_signal": ineff_signal,
+                        "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
                     },
                 )
 
@@ -1813,12 +1941,22 @@ def main() -> None:
                         "adjusted_bet_pct": adjusted_bet_pct,
                         "post_position_bet_pct": bet_pct,
                         "bet_amount_usdc": None,
+                        "proposed_bet_amount_usdc": proposed_bet_amount,
                         "kelly_raw": kelly_raw_value,
                         "kelly_fraction_value": kelly_fraction_value,
                         "posterior_for_kelly": posterior_for_kelly,
+                        "bayesian_posterior_raw": bayesian_posterior_raw,
+                        "bayesian_posterior_applied": bayesian_posterior_applied,
+                        "bayesian_applied": bayesian_posterior_applied is not None,
+                        "bayesian_update_count": bayesian_update_count,
+                        "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                        "likelihood_ratio": likelihood_ratio,
                         "implied_prob_market": implied_prob,
                         "min_edge_for_kelly": min_edge_for_kelly,
                         "edge_market": edge_value,
+                        "lmsr_execution_price": lmsr_execution_price,
+                        "lmsr_inefficiency_signal": ineff_signal,
+                        "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
                     },
                 )
                 if not should_add:

@@ -306,6 +306,7 @@ class MarketStateManager:
         outcome: str,
         log_prior: float,
         log_likelihood: float,
+        count_as_update: bool = True,
     ) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         row = self._conn.execute(
@@ -317,8 +318,18 @@ class MarketStateManager:
             (market_id, outcome),
         ).fetchone()
         if row:
-            updated_sum = float(row["log_likelihood_sum"] or 0.0) + float(log_likelihood)
-            updated_count = int(row["update_count"] or 0) + 1
+            existing_sum = float(row["log_likelihood_sum"] or 0.0)
+            existing_count = int(row["update_count"] or 0)
+            updated_sum = (
+                existing_sum + float(log_likelihood)
+                if count_as_update
+                else existing_sum
+            )
+            updated_count = (
+                existing_count + 1
+                if count_as_update
+                else existing_count
+            )
             with self._conn:
                 self._conn.execute(
                     """
@@ -349,8 +360,8 @@ class MarketStateManager:
                     market_id,
                     outcome,
                     float(log_prior),
-                    float(log_likelihood),
-                    1,
+                    float(log_likelihood) if count_as_update else 0.0,
+                    1 if count_as_update else 0,
                     timestamp,
                 ),
             )
