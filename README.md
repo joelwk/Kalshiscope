@@ -1,13 +1,14 @@
 # Prediscope
 
-Autonomous prediction-market trading bot using xAI Grok for research/scoring and PredictBase for market execution.
+Autonomous prediction-market trading bot using xAI Grok for research, edge scoring, and PredictBase for market execution.
 
 ## What It Does
 
 - Pulls active markets from PredictBase.
 - Filters by liquidity/category/close window.
-- Uses Grok to analyze outcomes and confidence.
-- Applies risk gates and position controls.
+- Uses Grok to analyze outcomes, confidence, and supporting evidence.
+- Applies edge, evidence-quality, and position-risk gates before trading.
+- Can layer Bayesian updating, LMSR-based price checks, and Kelly sizing behind feature flags.
 - Optionally submits orders and on-chain approvals.
 
 ## Prerequisites
@@ -83,7 +84,16 @@ Conditionally required:
 - `ALCHEMY_RPC_URL` when `EXECUTE_ONCHAIN=true` or `AUTO_APPROVE_USDC=true`
 - `PREDICTBASE_CONTRACT_ADDRESS` when `AUTO_APPROVE_USDC=true`
 
-Everything else has defaults in `.env.example`.
+Everything else has defaults in `.env.example`, including conservative rollout settings for edge thresholds, Kelly sizing, and optional Bayesian/LMSR layers.
+
+## Strategy Controls
+
+- `MIN_EDGE` sets the minimum edge required before a market can pass trade gating.
+- `KELLY_SIZING_ENABLED` switches sizing from edge scaling to fractional Kelly.
+- `BAYESIAN_ENABLED` enables posterior updates from model likelihood ratios across cycles.
+- `LMSR_ENABLED` enables an independent LMSR-based price verification layer.
+
+The template keeps Bayesian, LMSR, and Kelly conservative by default so they can be enabled gradually.
 
 ## Troubleshooting
 
