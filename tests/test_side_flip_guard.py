@@ -71,7 +71,7 @@ def test_flip_guard_bypasses_low_confidence_anchor() -> None:
     settings = Settings()
     market = _market()
     decision = _decision("NO", 0.62, evidence_quality=0.9)
-    anchor = {"outcome": "YES", "confidence": 0.55}
+    anchor = {"outcome": "YES", "confidence": 0.45}
 
     guarded, triggered, blocked = _apply_flip_guard(
         market,

@@ -14,7 +14,7 @@ class Settings:
     # Risk controls - Conservative defaults for value betting
     MIN_BET_USDC: float = 5.0
     MAX_BET_USDC: float = 50.0
-    MIN_CONFIDENCE: float = 0.65  # Raised from 0.60 - require meaningful edge
+    MIN_CONFIDENCE: float = 0.50  # Allows mid-probability bets; edge + evidence gates handle quality
     SLIPPAGE_CONFIDENCE_THRESHOLD: float = 0.70
     SLIPPAGE_PCT: float = 0.02
     MIN_LIQUIDITY_USDC: float = 100.0
@@ -22,9 +22,9 @@ class Settings:
 
     # Edge gating / sizing
     MIN_EDGE: float = 0.05
-    LOW_PRICE_THRESHOLD: float = 0.58
+    LOW_PRICE_THRESHOLD: float = 0.50
     HIGH_PRICE_THRESHOLD: float = 0.65
-    LOW_PRICE_MIN_EDGE: float = 0.10
+    LOW_PRICE_MIN_EDGE: float = 0.08
     EDGE_SCALING_RANGE: float = 0.15
     LOW_PRICE_BET_PENALTY: float = 0.50
     REQUIRE_IMPLIED_PRICE: bool = True
@@ -214,6 +214,18 @@ class Settings:
     # Score gate (phase A/B can run in shadow mode)
     SCORE_GATE_MODE: str = "shadow"  # off|shadow|active
     SCORE_GATE_THRESHOLD: float = 0.08
+
+    # Bayesian + LMSR + Kelly experimental layers
+    BAYESIAN_ENABLED: bool = False
+    BAYESIAN_PRIOR_DEFAULT: float = 0.50
+    BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
+    LMSR_ENABLED: bool = False
+    LMSR_LIQUIDITY_PARAM_B: float = 100000.0
+    LMSR_MIN_INEFFICIENCY: float = 0.05
+    KELLY_SIZING_ENABLED: bool = False
+    KELLY_FRACTION_DEFAULT: float = 0.25
+    KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
+    KELLY_FRACTION_SHORT_HORIZON: float = 0.10
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -518,6 +530,46 @@ def load_settings() -> Settings:
         SCORE_GATE_THRESHOLD=_read_env_float(
             "SCORE_GATE_THRESHOLD",
             Settings.SCORE_GATE_THRESHOLD,
+        ),
+        BAYESIAN_ENABLED=_read_env_bool(
+            "BAYESIAN_ENABLED",
+            Settings.BAYESIAN_ENABLED,
+        ),
+        BAYESIAN_PRIOR_DEFAULT=_read_env_float(
+            "BAYESIAN_PRIOR_DEFAULT",
+            Settings.BAYESIAN_PRIOR_DEFAULT,
+        ),
+        BAYESIAN_MIN_UPDATES_FOR_TRADE=_read_env_int(
+            "BAYESIAN_MIN_UPDATES_FOR_TRADE",
+            Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+        ),
+        LMSR_ENABLED=_read_env_bool(
+            "LMSR_ENABLED",
+            Settings.LMSR_ENABLED,
+        ),
+        LMSR_LIQUIDITY_PARAM_B=_read_env_float(
+            "LMSR_LIQUIDITY_PARAM_B",
+            Settings.LMSR_LIQUIDITY_PARAM_B,
+        ),
+        LMSR_MIN_INEFFICIENCY=_read_env_float(
+            "LMSR_MIN_INEFFICIENCY",
+            Settings.LMSR_MIN_INEFFICIENCY,
+        ),
+        KELLY_SIZING_ENABLED=_read_env_bool(
+            "KELLY_SIZING_ENABLED",
+            Settings.KELLY_SIZING_ENABLED,
+        ),
+        KELLY_FRACTION_DEFAULT=_read_env_float(
+            "KELLY_FRACTION_DEFAULT",
+            Settings.KELLY_FRACTION_DEFAULT,
+        ),
+        KELLY_FRACTION_SHORT_HORIZON_HOURS=_read_env_int(
+            "KELLY_FRACTION_SHORT_HORIZON_HOURS",
+            Settings.KELLY_FRACTION_SHORT_HORIZON_HOURS,
+        ),
+        KELLY_FRACTION_SHORT_HORIZON=_read_env_float(
+            "KELLY_FRACTION_SHORT_HORIZON",
+            Settings.KELLY_FRACTION_SHORT_HORIZON,
         ),
         FLIP_GUARD_ENABLED=_read_env_bool(
             "FLIP_GUARD_ENABLED",

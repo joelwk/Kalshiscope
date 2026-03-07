@@ -9,6 +9,8 @@ from main import (
     _filter_markets,
     _is_uniform_implied_probability,
     _passes_edge_threshold,
+    _sizing_mode_label,
+    _zero_bet_skip_message,
 )
 from models import Market, MarketOutcome, TradeDecision
 
@@ -34,11 +36,11 @@ def test_edge_gate_requires_implied_prob_when_configured() -> None:
 def test_edge_gate_blocks_low_edge_for_low_price() -> None:
     settings = Settings(
         MIN_EDGE=0.05,
-        LOW_PRICE_THRESHOLD=0.58,
-        LOW_PRICE_MIN_EDGE=0.10,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.08,
     )
-    implied_prob = 0.55
-    ok, edge, reason = _passes_edge_threshold(implied_prob, _decision(0.62), settings)
+    implied_prob = 0.45
+    ok, edge, reason = _passes_edge_threshold(implied_prob, _decision(0.50), settings)
     assert ok is False
     assert edge is not None
     assert "below min" in reason
@@ -47,26 +49,54 @@ def test_edge_gate_blocks_low_edge_for_low_price() -> None:
 def test_edge_gate_allows_when_edge_clears_threshold() -> None:
     settings = Settings(
         MIN_EDGE=0.05,
-        LOW_PRICE_THRESHOLD=0.58,
-        LOW_PRICE_MIN_EDGE=0.10,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.08,
     )
-    implied_prob = 0.60
-    ok, edge, reason = _passes_edge_threshold(implied_prob, _decision(0.67), settings)
+    implied_prob = 0.55
+    ok, edge, reason = _passes_edge_threshold(implied_prob, _decision(0.62), settings)
     assert ok is True
     assert round(edge, 4) == 0.07
+    assert reason == ""
+
+
+def test_edge_gate_allows_low_price_with_sufficient_edge() -> None:
+    """Verifies that underdog outcomes pass when edge exceeds LOW_PRICE_MIN_EDGE."""
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.08,
+    )
+    implied_prob = 0.45
+    ok, edge, reason = _passes_edge_threshold(implied_prob, _decision(0.55), settings)
+    assert ok is True
+    assert round(edge, 2) == 0.10
+    assert reason == ""
+
+
+def test_mid_price_outcome_uses_standard_edge() -> None:
+    """Outcomes above LOW_PRICE_THRESHOLD use MIN_EDGE, not the elevated bar."""
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.08,
+    )
+    implied_prob = 0.576
+    ok, edge, reason = _passes_edge_threshold(implied_prob, _decision(0.67), settings)
+    assert ok is True
+    assert round(edge, 3) == 0.094
     assert reason == ""
 
 
 def test_edge_based_sizing_scales_down_for_small_edge() -> None:
     settings = Settings(
         MIN_EDGE=0.05,
-        LOW_PRICE_THRESHOLD=0.58,
-        LOW_PRICE_MIN_EDGE=0.10,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.08,
         EDGE_SCALING_RANGE=0.10,
         LOW_PRICE_BET_PENALTY=0.5,
     )
     decision = _decision(0.66, bet_size_pct=0.6)
-    implied_prob = 0.60
+    implied_prob = 0.55
     edge = 0.06
     adjusted = _adjust_bet_size_for_edge(decision, implied_prob, edge, settings)
     assert 0 < adjusted < decision.bet_size_pct
@@ -150,3 +180,13 @@ def test_uniform_distribution_guard_for_multi_outcome_market() -> None:
     ]
     assert _is_uniform_implied_probability(0.25, outcomes) is True
     assert _is_uniform_implied_probability(0.30, outcomes) is False
+
+
+def test_sizing_mode_label_for_kelly_and_edge_scaling() -> None:
+    assert _sizing_mode_label(True) == "kelly"
+    assert _sizing_mode_label(False) == "edge_scaling"
+
+
+def test_zero_bet_skip_message_is_mode_aware() -> None:
+    assert "Kelly" in _zero_bet_skip_message("kelly")
+    assert "edge scaling" in _zero_bet_skip_message("edge_scaling")

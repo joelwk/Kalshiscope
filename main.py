@@ -6,9 +6,21 @@ from datetime import datetime, timedelta, timezone
 import re
 from typing import Any
 
+from bayesian_engine import (
+    BayesianState,
+    initial_state,
+    log_likelihood_from_ratio,
+    posterior_from_state,
+)
 from calibration import build_counterfactual_flags, compute_adaptive_thresholds
 from config import Settings, load_settings
 from grok_client import GrokClient
+from kelly import kelly_bet_pct, kelly_fraction
+from lmsr import (
+    infer_quantities_from_prices,
+    inefficiency_signal as lmsr_inefficiency_signal,
+    lmsr_prices,
+)
 from logging_config import (
     get_logger,
     log_trade_decision,
@@ -406,6 +418,94 @@ def _price_bucket(
     return _PRICE_BUCKET_HIGH
 
 
+def _canonical_outcome_name(market: Market, outcome: str) -> str:
+    market_outcome = _find_market_outcome(market, outcome)
+    if market_outcome:
+        return market_outcome.name
+    return outcome
+
+
+def _load_or_initialize_bayesian_states(
+    market: Market,
+    state_manager: MarketStateManager,
+    settings: Settings,
+) -> dict[str, BayesianState]:
+    states = state_manager.get_bayesian_state(market.id)
+    outcome_names = [outcome.name for outcome in market.outcomes]
+    if states:
+        return states
+
+    if len(outcome_names) == 2:
+        seeded_states = initial_state(len(outcome_names), prior=settings.BAYESIAN_PRIOR_DEFAULT)
+    else:
+        seeded_states = initial_state(len(outcome_names), prior=None)
+
+    initialized: dict[str, BayesianState] = {}
+    for outcome_name, state in zip(outcome_names, seeded_states):
+        initialized[outcome_name] = state
+        state_manager.update_bayesian_state(
+            market_id=market.id,
+            outcome=outcome_name,
+            log_prior=state.log_prior,
+            log_likelihood=0.0,
+        )
+    return initialized
+
+
+def _kelly_fraction_for_market_horizon(market: Market, settings: Settings) -> float:
+    if market.close_time is None:
+        return settings.KELLY_FRACTION_DEFAULT
+    close_time = market.close_time
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=timezone.utc)
+    horizon_seconds = (close_time - datetime.now(timezone.utc)).total_seconds()
+    short_horizon_seconds = max(0, settings.KELLY_FRACTION_SHORT_HORIZON_HOURS) * 3600
+    if short_horizon_seconds > 0 and horizon_seconds <= short_horizon_seconds:
+        return settings.KELLY_FRACTION_SHORT_HORIZON
+    return settings.KELLY_FRACTION_DEFAULT
+
+
+def _sizing_mode_label(kelly_enabled: bool) -> str:
+    return "kelly" if kelly_enabled else "edge_scaling"
+
+
+def _zero_bet_skip_message(sizing_mode: str) -> str:
+    if sizing_mode == "kelly":
+        return "bet size reduced to zero by Kelly sizing"
+    return "bet size reduced to zero by edge scaling"
+
+
+def _compute_lmsr_price_for_outcome(
+    market: Market,
+    decision_outcome: str,
+    settings: Settings,
+) -> float | None:
+    if not market.outcomes:
+        return None
+    prices: list[float] = []
+    outcome_names: list[str] = []
+    for market_outcome in market.outcomes:
+        implied = _get_implied_probability(market, market_outcome.name)
+        if implied is None:
+            continue
+        prices.append(implied)
+        outcome_names.append(market_outcome.name)
+
+    if len(prices) < 2:
+        return None
+    if not any(_outcomes_match(name, decision_outcome) for name in outcome_names):
+        return None
+    try:
+        quantities = infer_quantities_from_prices(prices, settings.LMSR_LIQUIDITY_PARAM_B)
+        recomputed_prices = lmsr_prices(quantities, settings.LMSR_LIQUIDITY_PARAM_B)
+    except (ValueError, OverflowError):
+        return None
+    for idx, name in enumerate(outcome_names):
+        if _outcomes_match(name, decision_outcome):
+            return recomputed_prices[idx]
+    return None
+
+
 def _best_orderbook_sell_price(
     orderbook: dict[str, Any],
     option_index: int,
@@ -656,6 +756,7 @@ def _update_resolved_markets(
             resolved_at=market.close_time,
         )
         if updated:
+            state_manager.reset_bayesian_state(market_id)
             resolved_count += 1
     if resolved_count:
         logger.info(
@@ -734,27 +835,27 @@ def _should_adjust_position(
     existing_position: Position | None,
     state: MarketState | None,
     settings: Settings,
-) -> tuple[bool, float]:
+) -> tuple[bool, float, str]:
     """Determine if position should be added to and calculate amount."""
     if not existing_position:
-        return True, decision.bet_size_pct
+        return True, decision.bet_size_pct, "new_position"
 
     if (
         settings.OPPOSITE_OUTCOME_STRATEGY == "block"
         and existing_position.outcome
         and existing_position.outcome.upper() != decision.outcome.upper()
     ):
-        return False, 0.0
+        return False, 0.0, "opposite_outcome_blocked"
 
     if existing_position.total_amount_usdc >= settings.MAX_POSITION_PER_MARKET_USDC:
-        return False, 0.0
+        return False, 0.0, "max_position_reached"
 
     remaining = (
         settings.MAX_POSITION_PER_MARKET_USDC
         - existing_position.total_amount_usdc
     )
     if remaining <= 0:
-        return False, 0.0
+        return False, 0.0, "no_remaining_capacity"
 
     override_threshold = _effective_position_override_threshold(market, settings)
     is_high_confidence = decision.confidence >= override_threshold
@@ -771,9 +872,14 @@ def _should_adjust_position(
     meets_increase_threshold = confidence_increase >= scaled_increase_threshold
 
     if not is_high_confidence and not meets_increase_threshold:
-        return False, 0.0
+        return False, 0.0, "insufficient_confidence_increase"
 
-    return True, min(decision.bet_size_pct, remaining / settings.MAX_BET_USDC)
+    reason = (
+        "high_confidence_override"
+        if is_high_confidence
+        else "confidence_increase_threshold_met"
+    )
+    return True, min(decision.bet_size_pct, remaining / settings.MAX_BET_USDC), reason
 
 
 def _log_settings_summary(settings) -> None:
@@ -806,6 +912,12 @@ def _log_settings_summary(settings) -> None:
             "categories_blocklist": settings.MARKET_CATEGORIES_BLOCKLIST,
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
+            "bayesian_enabled": settings.BAYESIAN_ENABLED,
+            "lmsr_enabled": settings.LMSR_ENABLED,
+            "kelly_sizing_enabled": settings.KELLY_SIZING_ENABLED,
+            "kelly_fraction_default": settings.KELLY_FRACTION_DEFAULT,
+            "kelly_fraction_short_horizon_hours": settings.KELLY_FRACTION_SHORT_HORIZON_HOURS,
+            "kelly_fraction_short_horizon": settings.KELLY_FRACTION_SHORT_HORIZON,
             "parallel_analysis_enabled": settings.PARALLEL_ANALYSIS_ENABLED,
             "analysis_max_workers": settings.ANALYSIS_MAX_WORKERS,
             "pre_order_market_refresh": settings.PRE_ORDER_MARKET_REFRESH,
@@ -1324,11 +1436,99 @@ def main() -> None:
 
                 entry_price = _get_outcome_entry_price(market, decision.outcome)
                 implied_prob = _get_implied_probability(market, decision.outcome)
+                bayesian_posterior: float | None = None
+                bayesian_update_count: int = 0
+                lmsr_price: float | None = None
+                ineff_signal: float | None = None
+                effective_confidence = decision.confidence
+
+                if settings.BAYESIAN_ENABLED and market.outcomes:
+                    try:
+                        canonical_outcome = _canonical_outcome_name(market, decision.outcome)
+                        bayesian_states = _load_or_initialize_bayesian_states(
+                            market=market,
+                            state_manager=state_manager,
+                            settings=settings,
+                        )
+
+                        likelihood_ratio = decision.likelihood_ratio
+                        if likelihood_ratio is not None and likelihood_ratio > 0:
+                            log_likelihood = log_likelihood_from_ratio(likelihood_ratio)
+                            is_binary_market = len(market.outcomes) == 2
+                            for market_outcome in market.outcomes:
+                                outcome_name = market_outcome.name
+                                state_for_outcome = bayesian_states.get(outcome_name)
+                                if state_for_outcome is None:
+                                    seeded_state = initial_state(1, prior=None)[0]
+                                    state_for_outcome = seeded_state
+                                    bayesian_states[outcome_name] = seeded_state
+                                if _outcomes_match(outcome_name, canonical_outcome):
+                                    outcome_log_likelihood = log_likelihood
+                                elif is_binary_market:
+                                    outcome_log_likelihood = -log_likelihood
+                                else:
+                                    outcome_log_likelihood = 0.0
+                                state_manager.update_bayesian_state(
+                                    market_id=market.id,
+                                    outcome=outcome_name,
+                                    log_prior=state_for_outcome.log_prior,
+                                    log_likelihood=outcome_log_likelihood,
+                                )
+                            bayesian_states = state_manager.get_bayesian_state(market.id)
+
+                        ordered_states = [
+                            bayesian_states[outcome.name]
+                            for outcome in market.outcomes
+                            if outcome.name in bayesian_states
+                        ]
+                        if len(ordered_states) == len(market.outcomes):
+                            posterior_values = posterior_from_state(ordered_states)
+                            for idx, market_outcome in enumerate(market.outcomes):
+                                if _outcomes_match(market_outcome.name, canonical_outcome):
+                                    bayesian_posterior = posterior_values[idx]
+                                    selected_state = bayesian_states.get(market_outcome.name)
+                                    bayesian_update_count = (
+                                        selected_state.update_count if selected_state else 0
+                                    )
+                                    break
+                            if (
+                                bayesian_posterior is not None
+                                and bayesian_update_count >= settings.BAYESIAN_MIN_UPDATES_FOR_TRADE
+                            ):
+                                effective_confidence = bayesian_posterior
+                    except Exception as exc:
+                        logger.warning(
+                            "Bayesian update failed for market %s: %s",
+                            market.id,
+                            exc,
+                            data={"market_id": market.id, "error": str(exc)},
+                        )
+
+                if settings.LMSR_ENABLED:
+                    lmsr_price = _compute_lmsr_price_for_outcome(
+                        market=market,
+                        decision_outcome=decision.outcome,
+                        settings=settings,
+                    )
+                    if lmsr_price is not None:
+                        posterior_for_signal = (
+                            bayesian_posterior if bayesian_posterior is not None else effective_confidence
+                        )
+                        try:
+                            ineff_signal = lmsr_inefficiency_signal(posterior_for_signal, lmsr_price)
+                        except ValueError:
+                            ineff_signal = None
+
+                decision_for_edge = (
+                    decision.model_copy(update={"confidence": effective_confidence})
+                    if effective_confidence != decision.confidence
+                    else decision
+                )
                 bucket = _price_bucket(implied_prob, settings)
                 price_bucket_stats[bucket] += 1
                 edge_ok, edge_value, edge_reason = _passes_edge_threshold(
                     implied_prob,
-                    decision,
+                    decision_for_edge,
                     settings,
                 )
                 if settings.CALIBRATION_MODE_ENABLED:
@@ -1337,7 +1537,7 @@ def main() -> None:
                         "cycle": cycle_count,
                         "edge_market": edge_value,
                         "implied_prob_market": implied_prob,
-                        "confidence": decision.confidence,
+                        "confidence": decision_for_edge.confidence,
                         "evidence_quality": decision.evidence_quality,
                         "liquidity_usdc": market.liquidity_usdc,
                         "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
@@ -1364,7 +1564,7 @@ def main() -> None:
                             "market_id": market.id,
                             "implied_prob": implied_prob,
                             "entry_price": entry_price,
-                            "confidence": decision.confidence,
+                            "confidence": decision_for_edge.confidence,
                             "edge": edge_value,
                         },
                     )
@@ -1389,12 +1589,55 @@ def main() -> None:
                     )
                     continue
 
+                if (
+                    settings.LMSR_ENABLED
+                    and ineff_signal is not None
+                    and abs(ineff_signal) < settings.LMSR_MIN_INEFFICIENCY
+                ):
+                    trades_skipped_edge += 1
+                    question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                    logger.info(
+                        "SKIP [%s] '%s' -> LMSR inefficiency too small (|%.4f| < %.4f)",
+                        market.id,
+                        question_short,
+                        ineff_signal,
+                        settings.LMSR_MIN_INEFFICIENCY,
+                        data={
+                            "market_id": market.id,
+                            "inefficiency_signal": ineff_signal,
+                            "lmsr_price": lmsr_price,
+                            "bayesian_posterior": bayesian_posterior,
+                            "bayesian_update_count": bayesian_update_count,
+                        },
+                    )
+                    continue
+
                 markets_passed_edge += 1
+
+                kelly_raw_value: float | None = None
+                kelly_fraction_value: float | None = None
+                posterior_for_kelly: float | None = None
+                min_edge_for_kelly: float | None = None
+                kelly_path_active = settings.KELLY_SIZING_ENABLED and implied_prob is not None
+                sizing_mode = _sizing_mode_label(kelly_path_active)
+                if kelly_path_active:
+                    posterior_for_kelly = (
+                        bayesian_posterior if bayesian_posterior is not None else effective_confidence
+                    )
+                    kelly_raw_value = kelly_fraction(
+                        posterior=posterior_for_kelly,
+                        market_price=implied_prob,
+                    )
+                    kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
 
                 score_result = compute_final_score(
                     market=market,
-                    decision=decision,
+                    decision=decision_for_edge,
                     implied_prob_market=implied_prob,
+                    bayesian_posterior=bayesian_posterior,
+                    lmsr_price=lmsr_price,
+                    inefficiency_signal=ineff_signal,
+                    kelly_raw=kelly_raw_value,
                 )
                 score_mode = settings.SCORE_GATE_MODE
                 if score_mode != "off":
@@ -1408,6 +1651,10 @@ def main() -> None:
                         "evidence_quality": score_result.evidence_quality,
                         "liquidity_penalty": score_result.liquidity_penalty,
                         "staleness_penalty": score_result.staleness_penalty,
+                        "bayesian_posterior": score_result.bayesian_posterior,
+                        "lmsr_price": score_result.lmsr_price,
+                        "inefficiency_signal": score_result.inefficiency_signal,
+                        "kelly_raw": score_result.kelly_raw,
                     }
                     if score_mode == "shadow":
                         logger.debug(
@@ -1431,28 +1678,90 @@ def main() -> None:
                         )
                         continue
 
-                adjusted_bet_pct = _adjust_bet_size_for_edge(
-                    decision,
-                    implied_prob,
-                    edge_value,
-                    settings,
-                )
+                if settings.KELLY_SIZING_ENABLED and implied_prob is not None:
+                    if posterior_for_kelly is None:
+                        posterior_for_kelly = (
+                            bayesian_posterior if bayesian_posterior is not None else effective_confidence
+                        )
+                    if kelly_fraction_value is None:
+                        kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
+                    min_edge_for_kelly = _edge_threshold_for_market(implied_prob, settings)
+                    adjusted_bet_pct = kelly_bet_pct(
+                        posterior=posterior_for_kelly,
+                        market_price=implied_prob,
+                        fraction=kelly_fraction_value,
+                        min_edge=min_edge_for_kelly,
+                    )
+                else:
+                    adjusted_bet_pct = _adjust_bet_size_for_edge(
+                        decision_for_edge,
+                        implied_prob,
+                        edge_value,
+                        settings,
+                    )
                 if adjusted_bet_pct <= 0:
                     trades_skipped_edge += 1
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                    skip_reason = _zero_bet_skip_message(sizing_mode)
                     logger.info(
-                        "SKIP [%s] '%s' -> bet size reduced to zero by edge scaling",
+                        "SKIP [%s] '%s' -> %s",
                         market.id,
                         question_short,
+                        skip_reason,
                         data={
                             "market_id": market.id,
+                            "sizing_mode": sizing_mode,
                             "implied_prob": implied_prob,
                             "entry_price": entry_price,
-                            "confidence": decision.confidence,
+                            "confidence": decision_for_edge.confidence,
                             "edge": edge_value,
+                            "kelly_raw": kelly_raw_value,
+                            "kelly_fraction_value": kelly_fraction_value,
+                            "posterior_for_kelly": posterior_for_kelly,
+                            "min_edge_for_kelly": min_edge_for_kelly,
+                        },
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": adjusted_bet_pct}
+                        ).model_dump(),
+                        execution_audit={
+                            "decision_phase": "post_sizing",
+                            "sizing_mode": sizing_mode,
+                            "adjusted_bet_pct": adjusted_bet_pct,
+                            "bet_amount_usdc": 0.0,
+                            "kelly_raw": kelly_raw_value,
+                            "kelly_fraction_value": kelly_fraction_value,
+                            "posterior_for_kelly": posterior_for_kelly,
+                            "implied_prob_market": implied_prob,
+                            "min_edge_for_kelly": min_edge_for_kelly,
+                            "edge_market": edge_value,
                         },
                     )
                     continue
+
+                log_trade_decision(
+                    market_id=market.id,
+                    question=market.question,
+                    decision=decision_for_edge.model_copy(
+                        update={"bet_size_pct": adjusted_bet_pct}
+                    ).model_dump(),
+                    execution_audit={
+                        "decision_phase": "post_sizing",
+                        "sizing_mode": sizing_mode,
+                        "position_decision": "pending",
+                        "adjusted_bet_pct": adjusted_bet_pct,
+                        "bet_amount_usdc": None,
+                        "kelly_raw": kelly_raw_value,
+                        "kelly_fraction_value": kelly_fraction_value,
+                        "posterior_for_kelly": posterior_for_kelly,
+                        "implied_prob_market": implied_prob,
+                        "min_edge_for_kelly": min_edge_for_kelly,
+                        "edge_market": edge_value,
+                    },
+                )
 
                 logger.debug(
                     "Edge passed: market=%s implied=%.3f edge=%.3f entry=%.3f bet_pct=%.3f",
@@ -1481,12 +1790,36 @@ def main() -> None:
                     )
                     existing_position = None
 
-                should_add, bet_pct = _should_adjust_position(
-                    decision.model_copy(update={"bet_size_pct": adjusted_bet_pct}),
+                should_add, bet_pct, position_reason = _should_adjust_position(
+                    decision_for_edge.model_copy(update={"bet_size_pct": adjusted_bet_pct}),
                     market,
                     existing_position,
                     state,
                     settings,
+                )
+                log_trade_decision(
+                    market_id=market.id,
+                    question=market.question,
+                    decision=decision_for_edge.model_copy(
+                        update={"bet_size_pct": adjusted_bet_pct}
+                    ).model_dump(),
+                    execution_audit={
+                        "decision_phase": "post_position_gate",
+                        "sizing_mode": sizing_mode,
+                        "position_decision": "allowed" if should_add else "blocked",
+                        "position_decision_reason": (
+                            position_reason if not should_add else None
+                        ),
+                        "adjusted_bet_pct": adjusted_bet_pct,
+                        "post_position_bet_pct": bet_pct,
+                        "bet_amount_usdc": None,
+                        "kelly_raw": kelly_raw_value,
+                        "kelly_fraction_value": kelly_fraction_value,
+                        "posterior_for_kelly": posterior_for_kelly,
+                        "implied_prob_market": implied_prob,
+                        "min_edge_for_kelly": min_edge_for_kelly,
+                        "edge_market": edge_value,
+                    },
                 )
                 if not should_add:
                     trades_skipped_position += 1
@@ -1497,7 +1830,8 @@ def main() -> None:
                         question_short,
                         data={
                             "market_id": market.id,
-                            "confidence": decision.confidence,
+                            "position_decision_reason": position_reason,
+                            "confidence": decision_for_edge.confidence,
                             "avg_confidence": (
                                 existing_position.avg_confidence
                                 if existing_position
@@ -1532,7 +1866,7 @@ def main() -> None:
                     market_id=market.id,
                     outcome=decision.outcome,
                     amount_usdc=bet_amount,
-                    confidence=decision.confidence,
+                    confidence=decision_for_edge.confidence,
                 )
 
                 # Skip order placement if in analysis-only mode (insufficient balance)
@@ -1544,7 +1878,7 @@ def main() -> None:
                         question_short,
                         decision.outcome,
                         bet_amount,
-                        decision.confidence,
+                        decision_for_edge.confidence,
                     )
                     trades_skipped_balance += 1
                     continue
@@ -1557,13 +1891,13 @@ def main() -> None:
                         question_short,
                         decision.outcome,
                         bet_amount,
-                        decision.confidence,
+                        decision_for_edge.confidence,
                         data={
                             "market_id": market.id,
                             "question": market.question,
                             "outcome": decision.outcome,
                             "amount_usdc": bet_amount,
-                            "confidence": decision.confidence,
+                            "confidence": decision_for_edge.confidence,
                             "reasoning": decision.reasoning,
                         },
                     )
@@ -1595,7 +1929,7 @@ def main() -> None:
 
                 if (
                     settings.ORDERBOOK_PRECHECK_ENABLED
-                    and decision.confidence >= settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE
+                    and decision_for_edge.confidence >= settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE
                 ):
                     option_index = None
                     for idx, market_outcome in enumerate(active_market.outcomes):
@@ -1658,12 +1992,12 @@ def main() -> None:
                     question_short,
                     decision.outcome,
                     bet_amount,
-                    decision.confidence,
+                    decision_for_edge.confidence,
                 )
 
                 slippage_pct = (
                     settings.SLIPPAGE_PCT
-                    if decision.confidence >= settings.SLIPPAGE_CONFIDENCE_THRESHOLD
+                    if decision_for_edge.confidence >= settings.SLIPPAGE_CONFIDENCE_THRESHOLD
                     else 0.0
                 )
 
@@ -1771,7 +2105,7 @@ def main() -> None:
                         outcome=decision.outcome,
                         entry_price=client_price or entry_price,
                         implied_prob=implied_prob,
-                        confidence=decision.confidence,
+                        confidence=decision_for_edge.confidence,
                         shares=client_shares,
                     )
                 except Exception as exc:

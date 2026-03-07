@@ -275,6 +275,7 @@ def log_trade_decision(
     question: str,
     decision: dict[str, Any],
     order: dict[str, Any] | None = None,
+    execution_audit: dict[str, Any] | None = None,
 ) -> None:
     """Log a trade decision to the dedicated trade log."""
     trade_logger = get_trade_logger()
@@ -292,6 +293,8 @@ def log_trade_decision(
         "edge_external": decision.get("edge_external"),
         "evidence_quality": decision.get("evidence_quality"),
     }
+    if execution_audit:
+        audit.update(execution_audit)
     data = {
         "market_id": market_id,
         "question": question[:100],
