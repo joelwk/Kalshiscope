@@ -44,6 +44,50 @@ class TestGrokClient(unittest.TestCase):
         with self.assertRaises(ValueError):
             _extract_json("no-json")
 
+    def test_analyze_market_parses_markdown_fenced_json(self) -> None:
+        market = Market(
+            id="m1a",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=150.0,
+        )
+        content = """
+        ```json
+        {"should_trade": false, "outcome": "NO", "confidence": 0.56, "bet_size_pct": 0.0, "reasoning": "Implied prob: 55%, My prob: 44%, Edge: -11%"}
+        ```
+        """
+        client = GrokClient(api_key="x")
+        client.client = DummyClient(content)
+
+        decision = client.analyze_market(market)
+        self.assertFalse(decision.should_trade)
+        self.assertEqual(decision.outcome, "NO")
+        self.assertAlmostEqual(decision.confidence, 0.56)
+
+    def test_analyze_market_repairs_single_quoted_keys(self) -> None:
+        market = Market(
+            id="m1b",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=150.0,
+        )
+        content = """
+        {'should_trade': false, 'outcome': "NO", 'confidence': 0.52, 'bet_size_pct': 0.0, 'reasoning': "Implied prob: 55%, My prob: 50%, Edge: -5%"}
+        """
+        client = GrokClient(api_key="x")
+        client.client = DummyClient(content)
+
+        decision = client.analyze_market(market)
+        self.assertFalse(decision.should_trade)
+        self.assertEqual(decision.outcome, "NO")
+        self.assertAlmostEqual(decision.confidence, 0.52)
+
     def test_analyze_market(self) -> None:
         market = Market(
             id="m1",

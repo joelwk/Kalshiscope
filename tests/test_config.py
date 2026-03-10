@@ -145,6 +145,8 @@ class TestConfig(unittest.TestCase):
             "FLIP_GUARD_MIN_CONF_GAIN": "0.10",
             "FLIP_GUARD_MIN_EDGE_GAIN": "0.05",
             "FLIP_GUARD_MIN_EVIDENCE_QUALITY": "0.75",
+            "FLIP_CIRCUIT_BREAKER_ENABLED": "false",
+            "FLIP_CIRCUIT_BREAKER_MAX_FLIPS": "5",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -154,6 +156,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.FLIP_GUARD_MIN_CONF_GAIN, 0.10)
         self.assertEqual(settings.FLIP_GUARD_MIN_EDGE_GAIN, 0.05)
         self.assertEqual(settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY, 0.75)
+        self.assertFalse(settings.FLIP_CIRCUIT_BREAKER_ENABLED)
+        self.assertEqual(settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS, 5)
 
     def test_parallel_and_execution_guard_settings_overrides(self) -> None:
         env = {

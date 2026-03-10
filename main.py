@@ -69,6 +69,7 @@ _MAX_CONFIDENCE = 1.0
 _KELLY_MIN_BET_POLICY_SKIP = "skip"
 _KELLY_MIN_BET_POLICY_FLOOR = "floor"
 _KELLY_MIN_BET_POLICY_FALLBACK_EDGE = "fallback_edge_scaling"
+_RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
 
 
 def _normalize_outcome_key(outcome: str | None) -> str:
@@ -76,7 +77,7 @@ def _normalize_outcome_key(outcome: str | None) -> str:
 
 
 def _build_reasoning_hash(decision: TradeDecision) -> str:
-    reasoning_text = (decision.reasoning or "").strip()[:200]
+    reasoning_text = _RE_VALIDATED_PREFIX.sub("", (decision.reasoning or "").strip())[:200]
     outcome_text = (decision.outcome or "").strip().lower()
     rounded_confidence = round(float(decision.confidence), 2)
     payload = f"{outcome_text}|{rounded_confidence:.2f}|{reasoning_text}"
@@ -428,8 +429,7 @@ def _effective_position_override_threshold(
     market: Market | None,
     settings: Settings,
 ) -> float:
-    cap = _max_confidence_for_market(market, settings)
-    return min(settings.HIGH_CONFIDENCE_POSITION_OVERRIDE, cap)
+    return settings.HIGH_CONFIDENCE_POSITION_OVERRIDE
 
 
 def _price_bucket(
@@ -931,6 +931,10 @@ def _calculate_bet(max_bet, bet_pct):
     return max_bet * bet_pct
 
 
+def _usdc_from_wei(balance_wei: int, decimals: int = 6) -> float:
+    return float(balance_wei) / float(10 ** max(decimals, 0))
+
+
 def _cap_confidence_for_category(
     decision: TradeDecision,
     market: Market,
@@ -1099,6 +1103,8 @@ def _log_settings_summary(settings) -> None:
             "flip_guard_min_conf_gain": settings.FLIP_GUARD_MIN_CONF_GAIN,
             "flip_guard_min_edge_gain": settings.FLIP_GUARD_MIN_EDGE_GAIN,
             "flip_guard_min_evidence_quality": settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
+            "flip_circuit_breaker_enabled": settings.FLIP_CIRCUIT_BREAKER_ENABLED,
+            "flip_circuit_breaker_max_flips": settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS,
         },
     )
     if settings.KELLY_SIZING_ENABLED and settings.MAX_BET_USDC > 0:
@@ -1434,14 +1440,16 @@ def main() -> None:
             markets = scheduler.prioritize_markets(markets, state_manager)
 
             cycle_bankroll: float | None = None
-            try:
-                cycle_bankroll = predictbase_client.get_available_balance()
-            except Exception as exc:
-                logger.debug(
-                    "Unable to fetch available balance for position cap: %s",
-                    exc,
-                    data={"error": str(exc)},
-                )
+            if web3_client is not None:
+                try:
+                    balance_wei = web3_client.get_usdc_balance()
+                    cycle_bankroll = _usdc_from_wei(balance_wei, settings.USDC_DECIMALS)
+                except Exception as exc:
+                    logger.debug(
+                        "On-chain balance lookup failed for position cap: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
 
             if settings.RESOLUTION_SYNC_INTERVAL_CYCLES > 0:
                 if cycle_count % settings.RESOLUTION_SYNC_INTERVAL_CYCLES == 0:
@@ -1585,6 +1593,15 @@ def main() -> None:
                                     exc,
                                     data={"market_id": market.id, "error": str(exc)},
                                 )
+                                logger.info(
+                                    "Market %s skipped for this cycle due to analysis failure after retries",
+                                    market.id,
+                                    data={
+                                        "market_id": market.id,
+                                        "final_action": "skip",
+                                        "final_reason": "analysis_failure_after_retries",
+                                    },
+                                )
                 except Exception as exc:
                     parallel_analysis_used = False
                     analysis_results.clear()
@@ -1615,6 +1632,15 @@ def main() -> None:
                             market.id,
                             exc,
                             data={"market_id": market.id, "error": str(exc)},
+                        )
+                        logger.info(
+                            "Market %s skipped for this cycle due to analysis failure after retries",
+                            market.id,
+                            data={
+                                "market_id": market.id,
+                                "final_action": "skip",
+                                "final_reason": "analysis_failure_after_retries",
+                            },
                         )
             analysis_phase_duration_ms = round(
                 (time.monotonic() - analysis_phase_start) * 1000,
@@ -1705,6 +1731,36 @@ def main() -> None:
                         exc,
                         data={"market_id": market.id, "error": str(exc)},
                     )
+
+                if settings.FLIP_CIRCUIT_BREAKER_ENABLED and decision.should_trade:
+                    try:
+                        flip_count = state_manager.get_outcome_flip_count(market.id)
+                    except Exception as exc:
+                        logger.debug(
+                            "Flip count lookup failed for market %s: %s",
+                            market.id,
+                            exc,
+                            data={"market_id": market.id, "error": str(exc)},
+                        )
+                    else:
+                        if flip_count >= settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS:
+                            decision = decision.model_copy(
+                                update={"should_trade": False, "bet_size_pct": 0.0}
+                            )
+                            logger.info(
+                                "SKIP [%s] '%s' -> flip circuit breaker (flips=%d, max=%d)",
+                                market.id,
+                                market.question[:40] + "..."
+                                if len(market.question) > 40
+                                else market.question,
+                                flip_count,
+                                settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS,
+                                data={
+                                    "market_id": market.id,
+                                    "flip_count": flip_count,
+                                    "flip_circuit_breaker_max": settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS,
+                                },
+                            )
 
                 if not decision.should_trade:
                     trades_skipped_no_trade += 1

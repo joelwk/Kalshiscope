@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from models import MarketState, OrderResponse, Position, TradeDecision
 logger = get_logger(__name__)
 
 _CONFIDENCE_TREND_WINDOW = 5
+_RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
 
 
 class MarketStateManager:
@@ -866,6 +868,28 @@ class MarketStateManager:
         value = row["reasoning_hash"]
         return str(value) if value else None
 
+    def get_outcome_flip_count(self, market_id: str) -> int:
+        rows = self._conn.execute(
+            """
+            SELECT outcome
+            FROM analyses
+            WHERE market_id = ?
+              AND outcome IS NOT NULL
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (market_id,),
+        ).fetchall()
+        flip_count = 0
+        previous_outcome: str | None = None
+        for row in rows:
+            current_outcome = str(row["outcome"] or "").strip().upper()
+            if not current_outcome:
+                continue
+            if previous_outcome is not None and current_outcome != previous_outcome:
+                flip_count += 1
+            previous_outcome = current_outcome
+        return flip_count
+
     def _market_exists(self, market_id: str) -> bool:
         return any(
             (
@@ -947,7 +971,7 @@ def _parse_order_ids(raw: str | None) -> list[str]:
 
 
 def _build_reasoning_hash(reasoning: str | None, outcome: str | None, confidence: float | None) -> str:
-    reasoning_text = (reasoning or "").strip()[:200]
+    reasoning_text = _RE_VALIDATED_PREFIX.sub("", (reasoning or "").strip())[:200]
     outcome_text = (outcome or "").strip().lower()
     rounded_confidence = round(float(confidence or 0.0), 2)
     payload = f"{outcome_text}|{rounded_confidence:.2f}|{reasoning_text}"
