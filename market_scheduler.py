@@ -8,6 +8,112 @@ from models import Market, MarketState
 
 logger = get_logger(__name__)
 
+_NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS = 0.25
+_NON_ACTIONABLE_TERMINAL_OUTCOMES = {
+    "analysis_only_insufficient_balance",
+    "bet_amount_zero",
+    "confidence_below_min",
+    "edge_gate_blocked",
+    "kelly_sub_floor_skip",
+    "lmsr_gate_blocked",
+    "no_trade_recommended",
+    "position_adjustment_blocked",
+    "score_gate_blocked",
+    "uniform_implied_probability",
+    "zero_bet_after_sizing",
+}
+
+
+def _normalize_terminal_outcome(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _base_reanalysis_cooldown_hours(
+    *,
+    is_urgent: bool,
+    reanalysis_cooldown_hours: int,
+    urgent_reanalysis_cooldown_hours: int,
+) -> float:
+    return float(
+        urgent_reanalysis_cooldown_hours
+        if is_urgent
+        else reanalysis_cooldown_hours
+    )
+
+
+def resolve_reanalysis_cooldown_hours(
+    market: Market,
+    state: MarketState | None,
+    *,
+    reanalysis_cooldown_hours: int,
+    urgent_days_before_close: int,
+    urgent_reanalysis_cooldown_hours: int,
+    now: datetime | None = None,
+) -> float:
+    now_utc = now or datetime.now(timezone.utc)
+    is_urgent = False
+    if market.close_time:
+        close_time = _normalize_timestamp(market.close_time)
+        urgent_cutoff = now_utc + timedelta(days=urgent_days_before_close)
+        is_urgent = close_time <= urgent_cutoff
+    base_cooldown = _base_reanalysis_cooldown_hours(
+        is_urgent=is_urgent,
+        reanalysis_cooldown_hours=reanalysis_cooldown_hours,
+        urgent_reanalysis_cooldown_hours=urgent_reanalysis_cooldown_hours,
+    )
+    terminal_outcome = _normalize_terminal_outcome(
+        state.last_terminal_outcome if state else None
+    )
+    if terminal_outcome in _NON_ACTIONABLE_TERMINAL_OUTCOMES:
+        return min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS)
+    return base_cooldown
+
+
+def next_eligible_reanalysis_at(
+    market: Market,
+    state: MarketState | None,
+    *,
+    reanalysis_cooldown_hours: int,
+    urgent_days_before_close: int,
+    urgent_reanalysis_cooldown_hours: int,
+    now: datetime | None = None,
+) -> datetime | None:
+    if not state or not state.last_analysis:
+        return None
+    last_analysis = _normalize_timestamp(state.last_analysis)
+    cooldown_hours = resolve_reanalysis_cooldown_hours(
+        market,
+        state,
+        reanalysis_cooldown_hours=reanalysis_cooldown_hours,
+        urgent_days_before_close=urgent_days_before_close,
+        urgent_reanalysis_cooldown_hours=urgent_reanalysis_cooldown_hours,
+        now=now,
+    )
+    return last_analysis + timedelta(hours=max(0.0, cooldown_hours))
+
+
+def remaining_reanalysis_cooldown_seconds(
+    market: Market,
+    state: MarketState | None,
+    *,
+    reanalysis_cooldown_hours: int,
+    urgent_days_before_close: int,
+    urgent_reanalysis_cooldown_hours: int,
+    now: datetime | None = None,
+) -> float | None:
+    now_utc = now or datetime.now(timezone.utc)
+    next_eligible_at = next_eligible_reanalysis_at(
+        market,
+        state,
+        reanalysis_cooldown_hours=reanalysis_cooldown_hours,
+        urgent_days_before_close=urgent_days_before_close,
+        urgent_reanalysis_cooldown_hours=urgent_reanalysis_cooldown_hours,
+        now=now_utc,
+    )
+    if next_eligible_at is None:
+        return None
+    return max(0.0, (next_eligible_at - now_utc).total_seconds())
+
 
 class MarketScheduler:
     """Prioritize markets and determine skip conditions based on state."""
@@ -68,19 +174,16 @@ class MarketScheduler:
             if close_time <= now:
                 return True, "market closed"
 
-        urgent = self._is_urgent_close(market, now)
-        if state and state.last_analysis:
-            last_analysis = state.last_analysis
-            if last_analysis.tzinfo is None:
-                last_analysis = last_analysis.replace(tzinfo=timezone.utc)
-            cooldown_hours = (
-                self.urgent_reanalysis_cooldown_hours
-                if urgent
-                else self.reanalysis_cooldown_hours
-            )
-            cooldown = timedelta(hours=cooldown_hours)
-            if (now - last_analysis) < cooldown:
-                return True, "recently analyzed"
+        remaining_seconds = remaining_reanalysis_cooldown_seconds(
+            market,
+            state,
+            reanalysis_cooldown_hours=self.reanalysis_cooldown_hours,
+            urgent_days_before_close=self.urgent_days_before_close,
+            urgent_reanalysis_cooldown_hours=self.urgent_reanalysis_cooldown_hours,
+            now=now,
+        )
+        if remaining_seconds is not None and remaining_seconds > 0:
+            return True, "recently analyzed"
 
         return False, ""
 

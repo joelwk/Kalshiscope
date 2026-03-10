@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -34,7 +35,8 @@ class MarketStateManager:
                     id TEXT PRIMARY KEY,
                     question TEXT,
                     close_time TEXT,
-                    category TEXT
+                    category TEXT,
+                    last_terminal_outcome TEXT
                 )
                 """
             )
@@ -46,6 +48,7 @@ class MarketStateManager:
                     confidence REAL,
                     outcome TEXT,
                     reasoning TEXT,
+                    reasoning_hash TEXT,
                     timestamp TEXT,
                     is_refined INTEGER,
                     refinement_reason TEXT
@@ -147,12 +150,25 @@ class MarketStateManager:
             self._backfill_resolution_state()
 
     def get_market_state(self, market_id: str) -> MarketState | None:
+        market_row = self._conn.execute(
+            """
+            SELECT last_terminal_outcome
+            FROM markets
+            WHERE id = ?
+            """,
+            (market_id,),
+        ).fetchone()
+        last_terminal_outcome = (
+            str(market_row["last_terminal_outcome"])
+            if market_row and market_row["last_terminal_outcome"] is not None
+            else None
+        )
         latest_row = self._conn.execute(
             """
             SELECT confidence, timestamp
             FROM analyses
             WHERE market_id = ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT 1
             """,
             (market_id,),
@@ -167,14 +183,17 @@ class MarketStateManager:
         if not latest_row:
             if not self._market_exists(market_id):
                 return None
-            return MarketState(market_id=market_id)
+            return MarketState(
+                market_id=market_id,
+                last_terminal_outcome=last_terminal_outcome,
+            )
 
         trend_rows = self._conn.execute(
             """
             SELECT confidence
             FROM analyses
             WHERE market_id = ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT ?
             """,
             (market_id, _CONFIDENCE_TREND_WINDOW),
@@ -187,6 +206,7 @@ class MarketStateManager:
             analysis_count=analysis_count,
             last_confidence=latest_row["confidence"],
             confidence_trend=confidence_trend,
+            last_terminal_outcome=last_terminal_outcome,
         )
 
     def get_position(self, market_id: str) -> Position | None:
@@ -253,7 +273,7 @@ class MarketStateManager:
             WHERE market_id = ?
               AND confidence IS NOT NULL
               AND confidence >= ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT 1
             """,
             (market_id, min_confidence),
@@ -266,7 +286,7 @@ class MarketStateManager:
             SELECT market_id, outcome, confidence, reasoning, timestamp, is_refined, refinement_reason
             FROM analyses
             WHERE market_id = ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT 1
             """,
             (market_id,),
@@ -381,19 +401,25 @@ class MarketStateManager:
         refinement_reason: str | None = None,
     ) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
+        reasoning_hash = _build_reasoning_hash(
+            decision.reasoning,
+            decision.outcome,
+            decision.confidence,
+        )
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO analyses (
-                    market_id, confidence, outcome, reasoning, timestamp, is_refined, refinement_reason
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    market_id, confidence, outcome, reasoning, reasoning_hash, timestamp,
+                    is_refined, refinement_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     market_id,
                     decision.confidence,
                     decision.outcome,
                     decision.reasoning,
+                    reasoning_hash,
                     timestamp,
                     1 if is_refined else 0,
                     refinement_reason,
@@ -406,6 +432,17 @@ class MarketStateManager:
             is_refined,
             refinement_reason or "-",
         )
+
+    def record_terminal_outcome(self, market_id: str, terminal_outcome: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (id, last_terminal_outcome)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET last_terminal_outcome = excluded.last_terminal_outcome
+                """,
+                (market_id, terminal_outcome),
+            )
 
     def record_trade(
         self,
@@ -804,7 +841,7 @@ class MarketStateManager:
             SELECT confidence
             FROM analyses
             WHERE market_id = ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, id DESC
             LIMIT 1
             """,
             (market_id,),
@@ -812,6 +849,22 @@ class MarketStateManager:
         if not row:
             return None
         return row["confidence"]
+
+    def get_last_reasoning_hash(self, market_id: str) -> str | None:
+        row = self._conn.execute(
+            """
+            SELECT reasoning_hash
+            FROM analyses
+            WHERE market_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (market_id,),
+        ).fetchone()
+        if not row:
+            return None
+        value = row["reasoning_hash"]
+        return str(value) if value else None
 
     def _market_exists(self, market_id: str) -> bool:
         return any(
@@ -835,6 +888,8 @@ class MarketStateManager:
 
     def _run_migrations(self) -> None:
         self._ensure_column("analyses", "refinement_reason", "TEXT")
+        self._ensure_column("analyses", "reasoning_hash", "TEXT")
+        self._ensure_column("markets", "last_terminal_outcome", "TEXT")
         self._ensure_column(
             "trade_outcomes",
             "resolution_state",
@@ -889,6 +944,14 @@ def _parse_order_ids(raw: str | None) -> list[str]:
     if isinstance(data, list):
         return [str(item) for item in data if item]
     return []
+
+
+def _build_reasoning_hash(reasoning: str | None, outcome: str | None, confidence: float | None) -> str:
+    reasoning_text = (reasoning or "").strip()[:200]
+    outcome_text = (outcome or "").strip().lower()
+    rounded_confidence = round(float(confidence or 0.0), 2)
+    payload = f"{outcome_text}|{rounded_confidence:.2f}|{reasoning_text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:

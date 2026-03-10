@@ -421,6 +421,7 @@ class GrokClient:
                 "implied_prob_external": implied,
                 "my_prob": my_prob,
                 "edge_external": edge,
+                "edge_source": edge_source,
                 "evidence_quality": evidence_quality,
                 "reasoning": (
                     f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
@@ -436,6 +437,20 @@ class GrokClient:
         previous_analysis: TradeDecision | None,
     ) -> dict[str, Any]:
         """Fill missing required decision fields from prior analysis during refinement."""
+        if (
+            previous_analysis is not None
+            and previous_analysis.likelihood_ratio is not None
+            and (
+                "likelihood_ratio" not in data
+                or data.get("likelihood_ratio") is None
+            )
+        ):
+            data = dict(data)
+            data["likelihood_ratio"] = previous_analysis.likelihood_ratio
+            logger.debug(
+                "Deep response omitted likelihood_ratio; reusing previous value: market payload merged",
+                data={"likelihood_ratio_source": "inherited_previous"},
+            )
         if _REQUIRED_DECISION_FIELDS.issubset(data):
             return data
         if previous_analysis is None:
@@ -818,6 +833,9 @@ class GrokClient:
                 )
                 data = _extract_json(content)
 
+            deep_likelihood_ratio_provided = (
+                "likelihood_ratio" in data and data.get("likelihood_ratio") is not None
+            )
             data = self._merge_partial_deep_response(data, previous_analysis)
             data = self._normalize_numeric_fields(data, market.id)
             decision = TradeDecision.model_validate(data)
@@ -826,6 +844,17 @@ class GrokClient:
                 decision,
                 profile_name=active_config.profile_name,
             )
+            likelihood_ratio_source = "missing"
+            if decision.likelihood_ratio is not None:
+                if deep_likelihood_ratio_provided:
+                    likelihood_ratio_source = "deep"
+                elif (
+                    previous_analysis is not None
+                    and previous_analysis.likelihood_ratio is not None
+                ):
+                    likelihood_ratio_source = "inherited_previous"
+                else:
+                    likelihood_ratio_source = "unknown"
 
             total_duration = (time.monotonic() - start_time) * 1000
             question_short = market.question[:60] + "..." if len(market.question) > 60 else market.question
@@ -847,6 +876,7 @@ class GrokClient:
                     "my_prob": decision.my_prob,
                     "edge_external": decision.edge_external,
                     "likelihood_ratio": decision.likelihood_ratio,
+                    "likelihood_ratio_source": likelihood_ratio_source,
                     "evidence_quality": decision.evidence_quality,
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,

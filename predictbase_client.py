@@ -206,6 +206,52 @@ class PredictBaseClient:
             )
             raise
 
+    def get_available_balance(self) -> float | None:
+        """Best-effort lookup for available account balance."""
+        if not self.wallet_address:
+            return None
+
+        candidate_paths = (
+            "/get_balance",
+            "/get-balance",
+            "/balance",
+            "/wallet-balance",
+        )
+        for path in candidate_paths:
+            url = f"{self.base_url}{path}"
+            start_time = time.monotonic()
+            try:
+                resp = self.session.get(
+                    url,
+                    params={"user": self.wallet_address},
+                    timeout=self.timeout_sec,
+                )
+                duration_ms = (time.monotonic() - start_time) * 1000
+                log_api_call(
+                    logger,
+                    method="GET",
+                    url=url,
+                    status_code=resp.status_code,
+                    duration_ms=duration_ms,
+                )
+                if resp.status_code >= 400:
+                    continue
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    for key in ("available", "balance", "usdc_balance", "available_balance"):
+                        value = payload.get(key)
+                        if value is None:
+                            continue
+                        try:
+                            return float(value)
+                        except (TypeError, ValueError):
+                            continue
+            except requests.exceptions.RequestException:
+                continue
+            except ValueError:
+                continue
+        return None
+
     def submit_order(
         self,
         order: OrderRequest,

@@ -25,8 +25,11 @@ class Settings:
     LOW_PRICE_THRESHOLD: float = 0.50
     HIGH_PRICE_THRESHOLD: float = 0.65
     LOW_PRICE_MIN_EDGE: float = 0.08
+    COINFLIP_PRICE_LOWER: float = 0.45
+    COINFLIP_PRICE_UPPER: float = 0.55
     EDGE_SCALING_RANGE: float = 0.15
     LOW_PRICE_BET_PENALTY: float = 0.50
+    FALLBACK_EDGE_MIN_EDGE: float = 0.08
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
@@ -54,6 +57,10 @@ class Settings:
         "theathletic.com",
         "rotowire.com",
         "actionnetwork.com",
+        "atptour.com",
+        "wtatennis.com",
+        "tennisexplorer.com",
+        "flashscore.com",
     )
     SEARCH_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "ESPN",
@@ -102,6 +109,10 @@ class Settings:
         "theathletic.com",
         "rotowire.com",
         "actionnetwork.com",
+        "atptour.com",
+        "wtatennis.com",
+        "tennisexplorer.com",
+        "flashscore.com",
     )
     SPORTS_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "ESPN",
@@ -113,6 +124,10 @@ class Settings:
         "FDSportsbook",
         "DKSportsbook",
         "BetMGM",
+        "ataborasso",
+        "TennisChannel",
+        "WTA",
+        "atptour",
     )
     CRYPTO_ALLOWED_DOMAINS: tuple[str, ...] = (
         "coindesk.com",
@@ -199,7 +214,7 @@ class Settings:
     REANALYSIS_COOLDOWN_HOURS: int = 6
     URGENT_REANALYSIS_DAYS_BEFORE_CLOSE: int = 1
     URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
-    PARALLEL_ANALYSIS_ENABLED: bool = False
+    PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 3
 
     # Resolution tracking
@@ -207,6 +222,7 @@ class Settings:
 
     # Position limits
     MAX_POSITION_PER_MARKET_USDC: float = 200.0
+    MAX_POSITION_PCT_OF_BANKROLL: float = 0.15
     MIN_CONFIDENCE_INCREASE_FOR_ADD: float = 0.10
     HIGH_CONFIDENCE_POSITION_OVERRIDE: float = 0.85  # Allow adding to position if conf >= this
     OPPOSITE_OUTCOME_STRATEGY: str = "block"  # block|hedge
@@ -217,6 +233,7 @@ class Settings:
 
     # Bayesian + LMSR + Kelly experimental layers
     BAYESIAN_ENABLED: bool = False
+    BAYESIAN_SKIP_STALE_UPDATES: bool = True
     BAYESIAN_PRIOR_DEFAULT: float = 0.50
     BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
     LMSR_ENABLED: bool = False
@@ -226,6 +243,7 @@ class Settings:
     KELLY_FRACTION_DEFAULT: float = 0.25
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
+    KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -336,11 +354,20 @@ def load_settings() -> Settings:
         LOW_PRICE_MIN_EDGE=_read_env_float(
             "LOW_PRICE_MIN_EDGE", Settings.LOW_PRICE_MIN_EDGE
         ),
+        COINFLIP_PRICE_LOWER=_read_env_float(
+            "COINFLIP_PRICE_LOWER", Settings.COINFLIP_PRICE_LOWER
+        ),
+        COINFLIP_PRICE_UPPER=_read_env_float(
+            "COINFLIP_PRICE_UPPER", Settings.COINFLIP_PRICE_UPPER
+        ),
         EDGE_SCALING_RANGE=_read_env_float(
             "EDGE_SCALING_RANGE", Settings.EDGE_SCALING_RANGE
         ),
         LOW_PRICE_BET_PENALTY=_read_env_float(
             "LOW_PRICE_BET_PENALTY", Settings.LOW_PRICE_BET_PENALTY
+        ),
+        FALLBACK_EDGE_MIN_EDGE=_read_env_float(
+            "FALLBACK_EDGE_MIN_EDGE", Settings.FALLBACK_EDGE_MIN_EDGE
         ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE
@@ -511,6 +538,10 @@ def load_settings() -> Settings:
             "MAX_POSITION_PER_MARKET_USDC",
             Settings.MAX_POSITION_PER_MARKET_USDC,
         ),
+        MAX_POSITION_PCT_OF_BANKROLL=_read_env_float(
+            "MAX_POSITION_PCT_OF_BANKROLL",
+            Settings.MAX_POSITION_PCT_OF_BANKROLL,
+        ),
         MIN_CONFIDENCE_INCREASE_FOR_ADD=_read_env_float(
             "MIN_CONFIDENCE_INCREASE_FOR_ADD",
             Settings.MIN_CONFIDENCE_INCREASE_FOR_ADD,
@@ -534,6 +565,10 @@ def load_settings() -> Settings:
         BAYESIAN_ENABLED=_read_env_bool(
             "BAYESIAN_ENABLED",
             Settings.BAYESIAN_ENABLED,
+        ),
+        BAYESIAN_SKIP_STALE_UPDATES=_read_env_bool(
+            "BAYESIAN_SKIP_STALE_UPDATES",
+            Settings.BAYESIAN_SKIP_STALE_UPDATES,
         ),
         BAYESIAN_PRIOR_DEFAULT=_read_env_float(
             "BAYESIAN_PRIOR_DEFAULT",
@@ -570,6 +605,10 @@ def load_settings() -> Settings:
         KELLY_FRACTION_SHORT_HORIZON=_read_env_float(
             "KELLY_FRACTION_SHORT_HORIZON",
             Settings.KELLY_FRACTION_SHORT_HORIZON,
+        ),
+        KELLY_MIN_BET_POLICY=_read_env_str(
+            "KELLY_MIN_BET_POLICY",
+            Settings.KELLY_MIN_BET_POLICY,
         ),
         FLIP_GUARD_ENABLED=_read_env_bool(
             "FLIP_GUARD_ENABLED",
@@ -610,12 +649,16 @@ def load_settings() -> Settings:
     score_mode = settings.SCORE_GATE_MODE.strip().lower()
     if score_mode not in {"off", "shadow", "active"}:
         score_mode = Settings.SCORE_GATE_MODE
+    kelly_min_bet_policy = settings.KELLY_MIN_BET_POLICY.strip().lower()
+    if kelly_min_bet_policy not in {"skip", "floor", "fallback_edge_scaling"}:
+        kelly_min_bet_policy = Settings.KELLY_MIN_BET_POLICY
 
     settings = Settings(
         **{
             **settings.__dict__,
             "OPPOSITE_OUTCOME_STRATEGY": strategy,
             "SCORE_GATE_MODE": score_mode,
+            "KELLY_MIN_BET_POLICY": kelly_min_bet_policy,
         }
     )
 

@@ -73,6 +73,10 @@ class TradeDecision(BaseModel):
         le=1.0,
         description="Optional explicit edge from external implied probability (my_prob - implied_prob_external).",
     )
+    edge_source: str | None = Field(
+        default=None,
+        description="Source of edge calculation (computed, fallback, or none).",
+    )
     likelihood_ratio: float | None = Field(
         default=None,
         gt=0.0,
@@ -124,6 +128,7 @@ class MarketState(BaseModel):
     analysis_count: int = 0
     last_confidence: float | None = None
     confidence_trend: list[float] = Field(default_factory=list)
+    last_terminal_outcome: str | None = None
 
 
 class Position(BaseModel):

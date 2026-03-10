@@ -185,3 +185,49 @@ def test_get_anchor_analysis_falls_back_to_latest(tmp_path) -> None:
         assert round(float(anchor["confidence"]), 2) == 0.58
     finally:
         manager.close()
+
+
+def test_record_terminal_outcome_persists_on_market_state(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m9"
+        manager.record_analysis(market_id, _decision(0.61), is_refined=False)
+        manager.record_terminal_outcome(market_id, "no_trade_recommended")
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.last_terminal_outcome == "no_trade_recommended"
+    finally:
+        manager.close()
+
+
+def test_reasoning_hash_and_stale_bayesian_update(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-stale"
+        decision = _decision(0.66, outcome="YES")
+        manager.record_analysis(market_id, decision, is_refined=False)
+        first_hash = manager.get_last_reasoning_hash(market_id)
+        assert first_hash is not None
+
+        manager.record_analysis(market_id, decision, is_refined=False)
+        second_hash = manager.get_last_reasoning_hash(market_id)
+        assert second_hash == first_hash
+
+        manager.update_bayesian_state(
+            market_id=market_id,
+            outcome="YES",
+            log_prior=0.0,
+            log_likelihood=0.2,
+            count_as_update=True,
+        )
+        manager.update_bayesian_state(
+            market_id=market_id,
+            outcome="YES",
+            log_prior=0.0,
+            log_likelihood=0.2,
+            count_as_update=False,
+        )
+        state = manager.get_bayesian_state(market_id)["YES"]
+        assert state.update_count == 1
+    finally:
+        manager.close()

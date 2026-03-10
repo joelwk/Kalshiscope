@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from market_scheduler import MarketScheduler
+from market_scheduler import MarketScheduler, remaining_reanalysis_cooldown_seconds
 from models import Market, MarketOutcome, MarketState
 
 
@@ -109,3 +109,66 @@ def test_should_not_skip_if_urgent_outside_urgent_cooldown() -> None:
     should_skip, reason = scheduler.should_skip(market, state)
     assert should_skip is False
     assert reason == ""
+
+
+def test_should_not_skip_non_actionable_terminal_outcome_after_short_cooldown() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    market = _market("m8", now + timedelta(days=4))
+    state = MarketState(
+        market_id="m8",
+        last_analysis=now - timedelta(minutes=20),
+        analysis_count=1,
+        last_confidence=0.58,
+        confidence_trend=[0.58],
+        last_terminal_outcome="no_trade_recommended",
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is False
+    assert reason == ""
+
+
+def test_should_skip_actionable_terminal_outcome_under_full_cooldown() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    market = _market("m9", now + timedelta(days=4))
+    state = MarketState(
+        market_id="m9",
+        last_analysis=now - timedelta(minutes=20),
+        analysis_count=1,
+        last_confidence=0.72,
+        confidence_trend=[0.72],
+        last_terminal_outcome="order_submitted",
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is True
+    assert reason == "recently analyzed"
+
+
+def test_remaining_cooldown_helper_matches_scheduler_skip() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=2, urgent_days_before_close=2)
+    market = _market("m10", now + timedelta(days=5))
+    state = MarketState(
+        market_id="m10",
+        last_analysis=now - timedelta(minutes=30),
+        analysis_count=1,
+        last_confidence=0.65,
+        confidence_trend=[0.65],
+        last_terminal_outcome="order_submitted",
+    )
+
+    remaining = remaining_reanalysis_cooldown_seconds(
+        market,
+        state,
+        reanalysis_cooldown_hours=scheduler.reanalysis_cooldown_hours,
+        urgent_days_before_close=scheduler.urgent_days_before_close,
+        urgent_reanalysis_cooldown_hours=scheduler.urgent_reanalysis_cooldown_hours,
+        now=now,
+    )
+    should_skip, _ = scheduler.should_skip(market, state)
+    assert remaining is not None
+    assert remaining > 0
+    assert should_skip is True
