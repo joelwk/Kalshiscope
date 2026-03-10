@@ -183,6 +183,7 @@ class TestConfig(unittest.TestCase):
             "XAI_API_KEY": "xai-key",
             "WALLET_PRIVATE_KEY": "0xabc",
             "BAYESIAN_ENABLED": "true",
+            "BAYESIAN_SKIP_STALE_UPDATES": "false",
             "BAYESIAN_PRIOR_DEFAULT": "0.58",
             "BAYESIAN_MIN_UPDATES_FOR_TRADE": "3",
             "LMSR_ENABLED": "true",
@@ -192,11 +193,17 @@ class TestConfig(unittest.TestCase):
             "KELLY_FRACTION_DEFAULT": "0.2",
             "KELLY_FRACTION_SHORT_HORIZON_HOURS": "2",
             "KELLY_FRACTION_SHORT_HORIZON": "0.1",
+            "KELLY_MIN_BET_POLICY": "floor",
+            "MAX_POSITION_PCT_OF_BANKROLL": "0.12",
+            "COINFLIP_PRICE_LOWER": "0.46",
+            "COINFLIP_PRICE_UPPER": "0.54",
+            "FALLBACK_EDGE_MIN_EDGE": "0.09",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
 
         self.assertTrue(settings.BAYESIAN_ENABLED)
+        self.assertFalse(settings.BAYESIAN_SKIP_STALE_UPDATES)
         self.assertEqual(settings.BAYESIAN_PRIOR_DEFAULT, 0.58)
         self.assertEqual(settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
         self.assertTrue(settings.LMSR_ENABLED)
@@ -206,6 +213,19 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KELLY_FRACTION_DEFAULT, 0.2)
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON_HOURS, 2)
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON, 0.1)
+        self.assertEqual(settings.KELLY_MIN_BET_POLICY, "floor")
+        self.assertEqual(settings.MAX_POSITION_PCT_OF_BANKROLL, 0.12)
+        self.assertEqual(settings.COINFLIP_PRICE_LOWER, 0.46)
+        self.assertEqual(settings.COINFLIP_PRICE_UPPER, 0.54)
+        self.assertEqual(settings.FALLBACK_EDGE_MIN_EDGE, 0.09)
+
+    def test_tennis_sources_present_in_sports_profile_defaults(self) -> None:
+        self.assertIn("atptour.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
+        self.assertIn("wtatennis.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
+        self.assertIn("tennisexplorer.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
+        self.assertIn("flashscore.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
+        self.assertIn("atptour", config.Settings.SPORTS_ALLOWED_X_HANDLES)
+        self.assertIn("WTA", config.Settings.SPORTS_ALLOWED_X_HANDLES)
 
 
 if __name__ == "__main__":

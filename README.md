@@ -90,10 +90,13 @@ Everything else has defaults in `.env.example`, including conservative rollout s
 
 - `MIN_EDGE` sets the minimum edge required before a market can pass trade gating.
 - `KELLY_SIZING_ENABLED` switches sizing from edge scaling to fractional Kelly.
+- `KELLY_MIN_BET_POLICY` controls how sub-floor Kelly bets are handled: `skip`, `floor`, or `fallback_edge_scaling`.
+- `REANALYSIS_COOLDOWN_HOURS` and `URGENT_REANALYSIS_COOLDOWN_HOURS` now apply action-aware cooldowns, so non-actionable outcomes (for example `no_trade_recommended` or `kelly_sub_floor_skip`) recycle faster.
 - `BAYESIAN_ENABLED` enables posterior updates from model likelihood ratios across cycles.
 - `LMSR_ENABLED` enables an independent LMSR-based price verification layer.
+- `PARALLEL_ANALYSIS_ENABLED` and `ANALYSIS_MAX_WORKERS` control threaded Grok analysis throughput for multi-candidate cycles.
 
-The template keeps Bayesian, LMSR, and Kelly conservative by default so they can be enabled gradually.
+The template defaults now target execution-oriented Phase 3 rollout while retaining explicit policy controls for risk and pacing.
 
 ## Troubleshooting
 

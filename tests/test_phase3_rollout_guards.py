@@ -3,7 +3,12 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from config import Settings
-from main import _applied_bayesian_posterior, _compute_lmsr_execution_price_for_outcome
+from main import (
+    _applied_bayesian_posterior,
+    _compute_lmsr_execution_price_for_outcome,
+    _resolve_min_bet_floor,
+    _should_skip_flip_refinement,
+)
 from market_state import MarketStateManager
 from models import Market, MarketOutcome, TradeDecision
 
@@ -82,3 +87,81 @@ def test_trade_decision_rejects_zero_likelihood_ratio() -> None:
     except ValidationError:
         return
     raise AssertionError("Expected likelihood_ratio=0.0 to fail validation")
+
+
+def test_resolve_min_bet_floor_skips_sub_floor_kelly_by_default() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.25,
+        min_bet_usdc=2.0,
+        max_bet_usdc=4.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        edge_scaling_bet_pct=0.60,
+    )
+    assert adjusted == 1.25
+    assert adjusted_pct == 0.3125
+    assert floor_applied is False
+    assert sub_floor_skipped is True
+    assert policy == "skip"
+
+
+def test_resolve_min_bet_floor_applies_floor_policy() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.25,
+        min_bet_usdc=2.0,
+        max_bet_usdc=4.0,
+        kelly_path_active=True,
+        min_bet_policy="floor",
+        edge_scaling_bet_pct=0.20,
+    )
+    assert adjusted == 2.0
+    assert adjusted_pct == 0.5
+    assert floor_applied is True
+    assert sub_floor_skipped is False
+    assert policy == "floor"
+
+
+def test_resolve_min_bet_floor_fallback_edge_scaling_uses_edge_size() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.25,
+        min_bet_usdc=2.0,
+        max_bet_usdc=8.0,
+        kelly_path_active=True,
+        min_bet_policy="fallback_edge_scaling",
+        edge_scaling_bet_pct=0.40,
+    )
+    assert adjusted == 3.2
+    assert adjusted_pct == 0.4
+    assert floor_applied is False
+    assert sub_floor_skipped is False
+    assert policy == "fallback_edge_scaling"
+
+
+def test_flip_refinement_precheck_blocks_unreachable_conf_gain() -> None:
+    settings = Settings()
+    market = Market(
+        id="m2",
+        question="Will team A win?",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.60),
+            MarketOutcome(name="NO", price=0.40),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.62,
+        bet_size_pct=0.2,
+        reasoning="flip candidate",
+        evidence_quality=0.8,
+    )
+    should_skip, reason, payload = _should_skip_flip_refinement(
+        market=market,
+        decision=decision,
+        anchor_analysis={"outcome": "YES", "confidence": 0.97},
+        settings=settings,
+    )
+    assert should_skip is True
+    assert reason is not None
+    assert "conf_gain_unreachable" in reason
+    assert payload is not None

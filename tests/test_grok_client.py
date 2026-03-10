@@ -209,6 +209,30 @@ class TestGrokClient(unittest.TestCase):
         self.assertAlmostEqual(decision.confidence, 0.74, places=6)
         self.assertAlmostEqual(decision.edge_external or 0.0, -0.016, places=6)
 
+    def test_analyze_market_deep_retains_previous_likelihood_ratio_when_missing(self) -> None:
+        market = Market(
+            id="m16",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=120.0,
+        )
+        previous = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.3,
+            reasoning="Previous analysis",
+            likelihood_ratio=1.8,
+        )
+        content = """
+        {"should_trade": true, "outcome": "YES", "confidence": 0.68, "bet_size_pct": 0.35, "reasoning": "updated", "likelihood_ratio": null}
+        """
+        client = GrokClient(api_key="x")
+        client.client = DummyClient(content)
+
+        decision = client.analyze_market_deep(market, previous_analysis=previous)
+        self.assertAlmostEqual(decision.likelihood_ratio or 0.0, 1.8, places=6)
+
     def test_analyze_market_clamps_overscaled_confidence(self) -> None:
         market = Market(
             id="m13",
