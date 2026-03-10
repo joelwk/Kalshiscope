@@ -5,13 +5,16 @@ from unittest.mock import patch
 from config import Settings
 from main import (
     _best_orderbook_sell_price,
+    _build_reasoning_hash,
     _cap_effective_confidence_for_market,
     _calculate_bet,
     _compute_next_wakeup_seconds,
     _edge_threshold_for_market,
+    _effective_position_override_threshold,
     _filter_markets,
     _log_settings_summary,
     _should_adjust_position,
+    _usdc_from_wei,
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
 
@@ -255,6 +258,44 @@ class TestMainUtils(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, "confidence_increase_threshold_met")
         self.assertAlmostEqual(bet_pct, 0.01, places=4)
+
+    def test_build_reasoning_hash_ignores_validated_prefix_variation(self) -> None:
+        decision_a = TradeDecision(
+            should_trade=False,
+            outcome="Yes",
+            confidence=0.70,
+            bet_size_pct=0.0,
+            reasoning=(
+                "[Validated eq=1.00 gate=allow reason=ok edge_market=0.041 "
+                "edge_source=computed] Core thesis unchanged"
+            ),
+        )
+        decision_b = TradeDecision(
+            should_trade=False,
+            outcome="Yes",
+            confidence=0.70,
+            bet_size_pct=0.0,
+            reasoning=(
+                "[Validated eq=0.95 gate=allow reason=ok edge_market=0.038 "
+                "edge_source=computed] Core thesis unchanged"
+            ),
+        )
+        self.assertEqual(_build_reasoning_hash(decision_a), _build_reasoning_hash(decision_b))
+
+    def test_effective_position_override_threshold_not_capped_by_category(self) -> None:
+        settings = Settings(
+            HIGH_CONFIDENCE_POSITION_OVERRIDE=0.85,
+            MAX_SPORTS_CONFIDENCE=0.80,
+            XAI_API_KEY="xai-key",
+            WALLET_PRIVATE_KEY="wallet-key",
+        )
+        sports_market = Market(id="s2", question="NBA: A vs B", category="sports")
+        threshold = _effective_position_override_threshold(sports_market, settings)
+        self.assertEqual(threshold, 0.85)
+        self.assertFalse(0.80 >= threshold)
+
+    def test_usdc_from_wei_conversion(self) -> None:
+        self.assertEqual(_usdc_from_wei(2_500_000, 6), 2.5)
 
 
 if __name__ == "__main__":

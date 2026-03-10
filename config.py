@@ -251,6 +251,8 @@ class Settings:
     FLIP_GUARD_MIN_CONF_GAIN: float = 0.08
     FLIP_GUARD_MIN_EDGE_GAIN: float = 0.03
     FLIP_GUARD_MIN_EVIDENCE_QUALITY: float = 0.60
+    FLIP_CIRCUIT_BREAKER_ENABLED: bool = True
+    FLIP_CIRCUIT_BREAKER_MAX_FLIPS: int = 3
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -629,6 +631,14 @@ def load_settings() -> Settings:
         FLIP_GUARD_MIN_EVIDENCE_QUALITY=_read_env_float(
             "FLIP_GUARD_MIN_EVIDENCE_QUALITY",
             Settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
+        ),
+        FLIP_CIRCUIT_BREAKER_ENABLED=_read_env_bool(
+            "FLIP_CIRCUIT_BREAKER_ENABLED",
+            Settings.FLIP_CIRCUIT_BREAKER_ENABLED,
+        ),
+        FLIP_CIRCUIT_BREAKER_MAX_FLIPS=_read_env_int(
+            "FLIP_CIRCUIT_BREAKER_MAX_FLIPS",
+            Settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS,
         ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),

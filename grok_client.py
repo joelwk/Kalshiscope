@@ -41,8 +41,10 @@ _PROB_CONSISTENCY_TOLERANCE = 0.08
 _MIN_MARKET_EDGE_FOR_TRADE = 0.05
 _LOW_QUALITY_EDGE_BUFFER = 0.08
 _LOW_QUALITY_EVIDENCE_THRESHOLD = 0.45
+_MAX_MODEL_RESPONSE_LOG_CHARS = 500
 _SYSTEM_PROMPT_SHARED = (
     "Output must strictly match the response schema.\n"
+    "Respond with a single valid JSON object only; use double-quoted keys and no trailing commas.\n"
     "The `outcome` field must exactly match one of the provided market outcomes.\n"
     "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
     "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
@@ -90,6 +92,27 @@ def _extract_json(text: str) -> dict[str, Any]:
         raise ValueError("No JSON object found in Grok response")
     snippet = text[start : end + 1]
     return json.loads(snippet)
+
+
+def _normalize_model_response_text(text: str) -> str:
+    """Normalize model responses before JSON parsing."""
+    normalized = text.strip()
+    fenced_block = re.search(r"```(?:json)?\s*(.*?)\s*```", normalized, re.IGNORECASE | re.DOTALL)
+    if fenced_block:
+        return fenced_block.group(1).strip()
+    return normalized
+
+
+def _repair_common_json_key_issues(text: str) -> str:
+    """Repair common JSON-like key formatting issues without touching values."""
+    return re.sub(r"([{,]\s*)'([A-Za-z_][A-Za-z0-9_]*)'\s*:", r'\1"\2":', text)
+
+
+def _response_preview(text: str, max_chars: int = _MAX_MODEL_RESPONSE_LOG_CHARS) -> str:
+    preview = " ".join(text.split())
+    if len(preview) <= max_chars:
+        return preview
+    return preview[:max_chars] + "..."
 
 
 def _format_previous_analysis(previous: TradeDecision | None) -> str:
@@ -620,6 +643,7 @@ class GrokClient:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
+        content = ""
         logger.debug(
             "Starting market analysis: id=%s",
             market.id,
@@ -668,7 +692,6 @@ class GrokClient:
                 )
             )
 
-            content = ""
             chunk_count = 0
             deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
             for _, chunk in chat.stream():
@@ -681,15 +704,27 @@ class GrokClient:
             if not content:
                 raise ValueError("Empty response from Grok")
 
+            normalized_content = _normalize_model_response_text(content)
             try:
-                data = json.loads(content)
+                data = json.loads(normalized_content)
             except json.JSONDecodeError:
                 logger.warning(
                     "Structured response parse fallback invoked for market=%s",
                     market.id,
                     data={"market_id": market.id},
                 )
-                data = _extract_json(content)
+                try:
+                    data = _extract_json(normalized_content)
+                except json.JSONDecodeError:
+                    repaired_content = _repair_common_json_key_issues(normalized_content)
+                    if repaired_content == normalized_content:
+                        raise
+                    logger.warning(
+                        "Structured response repair fallback invoked for market=%s",
+                        market.id,
+                        data={"market_id": market.id},
+                    )
+                    data = _extract_json(repaired_content)
 
             data = self._normalize_numeric_fields(data, market.id)
             decision = TradeDecision.model_validate(data)
@@ -730,6 +765,16 @@ class GrokClient:
 
         except Exception as exc:
             duration = (time.monotonic() - start_time) * 1000
+            if content:
+                logger.debug(
+                    "Model response preview for failed analysis: market=%s preview=%s",
+                    market.id,
+                    _response_preview(content),
+                    data={
+                        "market_id": market.id,
+                        "response_preview": _response_preview(content),
+                    },
+                )
             logger.error(
                 "Market analysis failed: id=%s, error=%s, duration=%.2fms",
                 market.id,
@@ -759,6 +804,7 @@ class GrokClient:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
+        content = ""
         logger.debug(
             "Starting deep market analysis: id=%s",
             market.id,
@@ -811,7 +857,6 @@ class GrokClient:
                 )
             )
 
-            content = ""
             chunk_count = 0
             deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
             for _, chunk in chat.stream():
@@ -823,15 +868,27 @@ class GrokClient:
 
             if not content:
                 raise ValueError("Empty response from Grok")
+            normalized_content = _normalize_model_response_text(content)
             try:
-                data = json.loads(content)
+                data = json.loads(normalized_content)
             except json.JSONDecodeError:
                 logger.warning(
                     "Structured response parse fallback invoked for market=%s (deep)",
                     market.id,
                     data={"market_id": market.id},
                 )
-                data = _extract_json(content)
+                try:
+                    data = _extract_json(normalized_content)
+                except json.JSONDecodeError:
+                    repaired_content = _repair_common_json_key_issues(normalized_content)
+                    if repaired_content == normalized_content:
+                        raise
+                    logger.warning(
+                        "Structured response repair fallback invoked for market=%s (deep)",
+                        market.id,
+                        data={"market_id": market.id},
+                    )
+                    data = _extract_json(repaired_content)
 
             deep_likelihood_ratio_provided = (
                 "likelihood_ratio" in data and data.get("likelihood_ratio") is not None
@@ -889,6 +946,16 @@ class GrokClient:
 
         except Exception as exc:
             duration = (time.monotonic() - start_time) * 1000
+            if content:
+                logger.debug(
+                    "Model response preview for failed deep analysis: market=%s preview=%s",
+                    market.id,
+                    _response_preview(content),
+                    data={
+                        "market_id": market.id,
+                        "response_preview": _response_preview(content),
+                    },
+                )
             logger.error(
                 "Deep market analysis failed: id=%s, error=%s, duration=%.2fms",
                 market.id,

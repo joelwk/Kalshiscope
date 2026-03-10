@@ -231,3 +231,49 @@ def test_reasoning_hash_and_stale_bayesian_update(tmp_path) -> None:
         assert state.update_count == 1
     finally:
         manager.close()
+
+
+def test_reasoning_hash_ignores_validated_prefix_variation(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-hash"
+        manager.record_analysis(
+            market_id,
+            TradeDecision(
+                should_trade=False,
+                outcome="YES",
+                confidence=0.66,
+                bet_size_pct=0.0,
+                reasoning="[Validated eq=1.00 edge_market=0.031] thesis text",
+            ),
+            is_refined=False,
+        )
+        first_hash = manager.get_last_reasoning_hash(market_id)
+        manager.record_analysis(
+            market_id,
+            TradeDecision(
+                should_trade=False,
+                outcome="YES",
+                confidence=0.66,
+                bet_size_pct=0.0,
+                reasoning="[Validated eq=0.95 edge_market=0.028] thesis text",
+            ),
+            is_refined=False,
+        )
+        second_hash = manager.get_last_reasoning_hash(market_id)
+        assert first_hash == second_hash
+    finally:
+        manager.close()
+
+
+def test_get_outcome_flip_count_counts_transitions(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-flips"
+        manager.record_analysis(market_id, _decision(0.60, outcome="YES"), is_refined=False)
+        manager.record_analysis(market_id, _decision(0.62, outcome="NO"), is_refined=False)
+        manager.record_analysis(market_id, _decision(0.64, outcome="YES"), is_refined=False)
+        manager.record_analysis(market_id, _decision(0.66, outcome="NO"), is_refined=False)
+        assert manager.get_outcome_flip_count(market_id) == 3
+    finally:
+        manager.close()
