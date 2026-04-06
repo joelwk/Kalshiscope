@@ -1,22 +1,25 @@
-# Prediscope
+# Kalshiscope
 
-Autonomous prediction-market trading bot using xAI Grok for research, edge scoring, and PredictBase for market execution.
+Autonomous prediction-market trading bot for Kalshi that uses xAI Grok for research, confidence estimation, and trade execution decisions.
 
 ## What It Does
 
-- Pulls active markets from PredictBase.
-- Filters by liquidity/category/close window.
-- Uses Grok to analyze outcomes, confidence, and supporting evidence.
-- Applies edge, evidence-quality, and position-risk gates before trading.
-- Can layer Bayesian updating, LMSR-based price checks, and Kelly sizing behind feature flags.
-- Optionally submits orders and on-chain approvals.
+- Pulls active markets from Kalshi Trade API v2.
+- Filters markets by liquidity, close window, category policy, ticker patterns, and event ladder shape.
+- Uses Grok to analyze outcomes, confidence, and evidence quality with profile-aware sourcing.
+- Applies layered gating before execution (confidence, edge, score, flip guard, and risk caps).
+- Supports optional Bayesian updates, LMSR checks, and Kelly sizing.
+- Submits Kalshi limit orders in live mode or simulates decisions in dry run.
 
 ## Prerequisites
 
 - Python `>=3.10`
 - [Poetry](https://python-poetry.org/docs/#installation) (recommended)
+- Kalshi API credentials:
+  - API key ID (`KALSHI_API_KEY_ID`)
+  - RSA private key file path (`KALSHI_PRIVATE_KEY_PATH`)
 
-## 5-Minute Quick Start (Recommended)
+## 5-Minute Quick Start
 
 1. Copy env template:
 
@@ -24,10 +27,11 @@ Autonomous prediction-market trading bot using xAI Grok for research, edge scori
 cp .env.example .env
 ```
 
-2. Edit `.env` and fill only:
+2. Edit `.env` and set:
 
 - `XAI_API_KEY`
-- `WALLET_PRIVATE_KEY`
+- `KALSHI_API_KEY_ID`
+- `KALSHI_PRIVATE_KEY_PATH`
 
 3. Install dependencies:
 
@@ -41,89 +45,96 @@ poetry install
 poetry run predi
 ```
 
-## pip Fallback
+You can also run:
 
-If you prefer `pip`:
+```bash
+poetry run kalshi
+```
+
+## pip Fallback
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-## Safe Mode vs Live Mode
+## Dry Run vs Live Trading
 
-Default `.env.example` is safety-first:
+`DRY_RUN=true` is the safety-first mode and prevents real order placement.
 
-- `DRY_RUN=true`
-- `AUTO_APPROVE_USDC=false`
-- `EXECUTE_ONCHAIN=false`
+- `DRY_RUN=true`: analyze and log candidate trades only.
+- `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
-This means no live orders or approvals by default.
-
-### Enable Live Trading (Explicit Opt-In)
-
-Only after validating behavior in dry run:
-
-1. Set `DRY_RUN=false`
-2. Set `EXECUTE_ONCHAIN=true` if you want on-chain execution
-3. Optionally set `AUTO_APPROVE_USDC=true` for automatic approvals
-
-When `EXECUTE_ONCHAIN=true` or `AUTO_APPROVE_USDC=true`, `ALCHEMY_RPC_URL` is required.
-
-When `AUTO_APPROVE_USDC=true`, `PREDICTBASE_CONTRACT_ADDRESS` is required.
+Start in dry run and switch to live only after reviewing behavior in logs.
 
 ## Environment Variables
 
-Required by default:
+Required:
 
 - `XAI_API_KEY`
-- `WALLET_PRIVATE_KEY`
+- `KALSHI_API_KEY_ID`
+- `KALSHI_PRIVATE_KEY_PATH`
 
-Conditionally required:
+Common optional variables:
 
-- `ALCHEMY_RPC_URL` when `EXECUTE_ONCHAIN=true` or `AUTO_APPROVE_USDC=true`
-- `PREDICTBASE_CONTRACT_ADDRESS` when `AUTO_APPROVE_USDC=true`
+- `KALSHI_API_BASE_URL` (defaults to Kalshi v2 endpoint)
+- `KALSHI_SERVER_SIDE_FILTERS_ENABLED`
+- `POLL_INTERVAL_SEC`
+- `MIN_LIQUIDITY_USDC`
+- `MARKET_MIN_CLOSE_DAYS`, `MARKET_MAX_CLOSE_DAYS`
 
-Everything else has defaults in `.env.example`, including conservative rollout settings for edge thresholds, Kelly sizing, and optional Bayesian/LMSR layers.
+See `.env.example` for the full set of runtime controls.
 
-## Strategy Controls
+## Strategy and Risk Controls
 
-- `MIN_EDGE` sets the minimum edge required before a market can pass trade gating.
-- `KELLY_SIZING_ENABLED` switches sizing from edge scaling to fractional Kelly.
-- `KELLY_MIN_BET_POLICY` controls how sub-floor Kelly bets are handled: `skip`, `floor`, or `fallback_edge_scaling`.
-- `REANALYSIS_COOLDOWN_HOURS` and `URGENT_REANALYSIS_COOLDOWN_HOURS` now apply action-aware cooldowns, so non-actionable outcomes (for example `no_trade_recommended` or `kelly_sub_floor_skip`) recycle faster.
-- `BAYESIAN_ENABLED` enables posterior updates from model likelihood ratios across cycles.
-- `LMSR_ENABLED` enables an independent LMSR-based price verification layer.
-- `PARALLEL_ANALYSIS_ENABLED` and `ANALYSIS_MAX_WORKERS` control threaded Grok analysis throughput for multi-candidate cycles.
+- `MIN_EDGE`, `LOW_PRICE_MIN_EDGE`, `FALLBACK_EDGE_MIN_EDGE` for edge thresholds.
+- `SCORE_GATE_MODE` (`off`, `shadow`, `active`) for decision scoring rollout.
+- `BAYESIAN_ENABLED`, `LMSR_ENABLED`, `KELLY_SIZING_ENABLED` for optional advanced layers.
+- `KELLY_MIN_BET_POLICY` controls handling when Kelly sizing is below minimum bet.
+- `MAX_POSITION_PCT_OF_BANKROLL`, `MAX_POSITION_PER_MARKET_USDC` cap exposure.
+- `OPPOSITE_OUTCOME_STRATEGY` and flip-guard settings reduce churn from side flips.
+- `MARKET_TICKER_BLOCKLIST_PREFIXES`, ladder collapse controls, and extreme-price filters reduce noisy candidates.
+- Category-specific research profiles tune source domains and X handles for sports, crypto, politics, and generic markets.
 
-The template defaults now target execution-oriented Phase 3 rollout while retaining explicit policy controls for risk and pacing.
+## State and Logging
+
+- State persistence: `STATE_DB_PATH` (SQLite) and optional JSON export (`STATE_JSON_EXPORT_PATH`).
+- Resolution tracking runs on a configurable cycle interval.
+- Logs are written under `LOG_DIR` (default `logs/`), including standard and error-focused outputs.
 
 ## Troubleshooting
 
 ### Missing required environment variables
 
-If startup fails with `Missing required environment variables`, check `.env` and mode flags:
+If startup fails with `Missing required environment variables`, verify:
 
-- Safe mode needs only `XAI_API_KEY` and `WALLET_PRIVATE_KEY`.
-- Live/on-chain mode requires `ALCHEMY_RPC_URL`.
-- Auto-approve also requires `PREDICTBASE_CONTRACT_ADDRESS`.
+- `XAI_API_KEY` is set.
+- `KALSHI_API_KEY_ID` is set.
+- `KALSHI_PRIVATE_KEY_PATH` points to an existing readable private key file.
 
-### RPC / chain issues
+### Kalshi authentication failures
 
-- Ensure `CHAIN_ID=8453` for Base mainnet.
-- Ensure your RPC endpoint is reachable and funded account has gas.
+- Confirm the API key ID matches the private key pair in your Kalshi account.
+- Ensure the private key is in the expected PEM/plaintext format used by your account.
+- Verify your system clock is accurate; signed request timestamps must be valid.
+
+### No trades executing
+
+- Confirm `DRY_RUN=false` for live placement.
+- Check gating thresholds (`MIN_CONFIDENCE`, `MIN_EDGE`, score gate mode).
+- Review liquidity, close-window, and category filters that may exclude candidates.
 
 ### Dependency issues
 
 - Poetry path: run `poetry install`.
 - pip path: run `pip install -r requirements.txt`.
-- If imports fail, verify active Python environment matches install location.
+- If imports fail, verify the active Python environment matches the install location.
 
 ## Security Notes
 
-- Never commit `.env`.
-- Treat private keys and API keys as compromised if leaked.
-- Rotate credentials immediately after any accidental exposure.
+- Never commit `.env` or Kalshi private key files.
+- Treat API credentials and private keys as compromised if leaked.
+- Rotate keys immediately after accidental exposure.
 
 ## Run Tests
 
