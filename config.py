@@ -15,6 +15,9 @@ class Settings:
     MIN_BET_USDC: float = 5.0
     MAX_BET_USDC: float = 50.0
     MIN_CONFIDENCE: float = 0.50  # Allows mid-probability bets; edge + evidence gates handle quality
+    CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
+    CONFIDENCE_GATE_MIN_EDGE: float = 0.15
+    CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
     SLIPPAGE_CONFIDENCE_THRESHOLD: float = 0.70
     SLIPPAGE_PCT: float = 0.02
     MIN_LIQUIDITY_USDC: float = 100.0
@@ -39,6 +42,23 @@ class Settings:
     # Filtering
     MARKET_CATEGORIES_ALLOWLIST: tuple[str, ...] = ()
     MARKET_CATEGORIES_BLOCKLIST: tuple[str, ...] = ()
+    MARKET_TICKER_BLOCKLIST_PREFIXES: tuple[str, ...] = (
+        "KXBTC15M-",
+        "KXETH15M-",
+        "KXSOL15M-",
+        "KXDOGE15M-",
+        "KXBNB15M-",
+        "KXXRP15M-",
+        "KXHYPE15M-",
+        "KXNETFLIX",
+        "KXSPOTIFY",
+        "KXMADDOW",
+    )
+    MIN_VOLUME_24H: float = 0.0
+    EXTREME_YES_PRICE_LOWER: float = 0.05
+    EXTREME_YES_PRICE_UPPER: float = 0.95
+    LADDER_COLLAPSE_THRESHOLD: int = 5
+    MAX_BRACKETS_PER_EVENT: int = 3
     # Date range filtering: only consider markets closing within this window (days from now)
     # Set to 0 or None to disable the filter
     MARKET_MIN_CLOSE_DAYS: int | None = None  # Minimum days until close (skip markets closing too soon)
@@ -47,6 +67,7 @@ class Settings:
     # xAI Grok
     XAI_API_KEY: str = ""
     GROK_MODEL: str = "grok-4-1-fast-reasoning"
+    GROK_MODEL_DEEP: str = "grok-4.20-beta-0309-reasoning"
     SEARCH_LOOKBACK_HOURS: int = 24
     SEARCH_ALLOWED_DOMAINS: tuple[str, ...] = (
         "espn.com",
@@ -181,24 +202,14 @@ class Settings:
         "YahooFinance",
     )
 
-    # PredictBase
-    PREDICTBASE_API_BASE_URL: str = "https://api.predictbase.app"
-    PREDICTBASE_API_KEY: str | None = None
-    PREDICTBASE_API_KEY_HEADER: str = "x-api-key"
-    PREDICTBASE_API_KEY_PREFIX: str = ""
-
-    # Web3
-    ALCHEMY_RPC_URL: str = ""
-    WALLET_PRIVATE_KEY: str = ""
-    USDC_TOKEN_ADDRESS: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    PREDICTBASE_CONTRACT_ADDRESS: str = ""
-    USDC_DECIMALS: int = 6
-    CHAIN_ID: int | None = 8453
+    # Kalshi
+    KALSHI_API_BASE_URL: str = "https://api.elections.kalshi.com/trade-api/v2"
+    KALSHI_API_KEY_ID: str = ""
+    KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
+    KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
 
     # Execution
     DRY_RUN: bool = True
-    AUTO_APPROVE_USDC: bool = False
-    EXECUTE_ONCHAIN: bool = False
     PRE_ORDER_MARKET_REFRESH: bool = False
     ORDERBOOK_PRECHECK_ENABLED: bool = False
     ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
@@ -216,6 +227,7 @@ class Settings:
     URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 3
+    MAX_MARKETS_PER_CYCLE: int = 50
 
     # Resolution tracking
     RESOLUTION_SYNC_INTERVAL_CYCLES: int = 3
@@ -265,7 +277,8 @@ class Settings:
 
 BASE_REQUIRED_ENV_VARS = (
     "XAI_API_KEY",
-    "WALLET_PRIVATE_KEY",
+    "KALSHI_API_KEY_ID",
+    "KALSHI_PRIVATE_KEY_PATH",
 )
 
 
@@ -342,10 +355,37 @@ def _read_env_int_optional(name: str, default: int | None) -> int | None:
 
 
 def load_settings() -> Settings:
+    legacy_model_aliases: dict[str, str] = {}
+
+    requested_model_initial = _read_env_str("GROK_MODEL", Settings.GROK_MODEL).strip()
+    normalized_model_initial = legacy_model_aliases.get(
+        requested_model_initial,
+        requested_model_initial,
+    )
+    requested_model_deep = _read_env_str(
+        "GROK_MODEL_DEEP",
+        Settings.GROK_MODEL_DEEP,
+    ).strip()
+    normalized_model_deep = legacy_model_aliases.get(
+        requested_model_deep,
+        requested_model_deep,
+    )
+
     settings = Settings(
         MIN_BET_USDC=_read_env_float("MIN_BET_USDC", Settings.MIN_BET_USDC),
         MAX_BET_USDC=_read_env_float("MAX_BET_USDC", Settings.MAX_BET_USDC),
         MIN_CONFIDENCE=_read_env_float("MIN_CONFIDENCE", Settings.MIN_CONFIDENCE),
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=_read_env_bool(
+            "CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED",
+            Settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED,
+        ),
+        CONFIDENCE_GATE_MIN_EDGE=_read_env_float(
+            "CONFIDENCE_GATE_MIN_EDGE", Settings.CONFIDENCE_GATE_MIN_EDGE
+        ),
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY",
+            Settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
+        ),
         MIN_EDGE=_read_env_float("MIN_EDGE", Settings.MIN_EDGE),
         LOW_PRICE_THRESHOLD=_read_env_float(
             "LOW_PRICE_THRESHOLD", Settings.LOW_PRICE_THRESHOLD
@@ -397,6 +437,27 @@ def load_settings() -> Settings:
         MARKET_CATEGORIES_BLOCKLIST=_split_csv(
             os.getenv("MARKET_CATEGORIES_BLOCKLIST")
         ),
+        MARKET_TICKER_BLOCKLIST_PREFIXES=_read_env_csv(
+            "MARKET_TICKER_BLOCKLIST_PREFIXES",
+            Settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
+        ),
+        MIN_VOLUME_24H=_read_env_float("MIN_VOLUME_24H", Settings.MIN_VOLUME_24H),
+        EXTREME_YES_PRICE_LOWER=_read_env_float(
+            "EXTREME_YES_PRICE_LOWER",
+            Settings.EXTREME_YES_PRICE_LOWER,
+        ),
+        EXTREME_YES_PRICE_UPPER=_read_env_float(
+            "EXTREME_YES_PRICE_UPPER",
+            Settings.EXTREME_YES_PRICE_UPPER,
+        ),
+        LADDER_COLLAPSE_THRESHOLD=_read_env_int(
+            "LADDER_COLLAPSE_THRESHOLD",
+            Settings.LADDER_COLLAPSE_THRESHOLD,
+        ),
+        MAX_BRACKETS_PER_EVENT=_read_env_int(
+            "MAX_BRACKETS_PER_EVENT",
+            Settings.MAX_BRACKETS_PER_EVENT,
+        ),
         MARKET_MIN_CLOSE_DAYS=_read_env_int_optional(
             "MARKET_MIN_CLOSE_DAYS", Settings.MARKET_MIN_CLOSE_DAYS
         ),
@@ -404,7 +465,8 @@ def load_settings() -> Settings:
             "MARKET_MAX_CLOSE_DAYS", Settings.MARKET_MAX_CLOSE_DAYS
         ),
         XAI_API_KEY=_read_env_str("XAI_API_KEY", Settings.XAI_API_KEY),
-        GROK_MODEL=_read_env_str("GROK_MODEL", Settings.GROK_MODEL),
+        GROK_MODEL=normalized_model_initial,
+        GROK_MODEL_DEEP=normalized_model_deep,
         SEARCH_LOOKBACK_HOURS=_read_env_int(
             "SEARCH_LOOKBACK_HOURS", Settings.SEARCH_LOOKBACK_HOURS
         ),
@@ -454,41 +516,20 @@ def load_settings() -> Settings:
         GENERIC_ALLOWED_X_HANDLES=_read_env_csv(
             "GENERIC_ALLOWED_X_HANDLES", Settings.GENERIC_ALLOWED_X_HANDLES
         ),
-        PREDICTBASE_API_BASE_URL=_read_env_str(
-            "PREDICTBASE_API_BASE_URL", Settings.PREDICTBASE_API_BASE_URL
+        KALSHI_API_BASE_URL=_read_env_str(
+            "KALSHI_API_BASE_URL", Settings.KALSHI_API_BASE_URL
         ),
-        PREDICTBASE_API_KEY=os.getenv("PREDICTBASE_API_KEY"),
-        PREDICTBASE_API_KEY_HEADER=_read_env_str(
-            "PREDICTBASE_API_KEY_HEADER", Settings.PREDICTBASE_API_KEY_HEADER
+        KALSHI_API_KEY_ID=_read_env_str(
+            "KALSHI_API_KEY_ID", Settings.KALSHI_API_KEY_ID
         ),
-        PREDICTBASE_API_KEY_PREFIX=_read_env_str(
-            "PREDICTBASE_API_KEY_PREFIX", Settings.PREDICTBASE_API_KEY_PREFIX
+        KALSHI_PRIVATE_KEY_PATH=_read_env_str(
+            "KALSHI_PRIVATE_KEY_PATH", Settings.KALSHI_PRIVATE_KEY_PATH
         ),
-        ALCHEMY_RPC_URL=_read_env_str(
-            "ALCHEMY_RPC_URL", Settings.ALCHEMY_RPC_URL
-        ),
-        WALLET_PRIVATE_KEY=_read_env_str(
-            "WALLET_PRIVATE_KEY", Settings.WALLET_PRIVATE_KEY
-        ),
-        USDC_TOKEN_ADDRESS=_read_env_str(
-            "USDC_TOKEN_ADDRESS", Settings.USDC_TOKEN_ADDRESS
-        ),
-        PREDICTBASE_CONTRACT_ADDRESS=_read_env_str(
-            "PREDICTBASE_CONTRACT_ADDRESS", Settings.PREDICTBASE_CONTRACT_ADDRESS
-        ),
-        USDC_DECIMALS=_read_env_int("USDC_DECIMALS", Settings.USDC_DECIMALS),
-        CHAIN_ID=(
-            int(os.getenv("CHAIN_ID"))
-            if os.getenv("CHAIN_ID")
-            else Settings.CHAIN_ID
+        KALSHI_SERVER_SIDE_FILTERS_ENABLED=_read_env_bool(
+            "KALSHI_SERVER_SIDE_FILTERS_ENABLED",
+            Settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
         ),
         DRY_RUN=_read_env_bool("DRY_RUN", Settings.DRY_RUN),
-        AUTO_APPROVE_USDC=_read_env_bool(
-            "AUTO_APPROVE_USDC", Settings.AUTO_APPROVE_USDC
-        ),
-        EXECUTE_ONCHAIN=_read_env_bool(
-            "EXECUTE_ONCHAIN", Settings.EXECUTE_ONCHAIN
-        ),
         PRE_ORDER_MARKET_REFRESH=_read_env_bool(
             "PRE_ORDER_MARKET_REFRESH", Settings.PRE_ORDER_MARKET_REFRESH
         ),
@@ -531,6 +572,9 @@ def load_settings() -> Settings:
         ),
         ANALYSIS_MAX_WORKERS=_read_env_int(
             "ANALYSIS_MAX_WORKERS", Settings.ANALYSIS_MAX_WORKERS
+        ),
+        MAX_MARKETS_PER_CYCLE=_read_env_int(
+            "MAX_MARKETS_PER_CYCLE", Settings.MAX_MARKETS_PER_CYCLE
         ),
         RESOLUTION_SYNC_INTERVAL_CYCLES=_read_env_int(
             "RESOLUTION_SYNC_INTERVAL_CYCLES",
@@ -677,12 +721,7 @@ def load_settings() -> Settings:
 
 
 def _required_env_vars(settings: Settings) -> tuple[str, ...]:
-    required = list(BASE_REQUIRED_ENV_VARS)
-    if settings.EXECUTE_ONCHAIN or settings.AUTO_APPROVE_USDC:
-        required.append("ALCHEMY_RPC_URL")
-    if settings.AUTO_APPROVE_USDC:
-        required.append("PREDICTBASE_CONTRACT_ADDRESS")
-    return tuple(required)
+    return tuple(BASE_REQUIRED_ENV_VARS)
 
 
 def _validate_required(

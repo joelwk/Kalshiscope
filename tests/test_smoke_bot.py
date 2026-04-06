@@ -22,7 +22,7 @@ class DummyGrok:
         return self._decision
 
 
-class DummyPredictBase:
+class DummyKalshi:
     def __init__(self, markets):
         self._markets = markets
         self.submitted = False
@@ -38,14 +38,14 @@ class DummyPredictBase:
 def test_bot_smoke_dry_run(
     monkeypatch, sample_market, sample_decision, dummy_settings
 ) -> None:
-    dummy_predictbase = DummyPredictBase([sample_market])
+    dummy_kalshi = DummyKalshi([sample_market])
 
     monkeypatch.setattr(main, "load_settings", lambda: dummy_settings)
     monkeypatch.setattr(main, "GrokClient", lambda *args, **kwargs: DummyGrok(sample_decision))
     monkeypatch.setattr(
         main,
-        "PredictBaseClient",
-        lambda *args, **kwargs: dummy_predictbase,
+        "KalshiClient",
+        lambda *args, **kwargs: dummy_kalshi,
     )
 
     def _stop_sleep(_):
@@ -56,14 +56,14 @@ def test_bot_smoke_dry_run(
     with pytest.raises(KeyboardInterrupt):
         main.main()
 
-    assert dummy_predictbase.submitted is False
+    assert dummy_kalshi.submitted is False
 
 
 def test_bot_smoke_parallel_analysis_dry_run(
     monkeypatch, sample_market, sample_decision, dummy_settings
 ) -> None:
     second_market = sample_market.model_copy(update={"id": "m2", "question": "Will it snow?"})
-    dummy_predictbase = DummyPredictBase([sample_market, second_market])
+    dummy_kalshi = DummyKalshi([sample_market, second_market])
     tuned_settings = replace(
         dummy_settings,
         PARALLEL_ANALYSIS_ENABLED=True,
@@ -77,8 +77,8 @@ def test_bot_smoke_parallel_analysis_dry_run(
     monkeypatch.setattr(main, "GrokClient", lambda *args, **kwargs: DummyGrok(sample_decision))
     monkeypatch.setattr(
         main,
-        "PredictBaseClient",
-        lambda *args, **kwargs: dummy_predictbase,
+        "KalshiClient",
+        lambda *args, **kwargs: dummy_kalshi,
     )
 
     def _stop_sleep(_):
@@ -89,4 +89,4 @@ def test_bot_smoke_parallel_analysis_dry_run(
     with pytest.raises(KeyboardInterrupt):
         main.main()
 
-    assert dummy_predictbase.submitted is False
+    assert dummy_kalshi.submitted is False

@@ -115,6 +115,35 @@ def _response_preview(text: str, max_chars: int = _MAX_MODEL_RESPONSE_LOG_CHARS)
     return preview[:max_chars] + "..."
 
 
+def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "reasoning_tokens": None,
+            "cached_tokens": None,
+        }
+
+    def _read(mapping_or_obj: Any, key: str) -> Any:
+        if mapping_or_obj is None:
+            return None
+        if isinstance(mapping_or_obj, dict):
+            return mapping_or_obj.get(key)
+        return getattr(mapping_or_obj, key, None)
+
+    prompt_details = _read(usage, "prompt_tokens_details")
+    completion_details = _read(usage, "completion_tokens_details")
+    return {
+        "prompt_tokens": _read(usage, "prompt_tokens"),
+        "completion_tokens": _read(usage, "completion_tokens"),
+        "reasoning_tokens": _read(completion_details, "reasoning_tokens"),
+        "cached_tokens": _read(prompt_details, "cached_tokens"),
+    }
+
+
 def _format_previous_analysis(previous: TradeDecision | None) -> str:
     if not previous:
         return "None"
@@ -174,21 +203,30 @@ def _category_research_hint(profile_name: str) -> str:
 
 class GrokClient:
     """Client for interacting with xAI Grok for market analysis."""
+    _init_log_emitted = False
 
     def __init__(
         self,
         api_key: str,
         model: str = "grok-3",
+        model_deep: str | None = None,
         min_bet_usdc: float = 2.0,
         max_bet_usdc: float = 10.0,
         search_config: SearchConfig | None = None,
     ) -> None:
         self.client = Client(api_key=api_key, timeout=_XAI_CLIENT_TIMEOUT_SECONDS)
         self.model = model
+        self.model_deep = model_deep or model
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
         self.default_search_config = search_config or _default_search_config()
-        logger.debug("GrokClient initialized with model=%s", model)
+        if not GrokClient._init_log_emitted:
+            logger.debug(
+                "GrokClient initialized with model=%s model_deep=%s",
+                model,
+                self.model_deep,
+            )
+            GrokClient._init_log_emitted = True
 
     def _active_search_config(self, search_config: SearchConfig | None) -> SearchConfig:
         config = search_config or self.default_search_config
@@ -613,9 +651,14 @@ class GrokClient:
 
         return normalized_payload
 
-    def _build_chat(self, config: SearchConfig, enable_multimedia: bool):
+    def _build_chat(
+        self,
+        config: SearchConfig,
+        enable_multimedia: bool,
+        model: str | None = None,
+    ):
         return self.client.chat.create(
-            model=self.model,
+            model=model or self.model,
             response_format=TradeDecision,
             tools=[
                 web_search(allowed_domains=config.allowed_domains),
@@ -644,6 +687,12 @@ class GrokClient:
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
         content = ""
+        usage_metrics: dict[str, int | None] = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "reasoning_tokens": None,
+            "cached_tokens": None,
+        }
         logger.debug(
             "Starting market analysis: id=%s",
             market.id,
@@ -654,6 +703,7 @@ class GrokClient:
                 "liquidity_usdc": market.liquidity_usdc,
                 "search_profile": active_config.profile_name,
                 "lookback_hours": active_config.lookback_hours,
+                "model": self.model,
             },
         )
 
@@ -683,20 +733,15 @@ class GrokClient:
                     f"bet_range=${self.min_bet_usdc:.2f}-${self.max_bet_usdc:.2f}\n"
                     f"{_category_research_hint(active_config.profile_name)}\n"
                     "</constraints>\n"
-                    "<output_rules>\n"
-                    "outcome must EXACTLY match one provided outcome label\n"
-                    "reasoning must explain why the selected outcome has edge over market pricing\n"
-                    "reasoning must explicitly include: Implied prob: X, My prob: Y, Edge: Z\n"
-                    "include likelihood_ratio as a positive decimal; use 1.0 for neutral evidence\n"
-                    "</output_rules>\n"
                 )
             )
 
             chunk_count = 0
             deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
-            for _, chunk in chat.stream():
+            for response, chunk in chat.stream():
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market.id}")
+                usage_metrics = _extract_usage_metrics(response)
                 if chunk.content:
                     content += chunk.content
                     chunk_count += 1
@@ -757,7 +802,12 @@ class GrokClient:
                     "evidence_quality": decision.evidence_quality,
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,
+                    "model": self.model,
                     "chunks": chunk_count,
+                    "prompt_tokens": usage_metrics["prompt_tokens"],
+                    "completion_tokens": usage_metrics["completion_tokens"],
+                    "reasoning_tokens": usage_metrics["reasoning_tokens"],
+                    "cached_tokens": usage_metrics["cached_tokens"],
                     "duration_ms": round(total_duration, 2),
                 },
             )
@@ -805,6 +855,12 @@ class GrokClient:
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
         content = ""
+        usage_metrics: dict[str, int | None] = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "reasoning_tokens": None,
+            "cached_tokens": None,
+        }
         logger.debug(
             "Starting deep market analysis: id=%s",
             market.id,
@@ -816,6 +872,7 @@ class GrokClient:
                 "previous_analysis": previous_summary,
                 "search_profile": active_config.profile_name,
                 "lookback_hours": active_config.lookback_hours,
+                "model": self.model_deep,
             },
         )
 
@@ -825,7 +882,11 @@ class GrokClient:
                 decision=previous_analysis,
                 config=active_config,
             )
-            chat = self._build_chat(active_config, enable_multimedia)
+            chat = self._build_chat(
+                active_config,
+                enable_multimedia,
+                model=self.model_deep,
+            )
             chat.append(
                 system(_SYSTEM_PROMPT_DEEP)
             )
@@ -846,22 +907,15 @@ class GrokClient:
                     "Re-check implied probability and edge from multiple sources.\n"
                     "If edge < 5%, return should_trade=false and bet_size_pct=0.0.\n"
                     "</constraints>\n"
-                    "<output_rules>\n"
-                    "outcome must EXACTLY match one provided outcome label\n"
-                    "if outcome changes vs previous analysis, justify stronger evidence and materially better edge\n"
-                    "always include every required TradeDecision field\n"
-                    "all probability fields must be decimals between 0 and 1\n"
-                    "edge_external must be a decimal between -1 and 1 (not percentages)\n"
-                    "likelihood_ratio must be a positive decimal; use 1.0 for neutral evidence\n"
-                    "</output_rules>\n"
                 )
             )
 
             chunk_count = 0
             deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
-            for _, chunk in chat.stream():
+            for response, chunk in chat.stream():
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market.id}")
+                usage_metrics = _extract_usage_metrics(response)
                 if chunk.content:
                     content += chunk.content
                     chunk_count += 1
@@ -937,7 +991,12 @@ class GrokClient:
                     "evidence_quality": decision.evidence_quality,
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,
+                    "model": self.model_deep,
                     "chunks": chunk_count,
+                    "prompt_tokens": usage_metrics["prompt_tokens"],
+                    "completion_tokens": usage_metrics["completion_tokens"],
+                    "reasoning_tokens": usage_metrics["reasoning_tokens"],
+                    "cached_tokens": usage_metrics["cached_tokens"],
                     "duration_ms": round(total_duration, 2),
                     "previous_analysis": previous_summary,
                 },

@@ -40,11 +40,10 @@ from models import (
     Position,
     TradeDecision,
 )
-from predictbase_client import PredictBaseClient
+from kalshi_client import KalshiClient
 from refinement import RefinementStrategy
 from research_profiles import build_market_search_config, market_category_flags
 from score_engine import compute_final_score
-from web3_client import Web3Client
 
 logger = get_logger("predictbot")
 
@@ -113,19 +112,26 @@ def _filter_markets(
     min_liquidity,
     allowlist,
     blocklist,
+    ticker_prefix_blocklist=(),
     min_close_days=None,
     max_close_days=None,
     stats: dict[str, int] | None = None,
+    min_volume_24h: float = 0.0,
+    extreme_yes_price_lower: float | None = None,
+    extreme_yes_price_upper: float | None = None,
 ):
     """Filter markets based on liquidity, category, and close date constraints."""
     filtered = []
     skipped_liquidity = 0
+    skipped_volume_24h = 0
+    skipped_extreme_price = 0
     skipped_allowlist = 0
     skipped_blocklist = 0
     skipped_close_too_soon = 0
     skipped_close_too_far = 0
     skipped_closed_now = 0
     skipped_resolved = 0
+    skipped_ticker_prefix_blocklist = 0
 
     now = datetime.now(timezone.utc)
     min_close_date = now + timedelta(days=min_close_days) if min_close_days else None
@@ -135,15 +141,41 @@ def _filter_markets(
         close_time = market.close_time
         if close_time and close_time.tzinfo is None:
             close_time = close_time.replace(tzinfo=timezone.utc)
-        if market.liquidity_usdc is not None and market.liquidity_usdc < min_liquidity:
+        effective_liquidity = (
+            market.liquidity_usdc if market.liquidity_usdc is not None else 0.0
+        )
+        if effective_liquidity < min_liquidity:
             skipped_liquidity += 1
             continue
+        if min_volume_24h > 0.0:
+            effective_volume_24h = (
+                market.volume_24h if market.volume_24h is not None else 0.0
+            )
+            if effective_volume_24h < min_volume_24h:
+                skipped_volume_24h += 1
+                continue
+        yes_price = _get_outcome_entry_price(market, "YES")
+        if yes_price is not None:
+            if (
+                extreme_yes_price_lower is not None
+                and yes_price <= extreme_yes_price_lower
+            ) or (
+                extreme_yes_price_upper is not None
+                and yes_price >= extreme_yes_price_upper
+            ):
+                skipped_extreme_price += 1
+                continue
         if allowlist and (market.category not in allowlist):
             skipped_allowlist += 1
             continue
         if blocklist and (market.category in blocklist):
             skipped_blocklist += 1
             continue
+        if ticker_prefix_blocklist:
+            market_id = (market.id or "").upper()
+            if any(market_id.startswith(prefix.upper()) for prefix in ticker_prefix_blocklist):
+                skipped_ticker_prefix_blocklist += 1
+                continue
         if _is_market_resolved_or_closed(market):
             skipped_resolved += 1
             continue
@@ -161,13 +193,17 @@ def _filter_markets(
         filtered.append(market)
 
     logger.debug(
-        "Market filtering complete: kept=%d, skipped_liquidity=%d, skipped_allowlist=%d, "
-        "skipped_blocklist=%d, skipped_resolved=%d, skipped_close_too_soon=%d, "
+        "Market filtering complete: kept=%d, skipped_liquidity=%d, skipped_volume_24h=%d, "
+        "skipped_extreme_price=%d, skipped_allowlist=%d, "
+        "skipped_blocklist=%d, skipped_ticker_prefix_blocklist=%d, skipped_resolved=%d, skipped_close_too_soon=%d, "
         "skipped_close_too_far=%d, skipped_closed_now=%d",
         len(filtered),
         skipped_liquidity,
+        skipped_volume_24h,
+        skipped_extreme_price,
         skipped_allowlist,
         skipped_blocklist,
+        skipped_ticker_prefix_blocklist,
         skipped_resolved,
         skipped_close_too_soon,
         skipped_close_too_far,
@@ -175,8 +211,11 @@ def _filter_markets(
         data={
             "kept": len(filtered),
             "skipped_liquidity": skipped_liquidity,
+            "skipped_volume_24h": skipped_volume_24h,
+            "skipped_extreme_price": skipped_extreme_price,
             "skipped_allowlist": skipped_allowlist,
             "skipped_blocklist": skipped_blocklist,
+            "skipped_ticker_prefix_blocklist": skipped_ticker_prefix_blocklist,
             "skipped_resolved": skipped_resolved,
             "skipped_close_too_soon": skipped_close_too_soon,
             "skipped_close_too_far": skipped_close_too_far,
@@ -188,8 +227,11 @@ def _filter_markets(
             {
                 "kept": len(filtered),
                 "skipped_liquidity": skipped_liquidity,
+                "skipped_volume_24h": skipped_volume_24h,
+                "skipped_extreme_price": skipped_extreme_price,
                 "skipped_allowlist": skipped_allowlist,
                 "skipped_blocklist": skipped_blocklist,
+                "skipped_ticker_prefix_blocklist": skipped_ticker_prefix_blocklist,
                 "skipped_resolved": skipped_resolved,
                 "skipped_close_too_soon": skipped_close_too_soon,
                 "skipped_close_too_far": skipped_close_too_far,
@@ -197,6 +239,82 @@ def _filter_markets(
             }
         )
     return filtered
+
+
+def _collapse_event_ladders(
+    markets: list[Market],
+    *,
+    ladder_collapse_threshold: int,
+    max_brackets_per_event: int,
+) -> list[Market]:
+    """Collapse large event ladders to the most price-informative brackets."""
+    if not markets:
+        return markets
+    if ladder_collapse_threshold <= 0 or max_brackets_per_event <= 0:
+        return markets
+
+    event_groups: dict[str, list[Market]] = {}
+    for market in markets:
+        event_ticker = (market.event_ticker or "").strip()
+        if not event_ticker:
+            continue
+        event_groups.setdefault(event_ticker, []).append(market)
+
+    collapsed_events = 0
+    removed_markets = 0
+    keep_ids: set[str] = set()
+    for event_ticker, event_markets in event_groups.items():
+        if len(event_markets) <= ladder_collapse_threshold:
+            for market in event_markets:
+                keep_ids.add(market.id)
+            continue
+
+        collapsed_events += 1
+        ranked = sorted(
+            event_markets,
+            key=lambda market: (
+                abs((_get_outcome_entry_price(market, "YES") or -1.0) - 0.5),
+                -(market.liquidity_usdc or 0.0),
+                market.id,
+            ),
+        )
+        selected = ranked[:max_brackets_per_event]
+        for market in selected:
+            keep_ids.add(market.id)
+        removed_markets += max(0, len(event_markets) - len(selected))
+        logger.debug(
+            "Collapsed ladder event=%s total=%d kept=%d",
+            event_ticker,
+            len(event_markets),
+            len(selected),
+            data={
+                "event_ticker": event_ticker,
+                "total_markets": len(event_markets),
+                "kept_markets": [market.id for market in selected],
+                "removed_count": max(0, len(event_markets) - len(selected)),
+            },
+        )
+
+    if collapsed_events == 0:
+        return markets
+
+    collapsed: list[Market] = []
+    for market in markets:
+        if market.id in keep_ids or not (market.event_ticker or "").strip():
+            collapsed.append(market)
+
+    logger.info(
+        "Collapsed event ladders: events=%d removed=%d kept=%d",
+        collapsed_events,
+        removed_markets,
+        len(collapsed),
+        data={
+            "collapsed_events": collapsed_events,
+            "removed_markets": removed_markets,
+            "kept_markets": len(collapsed),
+        },
+    )
+    return collapsed
 
 
 def _dedupe_markets_by_matchup(markets: list[Market]) -> list[Market]:
@@ -931,10 +1049,6 @@ def _calculate_bet(max_bet, bet_pct):
     return max_bet * bet_pct
 
 
-def _usdc_from_wei(balance_wei: int, decimals: int = 6) -> float:
-    return float(balance_wei) / float(10 ** max(decimals, 0))
-
-
 def _cap_confidence_for_category(
     decision: TradeDecision,
     market: Market,
@@ -1067,15 +1181,18 @@ def _log_settings_summary(settings) -> None:
             "min_bet_usdc": settings.MIN_BET_USDC,
             "max_bet_usdc": settings.MAX_BET_USDC,
             "min_confidence": settings.MIN_CONFIDENCE,
+            "confidence_gate_edge_override_enabled": settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED,
+            "confidence_gate_min_edge": settings.CONFIDENCE_GATE_MIN_EDGE,
+            "confidence_gate_min_evidence_quality": settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
             "min_liquidity_usdc": settings.MIN_LIQUIDITY_USDC,
             "poll_interval_sec": settings.POLL_INTERVAL_SEC,
             "market_min_close_days": settings.MARKET_MIN_CLOSE_DAYS,
             "market_max_close_days": settings.MARKET_MAX_CLOSE_DAYS,
-            "execute_onchain": settings.EXECUTE_ONCHAIN,
-            "auto_approve_usdc": settings.AUTO_APPROVE_USDC,
             "grok_model": settings.GROK_MODEL,
             "categories_allowlist": settings.MARKET_CATEGORIES_ALLOWLIST,
             "categories_blocklist": settings.MARKET_CATEGORIES_BLOCKLIST,
+            "ticker_prefix_blocklist": settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
+            "kalshi_server_side_filters_enabled": settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
             "bayesian_enabled": settings.BAYESIAN_ENABLED,
@@ -1133,6 +1250,30 @@ def _format_close_days_info(min_days, max_days) -> str:
     if max_days is not None:
         parts.append(f"max={max_days}d")
     return f", close_window=[{', '.join(parts)}]"
+
+
+def _build_kalshi_market_fetch_window(
+    min_close_days: int | None,
+    max_close_days: int | None,
+) -> tuple[datetime | None, datetime | None]:
+    now = datetime.now(timezone.utc)
+    start = now + timedelta(days=min_close_days) if min_close_days is not None else None
+    end = now + timedelta(days=max_close_days) if max_close_days is not None else None
+    return start, end
+
+
+def _confidence_gate_override_metrics(
+    market: Market,
+    decision: TradeDecision,
+) -> tuple[float | None, float | None]:
+    implied_prob = _get_implied_probability(market, decision.outcome)
+    market_edge = (decision.confidence - implied_prob) if implied_prob is not None else None
+    model_edge = decision.edge_external
+    if model_edge is not None and market_edge is not None:
+        return (max(model_edge, market_edge), market_edge)
+    if model_edge is not None:
+        return (model_edge, market_edge)
+    return (market_edge, market_edge)
 
 
 def _record_terminal_outcome(
@@ -1216,9 +1357,22 @@ def _build_grok_client_for_worker(settings: Settings) -> GrokClient:
     return GrokClient(
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
+        model_deep=settings.GROK_MODEL_DEEP,
         min_bet_usdc=settings.MIN_BET_USDC,
         max_bet_usdc=settings.MAX_BET_USDC,
     )
+
+
+def _cap_analysis_candidates(
+    analysis_candidates: list[dict[str, Any]],
+    max_markets_per_cycle: int,
+) -> list[dict[str, Any]]:
+    """Apply a hard cap to per-cycle market analysis candidates."""
+    if max_markets_per_cycle <= 0:
+        return []
+    if len(analysis_candidates) <= max_markets_per_cycle:
+        return analysis_candidates
+    return analysis_candidates[:max_markets_per_cycle]
 
 
 def _analyze_market_candidate(
@@ -1341,71 +1495,22 @@ def main() -> None:
     grok_client = GrokClient(
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
+        model_deep=settings.GROK_MODEL_DEEP,
         min_bet_usdc=settings.MIN_BET_USDC,
         max_bet_usdc=settings.MAX_BET_USDC,
     )
-    logger.debug("Grok client initialized with model=%s", settings.GROK_MODEL)
-
-    # Initialize Web3Client first to get wallet address for PredictBase
-    web3_client = None
-    wallet_address = None
-    if settings.EXECUTE_ONCHAIN or settings.AUTO_APPROVE_USDC:
-        if not settings.USDC_TOKEN_ADDRESS:
-            logger.error("USDC_TOKEN_ADDRESS is required for on-chain execution")
-            raise ValueError("USDC_TOKEN_ADDRESS is required for on-chain execution")
-        web3_client = Web3Client(
-            rpc_url=settings.ALCHEMY_RPC_URL,
-            private_key=settings.WALLET_PRIVATE_KEY,
-            usdc_token_address=settings.USDC_TOKEN_ADDRESS,
-            chain_id=settings.CHAIN_ID,
-        )
-        wallet_address = web3_client.address
-        logger.info(
-            "Web3 client initialized: address=%s, chain_id=%s",
-            web3_client.address,
-            web3_client.chain_id,
-        )
-
-    predictbase_client = PredictBaseClient(
-        base_url=settings.PREDICTBASE_API_BASE_URL,
-        api_key=settings.PREDICTBASE_API_KEY,
-        api_key_header=settings.PREDICTBASE_API_KEY_HEADER,
-        api_key_prefix=settings.PREDICTBASE_API_KEY_PREFIX,
-        wallet_address=wallet_address,
-        slippage_confidence_threshold=settings.SLIPPAGE_CONFIDENCE_THRESHOLD,
+    logger.debug(
+        "Grok client initialized with model=%s model_deep=%s",
+        settings.GROK_MODEL,
+        settings.GROK_MODEL_DEEP,
     )
-    logger.debug("PredictBase client initialized with base_url=%s", settings.PREDICTBASE_API_BASE_URL)
 
-    if web3_client and settings.AUTO_APPROVE_USDC:
-        if not settings.PREDICTBASE_CONTRACT_ADDRESS:
-            logger.error("PREDICTBASE_CONTRACT_ADDRESS is required for approvals")
-            raise ValueError("PREDICTBASE_CONTRACT_ADDRESS is required for approvals")
-
-        allowance = web3_client.get_allowance(settings.PREDICTBASE_CONTRACT_ADDRESS)
-        target_allowance = int(settings.MAX_BET_USDC * (10**settings.USDC_DECIMALS))
-        logger.debug(
-            "Checking USDC allowance: current=%d, target=%d",
-            allowance,
-            target_allowance,
-        )
-
-        if allowance < target_allowance:
-            if settings.DRY_RUN:
-                logger.info(
-                    "DRY_RUN: would approve USDC for contract=%s",
-                    settings.PREDICTBASE_CONTRACT_ADDRESS,
-                )
-            else:
-                logger.info(
-                    "Approving USDC for contract=%s, amount=%.2f",
-                    settings.PREDICTBASE_CONTRACT_ADDRESS,
-                    settings.MAX_BET_USDC,
-                )
-                web3_client.approve_usdc(
-                    settings.PREDICTBASE_CONTRACT_ADDRESS,
-                    settings.MAX_BET_USDC,
-                    decimals=settings.USDC_DECIMALS,
-                )
+    kalshi_client = KalshiClient(
+        base_url=settings.KALSHI_API_BASE_URL,
+        api_key_id=settings.KALSHI_API_KEY_ID,
+        private_key_path=settings.KALSHI_PRIVATE_KEY_PATH,
+    )
+    logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
 
     logger.info("PredictBot started (dry_run=%s)", settings.DRY_RUN)
     cycle_count = 0
@@ -1419,7 +1524,33 @@ def main() -> None:
         logger.info("Starting bot cycle #%d", cycle_count)
 
         try:
-            markets = predictbase_client.get_markets()
+            fetch_window_start, fetch_window_end = _build_kalshi_market_fetch_window(
+                settings.MARKET_MIN_CLOSE_DAYS,
+                settings.MARKET_MAX_CLOSE_DAYS,
+            )
+            if settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED:
+                try:
+                    markets = kalshi_client.get_markets(
+                        close_time_start=fetch_window_start,
+                        close_time_end=fetch_window_end,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Kalshi server-side filters failed; falling back to unfiltered fetch: %s",
+                        exc,
+                        data={
+                            "error": str(exc),
+                            "close_time_start": fetch_window_start.isoformat()
+                            if fetch_window_start
+                            else None,
+                            "close_time_end": fetch_window_end.isoformat()
+                            if fetch_window_end
+                            else None,
+                        },
+                    )
+                    markets = kalshi_client.get_markets()
+            else:
+                markets = kalshi_client.get_markets()
             fetched_count = len(markets)
             logger.info("Fetched %d raw markets", fetched_count)
 
@@ -1429,27 +1560,34 @@ def main() -> None:
                 settings.MIN_LIQUIDITY_USDC,
                 settings.MARKET_CATEGORIES_ALLOWLIST,
                 settings.MARKET_CATEGORIES_BLOCKLIST,
+                ticker_prefix_blocklist=settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
                 min_close_days=settings.MARKET_MIN_CLOSE_DAYS,
                 max_close_days=settings.MARKET_MAX_CLOSE_DAYS,
                 stats=filter_stats,
+                min_volume_24h=settings.MIN_VOLUME_24H,
+                extreme_yes_price_lower=settings.EXTREME_YES_PRICE_LOWER,
+                extreme_yes_price_upper=settings.EXTREME_YES_PRICE_UPPER,
             )
             logger.info("Filtered to %d eligible markets", len(markets))
 
+            markets = _collapse_event_ladders(
+                markets,
+                ladder_collapse_threshold=settings.LADDER_COLLAPSE_THRESHOLD,
+                max_brackets_per_event=settings.MAX_BRACKETS_PER_EVENT,
+            )
             markets = _dedupe_markets_by_matchup(markets)
 
             markets = scheduler.prioritize_markets(markets, state_manager)
 
             cycle_bankroll: float | None = None
-            if web3_client is not None:
-                try:
-                    balance_wei = web3_client.get_usdc_balance()
-                    cycle_bankroll = _usdc_from_wei(balance_wei, settings.USDC_DECIMALS)
-                except Exception as exc:
-                    logger.debug(
-                        "On-chain balance lookup failed for position cap: %s",
-                        exc,
-                        data={"error": str(exc)},
-                    )
+            try:
+                cycle_bankroll = kalshi_client.get_balance()
+            except Exception as exc:
+                logger.debug(
+                    "Kalshi balance lookup failed for position cap: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
 
             if settings.RESOLUTION_SYNC_INTERVAL_CYCLES > 0:
                 if cycle_count % settings.RESOLUTION_SYNC_INTERVAL_CYCLES == 0:
@@ -1541,6 +1679,23 @@ def main() -> None:
                         "state": state,
                         "anchor_analysis": anchor_analysis,
                     }
+                )
+
+            original_analysis_candidates_count = len(analysis_candidates)
+            analysis_candidates = _cap_analysis_candidates(
+                analysis_candidates,
+                settings.MAX_MARKETS_PER_CYCLE,
+            )
+            if len(analysis_candidates) < original_analysis_candidates_count:
+                logger.info(
+                    "Capped analysis candidates from %d to %d",
+                    original_analysis_candidates_count,
+                    len(analysis_candidates),
+                    data={
+                        "analysis_candidates_original": original_analysis_candidates_count,
+                        "analysis_candidates_capped": len(analysis_candidates),
+                        "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+                    },
                 )
 
             analysis_results: dict[str, dict[str, Any]] = {}
@@ -1698,12 +1853,6 @@ def main() -> None:
                         },
                     )
 
-                log_trade_decision(
-                    market_id=market.id,
-                    question=market.question,
-                    decision=decision.model_dump(),
-                )
-
                 previous_reasoning_hash: str | None = None
                 current_reasoning_hash = _build_reasoning_hash(decision)
                 if settings.BAYESIAN_SKIP_STALE_UPDATES:
@@ -1784,27 +1933,57 @@ def main() -> None:
                     continue
 
                 if decision.confidence < settings.MIN_CONFIDENCE:
-                    trades_skipped_confidence += 1
-                    log_trade_decision(
-                        market_id=market.id,
-                        question=market.question,
-                        decision=decision.model_dump(),
-                        execution_audit={
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "confidence_below_min",
-                        },
+                    override_edge, market_edge = _confidence_gate_override_metrics(market, decision)
+                    confidence_override_allowed = (
+                        settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED
+                        and override_edge is not None
+                        and override_edge >= settings.CONFIDENCE_GATE_MIN_EDGE
+                        and decision.evidence_quality
+                        >= settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY
                     )
-                    _record_terminal_outcome(state_manager, market.id, "confidence_below_min")
-                    question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
-                    logger.info(
-                        "SKIP [%s] '%s' -> conf %.2f < min %.2f",
-                        market.id,
-                        question_short,
-                        decision.confidence,
-                        settings.MIN_CONFIDENCE,
-                    )
-                    continue
+                    if confidence_override_allowed:
+                        logger.info(
+                            "Confidence gate override [%s]: conf %.2f < min %.2f but edge %.3f and evidence %.2f meet override thresholds",
+                            market.id,
+                            decision.confidence,
+                            settings.MIN_CONFIDENCE,
+                            override_edge,
+                            decision.evidence_quality,
+                            data={
+                                "market_id": market.id,
+                                "confidence": decision.confidence,
+                                "min_confidence": settings.MIN_CONFIDENCE,
+                                "override_edge": override_edge,
+                                "market_edge": market_edge,
+                                "model_edge": decision.edge_external,
+                                "evidence_quality": decision.evidence_quality,
+                            },
+                        )
+                    else:
+                        trades_skipped_confidence += 1
+                        log_trade_decision(
+                            market_id=market.id,
+                            question=market.question,
+                            decision=decision.model_dump(),
+                            execution_audit={
+                                "decision_terminal": True,
+                                "final_action": "skip",
+                                "final_reason": "confidence_below_min",
+                                "confidence_gate_override_allowed": False,
+                                "confidence_gate_override_edge": override_edge,
+                                "confidence_gate_override_market_edge": market_edge,
+                            },
+                        )
+                        _record_terminal_outcome(state_manager, market.id, "confidence_below_min")
+                        question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                        logger.info(
+                            "SKIP [%s] '%s' -> conf %.2f < min %.2f",
+                            market.id,
+                            question_short,
+                            decision.confidence,
+                            settings.MIN_CONFIDENCE,
+                        )
+                        continue
 
                 entry_price = _get_outcome_entry_price(market, decision.outcome)
                 implied_prob = _get_implied_probability(market, decision.outcome)
@@ -2619,7 +2798,7 @@ def main() -> None:
                 active_market = market
                 if settings.PRE_ORDER_MARKET_REFRESH:
                     try:
-                        refreshed = predictbase_client.get_market(market.id)
+                        refreshed = kalshi_client.get_market(market.id)
                         if refreshed.outcomes:
                             active_market = refreshed
                             logger.debug(
@@ -2649,7 +2828,7 @@ def main() -> None:
                             break
                     if option_index is not None:
                         try:
-                            orderbook = predictbase_client.get_market_orderbook(active_market.id)
+                            orderbook = kalshi_client.get_market_orderbook(active_market.id)
                             best_sell = _best_orderbook_sell_price(orderbook, option_index)
                             entry_price_for_check = _get_outcome_entry_price(active_market, decision.outcome)
                             if (
@@ -2706,17 +2885,10 @@ def main() -> None:
                     decision_for_edge.confidence,
                 )
 
-                slippage_pct = (
-                    settings.SLIPPAGE_PCT
-                    if decision_for_edge.confidence >= settings.SLIPPAGE_CONFIDENCE_THRESHOLD
-                    else 0.0
-                )
-
                 try:
-                    order_response = predictbase_client.submit_order(
+                    order_response = kalshi_client.submit_order(
                         order,
                         market=active_market,
-                        slippage_pct=slippage_pct,
                     )
                 except InsufficientBalanceError as balance_exc:
                     available = balance_exc.available
@@ -2811,45 +2983,6 @@ def main() -> None:
                     },
                 )
                 _record_terminal_outcome(state_manager, market.id, "order_submitted")
-
-                if settings.EXECUTE_ONCHAIN and web3_client:
-                    if order_response.onchain_payload:
-                        # Only validate wallet balance when an on-chain payload is actually present.
-                        # If PredictBase fulfills the order using deposited funds, the on-chain
-                        # wallet USDC balance is irrelevant and should not trigger warnings.
-                        if not web3_client.has_sufficient_balance(
-                            bet_amount, decimals=settings.USDC_DECIMALS
-                        ):
-                            logger.warning(
-                                "Skipping on-chain execution due to low wallet USDC balance: "
-                                "order=%s market=%s needed=%.2f",
-                                order_response.id,
-                                market.id,
-                                bet_amount,
-                                data={
-                                    "order_id": order_response.id,
-                                    "market_id": market.id,
-                                    "required_usdc": bet_amount,
-                                },
-                            )
-                            continue
-                        logger.info(
-                            "Executing on-chain trade for order=%s",
-                            order_response.id,
-                        )
-                        tx_hash = web3_client.send_onchain_payload(
-                            order_response.onchain_payload
-                        )
-                        logger.info(
-                            "On-chain trade submitted: order=%s, tx_hash=%s",
-                            order_response.id,
-                            tx_hash,
-                        )
-                    else:
-                        logger.warning(
-                            "No on-chain payload found for order=%s",
-                            order_response.id,
-                        )
 
                 try:
                     client_price = None

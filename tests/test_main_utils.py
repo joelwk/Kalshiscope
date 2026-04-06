@@ -6,15 +6,17 @@ from config import Settings
 from main import (
     _best_orderbook_sell_price,
     _build_reasoning_hash,
+    _cap_analysis_candidates,
     _cap_effective_confidence_for_market,
     _calculate_bet,
+    _collapse_event_ladders,
+    _confidence_gate_override_metrics,
     _compute_next_wakeup_seconds,
     _edge_threshold_for_market,
     _effective_position_override_threshold,
     _filter_markets,
     _log_settings_summary,
     _should_adjust_position,
-    _usdc_from_wei,
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
 
@@ -107,6 +109,105 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(stats["skipped_blocklist"], 1)
         self.assertEqual(stats["skipped_close_too_soon"], 1)
 
+    def test_filter_markets_applies_ticker_prefix_blocklist(self) -> None:
+        markets = [
+            Market(id="KXBTC15M-26APR061800-00", question="15m market", liquidity_usdc=200),
+            Market(id="KXBTCD-26APR0717-T70000", question="Daily market", liquidity_usdc=200),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=(),
+            ticker_prefix_blocklist=("KXBTC15M-",),
+            stats=stats,
+        )
+        self.assertEqual([m.id for m in filtered], ["KXBTCD-26APR0717-T70000"])
+        self.assertEqual(stats["skipped_ticker_prefix_blocklist"], 1)
+
+    def test_filter_markets_treats_null_liquidity_as_zero(self) -> None:
+        markets = [
+            Market(id="null-liq", question="Null liquidity", liquidity_usdc=None),
+            Market(id="ok-liq", question="Sufficient liquidity", liquidity_usdc=150),
+        ]
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=(),
+        )
+        self.assertEqual([m.id for m in filtered], ["ok-liq"])
+
+    def test_filter_markets_applies_volume_and_extreme_price_filters(self) -> None:
+        markets = [
+            Market(
+                id="low-volume",
+                question="Low volume",
+                outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+                liquidity_usdc=200,
+                volume_24h=5,
+            ),
+            Market(
+                id="extreme-price",
+                question="Extreme price",
+                outcomes=[MarketOutcome(name="YES", price=0.99), MarketOutcome(name="NO", price=0.01)],
+                liquidity_usdc=200,
+                volume_24h=100,
+            ),
+            Market(
+                id="kept",
+                question="Kept market",
+                outcomes=[MarketOutcome(name="YES", price=0.52), MarketOutcome(name="NO", price=0.48)],
+                liquidity_usdc=200,
+                volume_24h=100,
+            ),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=(),
+            stats=stats,
+            min_volume_24h=10,
+            extreme_yes_price_lower=0.05,
+            extreme_yes_price_upper=0.95,
+        )
+        self.assertEqual([m.id for m in filtered], ["kept"])
+        self.assertEqual(stats["skipped_volume_24h"], 1)
+        self.assertEqual(stats["skipped_extreme_price"], 1)
+
+    def test_collapse_event_ladders_keeps_most_informative_brackets(self) -> None:
+        event_markets = [
+            Market(id="m1", event_ticker="E1", question="Q", outcomes=[MarketOutcome(name="YES", price=0.10)]),
+            Market(id="m2", event_ticker="E1", question="Q", outcomes=[MarketOutcome(name="YES", price=0.49)]),
+            Market(id="m3", event_ticker="E1", question="Q", outcomes=[MarketOutcome(name="YES", price=0.51)]),
+            Market(id="m4", event_ticker="E1", question="Q", outcomes=[MarketOutcome(name="YES", price=0.90)]),
+            Market(id="m5", event_ticker="E1", question="Q", outcomes=[MarketOutcome(name="YES", price=0.70)]),
+            Market(id="m6", event_ticker="E2", question="Q", outcomes=[MarketOutcome(name="YES", price=0.30)]),
+            Market(id="no-event", question="Q", outcomes=[MarketOutcome(name="YES", price=0.60)]),
+        ]
+        collapsed = _collapse_event_ladders(
+            event_markets,
+            ladder_collapse_threshold=4,
+            max_brackets_per_event=3,
+        )
+        collapsed_ids = {market.id for market in collapsed}
+        self.assertEqual(len([m for m in collapsed if m.event_ticker == "E1"]), 3)
+        self.assertIn("m2", collapsed_ids)
+        self.assertIn("m3", collapsed_ids)
+        self.assertIn("m5", collapsed_ids)
+        self.assertIn("m6", collapsed_ids)
+        self.assertIn("no-event", collapsed_ids)
+
+    def test_cap_analysis_candidates_limits_list_size(self) -> None:
+        candidates = [{"market": f"m{i}"} for i in range(6)]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=3)
+        self.assertEqual(len(capped), 3)
+        self.assertEqual(capped[0]["market"], "m0")
+        self.assertEqual(capped[-1]["market"], "m2")
+
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {
             "sells": [
@@ -128,7 +229,8 @@ class TestMainUtils(unittest.TestCase):
             KELLY_FRACTION_SHORT_HORIZON_HOURS=1,
             KELLY_FRACTION_SHORT_HORIZON=0.1,
             XAI_API_KEY="xai-key",
-            WALLET_PRIVATE_KEY="wallet-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         with patch("main.logger.info") as info_mock:
             _log_settings_summary(settings)
@@ -174,7 +276,8 @@ class TestMainUtils(unittest.TestCase):
             URGENT_REANALYSIS_DAYS_BEFORE_CLOSE=1,
             URGENT_REANALYSIS_COOLDOWN_HOURS=1,
             XAI_API_KEY="xai-key",
-            WALLET_PRIVATE_KEY="wallet-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         wakeup_seconds = _compute_next_wakeup_seconds(
             [market],
@@ -189,7 +292,8 @@ class TestMainUtils(unittest.TestCase):
             MAX_SPORTS_CONFIDENCE=0.80,
             MAX_ESPORTS_CONFIDENCE=0.75,
             XAI_API_KEY="xai-key",
-            WALLET_PRIVATE_KEY="wallet-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         sports_market = Market(id="s1", question="NBA: A vs B", category="sports")
         esports_market = Market(id="e1", question="Esports: A vs B", category="esports")
@@ -217,7 +321,8 @@ class TestMainUtils(unittest.TestCase):
             COINFLIP_PRICE_UPPER=0.55,
             FALLBACK_EDGE_MIN_EDGE=0.08,
             XAI_API_KEY="xai-key",
-            WALLET_PRIVATE_KEY="wallet-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         self.assertEqual(_edge_threshold_for_market(0.60, settings, "computed"), 0.05)
         self.assertEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.08)
@@ -229,7 +334,8 @@ class TestMainUtils(unittest.TestCase):
             MAX_POSITION_PCT_OF_BANKROLL=0.15,
             MAX_BET_USDC=50.0,
             XAI_API_KEY="xai-key",
-            WALLET_PRIVATE_KEY="wallet-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         decision = TradeDecision(
             should_trade=True,
@@ -287,16 +393,31 @@ class TestMainUtils(unittest.TestCase):
             HIGH_CONFIDENCE_POSITION_OVERRIDE=0.85,
             MAX_SPORTS_CONFIDENCE=0.80,
             XAI_API_KEY="xai-key",
-            WALLET_PRIVATE_KEY="wallet-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         sports_market = Market(id="s2", question="NBA: A vs B", category="sports")
         threshold = _effective_position_override_threshold(sports_market, settings)
         self.assertEqual(threshold, 0.85)
         self.assertFalse(0.80 >= threshold)
 
-    def test_usdc_from_wei_conversion(self) -> None:
-        self.assertEqual(_usdc_from_wei(2_500_000, 6), 2.5)
-
+    def test_confidence_gate_override_metrics_prefers_stronger_edge(self) -> None:
+        market = Market(
+            id="m-override",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.10), MarketOutcome(name="NO", price=0.90)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.40,
+            bet_size_pct=0.5,
+            reasoning="test",
+            edge_external=0.12,
+        )
+        override_edge, market_edge = _confidence_gate_override_metrics(market, decision)
+        self.assertAlmostEqual(market_edge or 0.0, 0.30)
+        self.assertAlmostEqual(override_edge or 0.0, 0.30)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+from logging_config import get_logger, log_api_call
+from models import InsufficientBalanceError, Market, MarketOutcome, OrderRequest, OrderResponse
+
+logger = get_logger(__name__)
+
+_ONE_HUNDRED = 100
+_MIN_VALID_PRICE = 0.01
+_MAX_VALID_PRICE = 0.99
+_DEFAULT_PRICE = 0.50
+_DEFAULT_LIMIT = 1000
+_DEFAULT_TIME_IN_FORCE = "immediate_or_cancel"
+
+
+class KalshiClient:
+    """Client for interacting with the Kalshi Trade API v2."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key_id: str,
+        private_key_path: str,
+        timeout_sec: int = 20,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key_id = api_key_id
+        self.timeout_sec = timeout_sec
+        self.private_key = self._load_private_key(private_key_path)
+        self.session = requests.Session()
+        logger.debug(
+            "KalshiClient initialized: base_url=%s timeout=%ds",
+            self.base_url,
+            self.timeout_sec,
+        )
+
+    @staticmethod
+    def _load_private_key(private_key_path: str):
+        pem_bytes = Path(private_key_path).read_bytes()
+        return serialization.load_pem_private_key(pem_bytes, password=None)
+
+    def _build_signed_headers(self, method: str, path: str) -> dict[str, str]:
+        timestamp_ms = str(int(time.time() * 1000))
+        message = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
+        signature = self.private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        signature_b64 = base64.b64encode(signature).decode("utf-8")
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+            "KALSHI-ACCESS-SIGNATURE": signature_b64,
+            "Content-Type": "application/json",
+        }
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> requests.Response:
+        url = urljoin(f"{self.base_url}/", path.lstrip("/"))
+        parsed = urlparse(url)
+        signed_path = parsed.path
+        headers = self._build_signed_headers(method, signed_path)
+        start_time = time.monotonic()
+        response = None
+        try:
+            response = self.session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json,
+                headers=headers,
+                timeout=self.timeout_sec,
+            )
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method=method.upper(),
+                url=url,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+            )
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            log_api_call(
+                logger,
+                method=method.upper(),
+                url=url,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            raise
+
+    def get_markets(
+        self,
+        status: str = "open",
+        limit: int = _DEFAULT_LIMIT,
+        *,
+        close_time_start: datetime | None = None,
+        close_time_end: datetime | None = None,
+    ) -> list[Market]:
+        """Fetch all paginated markets from Kalshi."""
+        markets: list[Market] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": limit}
+            if status:
+                params["status"] = status
+            if cursor:
+                params["cursor"] = cursor
+            if close_time_start is not None:
+                params["close_time_start"] = close_time_start.astimezone(timezone.utc).isoformat()
+            if close_time_end is not None:
+                params["close_time_end"] = close_time_end.astimezone(timezone.utc).isoformat()
+            response = self._request("GET", "/markets", params=params)
+            payload = response.json()
+            raw_markets = payload.get("markets", []) if isinstance(payload, dict) else []
+            for raw_market in raw_markets:
+                markets.append(_parse_market(raw_market))
+            cursor = payload.get("cursor") if isinstance(payload, dict) else None
+            if not cursor:
+                break
+        return markets
+
+    def get_market(self, market_ticker: str) -> Market:
+        response = self._request("GET", f"/markets/{market_ticker}")
+        payload = response.json()
+        raw_market = payload.get("market", payload) if isinstance(payload, dict) else payload
+        return _parse_market(raw_market)
+
+    def get_market_orderbook(self, market_ticker: str) -> dict[str, Any]:
+        response = self._request("GET", f"/markets/{market_ticker}/orderbook")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Orderbook response is not a JSON object")
+        return payload
+
+    def get_balance(self) -> float:
+        """Return available balance in dollars."""
+        response = self._request("GET", "/portfolio/balance")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return 0.0
+        value_cents = (
+            payload.get("available_balance")
+            or payload.get("available")
+            or payload.get("balance")
+            or payload.get("portfolio_balance")
+            or 0
+        )
+        return _coerce_money_to_dollars(value_cents)
+
+    def get_positions(self) -> dict[str, Any]:
+        response = self._request("GET", "/portfolio/positions")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Positions response is not a JSON object")
+        return payload
+
+    def create_order(self, order: OrderRequest, market: Market | None = None) -> OrderResponse:
+        return self.submit_order(order, market=market)
+
+    def submit_order(self, order: OrderRequest, market: Market | None = None) -> OrderResponse:
+        """Submit a limit buy order in Kalshi format."""
+        side = _to_kalshi_side(order.outcome)
+        action = order.side.lower() if order.side else "buy"
+        if action not in {"buy", "sell"}:
+            action = "buy"
+
+        price = _resolve_order_price(order=order, market=market)
+        count = max(1, int(order.amount_usdc / price))
+        price_cents = int(round(price * _ONE_HUNDRED))
+        price_cents = max(1, min(99, price_cents))
+
+        payload = {
+            "ticker": order.market_id,
+            "client_order_id": _build_client_order_id(order.market_id or ""),
+            "type": "limit",
+            "time_in_force": _DEFAULT_TIME_IN_FORCE,
+            "action": action,
+            "side": side,
+            "count": count,
+        }
+        if side == "yes":
+            payload["yes_price"] = price_cents
+        else:
+            payload["no_price"] = price_cents
+
+        try:
+            response = self._request("POST", "/portfolio/orders", json=payload)
+        except requests.exceptions.HTTPError as exc:
+            response_text = ""
+            if exc.response is not None:
+                response_text = exc.response.text.lower()
+                logger.error(
+                    "Order rejected by Kalshi: market=%s status=%s payload=%s body=%s",
+                    order.market_id,
+                    exc.response.status_code,
+                    payload,
+                    exc.response.text,
+                    data={
+                        "market_id": order.market_id,
+                        "status_code": exc.response.status_code,
+                        "payload": payload,
+                        "response_body": exc.response.text,
+                    },
+                )
+            if "insufficient" in response_text and "balance" in response_text:
+                raise InsufficientBalanceError("Insufficient balance on Kalshi account") from exc
+            raise
+
+        response_data = response.json()
+        response_order = response_data.get("order", response_data) if isinstance(response_data, dict) else {}
+        order_id = (
+            response_order.get("order_id")
+            or response_order.get("id")
+            or response_data.get("order_id")
+            or response_data.get("id")
+        )
+        status = response_order.get("status") or response_data.get("status")
+        response_data["client_price"] = price
+        response_data["client_qty_shares"] = count
+        response_data["client_amount_usdc"] = order.amount_usdc
+        return OrderResponse(
+            id=str(order_id) if order_id else None,
+            status=status,
+            raw=response_data,
+        )
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        response = self._request("DELETE", f"/portfolio/orders/{order_id}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {"ok": True}
+        return payload
+
+
+def _to_kalshi_side(outcome: str) -> str:
+    normalized = (outcome or "").strip().lower()
+    if normalized in {"yes", "true", "1"}:
+        return "yes"
+    if normalized in {"no", "false", "0"}:
+        return "no"
+    return "yes"
+
+
+def _resolve_order_price(order: OrderRequest, market: Market | None) -> float:
+    if market:
+        for outcome in market.outcomes:
+            if outcome.name.strip().lower() == order.outcome.strip().lower() and outcome.price is not None:
+                return max(_MIN_VALID_PRICE, min(_MAX_VALID_PRICE, outcome.price))
+    return _DEFAULT_PRICE
+
+
+def _build_client_order_id(market_id: str) -> str:
+    """Build a compact, deterministic client order id within API length limits."""
+    timestamp_ms = int(time.time() * 1000)
+    digest = hashlib.sha1(market_id.encode("utf-8")).hexdigest()[:12]
+    return f"BOT-{digest}-{timestamp_ms}"
+
+
+def _parse_market(raw: dict[str, Any]) -> Market:
+    ticker = str(raw.get("ticker") or raw.get("id") or "")
+    question = str(raw.get("title") or raw.get("subtitle") or raw.get("question") or "")
+    if not ticker or not question:
+        raise ValueError("Missing ticker/title in market payload")
+
+    yes_price = _extract_yes_price(raw)
+    no_price = None if yes_price is None else max(0.0, min(1.0, 1.0 - yes_price))
+    outcomes = [
+        MarketOutcome(name="YES", price=yes_price),
+        MarketOutcome(name="NO", price=no_price),
+    ]
+    close_time = _parse_datetime(raw.get("close_time") or raw.get("expiration_time"))
+
+    volume_value = _coerce_float(raw.get("volume"))
+    if volume_value is None:
+        volume_value = _coerce_float(raw.get("volume_fp"))
+    open_interest_value = _coerce_float(raw.get("open_interest"))
+    if open_interest_value is None:
+        open_interest_value = _coerce_float(raw.get("open_interest_fp"))
+    liquidity_value = _coerce_float(raw.get("liquidity"))
+    if liquidity_value is None:
+        liquidity_value = _coerce_float(raw.get("liquidity_dollars"))
+
+    liquidity_usdc = volume_value
+    if liquidity_usdc is None:
+        liquidity_usdc = open_interest_value
+    if liquidity_usdc is None:
+        liquidity_usdc = liquidity_value
+
+    volume_24h = _coerce_float(raw.get("volume_24h"))
+    if volume_24h is None:
+        volume_24h = _coerce_float(raw.get("volume_24h_fp"))
+    event_ticker = str(raw.get("event_ticker") or "").strip() or None
+    series_ticker = str(raw.get("series_ticker") or "").strip() or None
+    market_type = str(raw.get("market_type") or "").strip() or None
+
+    extra = dict(raw)
+    for key in (
+        "ticker",
+        "id",
+        "title",
+        "subtitle",
+        "question",
+        "close_time",
+        "expiration_time",
+        "status",
+        "volume",
+        "volume_fp",
+        "volume_24h",
+        "volume_24h_fp",
+        "open_interest",
+        "open_interest_fp",
+        "liquidity",
+        "liquidity_dollars",
+        "event_ticker",
+        "series_ticker",
+        "market_type",
+    ):
+        extra.pop(key, None)
+
+    return Market(
+        id=ticker,
+        question=question,
+        outcomes=outcomes,
+        liquidity_usdc=liquidity_usdc,
+        category=raw.get("category") or series_ticker,
+        event_ticker=event_ticker,
+        series_ticker=series_ticker,
+        market_type=market_type,
+        volume=volume_value,
+        open_interest=open_interest_value,
+        volume_24h=volume_24h,
+        close_time=close_time,
+        url=None,
+        status=raw.get("status"),
+        **extra,
+    )
+
+
+def _extract_yes_price(raw: dict[str, Any]) -> float | None:
+    candidates = [
+        raw.get("yes_ask_dollars"),
+        raw.get("yes_bid_dollars"),
+        raw.get("last_price_dollars"),
+        raw.get("yes_ask"),
+        raw.get("yes_bid"),
+        raw.get("last_price"),
+    ]
+    for candidate in candidates:
+        parsed = _coerce_price(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _coerce_price(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric > 1.0:
+        numeric = numeric / _ONE_HUNDRED
+    return max(0.0, min(1.0, numeric))
+
+
+def _coerce_money_to_dollars(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if numeric >= _ONE_HUNDRED:
+        return numeric / _ONE_HUNDRED
+    return numeric
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None

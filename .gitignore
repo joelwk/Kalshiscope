@@ -7,3 +7,6 @@ logs/
 data/market_state.db
 data/market_state.json
 *.log
+*.txt
+*.pem
+kalshi-scope.txt

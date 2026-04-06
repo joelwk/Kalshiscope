@@ -1,16 +1,7 @@
-import json
-from pathlib import Path
-
 import pytest
 
 from config import Settings
 from models import Market, MarketOutcome, TradeDecision
-
-
-@pytest.fixture()
-def predictbase_markets_snapshot() -> dict:
-    path = Path(__file__).parent / "fixtures" / "predictbase_markets.json"
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @pytest.fixture()
@@ -39,14 +30,11 @@ def sample_decision() -> TradeDecision:
 def dummy_settings() -> Settings:
     return Settings(
         XAI_API_KEY="xai-key",
-        ALCHEMY_RPC_URL="https://rpc.example",
-        WALLET_PRIVATE_KEY="0xabc",
-        PREDICTBASE_API_BASE_URL="https://api.example",
+        KALSHI_API_BASE_URL="https://api.example/trade-api/v2",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         DRY_RUN=True,
-        EXECUTE_ONCHAIN=False,
-        AUTO_APPROVE_USDC=False,
         MIN_CONFIDENCE=0.7,
         MIN_LIQUIDITY_USDC=100.0,
         MAX_BET_USDC=50.0,
-        PREDICTBASE_API_KEY=None,
     )

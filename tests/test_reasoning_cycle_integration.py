@@ -31,7 +31,8 @@ def _market() -> Market:
 def _settings() -> Settings:
     return Settings(
         XAI_API_KEY="xai-key",
-        WALLET_PRIVATE_KEY="0xabc",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
     )
 
 

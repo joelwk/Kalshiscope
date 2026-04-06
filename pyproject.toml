@@ -1,18 +1,17 @@
 [tool.poetry]
-name = "predi"
+name = "kalshi-scope"
 version = "0.1.0"
 description = "Autonomous prediction market trading bot using xAI Grok"
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
-packages = [{ include = "predi" }]
+packages = [{ include = "kalshi" }]
 
 [tool.poetry.dependencies]
 python = "^3.10"
-openai = "^1.40.0"
 xai-sdk = "^1.3.1"
 pydantic = "^2.5.0"
 requests = "^2.31.0"
-web3 = "^6.0.0"
+cryptography = "^44.0.0"
 python-dotenv = "^1.0.0"
 tenacity = "^8.2.0"
 
@@ -20,7 +19,8 @@ tenacity = "^8.2.0"
 pytest = "^7.4.0"
 
 [tool.poetry.scripts]
-predi = "predi.cli:main"
+predi = "kalshi.cli:main"
+kalshi = "kalshi.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

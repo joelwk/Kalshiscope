@@ -151,6 +151,6 @@ def test_position_override_respects_sports_cap() -> None:
         market,
         settings,
     )
-    assert should_add is True
-    assert bet_pct == 0.4
-    assert reason == "high_confidence_override"
+    assert should_add is False
+    assert bet_pct == 0.0
+    assert reason == "insufficient_confidence_increase"

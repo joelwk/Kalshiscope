@@ -6,11 +6,16 @@ import config
 
 
 class TestConfig(unittest.TestCase):
+    def _required_env(self) -> dict[str, str]:
+        return {
+            "XAI_API_KEY": "xai-key",
+            "KALSHI_API_KEY_ID": "kalshi-key-id",
+            "KALSHI_PRIVATE_KEY_PATH": "kalshi-scope.txt",
+        }
+
     def test_load_settings_success(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "ALCHEMY_RPC_URL": "https://rpc.example",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "MARKET_CATEGORIES_ALLOWLIST": "sports, politics",
             "MARKET_CATEGORIES_BLOCKLIST": "crypto",
             "MIN_BET_USDC": "10",
@@ -20,9 +25,12 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
 
-        self.assertEqual(settings.XAI_API_KEY, "xai-key")
-        self.assertEqual(settings.ALCHEMY_RPC_URL, "https://rpc.example")
-        self.assertEqual(settings.WALLET_PRIVATE_KEY, "0xabc")
+        self.assertEqual(settings.XAI_API_KEY, self._required_env()["XAI_API_KEY"])
+        self.assertEqual(settings.KALSHI_API_KEY_ID, self._required_env()["KALSHI_API_KEY_ID"])
+        self.assertEqual(
+            settings.KALSHI_PRIVATE_KEY_PATH,
+            self._required_env()["KALSHI_PRIVATE_KEY_PATH"],
+        )
         self.assertEqual(settings.MARKET_CATEGORIES_ALLOWLIST, ("sports", "politics"))
         self.assertEqual(settings.MARKET_CATEGORIES_BLOCKLIST, ("crypto",))
         self.assertEqual(settings.MIN_BET_USDC, 10.0)
@@ -31,8 +39,7 @@ class TestConfig(unittest.TestCase):
 
     def test_close_days_filter_settings(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "MARKET_MIN_CLOSE_DAYS": "1",
             "MARKET_MAX_CLOSE_DAYS": "7",
         }
@@ -42,65 +49,49 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MARKET_MIN_CLOSE_DAYS, 1)
         self.assertEqual(settings.MARKET_MAX_CLOSE_DAYS, 7)
 
-    def test_close_days_filter_defaults_to_none(self) -> None:
+    def test_market_filtering_tuning_settings_overrides(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
+            "MIN_VOLUME_24H": "1250",
+            "EXTREME_YES_PRICE_LOWER": "0.04",
+            "EXTREME_YES_PRICE_UPPER": "0.96",
+            "LADDER_COLLAPSE_THRESHOLD": "7",
+            "MAX_BRACKETS_PER_EVENT": "4",
+            "MAX_MARKETS_PER_CYCLE": "80",
         }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+
+        self.assertEqual(settings.MIN_VOLUME_24H, 1250.0)
+        self.assertEqual(settings.EXTREME_YES_PRICE_LOWER, 0.04)
+        self.assertEqual(settings.EXTREME_YES_PRICE_UPPER, 0.96)
+        self.assertEqual(settings.LADDER_COLLAPSE_THRESHOLD, 7)
+        self.assertEqual(settings.MAX_BRACKETS_PER_EVENT, 4)
+        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 80)
+
+    def test_close_days_filter_defaults_to_none(self) -> None:
+        env = self._required_env()
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
 
         self.assertIsNone(settings.MARKET_MIN_CLOSE_DAYS)
         self.assertIsNone(settings.MARKET_MAX_CLOSE_DAYS)
 
-    def test_safe_mode_allows_missing_alchemy_rpc_url(self) -> None:
-        env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
-            "DRY_RUN": "true",
-            "EXECUTE_ONCHAIN": "false",
-            "AUTO_APPROVE_USDC": "false",
-        }
+    def test_dry_run_and_no_blockchain_flags_exist(self) -> None:
+        env = {**self._required_env(), "DRY_RUN": "true"}
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
-
-        self.assertEqual(settings.ALCHEMY_RPC_URL, "")
-
-    def test_execute_onchain_requires_alchemy_rpc_url(self) -> None:
-        env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
-            "EXECUTE_ONCHAIN": "true",
-            "AUTO_APPROVE_USDC": "false",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaisesRegex(ValueError, "ALCHEMY_RPC_URL"):
-                config.load_settings()
-
-    def test_auto_approve_requires_predictbase_contract_address(self) -> None:
-        env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
-            "AUTO_APPROVE_USDC": "true",
-            "EXECUTE_ONCHAIN": "false",
-            "ALCHEMY_RPC_URL": "https://rpc.example",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaisesRegex(ValueError, "PREDICTBASE_CONTRACT_ADDRESS"):
-                config.load_settings()
+        self.assertTrue(settings.DRY_RUN)
 
     def test_missing_required_env_raises(self) -> None:
-        env = {
-            "XAI_API_KEY": "xai-key",
-        }
+        env = {"XAI_API_KEY": "xai-key"}
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaises(ValueError):
                 config.load_settings()
 
     def test_search_settings_overrides(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "SEARCH_LOOKBACK_HOURS": "12",
             "SEARCH_ALLOWED_DOMAINS": "example.com, news.example",
             "SEARCH_ALLOWED_X_HANDLES": "Foo, Bar",
@@ -116,8 +107,7 @@ class TestConfig(unittest.TestCase):
 
     def test_build_search_config(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "SEARCH_LOOKBACK_HOURS": "6",
             "SEARCH_ALLOWED_DOMAINS": "example.com",
             "SEARCH_ALLOWED_X_HANDLES": "Foo",
@@ -138,8 +128,7 @@ class TestConfig(unittest.TestCase):
 
     def test_flip_guard_settings_overrides(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "FLIP_GUARD_ENABLED": "false",
             "FLIP_GUARD_MIN_ABS_CONFIDENCE": "0.70",
             "FLIP_GUARD_MIN_CONF_GAIN": "0.10",
@@ -161,8 +150,7 @@ class TestConfig(unittest.TestCase):
 
     def test_parallel_and_execution_guard_settings_overrides(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "PARALLEL_ANALYSIS_ENABLED": "true",
             "ANALYSIS_MAX_WORKERS": "4",
             "PRE_ORDER_MARKET_REFRESH": "true",
@@ -184,8 +172,7 @@ class TestConfig(unittest.TestCase):
 
     def test_bayesian_lmsr_kelly_settings_overrides(self) -> None:
         env = {
-            "XAI_API_KEY": "xai-key",
-            "WALLET_PRIVATE_KEY": "0xabc",
+            **self._required_env(),
             "BAYESIAN_ENABLED": "true",
             "BAYESIAN_SKIP_STALE_UPDATES": "false",
             "BAYESIAN_PRIOR_DEFAULT": "0.58",

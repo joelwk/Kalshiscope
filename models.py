@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class MarketOutcome(BaseModel):
@@ -18,14 +18,30 @@ class Market(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str
+    ticker: str | None = None
     question: str
     outcomes: list[MarketOutcome] = Field(default_factory=list)
     liquidity_usdc: Optional[float] = None
     category: Optional[str] = None
+    event_ticker: str | None = None
+    series_ticker: str | None = None
+    market_type: str | None = None
+    yes_price: float | None = None
+    no_price: float | None = None
+    volume: float | None = None
+    open_interest: float | None = None
     close_time: Optional[datetime] = None
     url: Optional[str] = None
     status: int | str | None = None
     winning_option_raw: str | int | None = None
+
+    @model_validator(mode="after")
+    def _normalize_identifiers(self) -> "Market":
+        if not self.id and self.ticker:
+            self.id = self.ticker
+        if not self.ticker and self.id:
+            self.ticker = self.id
+        return self
 
 
 class TradeDecision(BaseModel):
@@ -94,17 +110,26 @@ class TradeDecision(BaseModel):
 
 
 class OrderRequest(BaseModel):
-    market_id: str
+    market_id: str | None = None
+    ticker: str | None = None
     outcome: str
     amount_usdc: float
+    action: str = "buy"
+    order_type: str = "limit"
+    count: int | None = None
+    yes_price: int | None = None
     side: str = "BUY"
     confidence: float | None = None
 
-
-class OnChainPayload(BaseModel):
-    to: str
-    data: str
-    value_wei: Optional[int] = None
+    @model_validator(mode="after")
+    def _normalize_market_identifier(self) -> "OrderRequest":
+        if not self.market_id and self.ticker:
+            self.market_id = self.ticker
+        if not self.ticker and self.market_id:
+            self.ticker = self.market_id
+        if not self.market_id:
+            raise ValueError("OrderRequest requires market_id or ticker")
+        return self
 
 
 class OrderResponse(BaseModel):
@@ -112,7 +137,10 @@ class OrderResponse(BaseModel):
 
     id: Optional[str] = None
     status: Optional[str] = None
-    onchain_payload: Optional[OnChainPayload] = None
+    side: Optional[str] = None
+    action: Optional[str] = None
+    count: Optional[int] = None
+    yes_price: Optional[int] = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
