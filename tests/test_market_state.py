@@ -196,6 +196,17 @@ def test_record_terminal_outcome_persists_on_market_state(tmp_path) -> None:
         state = manager.get_market_state(market_id)
         assert state is not None
         assert state.last_terminal_outcome == "no_trade_recommended"
+        assert state.non_actionable_streak == 1
+
+        manager.record_terminal_outcome(market_id, "score_gate_blocked")
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.non_actionable_streak == 2
+
+        manager.record_terminal_outcome(market_id, "order_submitted")
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.non_actionable_streak == 0
     finally:
         manager.close()
 

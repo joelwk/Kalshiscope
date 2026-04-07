@@ -129,6 +129,25 @@ def test_should_not_skip_non_actionable_terminal_outcome_after_short_cooldown() 
     assert reason == ""
 
 
+def test_should_skip_non_actionable_terminal_outcome_on_second_streak() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    market = _market("m8b", now + timedelta(days=4))
+    state = MarketState(
+        market_id="m8b",
+        last_analysis=now - timedelta(minutes=20),
+        analysis_count=2,
+        last_confidence=0.58,
+        confidence_trend=[0.58, 0.57],
+        last_terminal_outcome="no_trade_recommended",
+        non_actionable_streak=2,
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is True
+    assert reason == "recently analyzed"
+
+
 def test_should_skip_actionable_terminal_outcome_under_full_cooldown() -> None:
     now = datetime.now(timezone.utc)
     scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)

@@ -15,6 +15,7 @@ from main import (
     _edge_threshold_for_market,
     _effective_position_override_threshold,
     _extract_order_cancel_reason,
+    _extract_order_fill_count,
     _filter_markets,
     _log_settings_summary,
     _should_adjust_position,
@@ -148,6 +149,10 @@ class TestMainUtils(unittest.TestCase):
         payload = {"status": "canceled", "cancel_reason": "price moved"}
         self.assertEqual(_extract_order_cancel_reason(payload), "price moved")
 
+    def test_extract_order_fill_count_reads_nested_order_field(self) -> None:
+        payload = {"order": {"status": "canceled", "fill_count_fp": "0.00"}}
+        self.assertEqual(_extract_order_fill_count(payload), 0.0)
+
     def test_filter_markets_treats_null_liquidity_as_zero(self) -> None:
         markets = [
             Market(id="null-liq", question="Null liquidity", liquidity_usdc=None),
@@ -229,6 +234,54 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(len(capped), 3)
         self.assertEqual(capped[0]["market"], "m0")
         self.assertEqual(capped[-1]["market"], "m2")
+
+    def test_cap_analysis_candidates_uses_family_round_robin(self) -> None:
+        candidates = [
+            {
+                "market": Market(
+                    id="c1",
+                    question="Will Bitcoin close above $70k?",
+                    category="crypto",
+                )
+            },
+            {
+                "market": Market(
+                    id="c2",
+                    question="Will Ethereum close above $4k?",
+                    category="crypto",
+                )
+            },
+            {
+                "market": Market(
+                    id="c3",
+                    question="Will Solana close above $200?",
+                    category="crypto",
+                )
+            },
+            {
+                "market": Market(
+                    id="s1",
+                    question="Will the Lakers win tonight?",
+                    category="sports",
+                )
+            },
+            {
+                "market": Market(
+                    id="s2",
+                    question="Will the Celtics win tonight?",
+                    category="sports",
+                )
+            },
+            {
+                "market": Market(
+                    id="p1",
+                    question="Will candidate X win the election?",
+                    category="politics",
+                )
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=4)
+        self.assertEqual([item["market"].id for item in capped], ["c1", "s1", "p1", "c2"])
 
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {

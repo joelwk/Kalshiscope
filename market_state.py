@@ -16,6 +16,19 @@ logger = get_logger(__name__)
 
 _CONFIDENCE_TREND_WINDOW = 5
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
+_NON_ACTIONABLE_TERMINAL_OUTCOMES = {
+    "analysis_only_insufficient_balance",
+    "bet_amount_zero",
+    "confidence_below_min",
+    "edge_gate_blocked",
+    "kelly_sub_floor_skip",
+    "lmsr_gate_blocked",
+    "no_trade_recommended",
+    "position_adjustment_blocked",
+    "score_gate_blocked",
+    "uniform_implied_probability",
+    "zero_bet_after_sizing",
+}
 
 
 class MarketStateManager:
@@ -38,7 +51,8 @@ class MarketStateManager:
                     question TEXT,
                     close_time TEXT,
                     category TEXT,
-                    last_terminal_outcome TEXT
+                    last_terminal_outcome TEXT,
+                    non_actionable_streak INTEGER DEFAULT 0
                 )
                 """
             )
@@ -154,7 +168,7 @@ class MarketStateManager:
     def get_market_state(self, market_id: str) -> MarketState | None:
         market_row = self._conn.execute(
             """
-            SELECT last_terminal_outcome
+            SELECT last_terminal_outcome, non_actionable_streak
             FROM markets
             WHERE id = ?
             """,
@@ -164,6 +178,11 @@ class MarketStateManager:
             str(market_row["last_terminal_outcome"])
             if market_row and market_row["last_terminal_outcome"] is not None
             else None
+        )
+        non_actionable_streak = (
+            int(market_row["non_actionable_streak"] or 0)
+            if market_row and market_row["non_actionable_streak"] is not None
+            else 0
         )
         latest_row = self._conn.execute(
             """
@@ -188,6 +207,7 @@ class MarketStateManager:
             return MarketState(
                 market_id=market_id,
                 last_terminal_outcome=last_terminal_outcome,
+                non_actionable_streak=non_actionable_streak,
             )
 
         trend_rows = self._conn.execute(
@@ -209,6 +229,7 @@ class MarketStateManager:
             last_confidence=latest_row["confidence"],
             confidence_trend=confidence_trend,
             last_terminal_outcome=last_terminal_outcome,
+            non_actionable_streak=non_actionable_streak,
         )
 
     def get_position(self, market_id: str) -> Position | None:
@@ -436,14 +457,31 @@ class MarketStateManager:
         )
 
     def record_terminal_outcome(self, market_id: str, terminal_outcome: str) -> None:
+        normalized = (terminal_outcome or "").strip().lower()
         with self._conn:
+            row = self._conn.execute(
+                """
+                SELECT non_actionable_streak
+                FROM markets
+                WHERE id = ?
+                """,
+                (market_id,),
+            ).fetchone()
+            previous_streak = int(row["non_actionable_streak"] or 0) if row else 0
+            next_streak = (
+                previous_streak + 1
+                if normalized in _NON_ACTIONABLE_TERMINAL_OUTCOMES
+                else 0
+            )
             self._conn.execute(
                 """
-                INSERT INTO markets (id, last_terminal_outcome)
-                VALUES (?, ?)
-                ON CONFLICT(id) DO UPDATE SET last_terminal_outcome = excluded.last_terminal_outcome
+                INSERT INTO markets (id, last_terminal_outcome, non_actionable_streak)
+                VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    last_terminal_outcome = excluded.last_terminal_outcome,
+                    non_actionable_streak = excluded.non_actionable_streak
                 """,
-                (market_id, terminal_outcome),
+                (market_id, terminal_outcome, next_streak),
             )
 
     def record_trade(
@@ -914,6 +952,7 @@ class MarketStateManager:
         self._ensure_column("analyses", "refinement_reason", "TEXT")
         self._ensure_column("analyses", "reasoning_hash", "TEXT")
         self._ensure_column("markets", "last_terminal_outcome", "TEXT")
+        self._ensure_column("markets", "non_actionable_streak", "INTEGER DEFAULT 0")
         self._ensure_column(
             "trade_outcomes",
             "resolution_state",

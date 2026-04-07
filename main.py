@@ -43,7 +43,7 @@ from models import (
 )
 from kalshi_client import KalshiClient
 from refinement import RefinementStrategy
-from research_profiles import build_market_search_config, market_category_flags
+from research_profiles import build_market_search_config, market_category_flags, market_family
 from score_engine import compute_final_score
 
 logger = get_logger("predictbot")
@@ -275,6 +275,31 @@ def _extract_order_cancel_reason(order_response: Any) -> str | None:
             value = nested_order.get(key)
             if value:
                 return str(value)
+    return None
+
+
+def _extract_order_fill_count(order_response: Any) -> float | None:
+    if order_response is None or not isinstance(order_response, dict):
+        return None
+    candidate_keys = ("fill_count_fp", "fill_count", "filled_count")
+    for key in candidate_keys:
+        value = order_response.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    nested_order = order_response.get("order")
+    if isinstance(nested_order, dict):
+        for key in candidate_keys:
+            value = nested_order.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -1162,10 +1187,7 @@ def _should_adjust_position(
     ):
         return False, 0.0, "opposite_outcome_blocked"
 
-    effective_max_position = settings.MAX_POSITION_PER_MARKET_USDC
-    if cycle_bankroll is not None and cycle_bankroll > 0:
-        bankroll_position_cap = cycle_bankroll * settings.MAX_POSITION_PCT_OF_BANKROLL
-        effective_max_position = min(effective_max_position, bankroll_position_cap)
+    effective_max_position = _effective_max_position_limit_usdc(settings, cycle_bankroll)
 
     if existing_position.total_amount_usdc >= effective_max_position:
         return False, 0.0, "max_position_reached"
@@ -1197,6 +1219,18 @@ def _should_adjust_position(
         else "confidence_increase_threshold_met"
     )
     return True, min(decision.bet_size_pct, remaining / settings.MAX_BET_USDC), reason
+
+
+def _effective_max_position_limit_usdc(
+    settings: Settings,
+    cycle_bankroll: float | None = None,
+) -> float:
+    """Compute effective per-market position cap for this cycle."""
+    effective_max_position = settings.MAX_POSITION_PER_MARKET_USDC
+    if cycle_bankroll is not None and cycle_bankroll > 0:
+        bankroll_position_cap = cycle_bankroll * settings.MAX_POSITION_PCT_OF_BANKROLL
+        effective_max_position = min(effective_max_position, bankroll_position_cap)
+    return effective_max_position
 
 
 def _log_settings_summary(settings) -> None:
@@ -1401,16 +1435,59 @@ def _build_grok_client_for_worker(settings: Settings) -> GrokClient:
     )
 
 
+def _analysis_candidate_family_counts(
+    analysis_candidates: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Build per-family counts for analysis candidate observability."""
+    counts: dict[str, int] = {}
+    for candidate in analysis_candidates:
+        market = candidate.get("market")
+        if not isinstance(market, Market):
+            continue
+        family = market_family(market)
+        counts[family] = counts.get(family, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _cap_analysis_candidates(
     analysis_candidates: list[dict[str, Any]],
     max_markets_per_cycle: int,
 ) -> list[dict[str, Any]]:
-    """Apply a hard cap to per-cycle market analysis candidates."""
+    """Apply a hard cap to per-cycle candidates with family stratification."""
     if max_markets_per_cycle <= 0:
         return []
     if len(analysis_candidates) <= max_markets_per_cycle:
         return analysis_candidates
-    return analysis_candidates[:max_markets_per_cycle]
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    family_order: list[str] = []
+    for candidate in analysis_candidates:
+        market = candidate.get("market")
+        if not isinstance(market, Market):
+            continue
+        family = market_family(market)
+        if family not in grouped:
+            grouped[family] = []
+            family_order.append(family)
+        grouped[family].append(candidate)
+
+    if not grouped:
+        return analysis_candidates[:max_markets_per_cycle]
+
+    selected: list[dict[str, Any]] = []
+    while len(selected) < max_markets_per_cycle:
+        progressed = False
+        for family in family_order:
+            family_candidates = grouped.get(family)
+            if not family_candidates:
+                continue
+            selected.append(family_candidates.pop(0))
+            progressed = True
+            if len(selected) >= max_markets_per_cycle:
+                break
+        if not progressed:
+            break
+    return selected
 
 
 def _analyze_market_candidate(
@@ -1649,6 +1726,8 @@ def main() -> None:
             scheduler_skipped_closed = 0
             scheduler_skipped_recently = 0
             scheduler_skipped_other = 0
+            position_skipped_saturated = 0
+            position_skipped_anchor_opposite = 0
             markets_analyzed = 0
             markets_refined = 0
             execution_candidates = 0
@@ -1699,6 +1778,38 @@ def main() -> None:
                     )
                     continue
 
+                existing_position: Position | None = None
+                try:
+                    existing_position = state_manager.get_position(market.id)
+                except Exception as exc:
+                    logger.warning(
+                        "Position lookup failed for market %s: %s",
+                        market.id,
+                        exc,
+                        data={"market_id": market.id, "error": str(exc)},
+                    )
+
+                effective_max_position = _effective_max_position_limit_usdc(
+                    settings,
+                    cycle_bankroll,
+                )
+                if (
+                    existing_position
+                    and existing_position.total_amount_usdc >= effective_max_position
+                ):
+                    position_skipped_saturated += 1
+                    logger.debug(
+                        "Skipping %s: position_saturated",
+                        market.id,
+                        data={
+                            "market_id": market.id,
+                            "reason": "position_saturated",
+                            "existing_position_usdc": existing_position.total_amount_usdc,
+                            "effective_max_position_usdc": effective_max_position,
+                        },
+                    )
+                    continue
+
                 anchor_analysis: dict[str, Any] | None = None
                 try:
                     anchor_analysis = state_manager.get_anchor_analysis(
@@ -1712,6 +1823,28 @@ def main() -> None:
                         exc,
                         data={"market_id": market.id, "error": str(exc)},
                     )
+                if (
+                    existing_position
+                    and settings.OPPOSITE_OUTCOME_STRATEGY == "block"
+                    and anchor_analysis
+                ):
+                    anchor_outcome = str(anchor_analysis.get("outcome") or "").strip()
+                    if anchor_outcome and not _outcomes_match(
+                        existing_position.outcome,
+                        anchor_outcome,
+                    ):
+                        position_skipped_anchor_opposite += 1
+                        logger.debug(
+                            "Skipping %s: position_anchor_outcome_conflict",
+                            market.id,
+                            data={
+                                "market_id": market.id,
+                                "reason": "position_anchor_outcome_conflict",
+                                "position_outcome": existing_position.outcome,
+                                "anchor_outcome": anchor_outcome,
+                            },
+                        )
+                        continue
                 analysis_candidates.append(
                     {
                         "market": market,
@@ -1721,9 +1854,15 @@ def main() -> None:
                 )
 
             original_analysis_candidates_count = len(analysis_candidates)
+            available_family_distribution = _analysis_candidate_family_counts(
+                analysis_candidates
+            )
             analysis_candidates = _cap_analysis_candidates(
                 analysis_candidates,
                 settings.MAX_MARKETS_PER_CYCLE,
+            )
+            selected_family_distribution = _analysis_candidate_family_counts(
+                analysis_candidates
             )
             if len(analysis_candidates) < original_analysis_candidates_count:
                 logger.info(
@@ -1736,6 +1875,23 @@ def main() -> None:
                         "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
                     },
                 )
+            logger.info(
+                "Analysis candidate funnel: available=%d selected=%d",
+                original_analysis_candidates_count,
+                len(analysis_candidates),
+                data={
+                    "analysis_candidates_available": original_analysis_candidates_count,
+                    "analysis_candidates_selected": len(analysis_candidates),
+                    "analysis_candidate_family_distribution_available": available_family_distribution,
+                    "analysis_candidate_family_distribution_selected": selected_family_distribution,
+                    "scheduler_skipped_closed": scheduler_skipped_closed,
+                    "scheduler_skipped_recently": scheduler_skipped_recently,
+                    "scheduler_skipped_other": scheduler_skipped_other,
+                    "position_skipped_saturated": position_skipped_saturated,
+                    "position_skipped_anchor_opposite": position_skipped_anchor_opposite,
+                    "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+                },
+            )
 
             analysis_results: dict[str, dict[str, Any]] = {}
             analysis_phase_start = time.monotonic()
@@ -3063,24 +3219,37 @@ def main() -> None:
                 )
                 normalized_order_status = (order_response.status or "").strip().lower()
                 order_cancel_reason = None
+                order_fill_count = None
                 if normalized_order_status in {"cancelled", "canceled"}:
                     if isinstance(order_response.raw, dict):
                         order_cancel_reason = _extract_order_cancel_reason(order_response.raw)
+                        order_fill_count = _extract_order_fill_count(order_response.raw)
                     logger.warning(
-                        "Order was canceled by exchange: market=%s order_id=%s status=%s reason=%s raw=%s",
+                        "Order was canceled by exchange: market=%s order_id=%s status=%s reason=%s fill_count=%s raw=%s",
                         market.id,
                         order_response.id,
                         order_response.status,
                         order_cancel_reason,
+                        order_fill_count,
                         order_response.raw,
                         data={
                             "market_id": market.id,
                             "order_id": order_response.id,
                             "order_status": order_response.status,
                             "order_cancel_reason": order_cancel_reason,
+                            "order_fill_count": order_fill_count,
                             "order_raw": order_response.raw,
                         },
                     )
+                unfilled_canceled_order = (
+                    normalized_order_status in {"cancelled", "canceled"}
+                    and (order_fill_count is None or order_fill_count <= 0.0)
+                )
+                final_reason = "order_submitted"
+                terminal_outcome = "order_submitted"
+                if unfilled_canceled_order:
+                    final_reason = "order_canceled_unfilled"
+                    terminal_outcome = "order_canceled_unfilled"
                 log_trade_decision(
                     market_id=market.id,
                     question=market.question,
@@ -3091,14 +3260,28 @@ def main() -> None:
                         "decision_phase": "order_submission",
                         "decision_terminal": True,
                         "final_action": "order_attempt",
-                        "final_reason": "order_submitted",
+                        "final_reason": final_reason,
                         "bet_amount_usdc": bet_amount,
                         "order_id": order_response.id,
                         "order_status": order_response.status,
                         "order_cancel_reason": order_cancel_reason,
+                        "order_fill_count": order_fill_count,
                     },
                 )
-                _record_terminal_outcome(state_manager, market.id, "order_submitted")
+                _record_terminal_outcome(state_manager, market.id, terminal_outcome)
+                if unfilled_canceled_order:
+                    logger.info(
+                        "Skip trade recording for unfilled canceled order: market=%s order_id=%s",
+                        market.id,
+                        order_response.id,
+                        data={
+                            "market_id": market.id,
+                            "order_id": order_response.id,
+                            "order_status": order_response.status,
+                            "order_fill_count": order_fill_count,
+                        },
+                    )
+                    continue
 
                 try:
                     client_price = None
