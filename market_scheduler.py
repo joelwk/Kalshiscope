@@ -9,6 +9,7 @@ from models import Market, MarketState
 logger = get_logger(__name__)
 
 _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS = 0.25
+_NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_SECOND = 1.0
 _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
     "analysis_only_insufficient_balance",
     "bet_amount_zero",
@@ -22,6 +23,13 @@ _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
     "uniform_implied_probability",
     "zero_bet_after_sizing",
 }
+_PRIORITY_STALENESS_WEIGHT = 2.0
+_PRIORITY_PRICE_OPPORTUNITY_WEIGHT = 1.5
+_PRIORITY_LIQUIDITY_WEIGHT = 0.75
+_PRIORITY_URGENT_BONUS = 1.0
+_PRIORITY_NON_ACTIONABLE_PENALTY = 0.5
+_LIQUIDITY_NORMALIZATION_CAP_USDC = 500.0
+_MAX_STALENESS_HOURS = 24.0 * 7.0
 
 
 def _normalize_terminal_outcome(value: str | None) -> str:
@@ -65,7 +73,12 @@ def resolve_reanalysis_cooldown_hours(
         state.last_terminal_outcome if state else None
     )
     if terminal_outcome in _NON_ACTIONABLE_TERMINAL_OUTCOMES:
-        return min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS)
+        non_actionable_streak = _effective_non_actionable_streak(state)
+        if non_actionable_streak <= 1:
+            return min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS)
+        if non_actionable_streak == 2:
+            return min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_SECOND)
+        return base_cooldown
     return base_cooldown
 
 
@@ -133,10 +146,10 @@ class MarketScheduler:
         markets: list[Market],
         state_manager: MarketStateManager,
     ) -> list[Market]:
-        """Sort markets by urgency and analysis recency."""
+        """Sort markets by urgency, staleness, opportunity, and liquidity."""
         now = datetime.now(timezone.utc)
 
-        def sort_key(market: Market) -> tuple[int, datetime, datetime]:
+        def sort_key(market: Market) -> tuple[float, datetime, str]:
             state = state_manager.get_market_state(market.id)
             last_analysis = state.last_analysis if state else None
             if last_analysis and last_analysis.tzinfo is None:
@@ -144,13 +157,33 @@ class MarketScheduler:
 
             urgent = self._is_urgent_close(market, now)
             close_time = _normalize_timestamp(market.close_time)
-
-            last_analysis_key = last_analysis or datetime.min.replace(tzinfo=timezone.utc)
-            return (
-                0 if urgent else 1,
-                last_analysis_key,
-                close_time,
+            staleness_hours = _staleness_hours(last_analysis, now)
+            staleness_score = min(
+                1.0,
+                staleness_hours / max(_MAX_STALENESS_HOURS, 1.0),
             )
+            yes_price = _extract_yes_price(market)
+            price_opportunity = _price_opportunity_score(yes_price)
+            liquidity_score = min(
+                1.0,
+                (market.liquidity_usdc or 0.0) / _LIQUIDITY_NORMALIZATION_CAP_USDC,
+            )
+            non_actionable_penalty = (
+                _PRIORITY_NON_ACTIONABLE_PENALTY
+                if _normalize_terminal_outcome(
+                    state.last_terminal_outcome if state else None
+                )
+                in _NON_ACTIONABLE_TERMINAL_OUTCOMES
+                else 0.0
+            )
+            priority_score = (
+                (_PRIORITY_URGENT_BONUS if urgent else 0.0)
+                + (_PRIORITY_STALENESS_WEIGHT * staleness_score)
+                + (_PRIORITY_PRICE_OPPORTUNITY_WEIGHT * price_opportunity)
+                + (_PRIORITY_LIQUIDITY_WEIGHT * liquidity_score)
+                - non_actionable_penalty
+            )
+            return (-priority_score, close_time, market.id)
 
         try:
             return sorted(markets, key=sort_key)
@@ -207,3 +240,38 @@ def _normalize_timestamp(
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _effective_non_actionable_streak(state: MarketState | None) -> int:
+    if not state:
+        return 0
+    raw_streak = max(0, int(getattr(state, "non_actionable_streak", 0) or 0))
+    terminal_outcome = _normalize_terminal_outcome(state.last_terminal_outcome)
+    if raw_streak == 0 and terminal_outcome in _NON_ACTIONABLE_TERMINAL_OUTCOMES:
+        return 1
+    return raw_streak
+
+
+def _extract_yes_price(market: Market) -> float | None:
+    if market.yes_price is not None:
+        return float(market.yes_price)
+    for outcome in market.outcomes or []:
+        if (outcome.name or "").strip().upper() != "YES":
+            continue
+        if outcome.price is None:
+            continue
+        return float(outcome.price)
+    return None
+
+
+def _price_opportunity_score(yes_price: float | None) -> float:
+    if yes_price is None:
+        return 0.0
+    distance_from_coinflip = abs(yes_price - 0.5)
+    return max(0.0, 1.0 - min(1.0, distance_from_coinflip / 0.5))
+
+
+def _staleness_hours(last_analysis: datetime | None, now: datetime) -> float:
+    if last_analysis is None:
+        return _MAX_STALENESS_HOURS
+    return max(0.0, (now - last_analysis).total_seconds() / 3600.0)

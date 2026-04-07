@@ -159,6 +159,7 @@ class MarketState(BaseModel):
     last_confidence: float | None = None
     confidence_trend: list[float] = Field(default_factory=list)
     last_terminal_outcome: str | None = None
+    non_actionable_streak: int = 0
 
 
 class Position(BaseModel):
