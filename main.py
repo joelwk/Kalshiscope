@@ -34,6 +34,7 @@ from market_state import MarketStateManager
 from models import (
     InsufficientBalanceError,
     Market,
+    MarketClosedError,
     MarketOutcome,
     MarketState,
     OrderRequest,
@@ -119,6 +120,7 @@ def _filter_markets(
     min_volume_24h: float = 0.0,
     extreme_yes_price_lower: float | None = None,
     extreme_yes_price_upper: float | None = None,
+    skip_weather_bin_markets: bool = False,
 ):
     """Filter markets based on liquidity, category, and close date constraints."""
     filtered = []
@@ -132,6 +134,7 @@ def _filter_markets(
     skipped_closed_now = 0
     skipped_resolved = 0
     skipped_ticker_prefix_blocklist = 0
+    skipped_weather_bin_markets = 0
 
     now = datetime.now(timezone.utc)
     min_close_date = now + timedelta(days=min_close_days) if min_close_days else None
@@ -176,6 +179,9 @@ def _filter_markets(
             if any(market_id.startswith(prefix.upper()) for prefix in ticker_prefix_blocklist):
                 skipped_ticker_prefix_blocklist += 1
                 continue
+        if skip_weather_bin_markets and _is_weather_bin_market((market.id or "").upper()):
+            skipped_weather_bin_markets += 1
+            continue
         if _is_market_resolved_or_closed(market):
             skipped_resolved += 1
             continue
@@ -196,7 +202,7 @@ def _filter_markets(
         "Market filtering complete: kept=%d, skipped_liquidity=%d, skipped_volume_24h=%d, "
         "skipped_extreme_price=%d, skipped_allowlist=%d, "
         "skipped_blocklist=%d, skipped_ticker_prefix_blocklist=%d, skipped_resolved=%d, skipped_close_too_soon=%d, "
-        "skipped_close_too_far=%d, skipped_closed_now=%d",
+        "skipped_close_too_far=%d, skipped_closed_now=%d, skipped_weather_bin_markets=%d",
         len(filtered),
         skipped_liquidity,
         skipped_volume_24h,
@@ -208,6 +214,7 @@ def _filter_markets(
         skipped_close_too_soon,
         skipped_close_too_far,
         skipped_closed_now,
+        skipped_weather_bin_markets,
         data={
             "kept": len(filtered),
             "skipped_liquidity": skipped_liquidity,
@@ -220,6 +227,7 @@ def _filter_markets(
             "skipped_close_too_soon": skipped_close_too_soon,
             "skipped_close_too_far": skipped_close_too_far,
             "skipped_closed_now": skipped_closed_now,
+            "skipped_weather_bin_markets": skipped_weather_bin_markets,
         },
     )
     if stats is not None:
@@ -236,9 +244,38 @@ def _filter_markets(
                 "skipped_close_too_soon": skipped_close_too_soon,
                 "skipped_close_too_far": skipped_close_too_far,
                 "skipped_closed_now": skipped_closed_now,
+                "skipped_weather_bin_markets": skipped_weather_bin_markets,
             }
         )
     return filtered
+
+
+def _is_weather_bin_market(market_id: str) -> bool:
+    return bool(re.match(r"^KX(?:LOWT|HIGHT|TEMP)[A-Z]+-.*-B[0-9]", market_id))
+
+
+def _extract_order_cancel_reason(order_response: Any) -> str | None:
+    if order_response is None or not isinstance(order_response, dict):
+        return None
+    reason_keys = (
+        "cancel_reason",
+        "cancellation_reason",
+        "status_reason",
+        "reject_reason",
+        "reason",
+        "error",
+    )
+    for key in reason_keys:
+        value = order_response.get(key)
+        if value:
+            return str(value)
+    nested_order = order_response.get("order")
+    if isinstance(nested_order, dict):
+        for key in reason_keys:
+            value = nested_order.get(key)
+            if value:
+                return str(value)
+    return None
 
 
 def _collapse_event_ladders(
@@ -1192,6 +1229,7 @@ def _log_settings_summary(settings) -> None:
             "categories_allowlist": settings.MARKET_CATEGORIES_ALLOWLIST,
             "categories_blocklist": settings.MARKET_CATEGORIES_BLOCKLIST,
             "ticker_prefix_blocklist": settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
+            "skip_weather_bin_markets": settings.SKIP_WEATHER_BIN_MARKETS,
             "kalshi_server_side_filters_enabled": settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
@@ -1561,6 +1599,7 @@ def main() -> None:
                 settings.MARKET_CATEGORIES_ALLOWLIST,
                 settings.MARKET_CATEGORIES_BLOCKLIST,
                 ticker_prefix_blocklist=settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
+                skip_weather_bin_markets=settings.SKIP_WEATHER_BIN_MARKETS,
                 min_close_days=settings.MARKET_MIN_CLOSE_DAYS,
                 max_close_days=settings.MARKET_MAX_CLOSE_DAYS,
                 stats=filter_stats,
@@ -2885,6 +2924,37 @@ def main() -> None:
                     decision_for_edge.confidence,
                 )
 
+                close_time_for_submission = active_market.close_time
+                if close_time_for_submission and close_time_for_submission.tzinfo is None:
+                    close_time_for_submission = close_time_for_submission.replace(tzinfo=timezone.utc)
+                if close_time_for_submission and close_time_for_submission <= datetime.now(timezone.utc):
+                    logger.info(
+                        "SKIP [%s] '%s' -> market closed before submission (close_time=%s)",
+                        market.id,
+                        question_short,
+                        close_time_for_submission.isoformat(),
+                        data={
+                            "market_id": market.id,
+                            "close_time": close_time_for_submission.isoformat(),
+                        },
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit={
+                            "decision_phase": "order_submission",
+                            "decision_terminal": True,
+                            "final_action": "skip",
+                            "final_reason": "market_closed_during_cycle",
+                            "bet_amount_usdc": bet_amount,
+                        },
+                    )
+                    _record_terminal_outcome(state_manager, market.id, "market_closed_during_cycle")
+                    continue
+
                 try:
                     order_response = kalshi_client.submit_order(
                         order,
@@ -2921,6 +2991,31 @@ def main() -> None:
                     )
                     _record_terminal_outcome(state_manager, market.id, "insufficient_balance")
                     continue  # Continue analyzing remaining markets
+                except MarketClosedError as closed_exc:
+                    logger.info(
+                        "Order skipped because market is closed: market=%s error=%s",
+                        market.id,
+                        closed_exc,
+                        data={"market_id": market.id, "error": str(closed_exc)},
+                    )
+                    trades_attempted += 1
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit={
+                            "decision_phase": "order_submission",
+                            "decision_terminal": True,
+                            "final_action": "order_attempt",
+                            "final_reason": "market_closed",
+                            "bet_amount_usdc": bet_amount,
+                            "order_error": str(closed_exc),
+                        },
+                    )
+                    _record_terminal_outcome(state_manager, market.id, "market_closed")
+                    continue
                 except Exception as order_exc:
                     error_msg = str(order_exc)
                     if (
@@ -2966,6 +3061,26 @@ def main() -> None:
                         "market_id": market.id,
                     },
                 )
+                normalized_order_status = (order_response.status or "").strip().lower()
+                order_cancel_reason = None
+                if normalized_order_status in {"cancelled", "canceled"}:
+                    if isinstance(order_response.raw, dict):
+                        order_cancel_reason = _extract_order_cancel_reason(order_response.raw)
+                    logger.warning(
+                        "Order was canceled by exchange: market=%s order_id=%s status=%s reason=%s raw=%s",
+                        market.id,
+                        order_response.id,
+                        order_response.status,
+                        order_cancel_reason,
+                        order_response.raw,
+                        data={
+                            "market_id": market.id,
+                            "order_id": order_response.id,
+                            "order_status": order_response.status,
+                            "order_cancel_reason": order_cancel_reason,
+                            "order_raw": order_response.raw,
+                        },
+                    )
                 log_trade_decision(
                     market_id=market.id,
                     question=market.question,
@@ -2980,6 +3095,7 @@ def main() -> None:
                         "bet_amount_usdc": bet_amount,
                         "order_id": order_response.id,
                         "order_status": order_response.status,
+                        "order_cancel_reason": order_cancel_reason,
                     },
                 )
                 _record_terminal_outcome(state_manager, market.id, "order_submitted")

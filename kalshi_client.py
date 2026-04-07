@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from logging_config import get_logger, log_api_call
-from models import InsufficientBalanceError, Market, MarketOutcome, OrderRequest, OrderResponse
+from models import (
+    InsufficientBalanceError,
+    Market,
+    MarketClosedError,
+    MarketOutcome,
+    OrderRequest,
+    OrderResponse,
+)
 
 logger = get_logger(__name__)
 
@@ -23,6 +31,27 @@ _MAX_VALID_PRICE = 0.99
 _DEFAULT_PRICE = 0.50
 _DEFAULT_LIMIT = 1000
 _DEFAULT_TIME_IN_FORCE = "immediate_or_cancel"
+_TICKER_CONTEXT_MAX_LEN = 200
+_TICKER_CITY_MAP = {
+    "AUS": "Austin",
+    "BOS": "Boston",
+    "CHI": "Chicago",
+    "DEN": "Denver",
+    "HOU": "Houston",
+    "LAX": "Los Angeles",
+    "LV": "Las Vegas",
+    "MIA": "Miami",
+    "MIN": "Minneapolis",
+    "NOLA": "New Orleans",
+    "NY": "New York",
+    "NYC": "New York City",
+    "NYCH": "New York City",
+    "OKC": "Oklahoma City",
+    "PHX": "Phoenix",
+    "SATX": "San Antonio",
+    "SEA": "Seattle",
+    "SFO": "San Francisco",
+}
 
 
 class KalshiClient:
@@ -230,6 +259,8 @@ class KalshiClient:
                 )
             if "insufficient" in response_text and "balance" in response_text:
                 raise InsufficientBalanceError("Insufficient balance on Kalshi account") from exc
+            if "market_closed" in response_text or "market closed" in response_text:
+                raise MarketClosedError("Market closed before order submission") from exc
             raise
 
         response_data = response.json()
@@ -284,7 +315,16 @@ def _build_client_order_id(market_id: str) -> str:
 
 def _parse_market(raw: dict[str, Any]) -> Market:
     ticker = str(raw.get("ticker") or raw.get("id") or "")
-    question = str(raw.get("title") or raw.get("subtitle") or raw.get("question") or "")
+    title = _clean_text(raw.get("title"))
+    subtitle = _clean_text(raw.get("subtitle"))
+    fallback_question = _clean_text(raw.get("question"))
+    rules_primary = _clean_text(raw.get("rules_primary"))
+    question = _build_market_question(
+        ticker=ticker,
+        title=title,
+        subtitle=subtitle,
+        fallback_question=fallback_question,
+    )
     if not ticker or not question:
         raise ValueError("Missing ticker/title in market payload")
 
@@ -346,6 +386,8 @@ def _parse_market(raw: dict[str, Any]) -> Market:
     return Market(
         id=ticker,
         question=question,
+        subtitle=subtitle,
+        resolution_criteria=rules_primary,
         outcomes=outcomes,
         liquidity_usdc=liquidity_usdc,
         category=raw.get("category") or series_ticker,
@@ -360,6 +402,69 @@ def _parse_market(raw: dict[str, Any]) -> Market:
         status=raw.get("status"),
         **extra,
     )
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _build_market_question(
+    *,
+    ticker: str,
+    title: str,
+    subtitle: str,
+    fallback_question: str,
+) -> str:
+    base_question = title or subtitle or fallback_question
+    ticker_context = _extract_ticker_context(ticker=ticker, base_question=base_question)
+    if ticker_context:
+        if base_question:
+            return f"{base_question} [Ticker context: {ticker_context}]"
+        return f"{ticker} [Ticker context: {ticker_context}]"
+    return base_question
+
+
+def _extract_ticker_context(*, ticker: str, base_question: str) -> str | None:
+    if not ticker:
+        return None
+    parts: list[str] = []
+    city_context = _extract_weather_city_from_ticker(ticker)
+    if city_context and city_context.lower() not in base_question.lower():
+        parts.append(f"location={city_context}")
+
+    threshold_token = _extract_ticker_value_token(ticker, "T")
+    if threshold_token is not None and str(threshold_token).lower() not in base_question.lower():
+        parts.append(f"threshold={threshold_token}")
+
+    bin_token = _extract_ticker_value_token(ticker, "B")
+    if bin_token is not None and str(bin_token).lower() not in base_question.lower():
+        parts.append(f"bin_center={bin_token}")
+
+    if not parts:
+        return None
+    return ", ".join(parts)[:_TICKER_CONTEXT_MAX_LEN]
+
+
+def _extract_weather_city_from_ticker(ticker: str) -> str | None:
+    weather_match = re.match(r"^KX(?:LOWT|HIGHT|TEMP)([A-Z]+)-", ticker.upper())
+    if not weather_match:
+        return None
+    city_code = weather_match.group(1)
+    return _TICKER_CITY_MAP.get(city_code, city_code)
+
+
+def _extract_ticker_value_token(ticker: str, token_prefix: str) -> str | None:
+    for token in ticker.split("-"):
+        if not token.startswith(token_prefix):
+            continue
+        if len(token) <= 1:
+            continue
+        candidate = token[1:]
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", candidate):
+            return candidate
+    return None
 
 
 def _extract_yes_price(raw: dict[str, Any]) -> float | None:

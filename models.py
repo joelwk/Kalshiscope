@@ -20,6 +20,8 @@ class Market(BaseModel):
     id: str
     ticker: str | None = None
     question: str
+    subtitle: str | None = None
+    resolution_criteria: str | None = None
     outcomes: list[MarketOutcome] = Field(default_factory=list)
     liquidity_usdc: Optional[float] = None
     category: Optional[str] = None
@@ -175,3 +177,7 @@ class InsufficientBalanceError(Exception):
     def __init__(self, message: str, available: float | None = None):
         super().__init__(message)
         self.available = available
+
+
+class MarketClosedError(Exception):
+    """Raised when submitting an order for a market that has already closed."""

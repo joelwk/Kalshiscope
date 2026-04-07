@@ -105,6 +105,19 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.SEARCH_ALLOWED_X_HANDLES, ("Foo", "Bar"))
         self.assertEqual(settings.MULTIMEDIA_CONFIDENCE_THRESHOLD, (0.6, 0.7))
 
+    def test_weather_profile_settings_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "WEATHER_ALLOWED_DOMAINS": "weather.gov,weather.com",
+            "WEATHER_ALLOWED_X_HANDLES": "NWS,weatherchannel",
+            "SKIP_WEATHER_BIN_MARKETS": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.WEATHER_ALLOWED_DOMAINS, ("weather.gov", "weather.com"))
+        self.assertEqual(settings.WEATHER_ALLOWED_X_HANDLES, ("NWS", "weatherchannel"))
+        self.assertFalse(settings.SKIP_WEATHER_BIN_MARKETS)
+
     def test_build_search_config(self) -> None:
         env = {
             **self._required_env(),

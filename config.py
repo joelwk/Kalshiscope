@@ -12,7 +12,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class Settings:
     # Risk controls - Conservative defaults for value betting
-    MIN_BET_USDC: float = 5.0
+    MIN_BET_USDC: float = 1.0
     MAX_BET_USDC: float = 50.0
     MIN_CONFIDENCE: float = 0.50  # Allows mid-probability bets; edge + evidence gates handle quality
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
@@ -54,6 +54,7 @@ class Settings:
         "KXSPOTIFY",
         "KXMADDOW",
     )
+    SKIP_WEATHER_BIN_MARKETS: bool = True
     MIN_VOLUME_24H: float = 0.0
     EXTREME_YES_PRICE_LOWER: float = 0.05
     EXTREME_YES_PRICE_UPPER: float = 0.95
@@ -184,6 +185,20 @@ class Settings:
         "politico",
         "WSJ",
         "FT",
+    )
+    WEATHER_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "weather.gov",
+        "weather.com",
+        "wunderground.com",
+        "accuweather.com",
+        "metoffice.gov.uk",
+    )
+    WEATHER_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "NWS",
+        "weatherchannel",
+        "NWSSPC",
+        "NHC_Atlantic",
+        "metoffice",
     )
     GENERIC_ALLOWED_DOMAINS: tuple[str, ...] = (
         "reuters.com",
@@ -441,6 +456,9 @@ def load_settings() -> Settings:
             "MARKET_TICKER_BLOCKLIST_PREFIXES",
             Settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
         ),
+        SKIP_WEATHER_BIN_MARKETS=_read_env_bool(
+            "SKIP_WEATHER_BIN_MARKETS", Settings.SKIP_WEATHER_BIN_MARKETS
+        ),
         MIN_VOLUME_24H=_read_env_float("MIN_VOLUME_24H", Settings.MIN_VOLUME_24H),
         EXTREME_YES_PRICE_LOWER=_read_env_float(
             "EXTREME_YES_PRICE_LOWER",
@@ -509,6 +527,12 @@ def load_settings() -> Settings:
         ),
         POLITICS_ALLOWED_X_HANDLES=_read_env_csv(
             "POLITICS_ALLOWED_X_HANDLES", Settings.POLITICS_ALLOWED_X_HANDLES
+        ),
+        WEATHER_ALLOWED_DOMAINS=_read_env_csv(
+            "WEATHER_ALLOWED_DOMAINS", Settings.WEATHER_ALLOWED_DOMAINS
+        ),
+        WEATHER_ALLOWED_X_HANDLES=_read_env_csv(
+            "WEATHER_ALLOWED_X_HANDLES", Settings.WEATHER_ALLOWED_X_HANDLES
         ),
         GENERIC_ALLOWED_DOMAINS=_read_env_csv(
             "GENERIC_ALLOWED_DOMAINS", Settings.GENERIC_ALLOWED_DOMAINS

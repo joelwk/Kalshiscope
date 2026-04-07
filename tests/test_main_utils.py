@@ -14,6 +14,7 @@ from main import (
     _compute_next_wakeup_seconds,
     _edge_threshold_for_market,
     _effective_position_override_threshold,
+    _extract_order_cancel_reason,
     _filter_markets,
     _log_settings_summary,
     _should_adjust_position,
@@ -125,6 +126,27 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual([m.id for m in filtered], ["KXBTCD-26APR0717-T70000"])
         self.assertEqual(stats["skipped_ticker_prefix_blocklist"], 1)
+
+    def test_filter_markets_skips_weather_bin_markets_when_enabled(self) -> None:
+        markets = [
+            Market(id="KXLOWTCHI-26APR06-B33.5", question="Bin market", liquidity_usdc=200),
+            Market(id="KXLOWTCHI-26APR06-T33", question="Threshold market", liquidity_usdc=200),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=(),
+            skip_weather_bin_markets=True,
+            stats=stats,
+        )
+        self.assertEqual([m.id for m in filtered], ["KXLOWTCHI-26APR06-T33"])
+        self.assertEqual(stats["skipped_weather_bin_markets"], 1)
+
+    def test_extract_order_cancel_reason_prefers_explicit_reason_keys(self) -> None:
+        payload = {"status": "canceled", "cancel_reason": "price moved"}
+        self.assertEqual(_extract_order_cancel_reason(payload), "price moved")
 
     def test_filter_markets_treats_null_liquidity_as_zero(self) -> None:
         markets = [

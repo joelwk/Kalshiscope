@@ -4,7 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 from config import Settings
 from models import Market
-from research_profiles import build_market_search_config, market_category_flags, market_family
+from research_profiles import (
+    build_market_search_config,
+    is_commodity_market,
+    market_category_flags,
+    market_family,
+)
 
 
 def test_market_family_sports() -> None:
@@ -47,6 +52,24 @@ def test_market_family_crypto() -> None:
 def test_market_family_politics() -> None:
     market = Market(id="3", question="Portugal Presidential Election Winner", category="politics")
     assert market_family(market) == "politics"
+
+
+def test_market_family_weather() -> None:
+    market = Market(
+        id="w1",
+        question="Will the minimum temperature be below 40F tomorrow?",
+        category="weather",
+    )
+    assert market_family(market) == "weather"
+
+
+def test_is_commodity_market_detects_gold() -> None:
+    market = Market(
+        id="c1",
+        question="Will the gold close price be above 4677 on Apr 7?",
+        category="commodities",
+    )
+    assert is_commodity_market(market) is True
 
 
 def test_dynamic_lookback_short_horizon() -> None:

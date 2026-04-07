@@ -16,6 +16,7 @@ from xai_sdk.tools import web_search, x_search
 from config import SearchConfig, Settings
 from logging_config import get_logger
 from models import Market, TradeDecision
+from research_profiles import is_commodity_market
 
 logger = get_logger(__name__)
 
@@ -180,7 +181,7 @@ def _format_market_outcome_prices(market: Market) -> str:
     return ", ".join(parts) if parts else "N/A"
 
 
-def _category_research_hint(profile_name: str) -> str:
+def _category_research_hint(profile_name: str, market: Market | None = None) -> str:
     if profile_name == "sports":
         return (
             "Sports guidance: prioritize current injury reports, lineup/rotation news, schedule fatigue, "
@@ -195,6 +196,16 @@ def _category_research_hint(profile_name: str) -> str:
         return (
             "Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, and "
             "time-sensitive catalysts over rumor accounts."
+        )
+    if profile_name == "weather":
+        return (
+            "Weather guidance: prioritize official weather sources (weather.gov/NWS) and hourly forecast tables. "
+            "Use location and threshold hints from ticker context to anchor the query."
+        )
+    if market is not None and is_commodity_market(market):
+        return (
+            "Commodities guidance: prioritize exchange settlement/last prices, front-month contract data, "
+            "and time-specific catalysts over opinion commentary."
         )
     return (
         "Generic guidance: prefer primary sources and high-credibility reporting; penalize stale or weakly corroborated claims."
@@ -721,7 +732,10 @@ class GrokClient:
             chat.append(
                 user(
                     "<market_data>\n"
+                    f"ticker={market.id}\n"
                     f"question={market.question}\n"
+                    f"subtitle={market.subtitle or 'N/A'}\n"
+                    f"resolution_criteria={market.resolution_criteria or 'N/A'}\n"
                     f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
                     f"market_outcome_prices={outcome_prices}\n"
                     f"liquidity_usdc={market.liquidity_usdc}\n"
@@ -731,7 +745,7 @@ class GrokClient:
                     "</market_data>\n"
                     "<constraints>\n"
                     f"bet_range=${self.min_bet_usdc:.2f}-${self.max_bet_usdc:.2f}\n"
-                    f"{_category_research_hint(active_config.profile_name)}\n"
+                    f"{_category_research_hint(active_config.profile_name, market)}\n"
                     "</constraints>\n"
                 )
             )
@@ -894,7 +908,10 @@ class GrokClient:
             chat.append(
                 user(
                     "<market_data>\n"
+                    f"ticker={market.id}\n"
                     f"question={market.question}\n"
+                    f"subtitle={market.subtitle or 'N/A'}\n"
+                    f"resolution_criteria={market.resolution_criteria or 'N/A'}\n"
                     f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
                     f"market_outcome_prices={outcome_prices}\n"
                     f"liquidity_usdc={market.liquidity_usdc}\n"
@@ -903,7 +920,7 @@ class GrokClient:
                     f"previous_analysis={previous_summary}\n"
                     "</market_data>\n"
                     "<constraints>\n"
-                    f"{_category_research_hint(active_config.profile_name)}\n"
+                    f"{_category_research_hint(active_config.profile_name, market)}\n"
                     "Re-check implied probability and edge from multiple sources.\n"
                     "If edge < 5%, return should_trade=false and bet_size_pct=0.0.\n"
                     "</constraints>\n"

@@ -3,8 +3,10 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import requests
+
 from kalshi_client import KalshiClient, _parse_market
-from models import Market, OrderRequest
+from models import Market, MarketClosedError, OrderRequest
 
 
 class _DummyPrivateKey:
@@ -22,6 +24,12 @@ class _DummyResponse:
 
     def raise_for_status(self) -> None:
         return None
+
+
+class _DummyHttpResponse:
+    def __init__(self, text: str, status_code: int = 409) -> None:
+        self.text = text
+        self.status_code = status_code
 
 
 class TestKalshiClient(unittest.TestCase):
@@ -99,6 +107,26 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(market.open_interest, 21)
         self.assertEqual(market.volume_24h, 12)
         self.assertEqual(market.liquidity_usdc, 33)
+
+    def test_parse_market_enriches_weather_question_and_resolution(self) -> None:
+        market = _parse_market(
+            {
+                "ticker": "KXLOWTCHI-26APR06-B33.5",
+                "title": "Will the minimum temperature be 33-34 on Apr 6, 2026?",
+                "subtitle": "Chicago overnight low range",
+                "rules_primary": "Resolves to the official city weather station minimum.",
+                "yes_ask": 42,
+                "status": "open",
+            }
+        )
+        self.assertIn("Ticker context", market.question)
+        self.assertIn("location=Chicago", market.question)
+        self.assertIn("bin_center=33.5", market.question)
+        self.assertEqual(market.subtitle, "Chicago overnight low range")
+        self.assertEqual(
+            market.resolution_criteria,
+            "Resolves to the official city weather station minimum.",
+        )
 
     def test_get_markets_handles_cursor_pagination(self) -> None:
         client = self._client()
@@ -213,6 +241,28 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(sent_payload["no_price"], 60)
         self.assertNotIn("yes_price", sent_payload)
         self.assertEqual(response.id, "ord-2")
+
+    def test_submit_order_raises_market_closed_error(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-5",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-5",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        response = _DummyHttpResponse(
+            '{"error":{"code":"market_closed","message":"market closed"}}'
+        )
+        http_error = requests.exceptions.HTTPError("409 market closed", response=response)
+
+        with patch.object(client, "_request", side_effect=http_error):
+            with self.assertRaises(MarketClosedError):
+                client.submit_order(order, market=market)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,24 @@ _POLITICS_KEYWORDS = (
     "poll",
     "referendum",
 )
+_WEATHER_KEYWORDS = (
+    "temperature",
+    "temp",
+    "weather",
+    "high temp",
+    "low temp",
+    "minimum temperature",
+    "maximum temperature",
+)
+_COMMODITY_KEYWORDS = (
+    "copper",
+    "gold",
+    "silver",
+    "brent",
+    "crude",
+    "oil",
+    "gas prices",
+)
 _LONG_HORIZON_HINTS = ("election", "presidential", "winner", "nominee")
 
 
@@ -122,6 +140,12 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
             domains=settings.POLITICS_ALLOWED_DOMAINS,
             x_handles=settings.POLITICS_ALLOWED_X_HANDLES,
         )
+    if family == "weather":
+        return ResearchProfile(
+            name=family,
+            domains=settings.WEATHER_ALLOWED_DOMAINS,
+            x_handles=settings.WEATHER_ALLOWED_X_HANDLES,
+        )
     return ResearchProfile(
         name="generic",
         domains=settings.GENERIC_ALLOWED_DOMAINS,
@@ -140,7 +164,16 @@ def market_family(market: Market) -> str:
         return "crypto"
     if any(keyword in text for keyword in _POLITICS_KEYWORDS):
         return "politics"
+    if any(keyword in text for keyword in _WEATHER_KEYWORDS):
+        return "weather"
     return "generic"
+
+
+def is_commodity_market(market: Market) -> bool:
+    category = (market.category or "").lower()
+    question = market.question.lower()
+    text = f"{category} {question}"
+    return any(keyword in text for keyword in _COMMODITY_KEYWORDS)
 
 
 def market_category_flags(market: Market) -> tuple[bool, bool]:

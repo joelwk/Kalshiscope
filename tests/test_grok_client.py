@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import SearchConfig
-from grok_client import GrokClient, _extract_json
+from grok_client import GrokClient, _category_research_hint, _extract_json
 from models import Market, MarketOutcome, TradeDecision
 
 
@@ -43,6 +43,15 @@ class TestGrokClient(unittest.TestCase):
     def test_extract_json_invalid(self) -> None:
         with self.assertRaises(ValueError):
             _extract_json("no-json")
+
+    def test_category_research_hint_weather_profile(self) -> None:
+        hint = _category_research_hint("weather")
+        self.assertIn("weather.gov", hint)
+
+    def test_category_research_hint_commodities_market(self) -> None:
+        market = Market(id="g1", question="Will gold close above 4600?", category="business")
+        hint = _category_research_hint("generic", market=market)
+        self.assertIn("Commodities guidance", hint)
 
     def test_analyze_market_parses_markdown_fenced_json(self) -> None:
         market = Market(
