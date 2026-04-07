@@ -519,6 +519,16 @@ def _get_outcome_entry_price(market: Market, outcome: str) -> float | None:
     return None
 
 
+def _set_outcome_entry_price(market: Market, outcome: str, price: float) -> bool:
+    market_outcome = _find_market_outcome(market, outcome)
+    if not market_outcome:
+        return False
+    if not (_MIN_VALID_PRICE <= price <= _MAX_VALID_PRICE):
+        return False
+    market_outcome.price = price
+    return True
+
+
 def _get_implied_probability(market: Market, outcome: str) -> float | None:
     market_outcome = _find_market_outcome(market, outcome)
     if not market_outcome:
@@ -1369,6 +1379,56 @@ def _record_terminal_outcome(
         )
 
 
+def _build_execution_audit(
+    *,
+    decision_phase: str | None = None,
+    decision_terminal: bool | None = None,
+    final_action: str | None = None,
+    final_reason: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build a compact execution audit payload with canonical keys."""
+    alias_to_canonical = {
+        "amount_usdc": "bet_amount_usdc",
+        "score_value": "score_final",
+        "confidence_gate_override_edge": "override_edge",
+        "confidence_gate_override_market_edge": "market_edge",
+        "implied_prob": "implied_prob_market",
+        "edge": "edge_market",
+    }
+    payload: dict[str, Any] = {}
+    if decision_phase is not None:
+        payload["decision_phase"] = decision_phase
+    if decision_terminal is not None:
+        payload["decision_terminal"] = decision_terminal
+    if final_action is not None:
+        payload["final_action"] = final_action
+    if final_reason is not None:
+        payload["final_reason"] = final_reason
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    for alias_key, canonical_key in alias_to_canonical.items():
+        if alias_key in payload and canonical_key not in payload:
+            payload[canonical_key] = payload[alias_key]
+        payload.pop(alias_key, None)
+    return payload
+
+
+def _passes_refreshed_edge_guard(
+    market: Market,
+    decision: TradeDecision,
+    settings: Settings,
+) -> tuple[bool, float | None, float | None, str]:
+    implied_prob = _get_implied_probability(market, decision.outcome)
+    edge_ok, edge_value, edge_reason = _passes_edge_threshold(
+        implied_prob,
+        decision,
+        settings,
+    )
+    return edge_ok, implied_prob, edge_value, edge_reason
+
+
 def _compute_next_wakeup_seconds(
     markets: list[Market],
     state_manager: MarketStateManager,
@@ -1432,6 +1492,7 @@ def _build_grok_client_for_worker(settings: Settings) -> GrokClient:
         model_deep=settings.GROK_MODEL_DEEP,
         min_bet_usdc=settings.MIN_BET_USDC,
         max_bet_usdc=settings.MAX_BET_USDC,
+        settings=settings,
     )
 
 
@@ -1603,16 +1664,13 @@ def main() -> None:
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
         urgent_reanalysis_cooldown_hours=settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
     )
-    refinement = RefinementStrategy(
-        urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
-    )
-
     grok_client = GrokClient(
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
         model_deep=settings.GROK_MODEL_DEEP,
         min_bet_usdc=settings.MIN_BET_USDC,
         max_bet_usdc=settings.MAX_BET_USDC,
+        settings=settings,
     )
     logger.debug(
         "Grok client initialized with model=%s model_deep=%s",
@@ -1624,6 +1682,7 @@ def main() -> None:
         base_url=settings.KALSHI_API_BASE_URL,
         api_key_id=settings.KALSHI_API_KEY_ID,
         private_key_path=settings.KALSHI_PRIVATE_KEY_PATH,
+        order_price_improvement_cents=settings.ORDER_PRICE_IMPROVEMENT_CENTS,
     )
     logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
 
@@ -1663,6 +1722,7 @@ def main() -> None:
                             else None,
                         },
                     )
+                    kalshi_client.reset_session()
                     markets = kalshi_client.get_markets()
             else:
                 markets = kalshi_client.get_markets()
@@ -2106,17 +2166,39 @@ def main() -> None:
                                 },
                             )
 
+                if decision.abstain:
+                    trades_skipped_no_trade += 1
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="abstain_low_evidence",
+                        ),
+                    )
+                    _record_terminal_outcome(state_manager, market.id, "abstain_low_evidence")
+                    question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                    logger.info(
+                        "SKIP [%s] '%s' -> abstain (low evidence quality %.2f)",
+                        market.id,
+                        question_short,
+                        decision.evidence_quality,
+                    )
+                    continue
+
                 if not decision.should_trade:
                     trades_skipped_no_trade += 1
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=decision.model_dump(),
-                        execution_audit={
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "no_trade_recommended",
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="no_trade_recommended",
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "no_trade_recommended")
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
@@ -2160,14 +2242,14 @@ def main() -> None:
                             market_id=market.id,
                             question=market.question,
                             decision=decision.model_dump(),
-                            execution_audit={
-                                "decision_terminal": True,
-                                "final_action": "skip",
-                                "final_reason": "confidence_below_min",
-                                "confidence_gate_override_allowed": False,
-                                "confidence_gate_override_edge": override_edge,
-                                "confidence_gate_override_market_edge": market_edge,
-                            },
+                            execution_audit=_build_execution_audit(
+                                decision_terminal=True,
+                                final_action="skip",
+                                final_reason="confidence_below_min",
+                                confidence_gate_override_allowed=False,
+                                override_edge=override_edge,
+                                market_edge=market_edge,
+                            ),
                         )
                         _record_terminal_outcome(state_manager, market.id, "confidence_below_min")
                         question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
@@ -2355,11 +2437,11 @@ def main() -> None:
                         market_id=market.id,
                         question=market.question,
                         decision=decision_for_edge.model_dump(),
-                        execution_audit={
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "edge_gate_blocked",
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="edge_gate_blocked",
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "edge_gate_blocked")
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
@@ -2385,11 +2467,11 @@ def main() -> None:
                         market_id=market.id,
                         question=market.question,
                         decision=decision_for_edge.model_dump(),
-                        execution_audit={
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "uniform_implied_probability",
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="uniform_implied_probability",
+                        ),
                     )
                     _record_terminal_outcome(
                         state_manager,
@@ -2416,8 +2498,31 @@ def main() -> None:
                 kelly_fraction_value: float | None = None
                 posterior_for_kelly: float | None = None
                 min_edge_for_kelly: float | None = None
-                kelly_path_active = settings.KELLY_SIZING_ENABLED and implied_prob is not None
+                kelly_bankroll_eligible = (
+                    cycle_bankroll is None or cycle_bankroll >= settings.KELLY_MIN_BANKROLL_USDC
+                )
+                kelly_path_active = (
+                    settings.KELLY_SIZING_ENABLED
+                    and implied_prob is not None
+                    and kelly_bankroll_eligible
+                )
                 sizing_mode = _sizing_mode_label(kelly_path_active)
+                if (
+                    settings.KELLY_SIZING_ENABLED
+                    and implied_prob is not None
+                    and not kelly_bankroll_eligible
+                ):
+                    logger.debug(
+                        "Kelly sizing disabled for cycle due to bankroll guard: market=%s bankroll=%.2f min=%.2f",
+                        market.id,
+                        cycle_bankroll,
+                        settings.KELLY_MIN_BANKROLL_USDC,
+                        data={
+                            "market_id": market.id,
+                            "cycle_bankroll": cycle_bankroll,
+                            "kelly_min_bankroll_usdc": settings.KELLY_MIN_BANKROLL_USDC,
+                        },
+                    )
                 if kelly_path_active:
                     posterior_for_kelly = (
                         bayesian_posterior_applied
@@ -2477,13 +2582,13 @@ def main() -> None:
                             market_id=market.id,
                             question=market.question,
                             decision=decision_for_edge.model_dump(),
-                            execution_audit={
-                                "decision_terminal": True,
-                                "final_action": "skip",
-                                "final_reason": "score_gate_blocked",
-                                "score_threshold": settings.SCORE_GATE_THRESHOLD,
-                                "score_value": score_result.final_score,
-                            },
+                            execution_audit=_build_execution_audit(
+                                decision_terminal=True,
+                                final_action="skip",
+                                final_reason="score_gate_blocked",
+                                score_threshold=settings.SCORE_GATE_THRESHOLD,
+                                score_final=score_result.final_score,
+                            ),
                         )
                         _record_terminal_outcome(state_manager, market.id, "score_gate_blocked")
                         question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
@@ -2503,7 +2608,7 @@ def main() -> None:
                     edge_value,
                     settings,
                 )
-                if settings.KELLY_SIZING_ENABLED and implied_prob is not None:
+                if kelly_path_active:
                     if posterior_for_kelly is None:
                         posterior_for_kelly = (
                             bayesian_posterior_applied
@@ -2549,30 +2654,30 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": adjusted_bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "post_sizing",
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "zero_bet_after_sizing",
-                            "sizing_mode": sizing_mode,
-                            "adjusted_bet_pct": adjusted_bet_pct,
-                            "bet_amount_usdc": 0.0,
-                            "kelly_raw": kelly_raw_value,
-                            "kelly_fraction_value": kelly_fraction_value,
-                            "posterior_for_kelly": posterior_for_kelly,
-                            "bayesian_posterior_raw": bayesian_posterior_raw,
-                            "bayesian_posterior_applied": bayesian_posterior_applied,
-                            "bayesian_applied": bayesian_posterior_applied is not None,
-                            "bayesian_update_count": bayesian_update_count,
-                            "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
-                            "likelihood_ratio": likelihood_ratio,
-                            "implied_prob_market": implied_prob,
-                            "min_edge_for_kelly": min_edge_for_kelly,
-                            "edge_market": edge_value,
-                            "lmsr_execution_price": lmsr_execution_price,
-                            "lmsr_inefficiency_signal": ineff_signal,
-                            "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="post_sizing",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="zero_bet_after_sizing",
+                            sizing_mode=sizing_mode,
+                            adjusted_bet_pct=adjusted_bet_pct,
+                            bet_amount_usdc=0.0,
+                            kelly_raw=kelly_raw_value,
+                            kelly_fraction_value=kelly_fraction_value,
+                            posterior_for_kelly=posterior_for_kelly,
+                            bayesian_posterior_raw=bayesian_posterior_raw,
+                            bayesian_posterior_applied=bayesian_posterior_applied,
+                            bayesian_applied=bayesian_posterior_applied is not None,
+                            bayesian_update_count=bayesian_update_count,
+                            bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                            likelihood_ratio=likelihood_ratio,
+                            implied_prob_market=implied_prob,
+                            min_edge_for_kelly=min_edge_for_kelly,
+                            edge_market=edge_value,
+                            lmsr_execution_price=lmsr_execution_price,
+                            lmsr_inefficiency_signal=ineff_signal,
+                            lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "zero_bet_after_sizing")
                     continue
@@ -2629,24 +2734,24 @@ def main() -> None:
                             decision=decision_for_edge.model_copy(
                                 update={"bet_size_pct": adjusted_bet_pct}
                             ).model_dump(),
-                            execution_audit={
-                                "decision_phase": "post_lmsr_gate",
-                                "decision_terminal": True,
-                                "final_action": "skip",
-                                "final_reason": "lmsr_gate_blocked",
-                                "lmsr_gate_decision": "blocked",
-                                "lmsr_execution_price": lmsr_execution_price,
-                                "lmsr_inefficiency_signal": ineff_signal,
-                                "lmsr_min_inefficiency": settings.LMSR_MIN_INEFFICIENCY,
-                                "proposed_bet_amount_usdc": proposed_bet_amount,
-                                "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
-                                "bayesian_posterior_raw": bayesian_posterior_raw,
-                                "bayesian_posterior_applied": bayesian_posterior_applied,
-                                "bayesian_applied": bayesian_posterior_applied is not None,
-                                "bayesian_update_count": bayesian_update_count,
-                                "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
-                                "likelihood_ratio": likelihood_ratio,
-                            },
+                            execution_audit=_build_execution_audit(
+                                decision_phase="post_lmsr_gate",
+                                decision_terminal=True,
+                                final_action="skip",
+                                final_reason="lmsr_gate_blocked",
+                                lmsr_gate_decision="blocked",
+                                lmsr_execution_price=lmsr_execution_price,
+                                lmsr_inefficiency_signal=ineff_signal,
+                                lmsr_min_inefficiency=settings.LMSR_MIN_INEFFICIENCY,
+                                proposed_bet_amount_usdc=proposed_bet_amount,
+                                lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
+                                bayesian_posterior_raw=bayesian_posterior_raw,
+                                bayesian_posterior_applied=bayesian_posterior_applied,
+                                bayesian_applied=bayesian_posterior_applied is not None,
+                                bayesian_update_count=bayesian_update_count,
+                                bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                                likelihood_ratio=likelihood_ratio,
+                            ),
                         )
                         _record_terminal_outcome(state_manager, market.id, "lmsr_gate_blocked")
                         continue
@@ -2659,34 +2764,34 @@ def main() -> None:
                     decision=decision_for_edge.model_copy(
                         update={"bet_size_pct": adjusted_bet_pct}
                     ).model_dump(),
-                    execution_audit={
-                        "decision_phase": "post_sizing",
-                        "sizing_mode": sizing_mode,
-                        "position_decision": "pending",
-                        "adjusted_bet_pct": adjusted_bet_pct,
-                        "bet_amount_usdc": None,
-                        "proposed_bet_amount_usdc": proposed_bet_amount,
-                        "kelly_raw_bet_amount_usdc": (
+                    execution_audit=_build_execution_audit(
+                        decision_phase="post_sizing",
+                        sizing_mode=sizing_mode,
+                        position_decision="pending",
+                        adjusted_bet_pct=adjusted_bet_pct,
+                        bet_amount_usdc=None,
+                        proposed_bet_amount_usdc=proposed_bet_amount,
+                        kelly_raw_bet_amount_usdc=(
                             proposed_bet_amount if sizing_mode == "kelly" else None
                         ),
-                        "min_bet_floor_applied": False,
-                        "kelly_sub_floor_skipped": False,
-                        "kelly_raw": kelly_raw_value,
-                        "kelly_fraction_value": kelly_fraction_value,
-                        "posterior_for_kelly": posterior_for_kelly,
-                        "bayesian_posterior_raw": bayesian_posterior_raw,
-                        "bayesian_posterior_applied": bayesian_posterior_applied,
-                        "bayesian_applied": bayesian_posterior_applied is not None,
-                        "bayesian_update_count": bayesian_update_count,
-                        "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
-                        "likelihood_ratio": likelihood_ratio,
-                        "implied_prob_market": implied_prob,
-                        "min_edge_for_kelly": min_edge_for_kelly,
-                        "edge_market": edge_value,
-                        "lmsr_execution_price": lmsr_execution_price,
-                        "lmsr_inefficiency_signal": ineff_signal,
-                        "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
-                    },
+                        min_bet_floor_applied=False,
+                        kelly_sub_floor_skipped=False,
+                        kelly_raw=kelly_raw_value,
+                        kelly_fraction_value=kelly_fraction_value,
+                        posterior_for_kelly=posterior_for_kelly,
+                        bayesian_posterior_raw=bayesian_posterior_raw,
+                        bayesian_posterior_applied=bayesian_posterior_applied,
+                        bayesian_applied=bayesian_posterior_applied is not None,
+                        bayesian_update_count=bayesian_update_count,
+                        bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                        likelihood_ratio=likelihood_ratio,
+                        implied_prob_market=implied_prob,
+                        min_edge_for_kelly=min_edge_for_kelly,
+                        edge_market=edge_value,
+                        lmsr_execution_price=lmsr_execution_price,
+                        lmsr_inefficiency_signal=ineff_signal,
+                        lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
+                    ),
                 )
 
                 logger.debug(
@@ -2730,43 +2835,39 @@ def main() -> None:
                     decision=decision_for_edge.model_copy(
                         update={"bet_size_pct": adjusted_bet_pct}
                     ).model_dump(),
-                    execution_audit={
-                        "decision_phase": "post_position_gate",
-                        "decision_terminal": not should_add,
-                        "final_action": "skip" if not should_add else None,
-                        "final_reason": (
-                            "position_adjustment_blocked" if not should_add else None
-                        ),
-                        "sizing_mode": sizing_mode,
-                        "position_decision": "allowed" if should_add else "blocked",
-                        "position_decision_reason": (
-                            position_reason if not should_add else None
-                        ),
-                        "adjusted_bet_pct": adjusted_bet_pct,
-                        "post_position_bet_pct": bet_pct,
-                        "bet_amount_usdc": None,
-                        "proposed_bet_amount_usdc": proposed_bet_amount,
-                        "kelly_raw_bet_amount_usdc": (
+                    execution_audit=_build_execution_audit(
+                        decision_phase="post_position_gate",
+                        decision_terminal=not should_add,
+                        final_action="skip" if not should_add else None,
+                        final_reason="position_adjustment_blocked" if not should_add else None,
+                        sizing_mode=sizing_mode,
+                        position_decision="allowed" if should_add else "blocked",
+                        position_decision_reason=position_reason if not should_add else None,
+                        adjusted_bet_pct=adjusted_bet_pct,
+                        post_position_bet_pct=bet_pct,
+                        bet_amount_usdc=None,
+                        proposed_bet_amount_usdc=proposed_bet_amount,
+                        kelly_raw_bet_amount_usdc=(
                             proposed_bet_amount if sizing_mode == "kelly" else None
                         ),
-                        "min_bet_floor_applied": False,
-                        "kelly_sub_floor_skipped": False,
-                        "kelly_raw": kelly_raw_value,
-                        "kelly_fraction_value": kelly_fraction_value,
-                        "posterior_for_kelly": posterior_for_kelly,
-                        "bayesian_posterior_raw": bayesian_posterior_raw,
-                        "bayesian_posterior_applied": bayesian_posterior_applied,
-                        "bayesian_applied": bayesian_posterior_applied is not None,
-                        "bayesian_update_count": bayesian_update_count,
-                        "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
-                        "likelihood_ratio": likelihood_ratio,
-                        "implied_prob_market": implied_prob,
-                        "min_edge_for_kelly": min_edge_for_kelly,
-                        "edge_market": edge_value,
-                        "lmsr_execution_price": lmsr_execution_price,
-                        "lmsr_inefficiency_signal": ineff_signal,
-                        "lmsr_liquidity_param_b": settings.LMSR_LIQUIDITY_PARAM_B,
-                    },
+                        min_bet_floor_applied=False,
+                        kelly_sub_floor_skipped=False,
+                        kelly_raw=kelly_raw_value,
+                        kelly_fraction_value=kelly_fraction_value,
+                        posterior_for_kelly=posterior_for_kelly,
+                        bayesian_posterior_raw=bayesian_posterior_raw,
+                        bayesian_posterior_applied=bayesian_posterior_applied,
+                        bayesian_applied=bayesian_posterior_applied is not None,
+                        bayesian_update_count=bayesian_update_count,
+                        bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                        likelihood_ratio=likelihood_ratio,
+                        implied_prob_market=implied_prob,
+                        min_edge_for_kelly=min_edge_for_kelly,
+                        edge_market=edge_value,
+                        lmsr_execution_price=lmsr_execution_price,
+                        lmsr_inefficiency_signal=ineff_signal,
+                        lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
+                    ),
                 )
                 if not should_add:
                     trades_skipped_position += 1
@@ -2806,12 +2907,12 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "bet_amount_zero",
-                            "post_position_bet_pct": bet_pct,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="bet_amount_zero",
+                            post_position_bet_pct=bet_pct,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "bet_amount_zero")
                     logger.debug("Skipping market %s: bet_amount=0", market.id)
@@ -2858,26 +2959,26 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "post_min_bet_floor",
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "kelly_sub_floor_skip",
-                            "sizing_mode": sizing_mode,
-                            "position_decision": "blocked",
-                            "position_decision_reason": "kelly_sub_floor_skip",
-                            "post_position_bet_pct": bet_pct,
-                            "raw_bet_amount_usdc": raw_bet_amount,
-                            "bet_amount_usdc": 0.0,
-                            "min_bet_usdc": settings.MIN_BET_USDC,
-                            "min_bet_floor_applied": False,
-                            "kelly_sub_floor_skipped": True,
-                            "kelly_min_bet_policy": settings.KELLY_MIN_BET_POLICY,
-                            "kelly_min_bet_policy_applied": min_bet_policy_applied,
-                            "kelly_raw": kelly_raw_value,
-                            "kelly_fraction_value": kelly_fraction_value,
-                            "posterior_for_kelly": posterior_for_kelly,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="post_min_bet_floor",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="kelly_sub_floor_skip",
+                            sizing_mode=sizing_mode,
+                            position_decision="blocked",
+                            position_decision_reason="kelly_sub_floor_skip",
+                            post_position_bet_pct=bet_pct,
+                            raw_bet_amount_usdc=raw_bet_amount,
+                            bet_amount_usdc=0.0,
+                            min_bet_usdc=settings.MIN_BET_USDC,
+                            min_bet_floor_applied=False,
+                            kelly_sub_floor_skipped=True,
+                            kelly_min_bet_policy=settings.KELLY_MIN_BET_POLICY,
+                            kelly_min_bet_policy_applied=min_bet_policy_applied,
+                            kelly_raw=kelly_raw_value,
+                            kelly_fraction_value=kelly_fraction_value,
+                            posterior_for_kelly=posterior_for_kelly,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "kelly_sub_floor_skip")
                     continue
@@ -2931,15 +3032,15 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "analysis_only_balance_skip",
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "analysis_only_insufficient_balance",
-                            "bet_amount_usdc": bet_amount,
-                            "raw_bet_amount_usdc": raw_bet_amount,
-                            "min_bet_floor_applied": min_bet_floor_applied,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="analysis_only_balance_skip",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="analysis_only_insufficient_balance",
+                            bet_amount_usdc=bet_amount,
+                            raw_bet_amount_usdc=raw_bet_amount,
+                            min_bet_floor_applied=min_bet_floor_applied,
+                        ),
                     )
                     _record_terminal_outcome(
                         state_manager,
@@ -2976,15 +3077,15 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "dry_run_order",
-                            "decision_terminal": True,
-                            "final_action": "order_attempt",
-                            "final_reason": "dry_run",
-                            "bet_amount_usdc": bet_amount,
-                            "raw_bet_amount_usdc": raw_bet_amount,
-                            "min_bet_floor_applied": min_bet_floor_applied,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="dry_run_order",
+                            decision_terminal=True,
+                            final_action="order_attempt",
+                            final_reason="dry_run",
+                            bet_amount_usdc=bet_amount,
+                            raw_bet_amount_usdc=raw_bet_amount,
+                            min_bet_floor_applied=min_bet_floor_applied,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "dry_run")
                     continue
@@ -3010,7 +3111,42 @@ def main() -> None:
                         )
                 if active_market is not market:
                     entry_price = _get_outcome_entry_price(active_market, decision.outcome)
-                    implied_prob = _get_implied_probability(active_market, decision.outcome)
+                    refreshed_edge_ok, implied_prob, refreshed_edge_value, refreshed_edge_reason = _passes_refreshed_edge_guard(
+                        active_market,
+                        decision_for_edge,
+                        settings,
+                    )
+                    if not refreshed_edge_ok:
+                        trades_skipped_edge += 1
+                        logger.info(
+                            "SKIP [%s] '%s' -> refreshed edge gate (%s)",
+                            market.id,
+                            question_short,
+                            refreshed_edge_reason,
+                            data={
+                                "market_id": market.id,
+                                "implied_prob": implied_prob,
+                                "confidence": decision_for_edge.confidence,
+                                "edge": refreshed_edge_value,
+                            },
+                        )
+                        log_trade_decision(
+                            market_id=market.id,
+                            question=market.question,
+                            decision=decision_for_edge.model_copy(
+                                update={"bet_size_pct": bet_pct}
+                            ).model_dump(),
+                            execution_audit=_build_execution_audit(
+                                decision_phase="post_market_refresh",
+                                decision_terminal=True,
+                                final_action="skip",
+                                final_reason="refreshed_edge_gate_blocked",
+                                implied_prob_market=implied_prob,
+                                edge_market=refreshed_edge_value,
+                            ),
+                        )
+                        _record_terminal_outcome(state_manager, market.id, "refreshed_edge_gate_blocked")
+                        continue
 
                 if (
                     settings.ORDERBOOK_PRECHECK_ENABLED
@@ -3025,6 +3161,12 @@ def main() -> None:
                         try:
                             orderbook = kalshi_client.get_market_orderbook(active_market.id)
                             best_sell = _best_orderbook_sell_price(orderbook, option_index)
+                            if best_sell is not None:
+                                _set_outcome_entry_price(
+                                    active_market,
+                                    decision.outcome,
+                                    best_sell,
+                                )
                             entry_price_for_check = _get_outcome_entry_price(active_market, decision.outcome)
                             if (
                                 best_sell is not None
@@ -3100,13 +3242,13 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "order_submission",
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "market_closed_during_cycle",
-                            "bet_amount_usdc": bet_amount,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="order_submission",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="market_closed_during_cycle",
+                            bet_amount_usdc=bet_amount,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "market_closed_during_cycle")
                     continue
@@ -3137,13 +3279,13 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "order_submission",
-                            "decision_terminal": True,
-                            "final_action": "skip",
-                            "final_reason": "insufficient_balance",
-                            "bet_amount_usdc": bet_amount,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="order_submission",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="insufficient_balance",
+                            bet_amount_usdc=bet_amount,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "insufficient_balance")
                     continue  # Continue analyzing remaining markets
@@ -3161,14 +3303,14 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "order_submission",
-                            "decision_terminal": True,
-                            "final_action": "order_attempt",
-                            "final_reason": "market_closed",
-                            "bet_amount_usdc": bet_amount,
-                            "order_error": str(closed_exc),
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="order_submission",
+                            decision_terminal=True,
+                            final_action="order_attempt",
+                            final_reason="market_closed",
+                            bet_amount_usdc=bet_amount,
+                            order_error=str(closed_exc),
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "market_closed")
                     continue
@@ -3193,14 +3335,14 @@ def main() -> None:
                         decision=decision_for_edge.model_copy(
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
-                        execution_audit={
-                            "decision_phase": "order_submission",
-                            "decision_terminal": True,
-                            "final_action": "order_attempt",
-                            "final_reason": "order_submission_failed",
-                            "bet_amount_usdc": bet_amount,
-                            "order_error": error_msg,
-                        },
+                        execution_audit=_build_execution_audit(
+                            decision_phase="order_submission",
+                            decision_terminal=True,
+                            final_action="order_attempt",
+                            final_reason="order_submission_failed",
+                            bet_amount_usdc=bet_amount,
+                            order_error=error_msg,
+                        ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "order_submission_failed")
                     continue  # Continue to next market for other errors
@@ -3256,17 +3398,17 @@ def main() -> None:
                     decision=decision_for_edge.model_copy(
                         update={"bet_size_pct": bet_pct}
                     ).model_dump(),
-                    execution_audit={
-                        "decision_phase": "order_submission",
-                        "decision_terminal": True,
-                        "final_action": "order_attempt",
-                        "final_reason": final_reason,
-                        "bet_amount_usdc": bet_amount,
-                        "order_id": order_response.id,
-                        "order_status": order_response.status,
-                        "order_cancel_reason": order_cancel_reason,
-                        "order_fill_count": order_fill_count,
-                    },
+                    execution_audit=_build_execution_audit(
+                        decision_phase="order_submission",
+                        decision_terminal=True,
+                        final_action="order_attempt",
+                        final_reason=final_reason,
+                        bet_amount_usdc=bet_amount,
+                        order_id=order_response.id,
+                        order_status=order_response.status,
+                        order_cancel_reason=order_cancel_reason,
+                        order_fill_count=order_fill_count,
+                    ),
                 )
                 _record_terminal_outcome(state_manager, market.id, terminal_outcome)
                 if unfilled_canceled_order:
@@ -3326,6 +3468,31 @@ def main() -> None:
 
             cycle_duration = (time.monotonic() - cycle_start) * 1000
             mode_suffix = " [ANALYSIS_ONLY]" if analysis_only_mode else ""
+            cycle_receipt = {
+                "cycle": cycle_count,
+                "cycle_id": cycle_id,
+                "duration_ms": round(cycle_duration, 2),
+                "fetched_markets": fetched_count,
+                "eligible_markets": len(markets),
+                "analysis_candidates": analysis_candidates_count,
+                "analyzed_markets": markets_analyzed,
+                "refined_markets": markets_refined,
+                "execution_candidates": execution_candidates,
+                "order_attempts": trades_attempted,
+                "skip_counts": {
+                    "no_trade": trades_skipped_no_trade,
+                    "confidence": trades_skipped_confidence,
+                    "edge": trades_skipped_edge,
+                    "position": trades_skipped_position,
+                    "balance": trades_skipped_balance,
+                    "kelly_sub_floor": trades_skipped_kelly_sub_floor,
+                },
+                "analysis_only_mode": analysis_only_mode,
+            }
+            logger.info(
+                "Cycle receipt",
+                data={"cycle_receipt": cycle_receipt},
+            )
             logger.info(
                 "Price bucket summary: low=%d mid=%d high=%d",
                 price_bucket_stats[_PRICE_BUCKET_LOW],

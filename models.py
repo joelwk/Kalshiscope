@@ -31,6 +31,7 @@ class Market(BaseModel):
     yes_price: float | None = None
     no_price: float | None = None
     volume: float | None = None
+    volume_24h: float | None = None
     open_interest: float | None = None
     close_time: Optional[datetime] = None
     url: Optional[str] = None
@@ -56,11 +57,7 @@ class TradeDecision(BaseModel):
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description=(
-            "YOUR probability estimate (0.0-1.0). CALIBRATION: Sports max 0.75-0.80. "
-            "If odds imply 60%, only set higher if you have specific edge. "
-            "Never 0.90+ for sports - even heavy favorites lose 15-25% of games."
-        ),
+        description="Your probability estimate (0.0-1.0).",
     )
     bet_size_pct: float = Field(
         ge=0.0,
@@ -108,6 +105,10 @@ class TradeDecision(BaseModel):
         ge=0.0,
         le=1.0,
         description="Evidence quality score (0-1), set by validation layer.",
+    )
+    abstain: bool = Field(
+        default=False,
+        description="True when evidence quality is too weak to act on this cycle.",
     )
 
 

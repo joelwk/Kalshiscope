@@ -9,14 +9,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_fixed
-from xai_sdk import Client
-from xai_sdk.chat import system, user
-from xai_sdk.tools import web_search, x_search
 
 from config import SearchConfig, Settings
 from logging_config import get_logger
 from models import Market, TradeDecision
 from research_profiles import is_commodity_market
+from xai_provider import XAIProvider
 
 logger = get_logger(__name__)
 
@@ -49,6 +47,10 @@ _SYSTEM_PROMPT_SHARED = (
     "The `outcome` field must exactly match one of the provided market outcomes.\n"
     "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
     "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
+    "For narrow-bin markets (temperature bins, price bins), confidence should reflect certainty in your analysis "
+    "direction, not just raw bin hit probability.\n"
+    "Set evidence_quality below 0.50 when evidence is sparse, conflicting, or proxy-based; reserve evidence_quality "
+    "above 0.80 for verified primary-source evidence.\n"
     "When search results are empty or irrelevant, reduce confidence and keep evidence quality below 0.50.\n"
     "Absence of evidence is not evidence of absence; treat sparse evidence as lower conviction.\n"
 )
@@ -57,7 +59,6 @@ _SYSTEM_PROMPT_ANALYZE = (
     "Use web search and X search to gather recent, source-backed evidence.\n\n"
     + _SYSTEM_PROMPT_SHARED
     + "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
-    + "Calibrate probabilities conservatively. For sports/esports, avoid overconfidence and generally keep confidence <=0.80.\n"
     + "Provide concise reasoning that includes implied probability, your probability, and edge.\n"
     + "Include likelihood_ratio as a positive decimal equal to "
     + "P(evidence|predicted_outcome)/P(evidence|alternative_outcome). "
@@ -71,15 +72,16 @@ _SYSTEM_PROMPT_DEEP = (
 )
 
 
-def _default_search_config() -> SearchConfig:
+def _default_search_config(settings: Settings | None = None) -> SearchConfig:
+    resolved = settings or Settings()
     now = datetime.now(timezone.utc)
-    from_date = now - timedelta(hours=Settings.SEARCH_LOOKBACK_HOURS)
+    from_date = now - timedelta(hours=resolved.SEARCH_LOOKBACK_HOURS)
     return SearchConfig(
         from_date=from_date,
         to_date=now,
-        allowed_domains=list(Settings.SEARCH_ALLOWED_DOMAINS),
-        allowed_x_handles=list(Settings.SEARCH_ALLOWED_X_HANDLES),
-        multimedia_confidence_range=Settings.MULTIMEDIA_CONFIDENCE_THRESHOLD,
+        allowed_domains=list(resolved.SEARCH_ALLOWED_DOMAINS),
+        allowed_x_handles=list(resolved.SEARCH_ALLOWED_X_HANDLES),
+        multimedia_confidence_range=resolved.MULTIMEDIA_CONFIDENCE_THRESHOLD,
     )
 
 
@@ -224,13 +226,19 @@ class GrokClient:
         min_bet_usdc: float = 2.0,
         max_bet_usdc: float = 10.0,
         search_config: SearchConfig | None = None,
+        settings: Settings | None = None,
+        provider: XAIProvider | None = None,
     ) -> None:
-        self.client = Client(api_key=api_key, timeout=_XAI_CLIENT_TIMEOUT_SECONDS)
+        self.provider = provider or XAIProvider(
+            api_key=api_key,
+            timeout_seconds=_XAI_CLIENT_TIMEOUT_SECONDS,
+        )
+        self.settings = settings
         self.model = model
         self.model_deep = model_deep or model
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
-        self.default_search_config = search_config or _default_search_config()
+        self.default_search_config = search_config or _default_search_config(settings)
         if not GrokClient._init_log_emitted:
             logger.debug(
                 "GrokClient initialized with model=%s model_deep=%s",
@@ -239,10 +247,18 @@ class GrokClient:
             )
             GrokClient._init_log_emitted = True
 
+    @property
+    def client(self):
+        return self.provider.client
+
+    @client.setter
+    def client(self, value) -> None:
+        self.provider.client = value
+
     def _active_search_config(self, search_config: SearchConfig | None) -> SearchConfig:
         config = search_config or self.default_search_config
         if not config.from_date or not config.to_date:
-            defaults = _default_search_config()
+            defaults = _default_search_config(self.settings)
             config = SearchConfig(
                 from_date=config.from_date or defaults.from_date,
                 to_date=config.to_date or defaults.to_date,
@@ -483,11 +499,19 @@ class GrokClient:
 
         gate_status = "allow" if should_trade else "block"
         reason_code = ",".join(gate_reasons) if gate_reasons else "ok"
+        abstain = evidence_quality < 0.20 or low_information
+        if abstain:
+            should_trade = False
+            gate_status = "abstain"
+            if "abstain_low_evidence" not in gate_reasons:
+                gate_reasons.append("abstain_low_evidence")
+            reason_code = ",".join(gate_reasons)
         bet_size_pct = decision.bet_size_pct if should_trade else 0.0
 
         return decision.model_copy(
             update={
                 "should_trade": should_trade,
+                "abstain": abstain,
                 "bet_size_pct": bet_size_pct,
                 "outcome": canonical_outcome,
                 "implied_prob_external": implied,
@@ -668,228 +692,131 @@ class GrokClient:
         enable_multimedia: bool,
         model: str | None = None,
     ):
-        return self.client.chat.create(
+        return self.provider.create_chat(
             model=model or self.model,
             response_format=TradeDecision,
-            tools=[
-                web_search(allowed_domains=config.allowed_domains),
-                x_search(
-                    from_date=config.from_date,
-                    to_date=config.to_date,
-                    allowed_x_handles=config.allowed_x_handles,
-                    enable_image_understanding=enable_multimedia,
-                    enable_video_understanding=enable_multimedia,
-                ),
-            ],
+            config=config,
+            enable_multimedia=enable_multimedia,
         )
 
-    @retry(
-        wait=wait_fixed(2),
-        stop=stop_after_attempt(3),
-        before_sleep=before_sleep_log(logger.logger, logging.WARNING),
-    )
-    def analyze_market(
+    def _build_market_prompt(
         self,
         market: Market,
-        search_config: SearchConfig | None = None,
-        previous_analysis: TradeDecision | None = None,
-    ) -> TradeDecision:
-        start_time = time.monotonic()
-        active_config = self._active_search_config(search_config)
-        previous_summary = _format_previous_analysis(previous_analysis)
-        content = ""
-        usage_metrics: dict[str, int | None] = {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "reasoning_tokens": None,
-            "cached_tokens": None,
-        }
-        logger.debug(
-            "Starting market analysis: id=%s",
-            market.id,
-            data={
-                "market_id": market.id,
-                "question": market.question[:100],
-                "outcomes": [o.name for o in market.outcomes],
-                "liquidity_usdc": market.liquidity_usdc,
-                "search_profile": active_config.profile_name,
-                "lookback_hours": active_config.lookback_hours,
-                "model": self.model,
-            },
+        active_config: SearchConfig,
+        previous_summary: str,
+        deep: bool,
+    ) -> str:
+        outcome_prices = _format_market_outcome_prices(market)
+        constraints = [f"{_category_research_hint(active_config.profile_name, market)}"]
+        if deep:
+            constraints.extend(
+                [
+                    "Re-check implied probability and edge from multiple sources.",
+                    "If edge < 5%, return should_trade=false and bet_size_pct=0.0.",
+                ]
+            )
+        else:
+            constraints.insert(0, f"bet_range=${self.min_bet_usdc:.2f}-${self.max_bet_usdc:.2f}")
+        return (
+            "<market_data>\n"
+            f"ticker={market.id}\n"
+            f"question={market.question}\n"
+            f"subtitle={market.subtitle or 'N/A'}\n"
+            f"resolution_criteria={market.resolution_criteria or 'N/A'}\n"
+            f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
+            f"market_outcome_prices={outcome_prices}\n"
+            f"liquidity_usdc={market.liquidity_usdc}\n"
+            f"research_profile={active_config.profile_name}\n"
+            f"lookback_hours={active_config.lookback_hours}\n"
+            f"previous_analysis={previous_summary}\n"
+            "</market_data>\n"
+            "<constraints>\n"
+            + "\n".join(constraints)
+            + "\n</constraints>\n"
         )
 
+    def _parse_response_payload(self, market_id: str, content: str, deep: bool) -> dict[str, Any]:
+        normalized_content = _normalize_model_response_text(content)
         try:
-            enable_multimedia = self._should_enable_multimedia(
-                market,
-                decision=previous_analysis,
-                config=active_config,
+            return json.loads(normalized_content)
+        except json.JSONDecodeError:
+            deep_suffix = " (deep)" if deep else ""
+            logger.warning(
+                "Structured response parse fallback invoked for market=%s%s",
+                market_id,
+                deep_suffix,
+                data={"market_id": market_id},
             )
-            chat = self._build_chat(active_config, enable_multimedia)
-            chat.append(
-                system(_SYSTEM_PROMPT_ANALYZE)
+        try:
+            return _extract_json(normalized_content)
+        except json.JSONDecodeError:
+            repaired_content = _repair_common_json_key_issues(normalized_content)
+            if repaired_content == normalized_content:
+                raise
+            deep_suffix = " (deep)" if deep else ""
+            logger.warning(
+                "Structured response repair fallback invoked for market=%s%s",
+                market_id,
+                deep_suffix,
+                data={"market_id": market_id},
             )
-            outcome_prices = _format_market_outcome_prices(market)
-            chat.append(
-                user(
-                    "<market_data>\n"
-                    f"ticker={market.id}\n"
-                    f"question={market.question}\n"
-                    f"subtitle={market.subtitle or 'N/A'}\n"
-                    f"resolution_criteria={market.resolution_criteria or 'N/A'}\n"
-                    f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
-                    f"market_outcome_prices={outcome_prices}\n"
-                    f"liquidity_usdc={market.liquidity_usdc}\n"
-                    f"research_profile={active_config.profile_name}\n"
-                    f"lookback_hours={active_config.lookback_hours}\n"
-                    f"previous_analysis={previous_summary}\n"
-                    "</market_data>\n"
-                    "<constraints>\n"
-                    f"bet_range=${self.min_bet_usdc:.2f}-${self.max_bet_usdc:.2f}\n"
-                    f"{_category_research_hint(active_config.profile_name, market)}\n"
-                    "</constraints>\n"
-                )
-            )
+            return _extract_json(repaired_content)
 
-            chunk_count = 0
-            deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
-            for response, chunk in chat.stream():
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market.id}")
-                usage_metrics = _extract_usage_metrics(response)
-                if chunk.content:
-                    content += chunk.content
-                    chunk_count += 1
-
-            if not content:
-                raise ValueError("Empty response from Grok")
-
-            normalized_content = _normalize_model_response_text(content)
-            try:
-                data = json.loads(normalized_content)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Structured response parse fallback invoked for market=%s",
-                    market.id,
-                    data={"market_id": market.id},
-                )
-                try:
-                    data = _extract_json(normalized_content)
-                except json.JSONDecodeError:
-                    repaired_content = _repair_common_json_key_issues(normalized_content)
-                    if repaired_content == normalized_content:
-                        raise
-                    logger.warning(
-                        "Structured response repair fallback invoked for market=%s",
-                        market.id,
-                        data={"market_id": market.id},
-                    )
-                    data = _extract_json(repaired_content)
-
-            data = self._normalize_numeric_fields(data, market.id)
-            decision = TradeDecision.model_validate(data)
-            decision = self._validate_and_enrich_decision(
-                market,
-                decision,
-                profile_name=active_config.profile_name,
-            )
-
-            total_duration = (time.monotonic() - start_time) * 1000
-            question_short = market.question[:60] + "..." if len(market.question) > 60 else market.question
-            logger.info(
-                "Grok decision [%s] '%s' -> trade=%s, conf=%.2f, outcome=%s",
-                market.id,
-                question_short,
-                decision.should_trade,
-                decision.confidence,
-                decision.outcome,
-                data={
-                    "market_id": market.id,
-                    "question": market.question,
-                    "should_trade": decision.should_trade,
-                    "confidence": decision.confidence,
-                    "outcome": decision.outcome,
-                    "bet_size_pct": decision.bet_size_pct,
-                    "implied_prob_external": decision.implied_prob_external,
-                    "my_prob": decision.my_prob,
-                    "edge_external": decision.edge_external,
-                    "likelihood_ratio": decision.likelihood_ratio,
-                    "evidence_quality": decision.evidence_quality,
-                    "search_profile": active_config.profile_name,
-                    "lookback_hours": active_config.lookback_hours,
-                    "model": self.model,
-                    "chunks": chunk_count,
-                    "prompt_tokens": usage_metrics["prompt_tokens"],
-                    "completion_tokens": usage_metrics["completion_tokens"],
-                    "reasoning_tokens": usage_metrics["reasoning_tokens"],
-                    "cached_tokens": usage_metrics["cached_tokens"],
-                    "duration_ms": round(total_duration, 2),
-                },
-            )
-            return decision
-
-        except Exception as exc:
-            duration = (time.monotonic() - start_time) * 1000
-            if content:
-                logger.debug(
-                    "Model response preview for failed analysis: market=%s preview=%s",
-                    market.id,
-                    _response_preview(content),
-                    data={
-                        "market_id": market.id,
-                        "response_preview": _response_preview(content),
-                    },
-                )
-            logger.error(
-                "Market analysis failed: id=%s, error=%s, duration=%.2fms",
-                market.id,
-                exc,
-                duration,
-                data={
-                    "market_id": market.id,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                    "duration_ms": round(duration, 2),
-                    "search_profile": active_config.profile_name,
-                },
-            )
-            raise
-
-    @retry(
-        wait=wait_fixed(2),
-        stop=stop_after_attempt(3),
-        before_sleep=before_sleep_log(logger.logger, logging.WARNING),
-    )
-    def analyze_market_deep(
+    def _stream_chat_content(
         self,
-        market: Market,
-        previous_analysis: TradeDecision | None = None,
-        search_config: SearchConfig | None = None,
-    ) -> TradeDecision:
-        start_time = time.monotonic()
-        active_config = self._active_search_config(search_config)
-        previous_summary = _format_previous_analysis(previous_analysis)
+        chat,
+        market_id: str,
+    ) -> tuple[str, int, dict[str, int | None]]:
         content = ""
+        chunk_count = 0
         usage_metrics: dict[str, int | None] = {
             "prompt_tokens": None,
             "completion_tokens": None,
             "reasoning_tokens": None,
             "cached_tokens": None,
         }
+        deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
+        for response, chunk in chat.stream():
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market_id}")
+            usage_metrics = _extract_usage_metrics(response)
+            if chunk.content:
+                content += chunk.content
+                chunk_count += 1
+        if not content:
+            raise ValueError("Empty response from Grok")
+        return content, chunk_count, usage_metrics
+
+    def _run_analysis(
+        self,
+        market: Market,
+        *,
+        search_config: SearchConfig | None,
+        previous_analysis: TradeDecision | None,
+        deep: bool,
+    ) -> TradeDecision:
+        start_time = time.monotonic()
+        active_config = self._active_search_config(search_config)
+        previous_summary = _format_previous_analysis(previous_analysis)
+        model = self.model_deep if deep else self.model
+        phase_label = "deep market analysis" if deep else "market analysis"
         logger.debug(
-            "Starting deep market analysis: id=%s",
+            "Starting %s: id=%s",
+            phase_label,
             market.id,
             data={
                 "market_id": market.id,
                 "question": market.question[:100],
                 "outcomes": [o.name for o in market.outcomes],
                 "liquidity_usdc": market.liquidity_usdc,
-                "previous_analysis": previous_summary,
+                "previous_analysis": previous_summary if deep else None,
                 "search_profile": active_config.profile_name,
                 "lookback_hours": active_config.lookback_hours,
-                "model": self.model_deep,
+                "model": model,
             },
         )
 
+        content = ""
         try:
             enable_multimedia = self._should_enable_multimedia(
                 market,
@@ -899,72 +826,33 @@ class GrokClient:
             chat = self._build_chat(
                 active_config,
                 enable_multimedia,
-                model=self.model_deep,
+                model=model,
             )
             chat.append(
-                system(_SYSTEM_PROMPT_DEEP)
+                self.provider.system_message(
+                    _SYSTEM_PROMPT_DEEP if deep else _SYSTEM_PROMPT_ANALYZE
+                )
             )
-            outcome_prices = _format_market_outcome_prices(market)
             chat.append(
-                user(
-                    "<market_data>\n"
-                    f"ticker={market.id}\n"
-                    f"question={market.question}\n"
-                    f"subtitle={market.subtitle or 'N/A'}\n"
-                    f"resolution_criteria={market.resolution_criteria or 'N/A'}\n"
-                    f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
-                    f"market_outcome_prices={outcome_prices}\n"
-                    f"liquidity_usdc={market.liquidity_usdc}\n"
-                    f"research_profile={active_config.profile_name}\n"
-                    f"lookback_hours={active_config.lookback_hours}\n"
-                    f"previous_analysis={previous_summary}\n"
-                    "</market_data>\n"
-                    "<constraints>\n"
-                    f"{_category_research_hint(active_config.profile_name, market)}\n"
-                    "Re-check implied probability and edge from multiple sources.\n"
-                    "If edge < 5%, return should_trade=false and bet_size_pct=0.0.\n"
-                    "</constraints>\n"
-                )
-            )
-
-            chunk_count = 0
-            deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
-            for response, chunk in chat.stream():
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market.id}")
-                usage_metrics = _extract_usage_metrics(response)
-                if chunk.content:
-                    content += chunk.content
-                    chunk_count += 1
-
-            if not content:
-                raise ValueError("Empty response from Grok")
-            normalized_content = _normalize_model_response_text(content)
-            try:
-                data = json.loads(normalized_content)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Structured response parse fallback invoked for market=%s (deep)",
-                    market.id,
-                    data={"market_id": market.id},
-                )
-                try:
-                    data = _extract_json(normalized_content)
-                except json.JSONDecodeError:
-                    repaired_content = _repair_common_json_key_issues(normalized_content)
-                    if repaired_content == normalized_content:
-                        raise
-                    logger.warning(
-                        "Structured response repair fallback invoked for market=%s (deep)",
-                        market.id,
-                        data={"market_id": market.id},
+                self.provider.user_message(
+                    self._build_market_prompt(
+                        market=market,
+                        active_config=active_config,
+                        previous_summary=previous_summary,
+                        deep=deep,
                     )
-                    data = _extract_json(repaired_content)
-
-            deep_likelihood_ratio_provided = (
-                "likelihood_ratio" in data and data.get("likelihood_ratio") is not None
+                )
             )
-            data = self._merge_partial_deep_response(data, previous_analysis)
+            content, chunk_count, usage_metrics = self._stream_chat_content(chat, market.id)
+            data = self._parse_response_payload(market.id, content, deep=deep)
+
+            deep_likelihood_ratio_provided = False
+            if deep:
+                deep_likelihood_ratio_provided = (
+                    "likelihood_ratio" in data and data.get("likelihood_ratio") is not None
+                )
+                data = self._merge_partial_deep_response(data, previous_analysis)
+
             data = self._normalize_numeric_fields(data, market.id)
             decision = TradeDecision.model_validate(data)
             decision = self._validate_and_enrich_decision(
@@ -972,9 +860,10 @@ class GrokClient:
                 decision,
                 profile_name=active_config.profile_name,
             )
+
             likelihood_ratio_source = "missing"
             if decision.likelihood_ratio is not None:
-                if deep_likelihood_ratio_provided:
+                if deep and deep_likelihood_ratio_provided:
                     likelihood_ratio_source = "deep"
                 elif (
                     previous_analysis is not None
@@ -987,7 +876,8 @@ class GrokClient:
             total_duration = (time.monotonic() - start_time) * 1000
             question_short = market.question[:60] + "..." if len(market.question) > 60 else market.question
             logger.info(
-                "Grok deep decision [%s] '%s' -> trade=%s, conf=%.2f, outcome=%s",
+                "Grok%s decision [%s] '%s' -> trade=%s, conf=%.2f, outcome=%s",
+                " deep" if deep else "",
                 market.id,
                 question_short,
                 decision.should_trade,
@@ -997,6 +887,7 @@ class GrokClient:
                     "market_id": market.id,
                     "question": market.question,
                     "should_trade": decision.should_trade,
+                    "abstain": decision.abstain,
                     "confidence": decision.confidence,
                     "outcome": decision.outcome,
                     "bet_size_pct": decision.bet_size_pct,
@@ -1004,27 +895,27 @@ class GrokClient:
                     "my_prob": decision.my_prob,
                     "edge_external": decision.edge_external,
                     "likelihood_ratio": decision.likelihood_ratio,
-                    "likelihood_ratio_source": likelihood_ratio_source,
+                    "likelihood_ratio_source": likelihood_ratio_source if deep else None,
                     "evidence_quality": decision.evidence_quality,
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,
-                    "model": self.model_deep,
+                    "model": model,
                     "chunks": chunk_count,
                     "prompt_tokens": usage_metrics["prompt_tokens"],
                     "completion_tokens": usage_metrics["completion_tokens"],
                     "reasoning_tokens": usage_metrics["reasoning_tokens"],
                     "cached_tokens": usage_metrics["cached_tokens"],
                     "duration_ms": round(total_duration, 2),
-                    "previous_analysis": previous_summary,
+                    "previous_analysis": previous_summary if deep else None,
                 },
             )
             return decision
-
         except Exception as exc:
             duration = (time.monotonic() - start_time) * 1000
             if content:
                 logger.debug(
-                    "Model response preview for failed deep analysis: market=%s preview=%s",
+                    "Model response preview for failed %s: market=%s preview=%s",
+                    phase_label,
                     market.id,
                     _response_preview(content),
                     data={
@@ -1033,7 +924,8 @@ class GrokClient:
                     },
                 )
             logger.error(
-                "Deep market analysis failed: id=%s, error=%s, duration=%.2fms",
+                "%s failed: id=%s, error=%s, duration=%.2fms",
+                phase_label.capitalize(),
                 market.id,
                 exc,
                 duration,
@@ -1042,8 +934,44 @@ class GrokClient:
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                     "duration_ms": round(duration, 2),
-                    "previous_analysis": previous_summary,
+                    "previous_analysis": previous_summary if deep else None,
                     "search_profile": active_config.profile_name,
                 },
             )
             raise
+
+    @retry(
+        wait=wait_fixed(2),
+        stop=stop_after_attempt(3),
+        before_sleep=before_sleep_log(logger.logger, logging.WARNING),
+    )
+    def analyze_market(
+        self,
+        market: Market,
+        search_config: SearchConfig | None = None,
+        previous_analysis: TradeDecision | None = None,
+    ) -> TradeDecision:
+        return self._run_analysis(
+            market=market,
+            search_config=search_config,
+            previous_analysis=previous_analysis,
+            deep=False,
+        )
+
+    @retry(
+        wait=wait_fixed(2),
+        stop=stop_after_attempt(3),
+        before_sleep=before_sleep_log(logger.logger, logging.WARNING),
+    )
+    def analyze_market_deep(
+        self,
+        market: Market,
+        previous_analysis: TradeDecision | None = None,
+        search_config: SearchConfig | None = None,
+    ) -> TradeDecision:
+        return self._run_analysis(
+            market=market,
+            search_config=search_config,
+            previous_analysis=previous_analysis,
+            deep=True,
+        )

@@ -10,8 +10,10 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from urllib3.util.retry import Retry
 
 from logging_config import get_logger, log_api_call
 from models import (
@@ -31,6 +33,12 @@ _MAX_VALID_PRICE = 0.99
 _DEFAULT_PRICE = 0.50
 _DEFAULT_LIMIT = 1000
 _DEFAULT_TIME_IN_FORCE = "immediate_or_cancel"
+_KALSHI_RETRY_TOTAL = 3
+_KALSHI_RETRY_BACKOFF_FACTOR = 0.5
+_KALSHI_RETRYABLE_STATUS_CODES = (502, 503, 504)
+_KALSHI_RETRY_ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+_MARKETS_PAGE_MAX_ATTEMPTS = 3
+_MARKETS_PAGE_RETRY_DELAY_SECONDS = 0.5
 _TICKER_CONTEXT_MAX_LEN = 200
 _TICKER_CITY_MAP = {
     "AUS": "Austin",
@@ -63,17 +71,42 @@ class KalshiClient:
         api_key_id: str,
         private_key_path: str,
         timeout_sec: int = 20,
+        order_price_improvement_cents: int = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key_id = api_key_id
         self.timeout_sec = timeout_sec
+        self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
         self.private_key = self._load_private_key(private_key_path)
-        self.session = requests.Session()
+        self.session = self._create_session()
         logger.debug(
-            "KalshiClient initialized: base_url=%s timeout=%ds",
+            "KalshiClient initialized: base_url=%s timeout=%ds order_price_improvement_cents=%d",
             self.base_url,
             self.timeout_sec,
+            self.order_price_improvement_cents,
         )
+
+    def _create_session(self) -> requests.Session:
+        retry_strategy = Retry(
+            total=_KALSHI_RETRY_TOTAL,
+            connect=_KALSHI_RETRY_TOTAL,
+            read=_KALSHI_RETRY_TOTAL,
+            status=_KALSHI_RETRY_TOTAL,
+            backoff_factor=_KALSHI_RETRY_BACKOFF_FACTOR,
+            status_forcelist=_KALSHI_RETRYABLE_STATUS_CODES,
+            allowed_methods=_KALSHI_RETRY_ALLOWED_METHODS,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session = requests.Session()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def reset_session(self) -> None:
+        self.session.close()
+        self.session = self._create_session()
+        logger.debug("Kalshi API session reset with retry adapter")
 
     @staticmethod
     def _load_private_key(private_key_path: str):
@@ -164,7 +197,31 @@ class KalshiClient:
                 params["close_time_start"] = close_time_start.astimezone(timezone.utc).isoformat()
             if close_time_end is not None:
                 params["close_time_end"] = close_time_end.astimezone(timezone.utc).isoformat()
-            response = self._request("GET", "/markets", params=params)
+            page_attempt = 0
+            while True:
+                page_attempt += 1
+                try:
+                    response = self._request("GET", "/markets", params=params)
+                    break
+                except requests.exceptions.RequestException as exc:
+                    if not _should_retry_market_page(exc) or page_attempt >= _MARKETS_PAGE_MAX_ATTEMPTS:
+                        raise
+                    next_attempt = page_attempt + 1
+                    logger.warning(
+                        "Kalshi market page fetch failed; retrying page attempt %d/%d: %s",
+                        next_attempt,
+                        _MARKETS_PAGE_MAX_ATTEMPTS,
+                        exc,
+                        data={
+                            "error": str(exc),
+                            "cursor": cursor,
+                            "status": status,
+                            "limit": limit,
+                            "next_attempt": next_attempt,
+                        },
+                    )
+                    self.reset_session()
+                    time.sleep(_MARKETS_PAGE_RETRY_DELAY_SECONDS)
             payload = response.json()
             raw_markets = payload.get("markets", []) if isinstance(payload, dict) else []
             for raw_market in raw_markets:
@@ -219,7 +276,12 @@ class KalshiClient:
         if action not in {"buy", "sell"}:
             action = "buy"
 
-        price = _resolve_order_price(order=order, market=market)
+        price = _resolve_order_price(
+            order=order,
+            market=market,
+            action=action,
+            order_price_improvement_cents=self.order_price_improvement_cents,
+        )
         count = max(1, int(order.amount_usdc / price))
         price_cents = int(round(price * _ONE_HUNDRED))
         price_cents = max(1, min(99, price_cents))
@@ -298,12 +360,22 @@ def _to_kalshi_side(outcome: str) -> str:
     return "yes"
 
 
-def _resolve_order_price(order: OrderRequest, market: Market | None) -> float:
+def _resolve_order_price(
+    order: OrderRequest,
+    market: Market | None,
+    *,
+    action: str,
+    order_price_improvement_cents: int,
+) -> float:
+    resolved_price = _DEFAULT_PRICE
     if market:
         for outcome in market.outcomes:
             if outcome.name.strip().lower() == order.outcome.strip().lower() and outcome.price is not None:
-                return max(_MIN_VALID_PRICE, min(_MAX_VALID_PRICE, outcome.price))
-    return _DEFAULT_PRICE
+                resolved_price = outcome.price
+                break
+    if action.strip().lower() == "buy" and order_price_improvement_cents > 0:
+        resolved_price += order_price_improvement_cents / _ONE_HUNDRED
+    return max(_MIN_VALID_PRICE, min(_MAX_VALID_PRICE, resolved_price))
 
 
 def _build_client_order_id(market_id: str) -> str:
@@ -529,3 +601,12 @@ def _parse_datetime(value: Any) -> datetime | None:
         return parsed
     except ValueError:
         return None
+
+
+def _should_retry_market_page(exc: requests.exceptions.RequestException) -> bool:
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+    return response.status_code in _KALSHI_RETRYABLE_STATUS_CODES
