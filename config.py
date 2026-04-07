@@ -16,7 +16,7 @@ class Settings:
     MAX_BET_USDC: float = 50.0
     MIN_CONFIDENCE: float = 0.50  # Allows mid-probability bets; edge + evidence gates handle quality
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
-    CONFIDENCE_GATE_MIN_EDGE: float = 0.15
+    CONFIDENCE_GATE_MIN_EDGE: float = 0.10
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
     SLIPPAGE_CONFIDENCE_THRESHOLD: float = 0.70
     SLIPPAGE_PCT: float = 0.02
@@ -226,8 +226,9 @@ class Settings:
     # Execution
     DRY_RUN: bool = True
     PRE_ORDER_MARKET_REFRESH: bool = False
-    ORDERBOOK_PRECHECK_ENABLED: bool = False
+    ORDERBOOK_PRECHECK_ENABLED: bool = True
     ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
+    ORDER_PRICE_IMPROVEMENT_CENTS: int = 2
     CALIBRATION_MODE_ENABLED: bool = False
     CALIBRATION_MIN_SAMPLES: int = 20
 
@@ -271,6 +272,7 @@ class Settings:
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
+    KELLY_MIN_BANKROLL_USDC: float = 50.0
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -564,6 +566,10 @@ def load_settings() -> Settings:
             "ORDERBOOK_PRECHECK_MIN_CONFIDENCE",
             Settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
         ),
+        ORDER_PRICE_IMPROVEMENT_CENTS=_read_env_int(
+            "ORDER_PRICE_IMPROVEMENT_CENTS",
+            Settings.ORDER_PRICE_IMPROVEMENT_CENTS,
+        ),
         CALIBRATION_MODE_ENABLED=_read_env_bool(
             "CALIBRATION_MODE_ENABLED", Settings.CALIBRATION_MODE_ENABLED
         ),
@@ -645,8 +651,11 @@ def load_settings() -> Settings:
             Settings.BAYESIAN_PRIOR_DEFAULT,
         ),
         BAYESIAN_MIN_UPDATES_FOR_TRADE=_read_env_int(
-            "BAYESIAN_MIN_UPDATES_FOR_TRADE",
-            Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+            "BAYESIAN_MIN_UPDATES",
+            _read_env_int(
+                "BAYESIAN_MIN_UPDATES_FOR_TRADE",
+                Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+            ),
         ),
         LMSR_ENABLED=_read_env_bool(
             "LMSR_ENABLED",
@@ -679,6 +688,10 @@ def load_settings() -> Settings:
         KELLY_MIN_BET_POLICY=_read_env_str(
             "KELLY_MIN_BET_POLICY",
             Settings.KELLY_MIN_BET_POLICY,
+        ),
+        KELLY_MIN_BANKROLL_USDC=_read_env_float(
+            "KELLY_MIN_BANKROLL_USDC",
+            Settings.KELLY_MIN_BANKROLL_USDC,
         ),
         FLIP_GUARD_ENABLED=_read_env_bool(
             "FLIP_GUARD_ENABLED",

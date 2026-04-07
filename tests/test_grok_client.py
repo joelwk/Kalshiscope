@@ -152,8 +152,8 @@ class TestGrokClient(unittest.TestCase):
             captured["x"] = kwargs
             return {"tool": "x"}
 
-        with patch("grok_client.web_search", side_effect=fake_web_search), patch(
-            "grok_client.x_search", side_effect=fake_x_search
+        with patch("xai_provider.web_search", side_effect=fake_web_search), patch(
+            "xai_provider.x_search", side_effect=fake_x_search
         ):
             client.analyze_market(market)
 
@@ -201,8 +201,8 @@ class TestGrokClient(unittest.TestCase):
             captured["x"] = kwargs
             return {"tool": "x"}
 
-        with patch("grok_client.web_search", side_effect=fake_web_search), patch(
-            "grok_client.x_search", side_effect=fake_x_search
+        with patch("xai_provider.web_search", side_effect=fake_web_search), patch(
+            "xai_provider.x_search", side_effect=fake_x_search
         ):
             client.analyze_market_deep(market, previous_analysis=previous)
 
@@ -339,6 +339,30 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertFalse(validated.should_trade)
         self.assertLess(validated.evidence_quality, 0.45)
+        self.assertFalse(validated.abstain)
+
+    def test_validate_and_enrich_sets_abstain_for_very_low_evidence(self) -> None:
+        market = Market(
+            id="m5a",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.62), MarketOutcome(name="NO", price=0.38)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.5,
+            reasoning="No search results. No evidence found.",
+            evidence_quality=0.0,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertTrue(validated.abstain)
+        self.assertFalse(validated.should_trade)
 
     def test_validate_and_enrich_caps_evidence_when_no_external_odds_found(self) -> None:
         market = Market(

@@ -5,6 +5,7 @@ from unittest.mock import patch
 from config import Settings
 from main import (
     _best_orderbook_sell_price,
+    _build_execution_audit,
     _build_reasoning_hash,
     _cap_analysis_candidates,
     _cap_effective_confidence_for_market,
@@ -18,6 +19,7 @@ from main import (
     _extract_order_fill_count,
     _filter_markets,
     _log_settings_summary,
+    _passes_refreshed_edge_guard,
     _should_adjust_position,
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
@@ -32,6 +34,72 @@ class DummyStateManager:
 
 
 class TestMainUtils(unittest.TestCase):
+    def test_market_model_exposes_volume_24h_field(self) -> None:
+        market = Market(id="m-volume", question="Volume test", volume_24h=123.0)
+        self.assertEqual(market.volume_24h, 123.0)
+
+    def test_build_execution_audit_omits_none_values(self) -> None:
+        payload = _build_execution_audit(
+            decision_phase="order_submission",
+            decision_terminal=True,
+            final_action="skip",
+            final_reason="test_reason",
+            nullable_value=None,
+            kept_value=3,
+        )
+        self.assertEqual(payload["decision_phase"], "order_submission")
+        self.assertTrue(payload["decision_terminal"])
+        self.assertEqual(payload["final_action"], "skip")
+        self.assertEqual(payload["final_reason"], "test_reason")
+        self.assertEqual(payload["kept_value"], 3)
+        self.assertNotIn("nullable_value", payload)
+
+    def test_build_execution_audit_normalizes_legacy_alias_keys(self) -> None:
+        payload = _build_execution_audit(
+            final_reason="test",
+            amount_usdc=5.0,
+            score_value=0.42,
+            confidence_gate_override_edge=0.09,
+            confidence_gate_override_market_edge=0.07,
+            implied_prob=0.51,
+            edge=0.11,
+        )
+        self.assertEqual(payload["bet_amount_usdc"], 5.0)
+        self.assertEqual(payload["score_final"], 0.42)
+        self.assertEqual(payload["override_edge"], 0.09)
+        self.assertEqual(payload["market_edge"], 0.07)
+        self.assertEqual(payload["implied_prob_market"], 0.51)
+        self.assertEqual(payload["edge_market"], 0.11)
+        self.assertNotIn("amount_usdc", payload)
+        self.assertNotIn("score_value", payload)
+        self.assertNotIn("confidence_gate_override_edge", payload)
+        self.assertNotIn("confidence_gate_override_market_edge", payload)
+        self.assertNotIn("implied_prob", payload)
+        self.assertNotIn("edge", payload)
+
+    def test_passes_refreshed_edge_guard_blocks_eroded_edge(self) -> None:
+        market = Market(
+            id="m-refresh",
+            question="Will team win?",
+            outcomes=[MarketOutcome(name="YES", price=0.70), MarketOutcome(name="NO", price=0.30)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.72,
+            bet_size_pct=0.4,
+            reasoning="test",
+        )
+        ok, implied_prob, edge, reason = _passes_refreshed_edge_guard(
+            market,
+            decision,
+            Settings(MIN_EDGE=0.05),
+        )
+        self.assertFalse(ok)
+        self.assertEqual(implied_prob, 0.70)
+        self.assertAlmostEqual(edge or 0.0, 0.02, places=6)
+        self.assertIn("below min", reason)
+
     def test_filter_markets(self) -> None:
         markets = [
             Market(id="1", question="Q1", liquidity_usdc=50, category="sports"),
