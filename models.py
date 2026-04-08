@@ -110,6 +110,26 @@ class TradeDecision(BaseModel):
         default=False,
         description="True when evidence quality is too weak to act on this cycle.",
     )
+    raw_should_trade: bool | None = Field(
+        default=None,
+        description="Raw model value before validation and enforcement.",
+    )
+    raw_outcome: str | None = Field(
+        default=None,
+        description="Raw model outcome before canonical normalization.",
+    )
+    raw_confidence: float | None = Field(
+        default=None,
+        description="Raw model confidence before normalization and capping.",
+    )
+    raw_bet_size_pct: float | None = Field(
+        default=None,
+        description="Raw model bet size before validation and policy gates.",
+    )
+    raw_reasoning: str | None = Field(
+        default=None,
+        description="Raw model reasoning before validator annotations.",
+    )
 
 
 class OrderRequest(BaseModel):

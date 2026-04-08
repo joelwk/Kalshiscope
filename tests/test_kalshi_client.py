@@ -187,6 +187,83 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(params["close_time_start"], "2026-04-06T00:00:00+00:00")
         self.assertEqual(params["close_time_end"], "2026-04-07T00:00:00+00:00")
 
+    def test_get_markets_respects_max_fetch_pages_cap(self) -> None:
+        client = self._client()
+        client.max_fetch_pages = 1
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-1", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "next-1",
+                }
+            ),
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-2", "title": "Q2", "yes_ask": 45},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+
+        with patch.object(client, "_request", side_effect=pages) as request_mock:
+            markets = client.get_markets()
+        self.assertEqual([m.id for m in markets], ["MKT-1"])
+        self.assertEqual(request_mock.call_count, 1)
+
+    def test_get_markets_skips_malformed_market_payload_without_aborting(self) -> None:
+        client = self._client()
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-OK-1", "title": "Q1", "yes_ask": 55},
+                        {"ticker": "MKT-BAD", "title": ""},
+                    ],
+                    "cursor": "next-1",
+                }
+            ),
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-OK-2", "title": "Q2", "yes_ask": 45},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+        with patch.object(client, "_request", side_effect=pages):
+            markets = client.get_markets()
+        self.assertEqual([m.id for m in markets], ["MKT-OK-1", "MKT-OK-2"])
+
+    def test_get_markets_deduplicates_market_ids_across_pages(self) -> None:
+        client = self._client()
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-DUP", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "next-1",
+                }
+            ),
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-DUP", "title": "Q1 duplicate", "yes_ask": 55},
+                        {"ticker": "MKT-UNIQ", "title": "Q2", "yes_ask": 45},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+        with patch.object(client, "_request", side_effect=pages):
+            markets = client.get_markets()
+        self.assertEqual([m.id for m in markets], ["MKT-DUP", "MKT-UNIQ"])
+
     def test_submit_order_maps_amount_to_count(self) -> None:
         client = self._client()
         market = Market(
@@ -241,6 +318,49 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(sent_payload["no_price"], 60)
         self.assertNotIn("yes_price", sent_payload)
         self.assertEqual(response.id, "ord-2")
+
+    def test_submit_order_market_uses_fill_or_kill_and_fallback_suffix(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-6",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.40}, {"name": "NO", "price": 0.60}],
+        )
+        order = OrderRequest(
+            market_id="MKT-6",
+            outcome="YES",
+            amount_usdc=6.0,
+            side="BUY",
+            order_type="market",
+        )
+        response_payload = {"order": {"order_id": "ord-6", "status": "filled"}}
+
+        with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
+            response = client.submit_order(order, market=market, retry_suffix="fb")
+
+        sent_payload = req_mock.call_args.kwargs["json"]
+        self.assertEqual(sent_payload["type"], "market")
+        self.assertEqual(sent_payload["time_in_force"], "fill_or_kill")
+        self.assertEqual(sent_payload["yes_price"], 97)
+        self.assertTrue(sent_payload["client_order_id"].endswith("-fb"))
+        self.assertEqual(response.id, "ord-6")
+
+    def test_submit_order_rejects_untradeable_price_band(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-7",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.99}, {"name": "NO", "price": 0.01}],
+        )
+        order = OrderRequest(
+            market_id="MKT-7",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+
+        with self.assertRaises(ValueError):
+            client.submit_order(order, market=market)
 
     def test_submit_order_raises_market_closed_error(self) -> None:
         client = self._client()

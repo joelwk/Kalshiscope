@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import SearchConfig
-from grok_client import GrokClient, _category_research_hint, _extract_json
+from grok_client import GrokClient, _category_research_hint, _extract_json, _is_timeout_class_error, _is_retriable_grok_error
 from models import Market, MarketOutcome, TradeDecision
 
 
@@ -35,6 +35,32 @@ class DummyClient:
         self.chat = DummyChatClient(content)
 
 
+class FailingChatSession:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def append(self, message):
+        return None
+
+    def stream(self):
+        raise self.error
+
+
+class FailingChatClient:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.create_calls = 0
+
+    def create(self, **kwargs):
+        self.create_calls += 1
+        return FailingChatSession(self.error)
+
+
+class FailingClient:
+    def __init__(self, error: Exception) -> None:
+        self.chat = FailingChatClient(error)
+
+
 class TestGrokClient(unittest.TestCase):
     def test_extract_json(self) -> None:
         payload = _extract_json("prefix {\"foo\": 1} suffix")
@@ -44,9 +70,49 @@ class TestGrokClient(unittest.TestCase):
         with self.assertRaises(ValueError):
             _extract_json("no-json")
 
+    def test_is_retriable_grok_error_classifies_fast_internal(self) -> None:
+        err = RuntimeError("StatusCode.INTERNAL: internal server error")
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=20_000.0))
+
+    def test_grpc_deadline_exceeded_is_retriable_regardless_of_duration(self) -> None:
+        err = RuntimeError(
+            'StatusCode.DEADLINE_EXCEEDED\ndetails = "Deadline Exceeded"'
+        )
+        self.assertTrue(_is_timeout_class_error(err))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=60_000.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=120_000.0))
+
+    def test_custom_stream_timeout_is_retriable(self) -> None:
+        err = TimeoutError("Grok stream exceeded 60s for market KXTEST-123")
+        self.assertTrue(_is_timeout_class_error(err))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_non_deadline_slow_failure_is_not_retriable(self) -> None:
+        err = RuntimeError("some random error")
+        self.assertFalse(_is_timeout_class_error(err))
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_analyze_market_stops_when_budget_exhausted(self) -> None:
+        market = Market(
+            id="m-budget",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        client = GrokClient(api_key="x")
+        client.client = FailingClient(
+            RuntimeError("StatusCode.INTERNAL: internal server error")
+        )
+        with patch("grok_client._DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS", 0.0):
+            with self.assertRaises(RuntimeError):
+                client.analyze_market(market)
+
     def test_category_research_hint_weather_profile(self) -> None:
         hint = _category_research_hint("weather")
         self.assertIn("weather.gov", hint)
+        self.assertIn("METAR/ASOS", hint)
+        self.assertIn("GFS vs ECMWF", hint)
+        self.assertIn("~72 hours", hint)
 
     def test_category_research_hint_commodities_market(self) -> None:
         market = Market(id="g1", question="Will gold close above 4600?", category="business")
@@ -490,6 +556,62 @@ class TestGrokClient(unittest.TestCase):
             profile_name="generic",
         )
         self.assertAlmostEqual(validated.edge_external or 0.0, 0.08, places=6)
+
+    def test_validate_and_enrich_verifiable_fallback_not_capped_to_half(self) -> None:
+        market = Market(
+            id="m11b",
+            question="Will minimum temp stay above 40F?",
+            outcomes=[MarketOutcome(name="YES", price=0.30), MarketOutcome(name="NO", price=0.70)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.92,
+            bet_size_pct=0.3,
+            reasoning=(
+                "No external odds found. Official NWS CLI and ASOS observation confirmed "
+                "settlement conditions."
+            ),
+            implied_prob_external=None,
+            my_prob=None,
+            edge_external=0.22,
+            evidence_quality=0.0,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.55)
+
+    def test_validate_and_enrich_applies_high_confidence_evidence_override(self) -> None:
+        market = Market(
+            id="m-override-eq",
+            question="Will max temp stay below 70F?",
+            outcomes=[MarketOutcome(name="YES", price=0.72), MarketOutcome(name="NO", price=0.28)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.95,
+            bet_size_pct=0.2,
+            reasoning=(
+                "NWS observation update with settlement context from exchange bulletin. "
+                "My prob: 95%. Edge: 23%."
+            ),
+            implied_prob_external=None,
+            my_prob=None,
+            edge_external=0.23,
+            evidence_quality=0.0,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.60)
 
     def test_validate_and_enrich_normalizes_outcome_label(self) -> None:
         market = Market(

@@ -27,8 +27,12 @@ class DummyKalshi:
         self._markets = markets
         self.submitted = False
 
-    def get_markets(self):
+    def get_markets(self, *, close_time_start=None, close_time_end=None):
+        _ = close_time_start, close_time_end
         return self._markets
+
+    def reset_session(self):
+        return None
 
     def submit_order(self, order, **kwargs):
         self.submitted = True

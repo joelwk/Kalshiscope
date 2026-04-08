@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 from config import Settings
 from main import (
+    _analysis_result_rank,
+    _analyze_market_candidate,
     _best_orderbook_sell_price,
+    _build_order_request_from_market,
+    _build_kalshi_market_fetch_window,
     _build_execution_audit,
     _build_reasoning_hash,
     _cap_analysis_candidates,
@@ -17,10 +21,17 @@ from main import (
     _effective_position_override_threshold,
     _extract_order_cancel_reason,
     _extract_order_fill_count,
+    _fetch_markets_with_optional_server_filters,
     _filter_markets,
+    _kelly_fraction_for_market_horizon,
     _log_settings_summary,
+    _max_confidence_for_market,
+    _passes_edge_threshold,
     _passes_refreshed_edge_guard,
+    _requires_market_refresh,
+    _ticker_resolution_date,
     _should_adjust_position,
+    _is_likely_resolved_by_ticker_date,
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
 
@@ -33,7 +44,53 @@ class DummyStateManager:
         return self.mapping.get(market_id)
 
 
+class DummyGrokClient:
+    def __init__(self, decision: TradeDecision) -> None:
+        self.decision = decision
+
+    def analyze_market(self, market, search_config=None, previous_analysis=None):
+        return self.decision
+
+
+class FailingGrokClient:
+    def analyze_market(self, market, search_config=None, previous_analysis=None):
+        raise RuntimeError("StatusCode.INTERNAL: internal server error")
+
+
 class TestMainUtils(unittest.TestCase):
+    class _DummyKalshiClient:
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls = []
+            self.reset_calls = 0
+
+        def get_markets(self, close_time_start=None, close_time_end=None):
+            self.calls.append((close_time_start, close_time_end))
+            response = self._responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        def reset_session(self):
+            self.reset_calls += 1
+
+    def test_analysis_result_rank_prioritizes_tradeable_high_quality(self) -> None:
+        tradeable = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.82,
+            bet_size_pct=0.2,
+            reasoning="tradeable",
+            evidence_quality=0.9,
+        )
+        non_tradeable = tradeable.model_copy(
+            update={"should_trade": False, "evidence_quality": 1.0}
+        )
+        self.assertGreater(
+            _analysis_result_rank({"decision": tradeable}),
+            _analysis_result_rank({"decision": non_tradeable}),
+        )
+
     def test_market_model_exposes_volume_24h_field(self) -> None:
         market = Market(id="m-volume", question="Volume test", volume_24h=123.0)
         self.assertEqual(market.volume_24h, 123.0)
@@ -135,6 +192,28 @@ class TestMainUtils(unittest.TestCase):
         # Market 4 has no close_time, so it passes (no filter applied)
         self.assertEqual([m.id for m in filtered], ["2", "4"])
 
+    def test_filter_markets_with_zero_min_close_days_applies_lower_bound(self) -> None:
+        now = datetime.now(timezone.utc)
+        markets = [
+            Market(id="closed", question="Closed", close_time=now - timedelta(seconds=1)),
+            Market(id="future", question="Future", close_time=now + timedelta(hours=1)),
+        ]
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=0,
+            allowlist=(),
+            blocklist=(),
+            min_close_days=0,
+            max_close_days=1,
+        )
+        self.assertEqual([m.id for m in filtered], ["future"])
+
+    def test_build_kalshi_market_fetch_window_preserves_zero_day_start(self) -> None:
+        start, end = _build_kalshi_market_fetch_window(0, 1)
+        self.assertIsNotNone(start)
+        self.assertIsNotNone(end)
+        self.assertLess(start, end)
+
     def test_filter_markets_max_close_days_only(self) -> None:
         now = datetime.now(timezone.utc)
         markets = [
@@ -198,8 +277,8 @@ class TestMainUtils(unittest.TestCase):
 
     def test_filter_markets_skips_weather_bin_markets_when_enabled(self) -> None:
         markets = [
-            Market(id="KXLOWTCHI-26APR06-B33.5", question="Bin market", liquidity_usdc=200),
-            Market(id="KXLOWTCHI-26APR06-T33", question="Threshold market", liquidity_usdc=200),
+            Market(id="KXLOWTCHI-99DEC31-B33.5", question="Bin market", liquidity_usdc=200),
+            Market(id="KXLOWTCHI-99DEC31-T33", question="Threshold market", liquidity_usdc=200),
         ]
         stats: dict[str, int] = {}
         filtered = _filter_markets(
@@ -210,7 +289,7 @@ class TestMainUtils(unittest.TestCase):
             skip_weather_bin_markets=True,
             stats=stats,
         )
-        self.assertEqual([m.id for m in filtered], ["KXLOWTCHI-26APR06-T33"])
+        self.assertEqual([m.id for m in filtered], ["KXLOWTCHI-99DEC31-T33"])
         self.assertEqual(stats["skipped_weather_bin_markets"], 1)
 
     def test_extract_order_cancel_reason_prefers_explicit_reason_keys(self) -> None:
@@ -272,6 +351,52 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual([m.id for m in filtered], ["kept"])
         self.assertEqual(stats["skipped_volume_24h"], 1)
         self.assertEqual(stats["skipped_extreme_price"], 1)
+
+    def test_filter_markets_applies_tradeable_price_band(self) -> None:
+        markets = [
+            Market(
+                id="too-cheap",
+                question="Too cheap market",
+                outcomes=[MarketOutcome(name="YES", price=0.02), MarketOutcome(name="NO", price=0.98)],
+                liquidity_usdc=200,
+            ),
+            Market(
+                id="too-expensive",
+                question="Too expensive market",
+                outcomes=[MarketOutcome(name="YES", price=0.98), MarketOutcome(name="NO", price=0.02)],
+                liquidity_usdc=200,
+            ),
+            Market(
+                id="tradeable",
+                question="Tradeable market",
+                outcomes=[MarketOutcome(name="YES", price=0.52), MarketOutcome(name="NO", price=0.48)],
+                liquidity_usdc=200,
+            ),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=(),
+            stats=stats,
+            min_tradeable_yes_price=0.05,
+            max_tradeable_yes_price=0.95,
+        )
+        self.assertEqual([m.id for m in filtered], ["tradeable"])
+        self.assertEqual(stats["skipped_untradeable_price"], 2)
+
+    def test_ticker_resolution_date_parses_kalshi_style_token(self) -> None:
+        parsed = _ticker_resolution_date("KXLOWTDC-26APR07-T44")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.month, 4)
+        self.assertEqual(parsed.day, 7)
+
+    def test_likely_resolved_by_ticker_date_flags_past_day(self) -> None:
+        market = Market(id="KXLOWTDC-26APR07-T44", question="Q")
+        now = datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc)
+        self.assertTrue(_is_likely_resolved_by_ticker_date(market, now))
 
     def test_collapse_event_ladders_keeps_most_informative_brackets(self) -> None:
         event_markets = [
@@ -430,6 +555,28 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(wakeup_seconds, 1)
 
+    def test_fetch_markets_with_optional_server_filters_retries_filtered_then_unfiltered(self) -> None:
+        now = datetime.now(timezone.utc)
+        expected = [Market(id="m", question="Q")]
+        client = self._DummyKalshiClient(
+            [
+                RuntimeError("first filtered failure"),
+                RuntimeError("second filtered failure"),
+                expected,
+            ]
+        )
+        markets = _fetch_markets_with_optional_server_filters(
+            client,
+            use_server_side_filters=True,
+            fetch_window_start=now,
+            fetch_window_end=now + timedelta(days=1),
+        )
+        self.assertEqual(markets, expected)
+        self.assertEqual(client.reset_calls, 1)
+        self.assertEqual(len(client.calls), 3)
+        # last call should be unfiltered fallback
+        self.assertEqual(client.calls[-1], (None, None))
+
     def test_cap_effective_confidence_for_market_respects_category_caps(self) -> None:
         settings = Settings(
             MAX_SPORTS_CONFIDENCE=0.80,
@@ -463,6 +610,7 @@ class TestMainUtils(unittest.TestCase):
             COINFLIP_PRICE_LOWER=0.45,
             COINFLIP_PRICE_UPPER=0.55,
             FALLBACK_EDGE_MIN_EDGE=0.08,
+            WEATHER_MIN_EDGE=0.10,
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -470,6 +618,55 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_edge_threshold_for_market(0.60, settings, "computed"), 0.05)
         self.assertEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.08)
         self.assertEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.08)
+        weather_market = Market(
+            id="w-edge",
+            question="Will rainfall exceed 1 inch in Miami tomorrow?",
+            category="weather",
+        )
+        self.assertEqual(
+            _edge_threshold_for_market(0.60, settings, "computed", market=weather_market),
+            0.10,
+        )
+
+    def test_max_confidence_for_weather_market_uses_weather_cap(self) -> None:
+        settings = Settings(
+            MAX_WEATHER_CONFIDENCE=0.79,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="w-cap",
+            question="Will a tropical storm form in the Gulf?",
+            category="weather",
+        )
+        self.assertEqual(_max_confidence_for_market(market, settings), 0.79)
+
+    def test_kelly_fraction_weather_multiplier_applies(self) -> None:
+        now = datetime.now(timezone.utc)
+        settings = Settings(
+            KELLY_FRACTION_DEFAULT=0.25,
+            KELLY_FRACTION_SHORT_HORIZON_HOURS=2,
+            KELLY_FRACTION_SHORT_HORIZON=0.10,
+            KELLY_FRACTION_WEATHER=0.50,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        weather_market = Market(
+            id="w-kelly",
+            question="Will it snow in Denver tonight?",
+            close_time=now + timedelta(hours=1),
+            category="weather",
+        )
+        generic_market = Market(
+            id="g-kelly",
+            question="Will earnings beat estimates?",
+            close_time=now + timedelta(hours=1),
+            category="business",
+        )
+        self.assertEqual(_kelly_fraction_for_market_horizon(generic_market, settings), 0.10)
+        self.assertEqual(_kelly_fraction_for_market_horizon(weather_market, settings), 0.05)
 
     def test_should_adjust_position_uses_bankroll_relative_cap(self) -> None:
         settings = Settings(
@@ -543,6 +740,134 @@ class TestMainUtils(unittest.TestCase):
         threshold = _effective_position_override_threshold(sports_market, settings)
         self.assertEqual(threshold, 0.85)
         self.assertFalse(0.80 >= threshold)
+
+    def test_requires_market_refresh_enforces_staleness_threshold(self) -> None:
+        self.assertTrue(
+            _requires_market_refresh(
+                pre_order_market_refresh=True,
+                market_data_age_seconds=None,
+                max_market_data_age_seconds=120,
+            )
+        )
+        self.assertFalse(
+            _requires_market_refresh(
+                pre_order_market_refresh=False,
+                market_data_age_seconds=60.0,
+                max_market_data_age_seconds=120,
+            )
+        )
+        self.assertTrue(
+            _requires_market_refresh(
+                pre_order_market_refresh=False,
+                market_data_age_seconds=121.0,
+                max_market_data_age_seconds=120,
+            )
+        )
+
+    def test_passes_edge_threshold_blocks_missing_implied_when_required(self) -> None:
+        settings = Settings(
+            REQUIRE_IMPLIED_PRICE=True,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.75,
+            bet_size_pct=0.3,
+            reasoning="test",
+        )
+        passed, edge, reason = _passes_edge_threshold(None, decision, settings)
+        self.assertFalse(passed)
+        self.assertIsNone(edge)
+        self.assertIn("missing implied", reason)
+
+    def test_analyze_market_candidate_returns_decision_payload(self) -> None:
+        market = Market(
+            id="m-candidate",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=200.0,
+            category="sports",
+        )
+        settings = Settings(
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.84,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 55%, My prob: 72%, Edge: 17%",
+            implied_prob_external=0.55,
+            my_prob=0.72,
+            edge_external=0.17,
+            evidence_quality=0.7,
+        )
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(decision),
+        )
+        self.assertIn("decision", result)
+        self.assertIn("was_refined", result)
+        self.assertFalse(result["was_refined"])
+        self.assertEqual(result["decision"].outcome, "YES")
+
+    def test_analyze_market_candidate_returns_failure_payload_on_initial_error(self) -> None:
+        market = Market(
+            id="m-candidate-fail",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=200.0,
+            category="sports",
+        )
+        settings = Settings(
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=FailingGrokClient(),
+        )
+        self.assertTrue(result["analysis_failed"])
+        self.assertIn("internal server error", result["analysis_error"].lower())
+        self.assertTrue(result["analysis_error_retriable_xai"])
+        self.assertFalse(result["was_refined"])
+
+    def test_build_order_request_from_market_uses_current_market_price(self) -> None:
+        market = Market(
+            id="m-order",
+            question="Will value be above threshold?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.67),
+                MarketOutcome(name="NO", price=0.33),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.81,
+            bet_size_pct=0.3,
+            reasoning="test",
+        )
+        order = _build_order_request_from_market(
+            market=market,
+            decision=decision,
+            amount_usdc=5.0,
+        )
+        self.assertEqual(order.market_id, "m-order")
+        self.assertEqual(order.outcome, "YES")
+        self.assertEqual(order.yes_price, 67)
 
     def test_confidence_gate_override_metrics_prefers_stronger_edge(self) -> None:
         market = Market(

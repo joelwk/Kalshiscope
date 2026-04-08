@@ -63,6 +63,24 @@ def test_market_family_weather() -> None:
     assert market_family(market) == "weather"
 
 
+def test_market_family_weather_precipitation_keyword() -> None:
+    market = Market(
+        id="w2",
+        question="Will rainfall exceed 2 inches in Miami?",
+        category=None,
+    )
+    assert market_family(market) == "weather"
+
+
+def test_market_family_weather_severe_keyword() -> None:
+    market = Market(
+        id="w3",
+        question="Will a hurricane make landfall in Florida this week?",
+        category=None,
+    )
+    assert market_family(market) == "weather"
+
+
 def test_is_commodity_market_detects_gold() -> None:
     market = Market(
         id="c1",
@@ -123,6 +141,40 @@ def test_dynamic_lookback_medium_fallback_without_close_time() -> None:
     )
     config = build_market_search_config(settings, market, now=now)
     assert config.lookback_hours == 72
+
+
+def test_dynamic_lookback_weather_short_horizon() -> None:
+    now = datetime.now(timezone.utc)
+    settings = Settings(
+        SEARCH_LOOKBACK_SHORT_HOURS=24,
+        SEARCH_LOOKBACK_MEDIUM_HOURS=72,
+        SEARCH_LOOKBACK_LONG_HOURS=168,
+    )
+    market = Market(
+        id="w4",
+        question="Will it rain in Boston tomorrow?",
+        close_time=now + timedelta(hours=18),
+        category="weather",
+    )
+    config = build_market_search_config(settings, market, now=now)
+    assert config.lookback_hours == 24
+
+
+def test_dynamic_lookback_weather_long_horizon() -> None:
+    now = datetime.now(timezone.utc)
+    settings = Settings(
+        SEARCH_LOOKBACK_SHORT_HOURS=24,
+        SEARCH_LOOKBACK_MEDIUM_HOURS=72,
+        SEARCH_LOOKBACK_LONG_HOURS=168,
+    )
+    market = Market(
+        id="w5",
+        question="Will snowfall exceed 6 inches in Chicago in 10 days?",
+        close_time=now + timedelta(days=10),
+        category="weather",
+    )
+    config = build_market_search_config(settings, market, now=now)
+    assert config.lookback_hours == 168
 
 
 def test_market_category_flags_esports() -> None:

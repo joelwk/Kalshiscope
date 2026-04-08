@@ -154,3 +154,33 @@ def test_position_override_respects_sports_cap() -> None:
     assert should_add is False
     assert bet_pct == 0.0
     assert reason == "insufficient_confidence_increase"
+
+
+def test_should_adjust_blocks_when_price_move_too_small() -> None:
+    settings = Settings(
+        MAX_BET_USDC=50.0,
+        MAX_POSITION_PER_MARKET_USDC=200.0,
+        MIN_CONFIDENCE_INCREASE_FOR_ADD=0.01,
+        MIN_PRICE_MOVE_FOR_READD=0.05,
+    )
+    position = Position(
+        market_id="m1",
+        outcome="YES",
+        total_amount_usdc=100.0,
+        avg_confidence=0.70,
+        trade_count=2,
+        first_trade=datetime.now(timezone.utc),
+        last_trade=datetime.now(timezone.utc),
+    )
+    should_add, bet_pct, reason = _should_adjust_position(
+        _decision(0.80, 0.3),
+        None,
+        position,
+        None,
+        settings,
+        current_entry_price=0.51,
+        last_entry_price=0.50,
+    )
+    assert should_add is False
+    assert bet_pct == 0.0
+    assert reason == "insufficient_price_move_for_readd"

@@ -17,15 +17,20 @@ logger = get_logger(__name__)
 _CONFIDENCE_TREND_WINDOW = 5
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
 _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
+    "analysis_failure",
     "analysis_only_insufficient_balance",
     "bet_amount_zero",
     "confidence_below_min",
+    "evidence_quality_below_min",
     "edge_gate_blocked",
     "kelly_sub_floor_skip",
     "lmsr_gate_blocked",
+    "max_trades_per_cycle_reached",
     "no_trade_recommended",
+    "orderbook_spread_too_wide",
     "position_adjustment_blocked",
     "score_gate_blocked",
+    "stale_market_data_refresh_failed",
     "uniform_implied_probability",
     "zero_bet_after_sizing",
 }
@@ -277,6 +282,24 @@ class MarketStateManager:
             first_trade=first_trade,
             last_trade=last_trade,
         )
+
+    def get_last_trade_entry_price(self, market_id: str) -> float | None:
+        row = self._conn.execute(
+            """
+            SELECT entry_price
+            FROM trade_outcome_events
+            WHERE market_id = ?
+            ORDER BY timestamp DESC, order_id DESC
+            LIMIT 1
+            """,
+            (market_id,),
+        ).fetchone()
+        if row is None or row["entry_price"] is None:
+            return None
+        try:
+            return float(row["entry_price"])
+        except (TypeError, ValueError):
+            return None
 
     def get_anchor_analysis(
         self,
