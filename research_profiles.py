@@ -73,6 +73,16 @@ _POLITICS_KEYWORDS = (
     "poll",
     "referendum",
 )
+_SPEECH_KEYWORDS = (
+    "mention",
+    "will say",
+    "say ",
+    "speak",
+    "speech",
+    "press conference",
+    "briefing",
+    "transcript",
+)
 _WEATHER_KEYWORDS = (
     "temperature",
     "temp",
@@ -116,6 +126,7 @@ _COMMODITY_KEYWORDS = (
     "gas prices",
 )
 _LONG_HORIZON_HINTS = ("election", "presidential", "winner", "nominee")
+_SPEECH_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -165,6 +176,12 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
             domains=settings.POLITICS_ALLOWED_DOMAINS,
             x_handles=settings.POLITICS_ALLOWED_X_HANDLES,
         )
+    if family == "speech":
+        return ResearchProfile(
+            name=family,
+            domains=settings.SPEECH_ALLOWED_DOMAINS,
+            x_handles=settings.SPEECH_ALLOWED_X_HANDLES,
+        )
     if family == "weather":
         return ResearchProfile(
             name=family,
@@ -189,6 +206,8 @@ def market_family(market: Market) -> str:
         return "crypto"
     if _has_keyword_match(text, _POLITICS_KEYWORDS):
         return "politics"
+    if _SPEECH_TICKER_PATTERN.search(market.id or "") or _has_keyword_match(text, _SPEECH_KEYWORDS):
+        return "speech"
     if _has_keyword_match(text, _WEATHER_KEYWORDS):
         return "weather"
     return "generic"

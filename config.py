@@ -20,7 +20,8 @@ class Settings:
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.10
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
-    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.50
+    CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.50
+    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.60
     MIN_LIQUIDITY_USDC: float = 5.0
     POLL_INTERVAL_SEC: int = 300
 
@@ -35,6 +36,7 @@ class Settings:
     LOW_PRICE_BET_PENALTY: float = 0.50
     FALLBACK_EDGE_MIN_EDGE: float = 0.08
     WEATHER_MIN_EDGE: float = 0.08
+    WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.15
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
@@ -56,8 +58,13 @@ class Settings:
         "KXNETFLIX",
         "KXSPOTIFY",
         "KXMADDOW",
+        "KXPOLITICSMENTION-",
+        "KXPERSONMENTION-",
+        "KXKHANNAMENTION-",
+        "KXCARNEYMENTION-",
     )
     SKIP_WEATHER_BIN_MARKETS: bool = True
+    CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED: bool = True
     MIN_VOLUME_24H: float = 0.0
     EXTREME_YES_PRICE_LOWER: float = 0.02
     EXTREME_YES_PRICE_UPPER: float = 0.98
@@ -191,6 +198,28 @@ class Settings:
         "WSJ",
         "FT",
     )
+    SPEECH_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "c-span.org",
+        "youtube.com",
+        "whitehouse.gov",
+        "pm.gc.ca",
+        "parl.ca",
+        "politico.com",
+        "reuters.com",
+        "apnews.com",
+    )
+    SPEECH_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "CSPAN",
+        "WhiteHouse",
+        "POTUS",
+        "CanadianPM",
+        "Reuters",
+        "AP",
+        "politico",
+        "CBCNews",
+        "BBCWorld",
+        "WSJ",
+    )
     WEATHER_ALLOWED_DOMAINS: tuple[str, ...] = (
         "weather.gov",
         "forecast.weather.gov",
@@ -231,7 +260,7 @@ class Settings:
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
     KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
-    KALSHI_MAX_FETCH_PAGES: int = 0
+    KALSHI_MAX_FETCH_PAGES: int = 10
 
     # Execution
     DRY_RUN: bool = True
@@ -239,11 +268,14 @@ class Settings:
     MAX_MARKET_DATA_AGE_SECONDS: int = 120
     ORDERBOOK_PRECHECK_ENABLED: bool = True
     ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
+    ORDERBOOK_MIN_RESTING_VOLUME: int = 3
     ORDER_PRICE_IMPROVEMENT_CENTS: int = 1
+    ORDER_DEFAULT_TIF: str = "gtc"
     ORDER_SUBMISSION_MIN_PRICE: float = 0.03
     ORDER_SUBMISSION_MAX_PRICE: float = 0.97
     ORDER_FALLBACK_TO_MARKET: bool = True
     ORDER_FALLBACK_MIN_CONFIDENCE: float = 0.85
+    ORDER_FALLBACK_MIN_LIQUIDITY_USDC: float = 200.0
     CALIBRATION_MODE_ENABLED: bool = False
     CALIBRATION_MIN_SAMPLES: int = 20
 
@@ -259,6 +291,7 @@ class Settings:
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 3
     MAX_MARKETS_PER_CYCLE: int = 20
+    MAX_WEATHER_CANDIDATES_PER_CYCLE: int = 3
     MAX_TRADES_PER_CYCLE: int = 5
     XAI_CIRCUIT_BREAKER_MAX_FAILURES: int = 3
     XAI_CLIENT_TIMEOUT_SECONDS: int = 120
@@ -279,7 +312,17 @@ class Settings:
     # Score gate (phase A/B can run in shadow mode)
     SCORE_GATE_MODE: str = "active"  # off|shadow|active
     SCORE_GATE_THRESHOLD: float = 0.12
-    WEATHER_SCORE_PENALTY: float = 0.03
+    SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.55
+    SCORE_LOW_INFO_PENALTY_BASE: float = 0.05
+    SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.05
+    SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT: int = 1
+    SCORE_CONFIDENCE_CALIBRATION_FLOOR: float = 0.50
+    SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE: float = 0.08
+    MENTION_MARKET_SCORE_PENALTY: float = 0.05
+    WEATHER_SCORE_PENALTY: float = 0.10
+    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.50
+    PRE_ANALYSIS_OPPORTUNITY_ENABLED: bool = True
+    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.20
 
     # Bayesian + LMSR + Kelly experimental layers
     BAYESIAN_ENABLED: bool = False
@@ -287,6 +330,7 @@ class Settings:
     BAYESIAN_PRIOR_DEFAULT: float = 0.50
     BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
     BAYESIAN_MAX_POSTERIOR: float = 0.97
+    BAYESIAN_MAX_CONFIDENCE_BOOST: float = 0.15
     LMSR_ENABLED: bool = False
     LMSR_LIQUIDITY_PARAM_B: float = 100000.0
     LMSR_MIN_INEFFICIENCY: float = 0.05
@@ -428,6 +472,10 @@ def load_settings() -> Settings:
             "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY",
             Settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
         ),
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=_read_env_float(
+            "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE",
+            Settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE,
+        ),
         MIN_EVIDENCE_QUALITY_FOR_TRADE=_read_env_float(
             "MIN_EVIDENCE_QUALITY_FOR_TRADE",
             Settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
@@ -460,6 +508,10 @@ def load_settings() -> Settings:
         WEATHER_MIN_EDGE=_read_env_float(
             "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
         ),
+        WEATHER_FALLBACK_EDGE_MIN_EDGE=_read_env_float(
+            "WEATHER_FALLBACK_EDGE_MIN_EDGE",
+            Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
+        ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE
         ),
@@ -490,6 +542,10 @@ def load_settings() -> Settings:
         ),
         SKIP_WEATHER_BIN_MARKETS=_read_env_bool(
             "SKIP_WEATHER_BIN_MARKETS", Settings.SKIP_WEATHER_BIN_MARKETS
+        ),
+        CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED=_read_env_bool(
+            "CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED",
+            Settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED,
         ),
         MIN_VOLUME_24H=_read_env_float("MIN_VOLUME_24H", Settings.MIN_VOLUME_24H),
         EXTREME_YES_PRICE_LOWER=_read_env_float(
@@ -568,6 +624,12 @@ def load_settings() -> Settings:
         POLITICS_ALLOWED_X_HANDLES=_read_env_csv(
             "POLITICS_ALLOWED_X_HANDLES", Settings.POLITICS_ALLOWED_X_HANDLES
         ),
+        SPEECH_ALLOWED_DOMAINS=_read_env_csv(
+            "SPEECH_ALLOWED_DOMAINS", Settings.SPEECH_ALLOWED_DOMAINS
+        ),
+        SPEECH_ALLOWED_X_HANDLES=_read_env_csv(
+            "SPEECH_ALLOWED_X_HANDLES", Settings.SPEECH_ALLOWED_X_HANDLES
+        ),
         WEATHER_ALLOWED_DOMAINS=_read_env_csv(
             "WEATHER_ALLOWED_DOMAINS", Settings.WEATHER_ALLOWED_DOMAINS
         ),
@@ -611,9 +673,17 @@ def load_settings() -> Settings:
             "ORDERBOOK_PRECHECK_MIN_CONFIDENCE",
             Settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
         ),
+        ORDERBOOK_MIN_RESTING_VOLUME=_read_env_int(
+            "ORDERBOOK_MIN_RESTING_VOLUME",
+            Settings.ORDERBOOK_MIN_RESTING_VOLUME,
+        ),
         ORDER_PRICE_IMPROVEMENT_CENTS=_read_env_int(
             "ORDER_PRICE_IMPROVEMENT_CENTS",
             Settings.ORDER_PRICE_IMPROVEMENT_CENTS,
+        ),
+        ORDER_DEFAULT_TIF=_read_env_str(
+            "ORDER_DEFAULT_TIF",
+            Settings.ORDER_DEFAULT_TIF,
         ),
         ORDER_SUBMISSION_MIN_PRICE=_read_env_float(
             "ORDER_SUBMISSION_MIN_PRICE",
@@ -630,6 +700,10 @@ def load_settings() -> Settings:
         ORDER_FALLBACK_MIN_CONFIDENCE=_read_env_float(
             "ORDER_FALLBACK_MIN_CONFIDENCE",
             Settings.ORDER_FALLBACK_MIN_CONFIDENCE,
+        ),
+        ORDER_FALLBACK_MIN_LIQUIDITY_USDC=_read_env_float(
+            "ORDER_FALLBACK_MIN_LIQUIDITY_USDC",
+            Settings.ORDER_FALLBACK_MIN_LIQUIDITY_USDC,
         ),
         CALIBRATION_MODE_ENABLED=_read_env_bool(
             "CALIBRATION_MODE_ENABLED", Settings.CALIBRATION_MODE_ENABLED
@@ -666,6 +740,10 @@ def load_settings() -> Settings:
         ),
         MAX_MARKETS_PER_CYCLE=_read_env_int(
             "MAX_MARKETS_PER_CYCLE", Settings.MAX_MARKETS_PER_CYCLE
+        ),
+        MAX_WEATHER_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_WEATHER_CANDIDATES_PER_CYCLE",
+            Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE,
         ),
         MAX_TRADES_PER_CYCLE=_read_env_int(
             "MAX_TRADES_PER_CYCLE",
@@ -723,9 +801,49 @@ def load_settings() -> Settings:
             "SCORE_GATE_THRESHOLD",
             Settings.SCORE_GATE_THRESHOLD,
         ),
+        SCORE_LOW_INFO_PENALTY_THRESHOLD=_read_env_float(
+            "SCORE_LOW_INFO_PENALTY_THRESHOLD",
+            Settings.SCORE_LOW_INFO_PENALTY_THRESHOLD,
+        ),
+        SCORE_LOW_INFO_PENALTY_BASE=_read_env_float(
+            "SCORE_LOW_INFO_PENALTY_BASE",
+            Settings.SCORE_LOW_INFO_PENALTY_BASE,
+        ),
+        SCORE_REPEATED_ANALYSIS_PENALTY_BASE=_read_env_float(
+            "SCORE_REPEATED_ANALYSIS_PENALTY_BASE",
+            Settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE,
+        ),
+        SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT=_read_env_int(
+            "SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT",
+            Settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT,
+        ),
+        SCORE_CONFIDENCE_CALIBRATION_FLOOR=_read_env_float(
+            "SCORE_CONFIDENCE_CALIBRATION_FLOOR",
+            Settings.SCORE_CONFIDENCE_CALIBRATION_FLOOR,
+        ),
+        SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE=_read_env_float(
+            "SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE",
+            Settings.SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE,
+        ),
+        MENTION_MARKET_SCORE_PENALTY=_read_env_float(
+            "MENTION_MARKET_SCORE_PENALTY",
+            Settings.MENTION_MARKET_SCORE_PENALTY,
+        ),
         WEATHER_SCORE_PENALTY=_read_env_float(
             "WEATHER_SCORE_PENALTY",
             Settings.WEATHER_SCORE_PENALTY,
+        ),
+        WEATHER_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "WEATHER_MIN_EVIDENCE_QUALITY",
+            Settings.WEATHER_MIN_EVIDENCE_QUALITY,
+        ),
+        PRE_ANALYSIS_OPPORTUNITY_ENABLED=_read_env_bool(
+            "PRE_ANALYSIS_OPPORTUNITY_ENABLED",
+            Settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED,
+        ),
+        PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=_read_env_float(
+            "PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE",
+            Settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
         ),
         BAYESIAN_ENABLED=_read_env_bool(
             "BAYESIAN_ENABLED",
@@ -749,6 +867,10 @@ def load_settings() -> Settings:
         BAYESIAN_MAX_POSTERIOR=_read_env_float(
             "BAYESIAN_MAX_POSTERIOR",
             Settings.BAYESIAN_MAX_POSTERIOR,
+        ),
+        BAYESIAN_MAX_CONFIDENCE_BOOST=_read_env_float(
+            "BAYESIAN_MAX_CONFIDENCE_BOOST",
+            Settings.BAYESIAN_MAX_CONFIDENCE_BOOST,
         ),
         LMSR_ENABLED=_read_env_bool(
             "LMSR_ENABLED",

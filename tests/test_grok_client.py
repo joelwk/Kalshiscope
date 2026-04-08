@@ -119,6 +119,11 @@ class TestGrokClient(unittest.TestCase):
         hint = _category_research_hint("generic", market=market)
         self.assertIn("Commodities guidance", hint)
 
+    def test_category_research_hint_speech_profile(self) -> None:
+        hint = _category_research_hint("speech")
+        self.assertIn("Speech/event guidance", hint)
+        self.assertIn("transcripts", hint)
+
     def test_analyze_market_parses_markdown_fenced_json(self) -> None:
         market = Market(
             id="m1a",
@@ -326,7 +331,23 @@ class TestGrokClient(unittest.TestCase):
 
         decision = client.analyze_market_deep(market)
         self.assertAlmostEqual(decision.confidence, 0.74, places=6)
-        self.assertAlmostEqual(decision.edge_external or 0.0, -0.016, places=6)
+        self.assertAlmostEqual(decision.edge_external or 0.0, 0.0, places=6)
+
+    def test_analyze_market_deep_normalizes_edge_at_negative_one_boundary(self) -> None:
+        market = Market(
+            id="m12-boundary",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+            liquidity_usdc=120.0,
+        )
+        content = """
+        {"should_trade": false, "outcome": "YES", "confidence": 0.60, "bet_size_pct": 0.0, "reasoning": "Edge: -1%", "edge_external": -1.0}
+        """
+        client = GrokClient(api_key="x")
+        client.client = DummyClient(content)
+
+        decision = client.analyze_market_deep(market)
+        self.assertAlmostEqual(decision.edge_external or 0.0, 0.0, places=6)
 
     def test_analyze_market_deep_retains_previous_likelihood_ratio_when_missing(self) -> None:
         market = Market(
@@ -384,6 +405,22 @@ class TestGrokClient(unittest.TestCase):
             )
         )
 
+    def test_should_enable_multimedia_for_speech_profile(self) -> None:
+        market = Market(
+            id="KXCARNEYMENTION-26APR08-ROCK",
+            question="Will Carney say rocket?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+            close_time=datetime.now(timezone.utc) + timedelta(days=3),
+        )
+        client = GrokClient(api_key="x")
+        self.assertTrue(
+            client._should_enable_multimedia(
+                market,
+                decision=None,
+                config=SearchConfig(profile_name="speech"),
+            )
+        )
+
     def test_validate_and_enrich_decision_downgrades_bad_evidence(self) -> None:
         market = Market(
             id="m5",
@@ -427,8 +464,35 @@ class TestGrokClient(unittest.TestCase):
             decision,
             profile_name="generic",
         )
+        self.assertFalse(validated.should_trade)
+        self.assertFalse(validated.abstain)
+
+    def test_validate_and_enrich_sets_abstain_for_double_blind_information_gap(self) -> None:
+        market = Market(
+            id="m5b",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.62), MarketOutcome(name="NO", price=0.38)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.4,
+            reasoning=(
+                "No external odds found. Implied probability: unknown. "
+                "No search results. No evidence found."
+            ),
+            evidence_quality=0.0,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
         self.assertTrue(validated.abstain)
         self.assertFalse(validated.should_trade)
+        self.assertIn("abstain_double_blind_information_gap", validated.reasoning)
 
     def test_validate_and_enrich_caps_evidence_when_no_external_odds_found(self) -> None:
         market = Market(
@@ -555,7 +619,33 @@ class TestGrokClient(unittest.TestCase):
             decision,
             profile_name="generic",
         )
-        self.assertAlmostEqual(validated.edge_external or 0.0, 0.08, places=6)
+        self.assertAlmostEqual(validated.edge_external or 0.0, 0.0, places=6)
+
+    def test_validate_and_enrich_uses_abs_market_gap_for_fallback_edge(self) -> None:
+        market = Market(
+            id="m11c",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.70), MarketOutcome(name="NO", price=0.30)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.64,
+            bet_size_pct=0.2,
+            reasoning="Edge: 8%",
+            implied_prob_external=None,
+            my_prob=0.64,
+            edge_external=0.08,
+            edge_source="fallback",
+            evidence_quality=0.5,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertAlmostEqual(validated.edge_external or 0.0, 0.06, places=6)
 
     def test_validate_and_enrich_verifiable_fallback_not_capped_to_half(self) -> None:
         market = Market(
@@ -612,6 +702,35 @@ class TestGrokClient(unittest.TestCase):
             profile_name="weather",
         )
         self.assertGreaterEqual(validated.evidence_quality, 0.60)
+
+    def test_validate_and_enrich_applies_weather_observed_evidence_floor(self) -> None:
+        market = Market(
+            id="m-weather-obs-floor",
+            question="Will max temp stay below 70F?",
+            outcomes=[MarketOutcome(name="YES", price=0.72), MarketOutcome(name="NO", price=0.28)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.90,
+            raw_confidence=0.90,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Observed station data shows threshold already exceeded and physically impossible to reverse."
+            ),
+            implied_prob_external=None,
+            my_prob=0.90,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.1,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.75)
 
     def test_validate_and_enrich_normalizes_outcome_label(self) -> None:
         market = Market(

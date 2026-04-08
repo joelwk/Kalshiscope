@@ -45,7 +45,10 @@ class XAIProvider:
                     model=model,
                     response_format=response_format,
                     tools=[
-                        web_search(allowed_domains=config.allowed_domains),
+                        web_search(
+                            allowed_domains=config.allowed_domains,
+                            enable_image_understanding=enable_multimedia,
+                        ),
                         x_search(
                             from_date=config.from_date,
                             to_date=config.to_date,

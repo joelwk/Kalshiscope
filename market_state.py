@@ -57,7 +57,8 @@ class MarketStateManager:
                     close_time TEXT,
                     category TEXT,
                     last_terminal_outcome TEXT,
-                    non_actionable_streak INTEGER DEFAULT 0
+                    non_actionable_streak INTEGER DEFAULT 0,
+                    fill_failure_count INTEGER DEFAULT 0
                 )
                 """
             )
@@ -174,6 +175,7 @@ class MarketStateManager:
         market_row = self._conn.execute(
             """
             SELECT last_terminal_outcome, non_actionable_streak
+                , fill_failure_count
             FROM markets
             WHERE id = ?
             """,
@@ -187,6 +189,11 @@ class MarketStateManager:
         non_actionable_streak = (
             int(market_row["non_actionable_streak"] or 0)
             if market_row and market_row["non_actionable_streak"] is not None
+            else 0
+        )
+        fill_failure_count = (
+            int(market_row["fill_failure_count"] or 0)
+            if market_row and market_row["fill_failure_count"] is not None
             else 0
         )
         latest_row = self._conn.execute(
@@ -213,6 +220,7 @@ class MarketStateManager:
                 market_id=market_id,
                 last_terminal_outcome=last_terminal_outcome,
                 non_actionable_streak=non_actionable_streak,
+                fill_failure_count=fill_failure_count,
             )
 
         trend_rows = self._conn.execute(
@@ -235,6 +243,7 @@ class MarketStateManager:
             confidence_trend=confidence_trend,
             last_terminal_outcome=last_terminal_outcome,
             non_actionable_streak=non_actionable_streak,
+            fill_failure_count=fill_failure_count,
         )
 
     def get_position(self, market_id: str) -> Position | None:
@@ -505,6 +514,30 @@ class MarketStateManager:
                     non_actionable_streak = excluded.non_actionable_streak
                 """,
                 (market_id, terminal_outcome, next_streak),
+            )
+
+    def increment_fill_failure_count(self, market_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (id, fill_failure_count)
+                VALUES (?, 1)
+                ON CONFLICT(id) DO UPDATE SET
+                    fill_failure_count = COALESCE(markets.fill_failure_count, 0) + 1
+                """,
+                (market_id,),
+            )
+
+    def reset_fill_failure_count(self, market_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (id, fill_failure_count)
+                VALUES (?, 0)
+                ON CONFLICT(id) DO UPDATE SET
+                    fill_failure_count = 0
+                """,
+                (market_id,),
             )
 
     def record_trade(
@@ -976,6 +1009,7 @@ class MarketStateManager:
         self._ensure_column("analyses", "reasoning_hash", "TEXT")
         self._ensure_column("markets", "last_terminal_outcome", "TEXT")
         self._ensure_column("markets", "non_actionable_streak", "INTEGER DEFAULT 0")
+        self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
         self._ensure_column(
             "trade_outcomes",
             "resolution_state",

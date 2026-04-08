@@ -246,3 +246,20 @@ def test_remaining_cooldown_helper_matches_scheduler_skip() -> None:
     assert remaining is not None
     assert remaining > 0
     assert should_skip is True
+
+
+def test_fill_failure_count_applies_cooldown_multiplier() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=2, urgent_days_before_close=2)
+    market = _market("m-fill-fail", now + timedelta(days=3))
+    state = MarketState(
+        market_id="m-fill-fail",
+        last_analysis=now - timedelta(hours=3),
+        analysis_count=4,
+        last_confidence=0.61,
+        confidence_trend=[0.6, 0.61],
+        fill_failure_count=3,
+    )
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is True
+    assert reason == "recently analyzed"

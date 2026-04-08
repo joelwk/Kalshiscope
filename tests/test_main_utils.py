@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from config import Settings
 from main import (
+    _available_orderbook_sell_quantity,
     _analysis_result_rank,
     _analyze_market_candidate,
     _best_orderbook_sell_price,
@@ -26,12 +27,16 @@ from main import (
     _kelly_fraction_for_market_horizon,
     _log_settings_summary,
     _max_confidence_for_market,
+    _min_evidence_quality_for_market,
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
     _ticker_resolution_date,
     _should_adjust_position,
     _is_likely_resolved_by_ticker_date,
+    _is_crypto_bin_market,
+    _is_weather_bin_market,
+    _is_weather_market_by_ticker,
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
 
@@ -90,6 +95,19 @@ class TestMainUtils(unittest.TestCase):
             _analysis_result_rank({"decision": tradeable}),
             _analysis_result_rank({"decision": non_tradeable}),
         )
+
+    def test_analysis_result_rank_prefers_higher_pre_execution_final_score(self) -> None:
+        tradeable = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.75,
+            bet_size_pct=0.2,
+            reasoning="tradeable",
+            evidence_quality=0.8,
+        )
+        lower = {"decision": tradeable, "pre_execution_final_score": 0.10}
+        higher = {"decision": tradeable, "pre_execution_final_score": 0.30}
+        self.assertGreater(_analysis_result_rank(higher), _analysis_result_rank(lower))
 
     def test_market_model_exposes_volume_24h_field(self) -> None:
         market = Market(id="m-volume", question="Volume test", volume_24h=123.0)
@@ -278,6 +296,7 @@ class TestMainUtils(unittest.TestCase):
     def test_filter_markets_skips_weather_bin_markets_when_enabled(self) -> None:
         markets = [
             Market(id="KXLOWTCHI-99DEC31-B33.5", question="Bin market", liquidity_usdc=200),
+            Market(id="KXHIGHMIA-99DEC31-B76.5", question="Miami bin market", liquidity_usdc=200),
             Market(id="KXLOWTCHI-99DEC31-T33", question="Threshold market", liquidity_usdc=200),
         ]
         stats: dict[str, int] = {}
@@ -290,7 +309,90 @@ class TestMainUtils(unittest.TestCase):
             stats=stats,
         )
         self.assertEqual([m.id for m in filtered], ["KXLOWTCHI-99DEC31-T33"])
-        self.assertEqual(stats["skipped_weather_bin_markets"], 1)
+        self.assertEqual(stats["skipped_weather_bin_markets"], 2)
+
+    def test_filter_markets_blocks_weather_markets_when_enabled(self) -> None:
+        markets = [
+            Market(
+                id="KXLOWTCHI-99DEC31-T33",
+                question="Will the low temp in Chicago be >33°?",
+                category="weather",
+                liquidity_usdc=200,
+            ),
+            Market(
+                id="KXBTCD-26APR0810-T71699.99",
+                question="Bitcoin above threshold?",
+                category="crypto",
+                liquidity_usdc=200,
+            ),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=("weather",),
+            stats=stats,
+        )
+        self.assertEqual([m.id for m in filtered], ["KXBTCD-26APR0810-T71699.99"])
+        self.assertEqual(stats["skipped_blocklist"], 1)
+
+    def test_filter_markets_blocks_weather_family_when_category_missing(self) -> None:
+        markets = [
+            Market(
+                id="weather-uncategorized",
+                question="Will rainfall exceed 2 inches in Miami tomorrow?",
+                category=None,
+                liquidity_usdc=200,
+            ),
+            Market(
+                id="crypto-kept",
+                question="Will BTC close above 70k?",
+                category=None,
+                liquidity_usdc=200,
+            ),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=("weather",),
+            stats=stats,
+        )
+        self.assertEqual([m.id for m in filtered], ["crypto-kept"])
+        self.assertEqual(stats["skipped_blocklist"], 1)
+
+    def test_weather_ticker_detection_helpers_match_expected_patterns(self) -> None:
+        self.assertTrue(_is_weather_bin_market("KXHIGHMIA-99DEC31-B76.5"))
+        self.assertTrue(_is_weather_bin_market("KXLOWTPHX-99DEC31-B67"))
+        self.assertFalse(_is_weather_bin_market("KXLOWTPHX-99DEC31-T67"))
+        self.assertTrue(_is_weather_market_by_ticker("KXHIGHCHI-99DEC31-T70"))
+        self.assertTrue(_is_weather_market_by_ticker("KXLOWTLV-99DEC31-B64"))
+        self.assertFalse(_is_weather_market_by_ticker("KXBTCD-26APR0810-T71699.99"))
+
+    def test_crypto_bin_ticker_detection_helper_matches_expected_patterns(self) -> None:
+        self.assertTrue(_is_crypto_bin_market("KXBTC-26APR0814-B71650"))
+        self.assertTrue(_is_crypto_bin_market("KXETHD-26APR08-B2000"))
+        self.assertFalse(_is_crypto_bin_market("KXBTCD-26APR0814-T71650"))
+
+    def test_filter_markets_skips_crypto_bin_markets_when_enabled(self) -> None:
+        markets = [
+            Market(id="KXBTC-26APR0814-B71650", question="BTC bin", liquidity_usdc=200),
+            Market(id="KXETHD-26APR08-B2000", question="ETH bin", liquidity_usdc=200),
+            Market(id="KXBTCD-26APR0814-T71650", question="BTC threshold", liquidity_usdc=200),
+        ]
+        stats: dict[str, int] = {}
+        filtered = _filter_markets(
+            markets,
+            min_liquidity=100,
+            allowlist=(),
+            blocklist=(),
+            skip_crypto_bin_markets=True,
+            stats=stats,
+        )
+        self.assertEqual([m.id for m in filtered], ["KXBTCD-26APR0814-T71650"])
+        self.assertEqual(stats["skipped_crypto_bin_markets"], 2)
 
     def test_extract_order_cancel_reason_prefers_explicit_reason_keys(self) -> None:
         payload = {"status": "canceled", "cancel_reason": "price moved"}
@@ -476,6 +578,40 @@ class TestMainUtils(unittest.TestCase):
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=4)
         self.assertEqual([item["market"].id for item in capped], ["c1", "s1", "p1", "c2"])
 
+    def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
+        candidates = [
+            {"market": Market(id="w1", question="Weather 1", category="weather")},
+            {"market": Market(id="c1", question="Crypto 1", category="crypto")},
+            {"market": Market(id="w2", question="Weather 2", category="weather")},
+            {"market": Market(id="s1", question="Sports 1", category="sports")},
+            {"market": Market(id="w3", question="Weather 3", category="weather")},
+            {"market": Market(id="p1", question="Politics 1", category="politics")},
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=5,
+            max_weather_candidates_per_cycle=1,
+        )
+        self.assertEqual([item["market"].id for item in capped], ["w1", "c1", "p1", "s1"])
+
+    def test_cap_analysis_candidates_prefers_lower_non_actionable_streak(self) -> None:
+        candidates = [
+            {
+                "market": Market(id="w-high-streak", question="Weather A", category="weather"),
+                "non_actionable_streak": 5,
+            },
+            {
+                "market": Market(id="w-low-streak", question="Weather B", category="weather"),
+                "non_actionable_streak": 1,
+            },
+            {
+                "market": Market(id="c1", question="Crypto", category="crypto"),
+                "non_actionable_streak": 0,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        self.assertEqual([item["market"].id for item in capped], ["w-low-streak", "c1"])
+
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {
             "sells": [
@@ -487,6 +623,24 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 0) or 0.0, 0.60)
         self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 1) or 0.0, 0.44)
         self.assertIsNone(_best_orderbook_sell_price(orderbook, 2))
+
+    def test_available_orderbook_sell_quantity_respects_price_limit(self) -> None:
+        orderbook = {
+            "sells": [
+                {"optionIndex": 0, "price": 0.45, "quantity": 2},
+                {"optionIndex": 0, "price": 0.50, "count": 3},
+                {"optionIndex": 0, "price": 0.60, "size": 7},
+                {"optionIndex": 1, "price": 0.44, "quantity": 5},
+            ]
+        }
+        self.assertEqual(
+            _available_orderbook_sell_quantity(orderbook, option_index=0, max_price=0.50),
+            5.0,
+        )
+        self.assertEqual(
+            _available_orderbook_sell_quantity(orderbook, option_index=0, max_price=None),
+            12.0,
+        )
 
     def test_log_settings_summary_includes_phase1_flags(self) -> None:
         settings = Settings(
@@ -611,6 +765,7 @@ class TestMainUtils(unittest.TestCase):
             COINFLIP_PRICE_UPPER=0.55,
             FALLBACK_EDGE_MIN_EDGE=0.08,
             WEATHER_MIN_EDGE=0.10,
+            WEATHER_FALLBACK_EDGE_MIN_EDGE=0.15,
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -627,6 +782,31 @@ class TestMainUtils(unittest.TestCase):
             _edge_threshold_for_market(0.60, settings, "computed", market=weather_market),
             0.10,
         )
+        self.assertEqual(
+            _edge_threshold_for_market(0.60, settings, "fallback", market=weather_market),
+            0.15,
+        )
+
+    def test_min_evidence_quality_for_weather_market_uses_weather_floor(self) -> None:
+        settings = Settings(
+            MIN_EVIDENCE_QUALITY_FOR_TRADE=0.5,
+            WEATHER_MIN_EVIDENCE_QUALITY=0.7,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        weather_market = Market(
+            id="w-eq",
+            question="Will rainfall exceed 2 inches in Miami?",
+            category="weather",
+        )
+        generic_market = Market(
+            id="g-eq",
+            question="Will BTC close above threshold?",
+            category="crypto",
+        )
+        self.assertEqual(_min_evidence_quality_for_market(weather_market, settings), 0.7)
+        self.assertEqual(_min_evidence_quality_for_market(generic_market, settings), 0.5)
 
     def test_max_confidence_for_weather_market_uses_weather_cap(self) -> None:
         settings = Settings(
@@ -782,6 +962,26 @@ class TestMainUtils(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIsNone(edge)
         self.assertIn("missing implied", reason)
+
+    def test_passes_edge_threshold_uses_raw_confidence_when_available(self) -> None:
+        settings = Settings(
+            MIN_EDGE=0.05,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.80,
+            raw_confidence=1.00,
+            bet_size_pct=0.4,
+            reasoning="test",
+        )
+        passed, edge, reason = _passes_edge_threshold(0.85, decision, settings)
+        self.assertTrue(passed)
+        self.assertAlmostEqual(edge or 0.0, 0.15, places=6)
+        self.assertEqual(reason, "")
 
     def test_analyze_market_candidate_returns_decision_payload(self) -> None:
         market = Market(

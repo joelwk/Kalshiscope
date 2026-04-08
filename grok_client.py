@@ -29,6 +29,11 @@ _RE_LOW_INFORMATION = re.compile(
     r"(?:evidence|information|data))",
     re.IGNORECASE,
 )
+_RE_WEATHER_OBS_LOCKED = re.compile(
+    r"(observ(?:ed|ation)[^\.]{0,80}(?:already|exceed|surpass|hit|locked)|already (?:above|below|over|under|exceeded)|"
+    r"physically impossible|threshold (?:already )?(?:met|exceeded)|high already reached)",
+    re.IGNORECASE,
+)
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
 _DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS = 120
 _DEFAULT_STREAM_TIMEOUT_SECONDS = 120
@@ -37,9 +42,12 @@ _PROB_CONSISTENCY_TOLERANCE = 0.08
 _MIN_MARKET_EDGE_FOR_TRADE = 0.05
 _LOW_QUALITY_EDGE_BUFFER = 0.08
 _LOW_QUALITY_EVIDENCE_THRESHOLD = 0.45
+_DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD = 0.50
 _EVIDENCE_OVERRIDE_MIN_CONFIDENCE = 0.90
 _EVIDENCE_OVERRIDE_MIN_MARKET_EDGE = 0.15
 _EVIDENCE_OVERRIDE_MIN_QUALITY = 0.60
+_WEATHER_OBS_CONFIDENCE_FLOOR = 0.85
+_WEATHER_OBS_EVIDENCE_FLOOR = 0.75
 _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "official",
     "nws",
@@ -73,6 +81,13 @@ _SYSTEM_PROMPT_ANALYZE = (
     "You are an autonomous prediction market analyst focused on finding tradable edge, not picking winners.\n"
     "Use web search and X search to gather recent, source-backed evidence.\n\n"
     + _SYSTEM_PROMPT_SHARED
+    + "Calibrate confidence: 0.50 means no information advantage over market pricing. "
+    + "Use confidence >0.70 only with specific, source-backed evidence that is directly relevant.\n"
+    + "For speech/mention markets (e.g. 'will person X say Y'), default to should_trade=false unless "
+    + "you have direct evidence from transcripts, official statements, or primary-source reporting.\n"
+    + "Treat rumor, commentary, and speculative social chatter as weak evidence.\n"
+    + "A tradable edge requires at least a 10 percentage point gap between your probability and market implied probability, "
+    + "plus evidence the market likely has not fully priced in.\n"
     + "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
     + "Provide concise reasoning that includes implied probability, your probability, and edge.\n"
     + "Include likelihood_ratio as a positive decimal equal to "
@@ -252,7 +267,19 @@ def _category_research_hint(profile_name: str, market: Market | None = None) -> 
             "location and threshold hints from ticker context to anchor the query. Calibrate confidence by lead "
             "time (highest inside ~72 hours), check model consensus/divergence (e.g., GFS vs ECMWF), and lower "
             "confidence when guidance diverges or ensemble spread is high. Include climatological base rates for "
-            "the location/time of year and explicitly account for higher uncertainty in precipitation or severe events."
+            "the location/time of year and explicitly account for higher uncertainty in precipitation or severe events. "
+            "When observed station data confirms the threshold is already exceeded (or physically unreachable), "
+            "treat this as high-certainty evidence and set evidence_quality >= 0.85."
+        )
+    if profile_name == "speech":
+        return (
+            "Speech/event guidance: this market asks whether a specific person will say a specific word "
+            "during an event. First confirm event status (scheduled/live/concluded) using official schedules "
+            "and livestream links. For concluded events, prioritize transcripts, detailed live-blog coverage, "
+            "or clip-level evidence. For upcoming events, model probability from speaker vocabulary history, "
+            "event agenda, and setting-specific language norms. Use X search for real-time reporter/attendee "
+            "coverage, and prefer primary sources over commentary. If transcript-quality evidence exists, score "
+            "evidence_quality >= 0.80; if only sparse proxy evidence exists, keep evidence_quality <= 0.45."
         )
     if market is not None and is_commodity_market(market):
         return (
@@ -374,6 +401,8 @@ class GrokClient:
         config: SearchConfig,
     ) -> bool:
         """Enable multimedia for borderline confidence or urgent markets."""
+        if config.profile_name == "speech":
+            return True
         if decision:
             lower, upper = config.multimedia_confidence_range
             if lower <= decision.confidence <= upper:
@@ -558,6 +587,11 @@ class GrokClient:
             )
         evidence_quality = max(0.0, min(1.0, evidence_quality))
         market_implied = self._market_implied_probability(market, canonical_outcome)
+        if edge_source == "fallback":
+            if market_implied is not None and my_prob is not None:
+                edge = abs(my_prob - market_implied)
+            else:
+                edge = 0.0
         market_edge = (
             (decision.confidence - market_implied)
             if market_implied is not None
@@ -577,6 +611,12 @@ class GrokClient:
             and self._has_verifiable_source_signal(decision.reasoning)
         ):
             evidence_quality = max(evidence_quality, _EVIDENCE_OVERRIDE_MIN_QUALITY)
+        if (
+            profile_name == "weather"
+            and (decision.raw_confidence or decision.confidence) >= _WEATHER_OBS_CONFIDENCE_FLOOR
+            and _RE_WEATHER_OBS_LOCKED.search(decision.reasoning or "")
+        ):
+            evidence_quality = max(evidence_quality, _WEATHER_OBS_EVIDENCE_FLOOR)
 
         should_trade = decision.should_trade
         gate_reasons: list[str] = []
@@ -608,12 +648,25 @@ class GrokClient:
 
         gate_status = "allow" if should_trade else "block"
         reason_code = ",".join(gate_reasons) if gate_reasons else "ok"
-        abstain = evidence_quality < 0.20 or low_information
+        double_blind_information_gap = no_external_odds and low_information
+        abstain = (
+            evidence_quality < 0.20
+            or (
+                double_blind_information_gap
+                and evidence_quality < _DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD
+            )
+        )
         if abstain:
             should_trade = False
             gate_status = "abstain"
             if "abstain_low_evidence" not in gate_reasons:
                 gate_reasons.append("abstain_low_evidence")
+            if (
+                double_blind_information_gap
+                and evidence_quality < _DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD
+                and "abstain_double_blind_information_gap" not in gate_reasons
+            ):
+                gate_reasons.append("abstain_double_blind_information_gap")
             reason_code = ",".join(gate_reasons)
         bet_size_pct = decision.bet_size_pct if should_trade else 0.0
 
@@ -737,7 +790,7 @@ class GrokClient:
 
             reasons: list[str] = []
             normalized_value = numeric_value
-            if abs(normalized_value) > 1.0:
+            if abs(normalized_value) >= 1.0:
                 normalized_value = normalized_value / 100.0
                 reasons.append("percent_to_decimal")
 

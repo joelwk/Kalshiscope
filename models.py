@@ -139,6 +139,7 @@ class OrderRequest(BaseModel):
     amount_usdc: float
     action: str = "buy"
     order_type: str = "limit"
+    time_in_force: str | None = None
     count: int | None = None
     yes_price: int | None = None
     side: str = "BUY"
@@ -181,6 +182,7 @@ class MarketState(BaseModel):
     confidence_trend: list[float] = Field(default_factory=list)
     last_terminal_outcome: str | None = None
     non_actionable_streak: int = 0
+    fill_failure_count: int = 0
 
 
 class Position(BaseModel):

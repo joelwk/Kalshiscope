@@ -120,6 +120,9 @@ class TestConfig(unittest.TestCase):
             "MAX_WEATHER_CONFIDENCE": "0.78",
             "WEATHER_MIN_EDGE": "0.09",
             "WEATHER_SCORE_PENALTY": "0.04",
+            "WEATHER_MIN_EVIDENCE_QUALITY": "0.72",
+            "WEATHER_FALLBACK_EDGE_MIN_EDGE": "0.18",
+            "MAX_WEATHER_CANDIDATES_PER_CYCLE": "2",
             "KELLY_FRACTION_WEATHER": "0.45",
         }
         with patch.dict(os.environ, env, clear=True):
@@ -130,7 +133,17 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.78)
         self.assertEqual(settings.WEATHER_MIN_EDGE, 0.09)
         self.assertEqual(settings.WEATHER_SCORE_PENALTY, 0.04)
+        self.assertEqual(settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.72)
+        self.assertEqual(settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.18)
+        self.assertEqual(settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.KELLY_FRACTION_WEATHER, 0.45)
+
+    def test_weather_profitability_defaults_are_conservative(self) -> None:
+        self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.80)
+        self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.10)
+        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.50)
+        self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 3)
 
     def test_weather_profile_defaults_include_official_sources(self) -> None:
         self.assertIn("weather.gov", config.Settings.WEATHER_ALLOWED_DOMAINS)
@@ -272,22 +285,31 @@ class TestConfig(unittest.TestCase):
 
     def test_profit_guardrail_defaults(self) -> None:
         settings = config.Settings()
-        self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.50)
+        self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.60)
         self.assertEqual(settings.SCORE_GATE_MODE, "active")
         self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.12)
+        self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.55)
+        self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.05)
         self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 20)
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 5)
         self.assertEqual(settings.ORDER_PRICE_IMPROVEMENT_CENTS, 1)
+        self.assertEqual(settings.ORDER_DEFAULT_TIF, "gtc")
         self.assertEqual(settings.ORDER_SUBMISSION_MIN_PRICE, 0.03)
         self.assertEqual(settings.ORDER_SUBMISSION_MAX_PRICE, 0.97)
         self.assertEqual(settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.05)
         self.assertEqual(settings.MAX_TRADEABLE_IMPLIED_PRICE, 0.95)
-        self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 0)
+        self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 10)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 180)
         self.assertTrue(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
+        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.50)
+        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.05)
+        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
+        self.assertEqual(settings.MENTION_MARKET_SCORE_PENALTY, 0.05)
+        self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
+        self.assertIn("KXPERSONMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
 
     def test_tennis_sources_present_in_sports_profile_defaults(self) -> None:
         self.assertIn("atptour.com", config.Settings.SPORTS_ALLOWED_DOMAINS)

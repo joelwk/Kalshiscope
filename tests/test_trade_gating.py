@@ -7,7 +7,9 @@ from main import (
     _adjust_bet_size_for_edge,
     _extract_winning_outcome,
     _filter_markets,
+    _is_confidence_override_allowed,
     _is_uniform_implied_probability,
+    _min_evidence_quality_for_market,
     _passes_edge_threshold,
     _sizing_mode_label,
     _zero_bet_skip_message,
@@ -191,3 +193,56 @@ def test_sizing_mode_label_for_kelly_and_edge_scaling() -> None:
 def test_zero_bet_skip_message_is_mode_aware() -> None:
     assert "Kelly" in _zero_bet_skip_message("kelly")
     assert "edge scaling" in _zero_bet_skip_message("edge_scaling")
+
+
+def test_min_evidence_quality_floor_default_is_raised() -> None:
+    settings = Settings()
+    generic_market = Market(id="m-eq-floor", question="Will BTC close above threshold?", category="crypto")
+    assert _min_evidence_quality_for_market(generic_market, settings) == 0.60
+
+
+def test_confidence_override_requires_floor_even_with_edge_and_evidence() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.50,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.35,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.9,
+    )
+    allowed, min_confidence = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+    )
+    assert min_confidence == 0.50
+    assert allowed is False
+
+
+def test_confidence_override_allows_when_floor_and_thresholds_met() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.50,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.52,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.9,
+    )
+    allowed, _ = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+    )
+    assert allowed is True

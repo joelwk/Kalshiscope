@@ -42,6 +42,8 @@ _PRIORITY_URGENT_BONUS = 1.0
 _PRIORITY_NON_ACTIONABLE_PENALTY = 0.5
 _LIQUIDITY_NORMALIZATION_CAP_USDC = 500.0
 _MAX_STALENESS_HOURS = 24.0 * 7.0
+_FILL_FAILURE_COOLDOWN_THRESHOLD = 3
+_FILL_FAILURE_COOLDOWN_MULTIPLIER = 2.0
 
 
 def _normalize_terminal_outcome(value: str | None) -> str:
@@ -96,8 +98,12 @@ def resolve_reanalysis_cooldown_hours(
             cooldown_hours = base_cooldown
         if terminal_outcome in _HARD_BACKOFF_TERMINAL_OUTCOMES:
             cooldown_hours = min(base_cooldown, cooldown_hours * 2.0)
-        return cooldown_hours
-    return base_cooldown
+    else:
+        cooldown_hours = base_cooldown
+    fill_failure_count = int(getattr(state, "fill_failure_count", 0) or 0) if state else 0
+    if fill_failure_count >= _FILL_FAILURE_COOLDOWN_THRESHOLD:
+        cooldown_hours *= _FILL_FAILURE_COOLDOWN_MULTIPLIER
+    return cooldown_hours
 
 
 def next_eligible_reanalysis_at(
@@ -234,6 +240,20 @@ class MarketScheduler:
             now=now,
         )
         if remaining_seconds is not None and remaining_seconds > 0:
+            fill_failure_count = int(getattr(state, "fill_failure_count", 0) or 0) if state else 0
+            if fill_failure_count >= _FILL_FAILURE_COOLDOWN_THRESHOLD:
+                logger.debug(
+                    "Applied fill-failure cooldown backoff: market=%s fill_failure_count=%d remaining_seconds=%.1f",
+                    market.id,
+                    fill_failure_count,
+                    remaining_seconds,
+                    data={
+                        "market_id": market.id,
+                        "fill_failure_count": fill_failure_count,
+                        "remaining_reanalysis_cooldown_seconds": remaining_seconds,
+                        "fill_failure_cooldown_multiplier": _FILL_FAILURE_COOLDOWN_MULTIPLIER,
+                    },
+                )
             return True, "recently analyzed"
 
         return False, ""

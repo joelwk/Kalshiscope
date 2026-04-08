@@ -317,3 +317,22 @@ def test_get_last_trade_entry_price_returns_latest(tmp_path) -> None:
         assert manager.get_last_trade_entry_price(market_id) == 0.51
     finally:
         manager.close()
+
+
+def test_fill_failure_count_tracking(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-fill-failure"
+        manager.increment_fill_failure_count(market_id)
+        manager.increment_fill_failure_count(market_id)
+        manager.increment_fill_failure_count(market_id)
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.fill_failure_count == 3
+
+        manager.reset_fill_failure_count(market_id)
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.fill_failure_count == 0
+    finally:
+        manager.close()

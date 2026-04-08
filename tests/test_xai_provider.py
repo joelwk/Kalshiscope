@@ -77,3 +77,37 @@ def test_create_chat_raises_after_retry_exhaustion() -> None:
                 enable_multimedia=False,
             )
     assert flaky_chat.calls == 3
+
+
+def test_create_chat_passes_image_understanding_to_web_search() -> None:
+    flaky_chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+
+    captured: dict[str, dict] = {}
+
+    def fake_web_search(*args, **kwargs):
+        captured["web"] = kwargs
+        return {"tool": "web"}
+
+    def fake_x_search(*args, **kwargs):
+        captured["x"] = kwargs
+        return {"tool": "x"}
+
+    with patch("xai_provider.web_search", side_effect=fake_web_search), patch(
+        "xai_provider.x_search", side_effect=fake_x_search
+    ):
+        provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=True,
+        )
+
+    assert captured["web"]["enable_image_understanding"] is True
+    assert captured["x"]["enable_image_understanding"] is True
