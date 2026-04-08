@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -80,6 +81,30 @@ _WEATHER_KEYWORDS = (
     "low temp",
     "minimum temperature",
     "maximum temperature",
+    "rain",
+    "rainfall",
+    "precipitation",
+    "snow",
+    "snowfall",
+    "inches of snow",
+    "hurricane",
+    "tropical storm",
+    "cyclone",
+    "tornado",
+    "severe weather",
+    "wind",
+    "wind speed",
+    "windchill",
+    "heat index",
+    "humidity",
+    "flood",
+    "drought",
+    "wildfire",
+    "air quality",
+    "aqi",
+    "forecast",
+    "nws",
+    "noaa",
 )
 _COMMODITY_KEYWORDS = (
     "copper",
@@ -160,11 +185,11 @@ def market_family(market: Market) -> str:
     category = (market.category or "").lower()
     question = market.question.lower()
     text = f"{category} {question}"
-    if any(keyword in text for keyword in _CRYPTO_KEYWORDS):
+    if _has_keyword_match(text, _CRYPTO_KEYWORDS):
         return "crypto"
-    if any(keyword in text for keyword in _POLITICS_KEYWORDS):
+    if _has_keyword_match(text, _POLITICS_KEYWORDS):
         return "politics"
-    if any(keyword in text for keyword in _WEATHER_KEYWORDS):
+    if _has_keyword_match(text, _WEATHER_KEYWORDS):
         return "weather"
     return "generic"
 
@@ -173,19 +198,26 @@ def is_commodity_market(market: Market) -> bool:
     category = (market.category or "").lower()
     question = market.question.lower()
     text = f"{category} {question}"
-    return any(keyword in text for keyword in _COMMODITY_KEYWORDS)
+    return _has_keyword_match(text, _COMMODITY_KEYWORDS)
+
+
+def _has_keyword_match(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
 
 
 def market_category_flags(market: Market) -> tuple[bool, bool]:
     category = (market.category or "").lower()
     question = market.question.lower()
     text = f"{category} {question}"
-    is_esports = any(keyword in text for keyword in _ESPORTS_KEYWORDS)
-    is_sports = any(keyword in text for keyword in _SPORTS_KEYWORDS)
+    is_esports = _has_keyword_match(text, _ESPORTS_KEYWORDS)
+    is_sports = _has_keyword_match(text, _SPORTS_KEYWORDS)
     return is_sports, is_esports
 
 
 def _lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
+    if market_family(market) == "weather":
+        return _weather_lookback_hours(settings, market, now)
+
     if market.close_time:
         close_time = market.close_time
         if close_time.tzinfo is None:
@@ -199,6 +231,24 @@ def _lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
     if any(token in question for token in _LONG_HORIZON_HINTS):
         return settings.SEARCH_LOOKBACK_LONG_HOURS
     return settings.SEARCH_LOOKBACK_MEDIUM_HOURS
+
+
+def _weather_lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
+    if market.close_time is None:
+        return settings.SEARCH_LOOKBACK_MEDIUM_HOURS
+
+    close_time = market.close_time
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=timezone.utc)
+    delta = close_time - now
+
+    if delta <= timedelta(hours=24):
+        return settings.SEARCH_LOOKBACK_SHORT_HOURS
+    if delta <= timedelta(days=3):
+        return settings.SEARCH_LOOKBACK_MEDIUM_HOURS
+    if delta <= timedelta(days=7):
+        return settings.SEARCH_LOOKBACK_MEDIUM_HOURS
+    return settings.SEARCH_LOOKBACK_LONG_HOURS
 
 
 def _prioritized_trim(items: tuple[str, ...], limit: int) -> list[str]:

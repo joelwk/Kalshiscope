@@ -33,6 +33,11 @@ _MAX_VALID_PRICE = 0.99
 _DEFAULT_PRICE = 0.50
 _DEFAULT_LIMIT = 1000
 _DEFAULT_TIME_IN_FORCE = "immediate_or_cancel"
+_MARKET_TIME_IN_FORCE = "fill_or_kill"
+_MARKET_FALLBACK_YES_PRICE_CENTS = 97
+_MARKET_FALLBACK_NO_PRICE_CENTS = 3
+_ORDER_SUBMISSION_MIN_PRICE = 0.03
+_ORDER_SUBMISSION_MAX_PRICE = 0.97
 _KALSHI_RETRY_TOTAL = 3
 _KALSHI_RETRY_BACKOFF_FACTOR = 0.5
 _KALSHI_RETRYABLE_STATUS_CODES = (502, 503, 504)
@@ -72,11 +77,16 @@ class KalshiClient:
         private_key_path: str,
         timeout_sec: int = 20,
         order_price_improvement_cents: int = 0,
+        max_fetch_pages: int | None = 10,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key_id = api_key_id
         self.timeout_sec = timeout_sec
         self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
+        self.max_fetch_pages = (
+            None if max_fetch_pages is None or int(max_fetch_pages) <= 0
+            else max(1, int(max_fetch_pages))
+        )
         self.private_key = self._load_private_key(private_key_path)
         self.session = self._create_session()
         logger.debug(
@@ -84,6 +94,7 @@ class KalshiClient:
             self.base_url,
             self.timeout_sec,
             self.order_price_improvement_cents,
+            data={"max_fetch_pages": self.max_fetch_pages},
         )
 
     def _create_session(self) -> requests.Session:
@@ -186,7 +197,9 @@ class KalshiClient:
     ) -> list[Market]:
         """Fetch all paginated markets from Kalshi."""
         markets: list[Market] = []
+        seen_market_ids: set[str] = set()
         cursor: str | None = None
+        pages_fetched = 0
         while True:
             params: dict[str, Any] = {"limit": limit}
             if status:
@@ -225,8 +238,40 @@ class KalshiClient:
             payload = response.json()
             raw_markets = payload.get("markets", []) if isinstance(payload, dict) else []
             for raw_market in raw_markets:
-                markets.append(_parse_market(raw_market))
+                try:
+                    parsed_market = _parse_market(raw_market)
+                except (ValueError, KeyError, TypeError) as exc:
+                    logger.warning(
+                        "Skipping malformed market payload during pagination: %s",
+                        exc,
+                        data={
+                            "error": str(exc),
+                            "cursor": cursor,
+                            "raw_ticker": (
+                                raw_market.get("ticker")
+                                if isinstance(raw_market, dict)
+                                else None
+                            ),
+                        },
+                    )
+                    continue
+                if parsed_market.id in seen_market_ids:
+                    continue
+                seen_market_ids.add(parsed_market.id)
+                markets.append(parsed_market)
+            pages_fetched += 1
             cursor = payload.get("cursor") if isinstance(payload, dict) else None
+            if self.max_fetch_pages is not None and pages_fetched >= self.max_fetch_pages:
+                if cursor:
+                    logger.warning(
+                        "Kalshi market fetch stopped at configured page cap: pages=%d",
+                        pages_fetched,
+                        data={
+                            "pages_fetched": pages_fetched,
+                            "max_fetch_pages": self.max_fetch_pages,
+                        },
+                    )
+                break
             if not cursor:
                 break
         return markets
@@ -269,12 +314,20 @@ class KalshiClient:
     def create_order(self, order: OrderRequest, market: Market | None = None) -> OrderResponse:
         return self.submit_order(order, market=market)
 
-    def submit_order(self, order: OrderRequest, market: Market | None = None) -> OrderResponse:
-        """Submit a limit buy order in Kalshi format."""
+    def submit_order(
+        self,
+        order: OrderRequest,
+        market: Market | None = None,
+        *,
+        retry_suffix: str | None = None,
+    ) -> OrderResponse:
+        """Submit a buy/sell order in Kalshi format."""
         side = _to_kalshi_side(order.outcome)
         action = order.side.lower() if order.side else "buy"
         if action not in {"buy", "sell"}:
             action = "buy"
+        normalized_order_type = (order.order_type or "limit").strip().lower()
+        is_market_order = normalized_order_type == "market"
 
         price = _resolve_order_price(
             order=order,
@@ -282,15 +335,29 @@ class KalshiClient:
             action=action,
             order_price_improvement_cents=self.order_price_improvement_cents,
         )
+        if price < _ORDER_SUBMISSION_MIN_PRICE or price > _ORDER_SUBMISSION_MAX_PRICE:
+            raise ValueError(
+                f"Order price {price:.3f} outside submission band "
+                f"[{_ORDER_SUBMISSION_MIN_PRICE:.2f}, {_ORDER_SUBMISSION_MAX_PRICE:.2f}]"
+            )
         count = max(1, int(order.amount_usdc / price))
         price_cents = int(round(price * _ONE_HUNDRED))
         price_cents = max(1, min(99, price_cents))
+        if is_market_order:
+            price_cents = (
+                _MARKET_FALLBACK_YES_PRICE_CENTS
+                if side == "yes"
+                else _MARKET_FALLBACK_NO_PRICE_CENTS
+            )
 
         payload = {
             "ticker": order.market_id,
-            "client_order_id": _build_client_order_id(order.market_id or ""),
-            "type": "limit",
-            "time_in_force": _DEFAULT_TIME_IN_FORCE,
+            "client_order_id": _build_client_order_id(
+                order.market_id or "",
+                suffix=retry_suffix,
+            ),
+            "type": "market" if is_market_order else "limit",
+            "time_in_force": _MARKET_TIME_IN_FORCE if is_market_order else _DEFAULT_TIME_IN_FORCE,
             "action": action,
             "side": side,
             "count": count,
@@ -378,11 +445,16 @@ def _resolve_order_price(
     return max(_MIN_VALID_PRICE, min(_MAX_VALID_PRICE, resolved_price))
 
 
-def _build_client_order_id(market_id: str) -> str:
+def _build_client_order_id(market_id: str, suffix: str | None = None) -> str:
     """Build a compact, deterministic client order id within API length limits."""
     timestamp_ms = int(time.time() * 1000)
     digest = hashlib.sha1(market_id.encode("utf-8")).hexdigest()[:12]
-    return f"BOT-{digest}-{timestamp_ms}"
+    client_order_id = f"BOT-{digest}-{timestamp_ms}"
+    if suffix:
+        safe_suffix = re.sub(r"[^A-Za-z0-9_-]", "", suffix)
+        if safe_suffix:
+            client_order_id = f"{client_order_id}-{safe_suffix}"
+    return client_order_id
 
 
 def _parse_market(raw: dict[str, Any]) -> Market:

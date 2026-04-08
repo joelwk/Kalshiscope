@@ -6,7 +6,9 @@ from typing import Iterable
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# .env should be the single source of truth for local bot runs.
+# Using override=True avoids stale exported shell vars shadowing updated .env values.
+load_dotenv(override=True)
 
 
 @dataclass(frozen=True)
@@ -18,9 +20,8 @@ class Settings:
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.10
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
-    SLIPPAGE_CONFIDENCE_THRESHOLD: float = 0.70
-    SLIPPAGE_PCT: float = 0.02
-    MIN_LIQUIDITY_USDC: float = 100.0
+    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.50
+    MIN_LIQUIDITY_USDC: float = 5.0
     POLL_INTERVAL_SEC: int = 300
 
     # Edge gating / sizing
@@ -33,11 +34,13 @@ class Settings:
     EDGE_SCALING_RANGE: float = 0.15
     LOW_PRICE_BET_PENALTY: float = 0.50
     FALLBACK_EDGE_MIN_EDGE: float = 0.08
+    WEATHER_MIN_EDGE: float = 0.08
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
     MAX_SPORTS_CONFIDENCE: float = 0.80  # Cap sports bets at 80% confidence
     MAX_ESPORTS_CONFIDENCE: float = 0.75  # Cap esports at 75%
+    MAX_WEATHER_CONFIDENCE: float = 0.80  # Cap weather at 80%
 
     # Filtering
     MARKET_CATEGORIES_ALLOWLIST: tuple[str, ...] = ()
@@ -56,8 +59,10 @@ class Settings:
     )
     SKIP_WEATHER_BIN_MARKETS: bool = True
     MIN_VOLUME_24H: float = 0.0
-    EXTREME_YES_PRICE_LOWER: float = 0.05
-    EXTREME_YES_PRICE_UPPER: float = 0.95
+    EXTREME_YES_PRICE_LOWER: float = 0.02
+    EXTREME_YES_PRICE_UPPER: float = 0.98
+    MIN_TRADEABLE_IMPLIED_PRICE: float = 0.05
+    MAX_TRADEABLE_IMPLIED_PRICE: float = 0.95
     LADDER_COLLAPSE_THRESHOLD: int = 5
     MAX_BRACKETS_PER_EVENT: int = 3
     # Date range filtering: only consider markets closing within this window (days from now)
@@ -188,17 +193,21 @@ class Settings:
     )
     WEATHER_ALLOWED_DOMAINS: tuple[str, ...] = (
         "weather.gov",
-        "weather.com",
+        "forecast.weather.gov",
+        "noaa.gov",
+        "tropicaltidbits.com",
         "wunderground.com",
-        "accuweather.com",
-        "metoffice.gov.uk",
     )
     WEATHER_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "NWS",
-        "weatherchannel",
         "NWSSPC",
         "NHC_Atlantic",
-        "metoffice",
+        "NWSChicago",
+        "NWSNewYorkNY",
+        "NWSLosAngeles",
+        "NWSHouston",
+        "NWSMiami",
+        "weatherchannel",
     )
     GENERIC_ALLOWED_DOMAINS: tuple[str, ...] = (
         "reuters.com",
@@ -222,13 +231,19 @@ class Settings:
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
     KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
+    KALSHI_MAX_FETCH_PAGES: int = 0
 
     # Execution
     DRY_RUN: bool = True
-    PRE_ORDER_MARKET_REFRESH: bool = False
+    PRE_ORDER_MARKET_REFRESH: bool = True
+    MAX_MARKET_DATA_AGE_SECONDS: int = 120
     ORDERBOOK_PRECHECK_ENABLED: bool = True
     ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
-    ORDER_PRICE_IMPROVEMENT_CENTS: int = 2
+    ORDER_PRICE_IMPROVEMENT_CENTS: int = 1
+    ORDER_SUBMISSION_MIN_PRICE: float = 0.03
+    ORDER_SUBMISSION_MAX_PRICE: float = 0.97
+    ORDER_FALLBACK_TO_MARKET: bool = True
+    ORDER_FALLBACK_MIN_CONFIDENCE: float = 0.85
     CALIBRATION_MODE_ENABLED: bool = False
     CALIBRATION_MIN_SAMPLES: int = 20
 
@@ -243,7 +258,12 @@ class Settings:
     URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 3
-    MAX_MARKETS_PER_CYCLE: int = 50
+    MAX_MARKETS_PER_CYCLE: int = 20
+    MAX_TRADES_PER_CYCLE: int = 5
+    XAI_CIRCUIT_BREAKER_MAX_FAILURES: int = 3
+    XAI_CLIENT_TIMEOUT_SECONDS: int = 120
+    GROK_STREAM_TIMEOUT_SECONDS: int = 120
+    GROK_ANALYSIS_MAX_BUDGET_SECONDS: int = 180
 
     # Resolution tracking
     RESOLUTION_SYNC_INTERVAL_CYCLES: int = 3
@@ -252,18 +272,21 @@ class Settings:
     MAX_POSITION_PER_MARKET_USDC: float = 200.0
     MAX_POSITION_PCT_OF_BANKROLL: float = 0.15
     MIN_CONFIDENCE_INCREASE_FOR_ADD: float = 0.10
+    MIN_PRICE_MOVE_FOR_READD: float = 0.05
     HIGH_CONFIDENCE_POSITION_OVERRIDE: float = 0.85  # Allow adding to position if conf >= this
     OPPOSITE_OUTCOME_STRATEGY: str = "block"  # block|hedge
 
     # Score gate (phase A/B can run in shadow mode)
-    SCORE_GATE_MODE: str = "shadow"  # off|shadow|active
-    SCORE_GATE_THRESHOLD: float = 0.08
+    SCORE_GATE_MODE: str = "active"  # off|shadow|active
+    SCORE_GATE_THRESHOLD: float = 0.12
+    WEATHER_SCORE_PENALTY: float = 0.03
 
     # Bayesian + LMSR + Kelly experimental layers
     BAYESIAN_ENABLED: bool = False
     BAYESIAN_SKIP_STALE_UPDATES: bool = True
     BAYESIAN_PRIOR_DEFAULT: float = 0.50
     BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
+    BAYESIAN_MAX_POSTERIOR: float = 0.97
     LMSR_ENABLED: bool = False
     LMSR_LIQUIDITY_PARAM_B: float = 100000.0
     LMSR_MIN_INEFFICIENCY: float = 0.05
@@ -271,6 +294,7 @@ class Settings:
     KELLY_FRACTION_DEFAULT: float = 0.25
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
+    KELLY_FRACTION_WEATHER: float = 0.50
     KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
     KELLY_MIN_BANKROLL_USDC: float = 50.0
 
@@ -282,6 +306,7 @@ class Settings:
     FLIP_GUARD_MIN_EVIDENCE_QUALITY: float = 0.60
     FLIP_CIRCUIT_BREAKER_ENABLED: bool = True
     FLIP_CIRCUIT_BREAKER_MAX_FLIPS: int = 3
+    EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE: bool = True
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -403,6 +428,10 @@ def load_settings() -> Settings:
             "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY",
             Settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
         ),
+        MIN_EVIDENCE_QUALITY_FOR_TRADE=_read_env_float(
+            "MIN_EVIDENCE_QUALITY_FOR_TRADE",
+            Settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+        ),
         MIN_EDGE=_read_env_float("MIN_EDGE", Settings.MIN_EDGE),
         LOW_PRICE_THRESHOLD=_read_env_float(
             "LOW_PRICE_THRESHOLD", Settings.LOW_PRICE_THRESHOLD
@@ -428,6 +457,9 @@ def load_settings() -> Settings:
         FALLBACK_EDGE_MIN_EDGE=_read_env_float(
             "FALLBACK_EDGE_MIN_EDGE", Settings.FALLBACK_EDGE_MIN_EDGE
         ),
+        WEATHER_MIN_EDGE=_read_env_float(
+            "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
+        ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE
         ),
@@ -437,11 +469,9 @@ def load_settings() -> Settings:
         MAX_ESPORTS_CONFIDENCE=_read_env_float(
             "MAX_ESPORTS_CONFIDENCE", Settings.MAX_ESPORTS_CONFIDENCE
         ),
-        SLIPPAGE_CONFIDENCE_THRESHOLD=_read_env_float(
-            "SLIPPAGE_CONFIDENCE_THRESHOLD",
-            Settings.SLIPPAGE_CONFIDENCE_THRESHOLD,
+        MAX_WEATHER_CONFIDENCE=_read_env_float(
+            "MAX_WEATHER_CONFIDENCE", Settings.MAX_WEATHER_CONFIDENCE
         ),
-        SLIPPAGE_PCT=_read_env_float("SLIPPAGE_PCT", Settings.SLIPPAGE_PCT),
         MIN_LIQUIDITY_USDC=_read_env_float(
             "MIN_LIQUIDITY_USDC", Settings.MIN_LIQUIDITY_USDC
         ),
@@ -469,6 +499,14 @@ def load_settings() -> Settings:
         EXTREME_YES_PRICE_UPPER=_read_env_float(
             "EXTREME_YES_PRICE_UPPER",
             Settings.EXTREME_YES_PRICE_UPPER,
+        ),
+        MIN_TRADEABLE_IMPLIED_PRICE=_read_env_float(
+            "MIN_TRADEABLE_IMPLIED_PRICE",
+            Settings.MIN_TRADEABLE_IMPLIED_PRICE,
+        ),
+        MAX_TRADEABLE_IMPLIED_PRICE=_read_env_float(
+            "MAX_TRADEABLE_IMPLIED_PRICE",
+            Settings.MAX_TRADEABLE_IMPLIED_PRICE,
         ),
         LADDER_COLLAPSE_THRESHOLD=_read_env_int(
             "LADDER_COLLAPSE_THRESHOLD",
@@ -555,9 +593,16 @@ def load_settings() -> Settings:
             "KALSHI_SERVER_SIDE_FILTERS_ENABLED",
             Settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
         ),
+        KALSHI_MAX_FETCH_PAGES=_read_env_int(
+            "KALSHI_MAX_FETCH_PAGES", Settings.KALSHI_MAX_FETCH_PAGES
+        ),
         DRY_RUN=_read_env_bool("DRY_RUN", Settings.DRY_RUN),
         PRE_ORDER_MARKET_REFRESH=_read_env_bool(
             "PRE_ORDER_MARKET_REFRESH", Settings.PRE_ORDER_MARKET_REFRESH
+        ),
+        MAX_MARKET_DATA_AGE_SECONDS=_read_env_int(
+            "MAX_MARKET_DATA_AGE_SECONDS",
+            Settings.MAX_MARKET_DATA_AGE_SECONDS,
         ),
         ORDERBOOK_PRECHECK_ENABLED=_read_env_bool(
             "ORDERBOOK_PRECHECK_ENABLED", Settings.ORDERBOOK_PRECHECK_ENABLED
@@ -569,6 +614,22 @@ def load_settings() -> Settings:
         ORDER_PRICE_IMPROVEMENT_CENTS=_read_env_int(
             "ORDER_PRICE_IMPROVEMENT_CENTS",
             Settings.ORDER_PRICE_IMPROVEMENT_CENTS,
+        ),
+        ORDER_SUBMISSION_MIN_PRICE=_read_env_float(
+            "ORDER_SUBMISSION_MIN_PRICE",
+            Settings.ORDER_SUBMISSION_MIN_PRICE,
+        ),
+        ORDER_SUBMISSION_MAX_PRICE=_read_env_float(
+            "ORDER_SUBMISSION_MAX_PRICE",
+            Settings.ORDER_SUBMISSION_MAX_PRICE,
+        ),
+        ORDER_FALLBACK_TO_MARKET=_read_env_bool(
+            "ORDER_FALLBACK_TO_MARKET",
+            Settings.ORDER_FALLBACK_TO_MARKET,
+        ),
+        ORDER_FALLBACK_MIN_CONFIDENCE=_read_env_float(
+            "ORDER_FALLBACK_MIN_CONFIDENCE",
+            Settings.ORDER_FALLBACK_MIN_CONFIDENCE,
         ),
         CALIBRATION_MODE_ENABLED=_read_env_bool(
             "CALIBRATION_MODE_ENABLED", Settings.CALIBRATION_MODE_ENABLED
@@ -606,6 +667,26 @@ def load_settings() -> Settings:
         MAX_MARKETS_PER_CYCLE=_read_env_int(
             "MAX_MARKETS_PER_CYCLE", Settings.MAX_MARKETS_PER_CYCLE
         ),
+        MAX_TRADES_PER_CYCLE=_read_env_int(
+            "MAX_TRADES_PER_CYCLE",
+            Settings.MAX_TRADES_PER_CYCLE,
+        ),
+        XAI_CIRCUIT_BREAKER_MAX_FAILURES=_read_env_int(
+            "XAI_CIRCUIT_BREAKER_MAX_FAILURES",
+            Settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+        ),
+        XAI_CLIENT_TIMEOUT_SECONDS=_read_env_int(
+            "XAI_CLIENT_TIMEOUT_SECONDS",
+            Settings.XAI_CLIENT_TIMEOUT_SECONDS,
+        ),
+        GROK_STREAM_TIMEOUT_SECONDS=_read_env_int(
+            "GROK_STREAM_TIMEOUT_SECONDS",
+            Settings.GROK_STREAM_TIMEOUT_SECONDS,
+        ),
+        GROK_ANALYSIS_MAX_BUDGET_SECONDS=_read_env_int(
+            "GROK_ANALYSIS_MAX_BUDGET_SECONDS",
+            Settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS,
+        ),
         RESOLUTION_SYNC_INTERVAL_CYCLES=_read_env_int(
             "RESOLUTION_SYNC_INTERVAL_CYCLES",
             Settings.RESOLUTION_SYNC_INTERVAL_CYCLES,
@@ -622,6 +703,10 @@ def load_settings() -> Settings:
             "MIN_CONFIDENCE_INCREASE_FOR_ADD",
             Settings.MIN_CONFIDENCE_INCREASE_FOR_ADD,
         ),
+        MIN_PRICE_MOVE_FOR_READD=_read_env_float(
+            "MIN_PRICE_MOVE_FOR_READD",
+            Settings.MIN_PRICE_MOVE_FOR_READD,
+        ),
         HIGH_CONFIDENCE_POSITION_OVERRIDE=_read_env_float(
             "HIGH_CONFIDENCE_POSITION_OVERRIDE",
             Settings.HIGH_CONFIDENCE_POSITION_OVERRIDE,
@@ -637,6 +722,10 @@ def load_settings() -> Settings:
         SCORE_GATE_THRESHOLD=_read_env_float(
             "SCORE_GATE_THRESHOLD",
             Settings.SCORE_GATE_THRESHOLD,
+        ),
+        WEATHER_SCORE_PENALTY=_read_env_float(
+            "WEATHER_SCORE_PENALTY",
+            Settings.WEATHER_SCORE_PENALTY,
         ),
         BAYESIAN_ENABLED=_read_env_bool(
             "BAYESIAN_ENABLED",
@@ -656,6 +745,10 @@ def load_settings() -> Settings:
                 "BAYESIAN_MIN_UPDATES_FOR_TRADE",
                 Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
             ),
+        ),
+        BAYESIAN_MAX_POSTERIOR=_read_env_float(
+            "BAYESIAN_MAX_POSTERIOR",
+            Settings.BAYESIAN_MAX_POSTERIOR,
         ),
         LMSR_ENABLED=_read_env_bool(
             "LMSR_ENABLED",
@@ -684,6 +777,10 @@ def load_settings() -> Settings:
         KELLY_FRACTION_SHORT_HORIZON=_read_env_float(
             "KELLY_FRACTION_SHORT_HORIZON",
             Settings.KELLY_FRACTION_SHORT_HORIZON,
+        ),
+        KELLY_FRACTION_WEATHER=_read_env_float(
+            "KELLY_FRACTION_WEATHER",
+            Settings.KELLY_FRACTION_WEATHER,
         ),
         KELLY_MIN_BET_POLICY=_read_env_str(
             "KELLY_MIN_BET_POLICY",
@@ -720,6 +817,10 @@ def load_settings() -> Settings:
         FLIP_CIRCUIT_BREAKER_MAX_FLIPS=_read_env_int(
             "FLIP_CIRCUIT_BREAKER_MAX_FLIPS",
             Settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS,
+        ),
+        EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE=_read_env_bool(
+            "EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE",
+            Settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE,
         ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),

@@ -45,6 +45,7 @@ from kalshi_client import KalshiClient
 from refinement import RefinementStrategy
 from research_profiles import build_market_search_config, market_category_flags, market_family
 from score_engine import compute_final_score
+from xai_provider import XAIProvider
 
 logger = get_logger("predictbot")
 
@@ -66,14 +67,45 @@ _RESOLVED_MARKET_STATUS = {
 _ADAPTIVE_SLEEP_CAP_SECONDS = 1800
 _ORDERBOOK_SPREAD_CUTOFF_DEFAULT = 0.08
 _MAX_CONFIDENCE = 1.0
+_TICKER_DATE_PATTERN = re.compile(
+    r"-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(?:-|$)",
+    re.IGNORECASE,
+)
+_MONTH_ABBREVIATIONS = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
+}
 _KELLY_MIN_BET_POLICY_SKIP = "skip"
 _KELLY_MIN_BET_POLICY_FLOOR = "floor"
 _KELLY_MIN_BET_POLICY_FALLBACK_EDGE = "fallback_edge_scaling"
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
+_XAI_RETRIABLE_ERROR_MARKERS = (
+    "statuscode.internal",
+    "internal server error",
+    "service temporarily unavailable",
+    "temporarily unavailable",
+)
 
 
 def _normalize_outcome_key(outcome: str | None) -> str:
     return re.sub(r"\s+", " ", (outcome or "").strip()).lower()
+
+
+def _is_retriable_xai_error(error_text: str | None) -> bool:
+    normalized = (error_text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _XAI_RETRIABLE_ERROR_MARKERS)
 
 
 def _build_reasoning_hash(decision: TradeDecision) -> str:
@@ -120,6 +152,8 @@ def _filter_markets(
     min_volume_24h: float = 0.0,
     extreme_yes_price_lower: float | None = None,
     extreme_yes_price_upper: float | None = None,
+    min_tradeable_yes_price: float | None = None,
+    max_tradeable_yes_price: float | None = None,
     skip_weather_bin_markets: bool = False,
 ):
     """Filter markets based on liquidity, category, and close date constraints."""
@@ -127,6 +161,7 @@ def _filter_markets(
     skipped_liquidity = 0
     skipped_volume_24h = 0
     skipped_extreme_price = 0
+    skipped_untradeable_price = 0
     skipped_allowlist = 0
     skipped_blocklist = 0
     skipped_close_too_soon = 0
@@ -135,10 +170,19 @@ def _filter_markets(
     skipped_resolved = 0
     skipped_ticker_prefix_blocklist = 0
     skipped_weather_bin_markets = 0
+    skipped_likely_resolved_by_ticker = 0
 
     now = datetime.now(timezone.utc)
-    min_close_date = now + timedelta(days=min_close_days) if min_close_days else None
-    max_close_date = now + timedelta(days=max_close_days) if max_close_days else None
+    min_close_date = (
+        now + timedelta(days=min_close_days)
+        if min_close_days is not None
+        else None
+    )
+    max_close_date = (
+        now + timedelta(days=max_close_days)
+        if max_close_days is not None
+        else None
+    )
 
     for market in markets:
         close_time = market.close_time
@@ -159,6 +203,15 @@ def _filter_markets(
                 continue
         yes_price = _get_outcome_entry_price(market, "YES")
         if yes_price is not None:
+            if (
+                min_tradeable_yes_price is not None
+                and yes_price <= min_tradeable_yes_price
+            ) or (
+                max_tradeable_yes_price is not None
+                and yes_price >= max_tradeable_yes_price
+            ):
+                skipped_untradeable_price += 1
+                continue
             if (
                 extreme_yes_price_lower is not None
                 and yes_price <= extreme_yes_price_lower
@@ -182,6 +235,9 @@ def _filter_markets(
         if skip_weather_bin_markets and _is_weather_bin_market((market.id or "").upper()):
             skipped_weather_bin_markets += 1
             continue
+        if _is_likely_resolved_by_ticker_date(market, now):
+            skipped_likely_resolved_by_ticker += 1
+            continue
         if _is_market_resolved_or_closed(market):
             skipped_resolved += 1
             continue
@@ -200,12 +256,14 @@ def _filter_markets(
 
     logger.debug(
         "Market filtering complete: kept=%d, skipped_liquidity=%d, skipped_volume_24h=%d, "
-        "skipped_extreme_price=%d, skipped_allowlist=%d, "
+        "skipped_untradeable_price=%d, skipped_extreme_price=%d, skipped_allowlist=%d, "
         "skipped_blocklist=%d, skipped_ticker_prefix_blocklist=%d, skipped_resolved=%d, skipped_close_too_soon=%d, "
-        "skipped_close_too_far=%d, skipped_closed_now=%d, skipped_weather_bin_markets=%d",
+        "skipped_close_too_far=%d, skipped_closed_now=%d, skipped_weather_bin_markets=%d, "
+        "skipped_likely_resolved_by_ticker=%d",
         len(filtered),
         skipped_liquidity,
         skipped_volume_24h,
+        skipped_untradeable_price,
         skipped_extreme_price,
         skipped_allowlist,
         skipped_blocklist,
@@ -215,10 +273,12 @@ def _filter_markets(
         skipped_close_too_far,
         skipped_closed_now,
         skipped_weather_bin_markets,
+        skipped_likely_resolved_by_ticker,
         data={
             "kept": len(filtered),
             "skipped_liquidity": skipped_liquidity,
             "skipped_volume_24h": skipped_volume_24h,
+            "skipped_untradeable_price": skipped_untradeable_price,
             "skipped_extreme_price": skipped_extreme_price,
             "skipped_allowlist": skipped_allowlist,
             "skipped_blocklist": skipped_blocklist,
@@ -228,6 +288,7 @@ def _filter_markets(
             "skipped_close_too_far": skipped_close_too_far,
             "skipped_closed_now": skipped_closed_now,
             "skipped_weather_bin_markets": skipped_weather_bin_markets,
+            "skipped_likely_resolved_by_ticker": skipped_likely_resolved_by_ticker,
         },
     )
     if stats is not None:
@@ -236,6 +297,7 @@ def _filter_markets(
                 "kept": len(filtered),
                 "skipped_liquidity": skipped_liquidity,
                 "skipped_volume_24h": skipped_volume_24h,
+                "skipped_untradeable_price": skipped_untradeable_price,
                 "skipped_extreme_price": skipped_extreme_price,
                 "skipped_allowlist": skipped_allowlist,
                 "skipped_blocklist": skipped_blocklist,
@@ -245,6 +307,7 @@ def _filter_markets(
                 "skipped_close_too_far": skipped_close_too_far,
                 "skipped_closed_now": skipped_closed_now,
                 "skipped_weather_bin_markets": skipped_weather_bin_markets,
+                "skipped_likely_resolved_by_ticker": skipped_likely_resolved_by_ticker,
             }
         )
     return filtered
@@ -252,6 +315,32 @@ def _filter_markets(
 
 def _is_weather_bin_market(market_id: str) -> bool:
     return bool(re.match(r"^KX(?:LOWT|HIGHT|TEMP)[A-Z]+-.*-B[0-9]", market_id))
+
+
+def _ticker_resolution_date(market_id: str) -> datetime | None:
+    match = _TICKER_DATE_PATTERN.search((market_id or "").upper())
+    if not match:
+        return None
+    year_token, month_token, day_token = match.groups()
+    month = _MONTH_ABBREVIATIONS.get(month_token.upper())
+    if month is None:
+        return None
+    try:
+        return datetime(
+            year=2000 + int(year_token),
+            month=month,
+            day=int(day_token),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+def _is_likely_resolved_by_ticker_date(market: Market, now: datetime) -> bool:
+    resolution_date = _ticker_resolution_date(market.id or "")
+    if resolution_date is None:
+        return False
+    return resolution_date.date() < now.date()
 
 
 def _extract_order_cancel_reason(order_response: Any) -> str | None:
@@ -529,6 +618,23 @@ def _set_outcome_entry_price(market: Market, outcome: str, price: float) -> bool
     return True
 
 
+def _build_order_request_from_market(
+    market: Market,
+    decision: TradeDecision,
+    amount_usdc: float,
+) -> OrderRequest:
+    order_data: dict[str, Any] = {
+        "market_id": market.id,
+        "outcome": decision.outcome,
+        "amount_usdc": amount_usdc,
+        "confidence": decision.confidence,
+    }
+    outcome_price = _get_outcome_entry_price(market, decision.outcome)
+    if outcome_price is not None:
+        order_data["yes_price"] = int(round(outcome_price * 100))
+    return OrderRequest(**order_data)
+
+
 def _get_implied_probability(market: Market, outcome: str) -> float | None:
     market_outcome = _find_market_outcome(market, outcome)
     if not market_outcome:
@@ -549,8 +655,11 @@ def _edge_threshold_for_market(
     implied_prob: float,
     settings: Settings,
     edge_source: str | None = None,
+    market: Market | None = None,
 ) -> float:
     min_edge = settings.MIN_EDGE
+    if market is not None and market_family(market) == "weather":
+        min_edge = max(min_edge, settings.WEATHER_MIN_EDGE)
     if implied_prob < settings.LOW_PRICE_THRESHOLD:
         min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
     if settings.COINFLIP_PRICE_LOWER <= implied_prob <= settings.COINFLIP_PRICE_UPPER:
@@ -564,13 +673,19 @@ def _passes_edge_threshold(
     implied_prob: float | None,
     decision: TradeDecision,
     settings: Settings,
+    market: Market | None = None,
 ) -> tuple[bool, float | None, str]:
     if implied_prob is None:
         if settings.REQUIRE_IMPLIED_PRICE:
             return False, None, "missing implied probability"
         return True, None, ""
     edge = decision.confidence - implied_prob
-    min_edge = _edge_threshold_for_market(implied_prob, settings, decision.edge_source)
+    min_edge = _edge_threshold_for_market(
+        implied_prob,
+        settings,
+        decision.edge_source,
+        market=market,
+    )
     if edge < min_edge:
         return False, edge, f"edge {edge:.2f} below min {min_edge:.2f}"
     return True, edge, ""
@@ -581,10 +696,16 @@ def _adjust_bet_size_for_edge(
     implied_prob: float | None,
     edge: float | None,
     settings: Settings,
+    market: Market | None = None,
 ) -> float:
     if edge is None or implied_prob is None:
         return decision.bet_size_pct
-    min_edge = _edge_threshold_for_market(implied_prob, settings, decision.edge_source)
+    min_edge = _edge_threshold_for_market(
+        implied_prob,
+        settings,
+        decision.edge_source,
+        market=market,
+    )
     edge_over = edge - min_edge
     if edge_over <= 0:
         return 0.0
@@ -596,6 +717,15 @@ def _adjust_bet_size_for_edge(
     return max(0.0, min(1.0, bet_pct))
 
 
+def _is_within_order_submission_band(
+    price: float | None,
+    settings: Settings,
+) -> bool:
+    if price is None:
+        return False
+    return settings.ORDER_SUBMISSION_MIN_PRICE <= price <= settings.ORDER_SUBMISSION_MAX_PRICE
+
+
 def _max_confidence_for_market(market: Market | None, settings: Settings) -> float:
     if not market:
         return 1.0
@@ -604,6 +734,8 @@ def _max_confidence_for_market(market: Market | None, settings: Settings) -> flo
         return settings.MAX_SPORTS_CONFIDENCE
     if is_esports:
         return settings.MAX_ESPORTS_CONFIDENCE
+    if market_family(market) == "weather":
+        return settings.MAX_WEATHER_CONFIDENCE
     return 1.0
 
 
@@ -683,16 +815,25 @@ def _applied_bayesian_posterior(
 
 
 def _kelly_fraction_for_market_horizon(market: Market, settings: Settings) -> float:
+    weather_multiplier = max(0.0, settings.KELLY_FRACTION_WEATHER)
+    is_weather_market = market_family(market) == "weather"
+
     if market.close_time is None:
-        return settings.KELLY_FRACTION_DEFAULT
+        base_fraction = settings.KELLY_FRACTION_DEFAULT
+        if is_weather_market:
+            return max(0.0, min(1.0, base_fraction * weather_multiplier))
+        return base_fraction
     close_time = market.close_time
     if close_time.tzinfo is None:
         close_time = close_time.replace(tzinfo=timezone.utc)
     horizon_seconds = (close_time - datetime.now(timezone.utc)).total_seconds()
     short_horizon_seconds = max(0, settings.KELLY_FRACTION_SHORT_HORIZON_HOURS) * 3600
+    base_fraction = settings.KELLY_FRACTION_DEFAULT
     if short_horizon_seconds > 0 and horizon_seconds <= short_horizon_seconds:
-        return settings.KELLY_FRACTION_SHORT_HORIZON
-    return settings.KELLY_FRACTION_DEFAULT
+        base_fraction = settings.KELLY_FRACTION_SHORT_HORIZON
+    if is_weather_market:
+        return max(0.0, min(1.0, base_fraction * weather_multiplier))
+    return base_fraction
 
 
 def _sizing_mode_label(kelly_enabled: bool) -> str:
@@ -946,13 +1087,14 @@ def _apply_flip_guard(
     edge_delta = None
     edge_gain_ok = True
     if new_edge is not None and anchor_edge is not None:
-        edge_delta = new_edge - anchor_edge
+        edge_delta = abs(new_edge) - abs(anchor_edge)
         edge_gain_ok = edge_delta >= settings.FLIP_GUARD_MIN_EDGE_GAIN
 
     abs_conf_ok = decision.confidence >= settings.FLIP_GUARD_MIN_ABS_CONFIDENCE
     conf_gain_ok = confidence_delta >= settings.FLIP_GUARD_MIN_CONF_GAIN
     evidence_quality = decision.evidence_quality or 0.0
     evidence_ok = evidence_quality >= settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY
+    high_evidence_flip_override = evidence_quality >= 0.90 and decision.confidence >= 0.90
 
     payload = {
         "market_id": market.id,
@@ -969,9 +1111,10 @@ def _apply_flip_guard(
         "conf_gain_ok": conf_gain_ok,
         "edge_gain_ok": edge_gain_ok,
         "evidence_ok": evidence_ok,
+        "high_evidence_flip_override": high_evidence_flip_override,
     }
 
-    if abs_conf_ok and conf_gain_ok and edge_gain_ok and evidence_ok:
+    if high_evidence_flip_override or (abs_conf_ok and conf_gain_ok and edge_gain_ok and evidence_ok):
         logger.info(
             "FlipGuard passed: market=%s anchor=%s proposed=%s conf_delta=%.3f edge_delta=%s",
             market.id,
@@ -1129,7 +1272,15 @@ def _cap_confidence_for_category(
     """Apply confidence caps based on market category to prevent overconfidence."""
     max_conf = _max_confidence_for_market(market, settings)
     is_sports, is_esports = market_category_flags(market)
-    cap_reason = "sports" if is_sports else ("esports" if is_esports else None)
+    family = market_family(market)
+    if is_sports:
+        cap_reason = "sports"
+    elif is_esports:
+        cap_reason = "esports"
+    elif family == "weather":
+        cap_reason = "weather"
+    else:
+        cap_reason = "general"
 
     if decision.confidence > max_conf:
         logger.info(
@@ -1185,6 +1336,8 @@ def _should_adjust_position(
     state: MarketState | None,
     settings: Settings,
     cycle_bankroll: float | None = None,
+    current_entry_price: float | None = None,
+    last_entry_price: float | None = None,
 ) -> tuple[bool, float, str]:
     """Determine if position should be added to and calculate amount."""
     if not existing_position:
@@ -1222,6 +1375,16 @@ def _should_adjust_position(
 
     if not is_high_confidence and not meets_increase_threshold:
         return False, 0.0, "insufficient_confidence_increase"
+
+    if (
+        current_entry_price is not None
+        and last_entry_price is not None
+        and current_entry_price > 0.0
+        and last_entry_price > 0.0
+    ):
+        relative_move = abs(current_entry_price - last_entry_price) / last_entry_price
+        if relative_move < settings.MIN_PRICE_MOVE_FOR_READD:
+            return False, 0.0, "insufficient_price_move_for_readd"
 
     reason = (
         "high_confidence_override"
@@ -1265,7 +1428,10 @@ def _log_settings_summary(settings) -> None:
             "confidence_gate_edge_override_enabled": settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED,
             "confidence_gate_min_edge": settings.CONFIDENCE_GATE_MIN_EDGE,
             "confidence_gate_min_evidence_quality": settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
+            "min_evidence_quality_for_trade": settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
             "min_liquidity_usdc": settings.MIN_LIQUIDITY_USDC,
+            "min_tradeable_implied_price": settings.MIN_TRADEABLE_IMPLIED_PRICE,
+            "max_tradeable_implied_price": settings.MAX_TRADEABLE_IMPLIED_PRICE,
             "poll_interval_sec": settings.POLL_INTERVAL_SEC,
             "market_min_close_days": settings.MARKET_MIN_CLOSE_DAYS,
             "market_max_close_days": settings.MARKET_MAX_CLOSE_DAYS,
@@ -1275,10 +1441,14 @@ def _log_settings_summary(settings) -> None:
             "ticker_prefix_blocklist": settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
             "skip_weather_bin_markets": settings.SKIP_WEATHER_BIN_MARKETS,
             "kalshi_server_side_filters_enabled": settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
+            "kalshi_max_fetch_pages": settings.KALSHI_MAX_FETCH_PAGES,
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
+            "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+            "max_trades_per_cycle": settings.MAX_TRADES_PER_CYCLE,
             "bayesian_enabled": settings.BAYESIAN_ENABLED,
             "bayesian_skip_stale_updates": settings.BAYESIAN_SKIP_STALE_UPDATES,
+            "bayesian_max_posterior": settings.BAYESIAN_MAX_POSTERIOR,
             "lmsr_enabled": settings.LMSR_ENABLED,
             "kelly_sizing_enabled": settings.KELLY_SIZING_ENABLED,
             "kelly_fraction_default": settings.KELLY_FRACTION_DEFAULT,
@@ -1291,9 +1461,18 @@ def _log_settings_summary(settings) -> None:
             "max_position_pct_of_bankroll": settings.MAX_POSITION_PCT_OF_BANKROLL,
             "parallel_analysis_enabled": settings.PARALLEL_ANALYSIS_ENABLED,
             "analysis_max_workers": settings.ANALYSIS_MAX_WORKERS,
+            "xai_circuit_breaker_max_failures": settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+            "xai_client_timeout_seconds": settings.XAI_CLIENT_TIMEOUT_SECONDS,
+            "grok_stream_timeout_seconds": settings.GROK_STREAM_TIMEOUT_SECONDS,
+            "grok_analysis_max_budget_seconds": settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS,
             "pre_order_market_refresh": settings.PRE_ORDER_MARKET_REFRESH,
+            "max_market_data_age_seconds": settings.MAX_MARKET_DATA_AGE_SECONDS,
             "orderbook_precheck_enabled": settings.ORDERBOOK_PRECHECK_ENABLED,
             "orderbook_precheck_min_confidence": settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
+            "order_submission_min_price": settings.ORDER_SUBMISSION_MIN_PRICE,
+            "order_submission_max_price": settings.ORDER_SUBMISSION_MAX_PRICE,
+            "order_fallback_to_market": settings.ORDER_FALLBACK_TO_MARKET,
+            "order_fallback_min_confidence": settings.ORDER_FALLBACK_MIN_CONFIDENCE,
             "calibration_mode_enabled": settings.CALIBRATION_MODE_ENABLED,
             "calibration_min_samples": settings.CALIBRATION_MIN_SAMPLES,
             "opposite_outcome_strategy": settings.OPPOSITE_OUTCOME_STRATEGY,
@@ -1304,6 +1483,7 @@ def _log_settings_summary(settings) -> None:
             "flip_guard_min_evidence_quality": settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
             "flip_circuit_breaker_enabled": settings.FLIP_CIRCUIT_BREAKER_ENABLED,
             "flip_circuit_breaker_max_flips": settings.FLIP_CIRCUIT_BREAKER_MAX_FLIPS,
+            "evidence_quality_high_confidence_override": settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE,
         },
     )
     if settings.KELLY_SIZING_ENABLED and settings.MAX_BET_USDC > 0:
@@ -1344,6 +1524,70 @@ def _build_kalshi_market_fetch_window(
     return start, end
 
 
+def _fetch_markets_with_optional_server_filters(
+    kalshi_client: KalshiClient,
+    *,
+    use_server_side_filters: bool,
+    fetch_window_start: datetime | None,
+    fetch_window_end: datetime | None,
+) -> list[Market]:
+    if not use_server_side_filters:
+        return kalshi_client.get_markets()
+    try:
+        return kalshi_client.get_markets(
+            close_time_start=fetch_window_start,
+            close_time_end=fetch_window_end,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Kalshi server-side filters failed; attempting filtered retry before unfiltered fallback: %s",
+            exc,
+            data={
+                "error": str(exc),
+                "close_time_start": fetch_window_start.isoformat()
+                if fetch_window_start
+                else None,
+                "close_time_end": fetch_window_end.isoformat()
+                if fetch_window_end
+                else None,
+            },
+        )
+        kalshi_client.reset_session()
+        try:
+            return kalshi_client.get_markets(
+                close_time_start=fetch_window_start,
+                close_time_end=fetch_window_end,
+            )
+        except Exception as retry_exc:
+            logger.warning(
+                "Kalshi filtered retry failed; falling back to unfiltered fetch: %s",
+                retry_exc,
+                data={
+                    "error": str(retry_exc),
+                    "close_time_start": fetch_window_start.isoformat()
+                    if fetch_window_start
+                    else None,
+                    "close_time_end": fetch_window_end.isoformat()
+                    if fetch_window_end
+                    else None,
+                },
+            )
+            return kalshi_client.get_markets()
+
+
+def _requires_market_refresh(
+    *,
+    pre_order_market_refresh: bool,
+    market_data_age_seconds: float | None,
+    max_market_data_age_seconds: int,
+) -> bool:
+    if pre_order_market_refresh:
+        return True
+    if market_data_age_seconds is None:
+        return False
+    return market_data_age_seconds > max_market_data_age_seconds
+
+
 def _confidence_gate_override_metrics(
     market: Market,
     decision: TradeDecision,
@@ -1377,6 +1621,25 @@ def _record_terminal_outcome(
                 "error": str(exc),
             },
         )
+
+
+def _record_rejection_reason(
+    rejection_breakdown: dict[str, int],
+    reason: str,
+) -> None:
+    rejection_breakdown[reason] = rejection_breakdown.get(reason, 0) + 1
+
+
+def _analysis_result_rank(result: dict[str, Any] | None) -> tuple[float, float, float]:
+    if not result:
+        return (0.0, 0.0, 0.0)
+    decision = result.get("decision")
+    if not isinstance(decision, TradeDecision):
+        return (0.0, 0.0, 0.0)
+    should_trade_rank = 1.0 if decision.should_trade and not decision.abstain else 0.0
+    evidence_rank = max(0.0, min(1.0, decision.evidence_quality))
+    confidence_rank = max(0.0, min(1.0, decision.confidence))
+    return (should_trade_rank, evidence_rank, confidence_rank)
 
 
 def _build_execution_audit(
@@ -1425,6 +1688,7 @@ def _passes_refreshed_edge_guard(
         implied_prob,
         decision,
         settings,
+        market=market,
     )
     return edge_ok, implied_prob, edge_value, edge_reason
 
@@ -1484,8 +1748,11 @@ def _compute_next_wakeup_seconds(
     return max(1, int(capped))
 
 
-def _build_grok_client_for_worker(settings: Settings) -> GrokClient:
-    """Create an isolated Grok client for threaded analysis workers."""
+def _build_grok_client_for_worker(
+    settings: Settings,
+    provider: XAIProvider | None = None,
+) -> GrokClient:
+    """Create a Grok client for threaded analysis workers."""
     return GrokClient(
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
@@ -1493,6 +1760,7 @@ def _build_grok_client_for_worker(settings: Settings) -> GrokClient:
         min_bet_usdc=settings.MIN_BET_USDC,
         max_bet_usdc=settings.MAX_BET_USDC,
         settings=settings,
+        provider=provider,
     )
 
 
@@ -1561,11 +1829,38 @@ def _analyze_market_candidate(
     """Run analysis/refinement/guardrails for a market candidate."""
     previous_analysis = _build_previous_analysis(anchor_analysis)
     search_config = build_market_search_config(settings, market)
-    decision = grok_client.analyze_market(
-        market,
-        search_config=search_config,
-        previous_analysis=previous_analysis,
-    )
+    try:
+        decision = grok_client.analyze_market(
+            market,
+            search_config=search_config,
+            previous_analysis=previous_analysis,
+        )
+    except Exception as exc:
+        error_text = str(exc)
+        logger.error(
+            "Initial market analysis failed for %s: %s",
+            market.id,
+            exc,
+            data={
+                "market_id": market.id,
+                "error": error_text,
+                "error_type": type(exc).__name__,
+                "analysis_phase": "initial",
+            },
+        )
+        return {
+            "analysis_failed": True,
+            "analysis_error": error_text,
+            "analysis_error_type": type(exc).__name__,
+            "analysis_error_retriable_xai": _is_retriable_xai_error(error_text),
+            "was_refined": False,
+            "refinement_reason_text": None,
+            "flip_triggered": False,
+            "flip_blocked": False,
+            "refinement_skipped_by_flip_precheck": False,
+            "flip_precheck_reason": None,
+            "market_outcome_mismatch_counted": False,
+        }
 
     anchor_outcome: str | None = None
     if anchor_analysis and anchor_analysis.get("outcome") is not None:
@@ -1664,6 +1959,10 @@ def main() -> None:
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
         urgent_reanalysis_cooldown_hours=settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
     )
+    shared_xai_provider = XAIProvider(
+        api_key=settings.XAI_API_KEY,
+        timeout_seconds=settings.XAI_CLIENT_TIMEOUT_SECONDS,
+    )
     grok_client = GrokClient(
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
@@ -1671,6 +1970,7 @@ def main() -> None:
         min_bet_usdc=settings.MIN_BET_USDC,
         max_bet_usdc=settings.MAX_BET_USDC,
         settings=settings,
+        provider=shared_xai_provider,
     )
     logger.debug(
         "Grok client initialized with model=%s model_deep=%s",
@@ -1683,6 +1983,7 @@ def main() -> None:
         api_key_id=settings.KALSHI_API_KEY_ID,
         private_key_path=settings.KALSHI_PRIVATE_KEY_PATH,
         order_price_improvement_cents=settings.ORDER_PRICE_IMPROVEMENT_CENTS,
+        max_fetch_pages=settings.KALSHI_MAX_FETCH_PAGES,
     )
     logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
 
@@ -1702,30 +2003,12 @@ def main() -> None:
                 settings.MARKET_MIN_CLOSE_DAYS,
                 settings.MARKET_MAX_CLOSE_DAYS,
             )
-            if settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED:
-                try:
-                    markets = kalshi_client.get_markets(
-                        close_time_start=fetch_window_start,
-                        close_time_end=fetch_window_end,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Kalshi server-side filters failed; falling back to unfiltered fetch: %s",
-                        exc,
-                        data={
-                            "error": str(exc),
-                            "close_time_start": fetch_window_start.isoformat()
-                            if fetch_window_start
-                            else None,
-                            "close_time_end": fetch_window_end.isoformat()
-                            if fetch_window_end
-                            else None,
-                        },
-                    )
-                    kalshi_client.reset_session()
-                    markets = kalshi_client.get_markets()
-            else:
-                markets = kalshi_client.get_markets()
+            markets = _fetch_markets_with_optional_server_filters(
+                kalshi_client,
+                use_server_side_filters=settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
+                fetch_window_start=fetch_window_start,
+                fetch_window_end=fetch_window_end,
+            )
             fetched_count = len(markets)
             logger.info("Fetched %d raw markets", fetched_count)
 
@@ -1743,6 +2026,8 @@ def main() -> None:
                 min_volume_24h=settings.MIN_VOLUME_24H,
                 extreme_yes_price_lower=settings.EXTREME_YES_PRICE_LOWER,
                 extreme_yes_price_upper=settings.EXTREME_YES_PRICE_UPPER,
+                min_tradeable_yes_price=settings.MIN_TRADEABLE_IMPLIED_PRICE,
+                max_tradeable_yes_price=settings.MAX_TRADEABLE_IMPLIED_PRICE,
             )
             logger.info("Filtered to %d eligible markets", len(markets))
 
@@ -1777,6 +2062,9 @@ def main() -> None:
                         )
 
             trades_attempted = 0
+            trades_filled = 0
+            trades_canceled_unfilled = 0
+            total_usd_deployed = 0.0
             trades_skipped_confidence = 0
             trades_skipped_balance = 0
             trades_skipped_no_trade = 0
@@ -1791,6 +2079,7 @@ def main() -> None:
             markets_analyzed = 0
             markets_refined = 0
             execution_candidates = 0
+            decisions_made = 0
             score_gate_blocked = 0
             flip_guard_triggered = 0
             flip_guard_blocked = 0
@@ -1803,6 +2092,7 @@ def main() -> None:
                 _PRICE_BUCKET_HIGH: 0,
             }
             calibration_samples: list[dict[str, Any]] = []
+            rejection_breakdown: dict[str, int] = {}
 
             analysis_candidates: list[dict[str, Any]] = []
             for market in markets:
@@ -1910,6 +2200,7 @@ def main() -> None:
                         "market": market,
                         "state": state,
                         "anchor_analysis": anchor_analysis,
+                        "market_snapshot_monotonic": time.monotonic(),
                     }
                 )
 
@@ -1917,9 +2208,13 @@ def main() -> None:
             available_family_distribution = _analysis_candidate_family_counts(
                 analysis_candidates
             )
+            analysis_candidate_attempt_limit = settings.MAX_MARKETS_PER_CYCLE + max(
+                0,
+                settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+            )
             analysis_candidates = _cap_analysis_candidates(
                 analysis_candidates,
-                settings.MAX_MARKETS_PER_CYCLE,
+                analysis_candidate_attempt_limit,
             )
             selected_family_distribution = _analysis_candidate_family_counts(
                 analysis_candidates
@@ -1933,6 +2228,7 @@ def main() -> None:
                         "analysis_candidates_original": original_analysis_candidates_count,
                         "analysis_candidates_capped": len(analysis_candidates),
                         "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+                        "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
                     },
                 )
             logger.info(
@@ -1950,6 +2246,7 @@ def main() -> None:
                     "position_skipped_saturated": position_skipped_saturated,
                     "position_skipped_anchor_opposite": position_skipped_anchor_opposite,
                     "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+                    "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
                 },
             )
 
@@ -1957,10 +2254,12 @@ def main() -> None:
             analysis_phase_start = time.monotonic()
             analysis_candidates_count = len(analysis_candidates)
             parallel_analysis_requested = (
-                settings.PARALLEL_ANALYSIS_ENABLED and analysis_candidates_count > 1
+                settings.PARALLEL_ANALYSIS_ENABLED
+                and analysis_candidates_count > 1
             )
             parallel_analysis_used = False
             analysis_worker_count = 1
+            xai_circuit_breaker_triggered = False
 
             if parallel_analysis_requested:
                 configured_workers = max(1, settings.ANALYSIS_MAX_WORKERS)
@@ -1981,7 +2280,10 @@ def main() -> None:
                         parallel_analysis_used = True
                         future_to_market = {}
                         for candidate in analysis_candidates:
-                            worker_client = _build_grok_client_for_worker(settings)
+                            worker_client = _build_grok_client_for_worker(
+                                settings,
+                                provider=shared_xai_provider,
+                            )
                             future = executor.submit(
                                 _analyze_market_candidate,
                                 candidate["market"],
@@ -2012,6 +2314,27 @@ def main() -> None:
                                         "final_reason": "analysis_failure_after_retries",
                                     },
                                 )
+                                _record_terminal_outcome(
+                                    state_manager,
+                                    market.id,
+                                    "analysis_failure",
+                                )
+                    if parallel_analysis_used and settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES > 0:
+                        xai_failure_count = sum(
+                            1 for r in analysis_results.values()
+                            if r.get("analysis_failed") and r.get("analysis_error_retriable_xai")
+                        )
+                        if xai_failure_count >= settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES:
+                            xai_circuit_breaker_triggered = True
+                            logger.warning(
+                                "xAI circuit breaker would have triggered: %d retriable failures detected in parallel batch",
+                                xai_failure_count,
+                                data={
+                                    "xai_circuit_breaker_max_failures": settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+                                    "xai_retriable_failures": xai_failure_count,
+                                    "total_results": len(analysis_results),
+                                },
+                            )
                 except Exception as exc:
                     parallel_analysis_used = False
                     analysis_results.clear()
@@ -2026,22 +2349,62 @@ def main() -> None:
                     )
 
             if not parallel_analysis_used:
-                for candidate in analysis_candidates:
+                successful_analysis_count = 0
+                consecutive_xai_failures = 0
+                for candidate_index, candidate in enumerate(analysis_candidates):
+                    if successful_analysis_count >= settings.MAX_MARKETS_PER_CYCLE:
+                        break
                     market = candidate["market"]
                     try:
-                        analysis_results[market.id] = _analyze_market_candidate(
+                        result = _analyze_market_candidate(
                             market=market,
                             state=candidate["state"],
                             anchor_analysis=candidate["anchor_analysis"],
                             settings=settings,
                             grok_client=grok_client,
                         )
+                        analysis_results[market.id] = result
+                        if result.get("analysis_failed"):
+                            if result.get("analysis_error_retriable_xai"):
+                                consecutive_xai_failures += 1
+                            else:
+                                consecutive_xai_failures = 0
+                        else:
+                            consecutive_xai_failures = 0
+                            successful_analysis_count += 1
+
+                        if (
+                            not xai_circuit_breaker_triggered
+                            and settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES > 0
+                            and consecutive_xai_failures >= settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES
+                        ):
+                            xai_circuit_breaker_triggered = True
+                            remaining_candidates = analysis_candidates[candidate_index + 1 :]
+                            for skipped_candidate in remaining_candidates:
+                                skipped_market = skipped_candidate["market"]
+                                _record_terminal_outcome(
+                                    state_manager,
+                                    skipped_market.id,
+                                    "analysis_skipped_xai_circuit_breaker",
+                                )
+                            logger.warning(
+                                "xAI analysis circuit breaker triggered after %d consecutive failures; skipped %d remaining markets",
+                                consecutive_xai_failures,
+                                len(remaining_candidates),
+                                data={
+                                    "xai_circuit_breaker_max_failures": settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+                                    "consecutive_xai_failures": consecutive_xai_failures,
+                                    "skipped_remaining_markets": len(remaining_candidates),
+                                },
+                            )
+                            break
                     except Exception as exc:
+                        error_text = str(exc)
                         logger.error(
                             "Failed to analyze market %s: %s",
                             market.id,
                             exc,
-                            data={"market_id": market.id, "error": str(exc)},
+                            data={"market_id": market.id, "error": error_text},
                         )
                         logger.info(
                             "Market %s skipped for this cycle due to analysis failure after retries",
@@ -2052,18 +2415,53 @@ def main() -> None:
                                 "final_reason": "analysis_failure_after_retries",
                             },
                         )
+                        _record_terminal_outcome(
+                            state_manager,
+                            market.id,
+                            "analysis_failure",
+                        )
+                        if _is_retriable_xai_error(error_text):
+                            consecutive_xai_failures += 1
+                        else:
+                            consecutive_xai_failures = 0
+                        if (
+                            not xai_circuit_breaker_triggered
+                            and settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES > 0
+                            and consecutive_xai_failures >= settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES
+                        ):
+                            xai_circuit_breaker_triggered = True
+                            remaining_candidates = analysis_candidates[candidate_index + 1 :]
+                            for skipped_candidate in remaining_candidates:
+                                skipped_market = skipped_candidate["market"]
+                                _record_terminal_outcome(
+                                    state_manager,
+                                    skipped_market.id,
+                                    "analysis_skipped_xai_circuit_breaker",
+                                )
+                            logger.warning(
+                                "xAI analysis circuit breaker triggered after %d consecutive failures; skipped %d remaining markets",
+                                consecutive_xai_failures,
+                                len(remaining_candidates),
+                                data={
+                                    "xai_circuit_breaker_max_failures": settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+                                    "consecutive_xai_failures": consecutive_xai_failures,
+                                    "skipped_remaining_markets": len(remaining_candidates),
+                                },
+                            )
+                            break
             analysis_phase_duration_ms = round(
                 (time.monotonic() - analysis_phase_start) * 1000,
                 2,
             )
             logger.info(
-                "Analysis phase complete: requested_parallel=%s used_parallel=%s candidates=%d workers=%d duration=%.2fms completed=%d",
+                "Analysis phase complete: requested_parallel=%s used_parallel=%s candidates=%d workers=%d duration=%.2fms completed=%d circuit_breaker=%s",
                 parallel_analysis_requested,
                 parallel_analysis_used,
                 analysis_candidates_count,
                 analysis_worker_count,
                 analysis_phase_duration_ms,
                 len(analysis_results),
+                xai_circuit_breaker_triggered,
                 data={
                     "parallel_analysis_requested": parallel_analysis_requested,
                     "parallel_analysis_used": parallel_analysis_used,
@@ -2071,18 +2469,51 @@ def main() -> None:
                     "analysis_workers": analysis_worker_count,
                     "analysis_phase_duration_ms": analysis_phase_duration_ms,
                     "analysis_completed": len(analysis_results),
+                    "xai_circuit_breaker_triggered": xai_circuit_breaker_triggered,
+                    "xai_circuit_breaker_max_failures": settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+                    "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
                 },
             )
 
+            analysis_candidates = sorted(
+                analysis_candidates,
+                key=lambda candidate: _analysis_result_rank(
+                    analysis_results.get(candidate["market"].id)
+                ),
+                reverse=True,
+            )
+
             for candidate in analysis_candidates:
+                if markets_analyzed >= settings.MAX_MARKETS_PER_CYCLE:
+                    break
                 market = candidate["market"]
                 state = candidate["state"]
                 market_start = time.monotonic()
+                market_snapshot_monotonic = candidate.get("market_snapshot_monotonic")
                 analysis_result = analysis_results.get(market.id)
                 if analysis_result is None:
                     continue
+                if analysis_result.get("analysis_failed"):
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "analysis_failure",
+                    )
+                    logger.info(
+                        "Market %s skipped due to initial analysis failure: %s",
+                        market.id,
+                        analysis_result.get("analysis_error"),
+                        data={
+                            "market_id": market.id,
+                            "final_action": "skip",
+                            "final_reason": "analysis_failure_after_retries",
+                            "error_type": analysis_result.get("analysis_error_type"),
+                        },
+                    )
+                    continue
                 markets_analyzed += 1
                 decision = analysis_result["decision"]
+                decisions_made += 1
                 was_refined = analysis_result["was_refined"]
                 if was_refined:
                     markets_refined += 1
@@ -2168,6 +2599,7 @@ def main() -> None:
 
                 if decision.abstain:
                     trades_skipped_no_trade += 1
+                    _record_rejection_reason(rejection_breakdown, "abstain_low_evidence")
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -2190,6 +2622,7 @@ def main() -> None:
 
                 if not decision.should_trade:
                     trades_skipped_no_trade += 1
+                    _record_rejection_reason(rejection_breakdown, "no_trade_recommended")
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -2238,6 +2671,7 @@ def main() -> None:
                         )
                     else:
                         trades_skipped_confidence += 1
+                        _record_rejection_reason(rejection_breakdown, "confidence_below_min")
                         log_trade_decision(
                             market_id=market.id,
                             question=market.question,
@@ -2359,6 +2793,10 @@ def main() -> None:
                                 min_updates_for_trade=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
                             )
                             if bayesian_posterior_applied is not None:
+                                bayesian_posterior_applied = min(
+                                    bayesian_posterior_applied,
+                                    settings.BAYESIAN_MAX_POSTERIOR,
+                                )
                                 capped_confidence = _cap_effective_confidence_for_market(
                                     bayesian_posterior_applied,
                                     market,
@@ -2403,12 +2841,40 @@ def main() -> None:
                     if effective_confidence != decision.confidence
                     else decision
                 )
+                if (
+                    decision_for_edge.evidence_quality
+                    < settings.MIN_EVIDENCE_QUALITY_FOR_TRADE
+                ):
+                    trades_skipped_no_trade += 1
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "evidence_quality_below_min",
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="evidence_quality_below_min",
+                            evidence_quality=decision_for_edge.evidence_quality,
+                            min_evidence_quality=settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "evidence_quality_below_min",
+                    )
+                    continue
                 bucket = _price_bucket(implied_prob, settings)
                 price_bucket_stats[bucket] += 1
                 edge_ok, edge_value, edge_reason = _passes_edge_threshold(
                     implied_prob,
                     decision_for_edge,
                     settings,
+                    market=market,
                 )
                 if settings.CALIBRATION_MODE_ENABLED:
                     calibration_payload = {
@@ -2433,6 +2899,7 @@ def main() -> None:
                     )
                 if not edge_ok:
                     trades_skipped_edge += 1
+                    _record_rejection_reason(rejection_breakdown, "edge_gate_blocked")
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -2463,6 +2930,10 @@ def main() -> None:
                 if _is_uniform_implied_probability(implied_prob, market.outcomes):
                     uniform_implied = 1.0 / len(market.outcomes)
                     trades_skipped_edge += 1
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "uniform_implied_probability",
+                    )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -2543,6 +3014,8 @@ def main() -> None:
                     lmsr_price=lmsr_execution_price,
                     inefficiency_signal=ineff_signal,
                     kelly_raw=kelly_raw_value,
+                    is_weather_market=(market_family(market) == "weather"),
+                    weather_score_penalty=settings.WEATHER_SCORE_PENALTY,
                 )
                 score_mode = settings.SCORE_GATE_MODE
                 if score_mode != "off":
@@ -2554,6 +3027,11 @@ def main() -> None:
                         "edge_market": score_result.edge_market,
                         "edge_external": score_result.edge_external,
                         "evidence_quality": score_result.evidence_quality,
+                        "evidence_component": score_result.evidence_component,
+                        "bayesian_component": score_result.bayesian_component,
+                        "inefficiency_component": score_result.inefficiency_component,
+                        "kelly_component": score_result.kelly_component,
+                        "confidence_alignment_bonus": score_result.confidence_alignment_bonus,
                         "liquidity_penalty": score_result.liquidity_penalty,
                         "staleness_penalty": score_result.staleness_penalty,
                         "bayesian_posterior": score_result.bayesian_posterior,
@@ -2578,6 +3056,7 @@ def main() -> None:
                     elif score_result.final_score < settings.SCORE_GATE_THRESHOLD:
                         score_gate_blocked += 1
                         trades_skipped_edge += 1
+                        _record_rejection_reason(rejection_breakdown, "score_gate_blocked")
                         log_trade_decision(
                             market_id=market.id,
                             question=market.question,
@@ -2588,6 +3067,7 @@ def main() -> None:
                                 final_reason="score_gate_blocked",
                                 score_threshold=settings.SCORE_GATE_THRESHOLD,
                                 score_final=score_result.final_score,
+                                score_breakdown=score_payload,
                             ),
                         )
                         _record_terminal_outcome(state_manager, market.id, "score_gate_blocked")
@@ -2607,6 +3087,7 @@ def main() -> None:
                     implied_prob,
                     edge_value,
                     settings,
+                    market=market,
                 )
                 if kelly_path_active:
                     if posterior_for_kelly is None:
@@ -2617,7 +3098,11 @@ def main() -> None:
                         )
                     if kelly_fraction_value is None:
                         kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
-                    min_edge_for_kelly = _edge_threshold_for_market(implied_prob, settings)
+                    min_edge_for_kelly = _edge_threshold_for_market(
+                        implied_prob,
+                        settings,
+                        market=market,
+                    )
                     adjusted_bet_pct = kelly_bet_pct(
                         posterior=posterior_for_kelly,
                         market_price=implied_prob,
@@ -2628,6 +3113,7 @@ def main() -> None:
                     adjusted_bet_pct = edge_scaling_bet_pct
                 if adjusted_bet_pct <= 0:
                     trades_skipped_edge += 1
+                    _record_rejection_reason(rejection_breakdown, "zero_bet_after_sizing")
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     skip_reason = _zero_bet_skip_message(sizing_mode)
                     logger.info(
@@ -2708,6 +3194,7 @@ def main() -> None:
                         and abs(ineff_signal) < settings.LMSR_MIN_INEFFICIENCY
                     ):
                         trades_skipped_edge += 1
+                        _record_rejection_reason(rejection_breakdown, "lmsr_gate_blocked")
                         question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                         logger.info(
                             "SKIP [%s] '%s' -> LMSR inefficiency too small (|%.4f| < %.4f)",
@@ -2758,42 +3245,6 @@ def main() -> None:
 
                 execution_candidates += 1
 
-                log_trade_decision(
-                    market_id=market.id,
-                    question=market.question,
-                    decision=decision_for_edge.model_copy(
-                        update={"bet_size_pct": adjusted_bet_pct}
-                    ).model_dump(),
-                    execution_audit=_build_execution_audit(
-                        decision_phase="post_sizing",
-                        sizing_mode=sizing_mode,
-                        position_decision="pending",
-                        adjusted_bet_pct=adjusted_bet_pct,
-                        bet_amount_usdc=None,
-                        proposed_bet_amount_usdc=proposed_bet_amount,
-                        kelly_raw_bet_amount_usdc=(
-                            proposed_bet_amount if sizing_mode == "kelly" else None
-                        ),
-                        min_bet_floor_applied=False,
-                        kelly_sub_floor_skipped=False,
-                        kelly_raw=kelly_raw_value,
-                        kelly_fraction_value=kelly_fraction_value,
-                        posterior_for_kelly=posterior_for_kelly,
-                        bayesian_posterior_raw=bayesian_posterior_raw,
-                        bayesian_posterior_applied=bayesian_posterior_applied,
-                        bayesian_applied=bayesian_posterior_applied is not None,
-                        bayesian_update_count=bayesian_update_count,
-                        bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
-                        likelihood_ratio=likelihood_ratio,
-                        implied_prob_market=implied_prob,
-                        min_edge_for_kelly=min_edge_for_kelly,
-                        edge_market=edge_value,
-                        lmsr_execution_price=lmsr_execution_price,
-                        lmsr_inefficiency_signal=ineff_signal,
-                        lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
-                    ),
-                )
-
                 logger.debug(
                     "Edge passed: market=%s implied=%.3f edge=%.3f entry=%.3f bet_pct=%.3f",
                     market.id,
@@ -2820,6 +3271,16 @@ def main() -> None:
                         data={"market_id": market.id, "error": str(exc)},
                     )
                     existing_position = None
+                try:
+                    last_entry_price = state_manager.get_last_trade_entry_price(market.id)
+                except Exception as exc:
+                    logger.debug(
+                        "Last entry lookup failed for market %s: %s",
+                        market.id,
+                        exc,
+                        data={"market_id": market.id, "error": str(exc)},
+                    )
+                    last_entry_price = None
 
                 should_add, bet_pct, position_reason = _should_adjust_position(
                     decision_for_edge.model_copy(update={"bet_size_pct": adjusted_bet_pct}),
@@ -2828,48 +3289,50 @@ def main() -> None:
                     state,
                     settings,
                     cycle_bankroll=cycle_bankroll,
-                )
-                log_trade_decision(
-                    market_id=market.id,
-                    question=market.question,
-                    decision=decision_for_edge.model_copy(
-                        update={"bet_size_pct": adjusted_bet_pct}
-                    ).model_dump(),
-                    execution_audit=_build_execution_audit(
-                        decision_phase="post_position_gate",
-                        decision_terminal=not should_add,
-                        final_action="skip" if not should_add else None,
-                        final_reason="position_adjustment_blocked" if not should_add else None,
-                        sizing_mode=sizing_mode,
-                        position_decision="allowed" if should_add else "blocked",
-                        position_decision_reason=position_reason if not should_add else None,
-                        adjusted_bet_pct=adjusted_bet_pct,
-                        post_position_bet_pct=bet_pct,
-                        bet_amount_usdc=None,
-                        proposed_bet_amount_usdc=proposed_bet_amount,
-                        kelly_raw_bet_amount_usdc=(
-                            proposed_bet_amount if sizing_mode == "kelly" else None
-                        ),
-                        min_bet_floor_applied=False,
-                        kelly_sub_floor_skipped=False,
-                        kelly_raw=kelly_raw_value,
-                        kelly_fraction_value=kelly_fraction_value,
-                        posterior_for_kelly=posterior_for_kelly,
-                        bayesian_posterior_raw=bayesian_posterior_raw,
-                        bayesian_posterior_applied=bayesian_posterior_applied,
-                        bayesian_applied=bayesian_posterior_applied is not None,
-                        bayesian_update_count=bayesian_update_count,
-                        bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
-                        likelihood_ratio=likelihood_ratio,
-                        implied_prob_market=implied_prob,
-                        min_edge_for_kelly=min_edge_for_kelly,
-                        edge_market=edge_value,
-                        lmsr_execution_price=lmsr_execution_price,
-                        lmsr_inefficiency_signal=ineff_signal,
-                        lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
-                    ),
+                    current_entry_price=entry_price,
+                    last_entry_price=last_entry_price,
                 )
                 if not should_add:
+                    _record_rejection_reason(rejection_breakdown, "position_adjustment_blocked")
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": adjusted_bet_pct}
+                        ).model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="post_position_gate",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="position_adjustment_blocked",
+                            sizing_mode=sizing_mode,
+                            position_decision="blocked",
+                            position_decision_reason=position_reason,
+                            adjusted_bet_pct=adjusted_bet_pct,
+                            post_position_bet_pct=bet_pct,
+                            proposed_bet_amount_usdc=proposed_bet_amount,
+                            kelly_raw_bet_amount_usdc=(
+                                proposed_bet_amount if sizing_mode == "kelly" else None
+                            ),
+                            min_bet_floor_applied=False,
+                            kelly_sub_floor_skipped=False,
+                            kelly_raw=kelly_raw_value,
+                            kelly_fraction_value=kelly_fraction_value,
+                            posterior_for_kelly=posterior_for_kelly,
+                            bayesian_posterior_raw=bayesian_posterior_raw,
+                            bayesian_posterior_applied=bayesian_posterior_applied,
+                            bayesian_applied=bayesian_posterior_applied is not None,
+                            bayesian_update_count=bayesian_update_count,
+                            bayesian_min_updates=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                            likelihood_ratio=likelihood_ratio,
+                            implied_prob_market=implied_prob,
+                            min_edge_for_kelly=min_edge_for_kelly,
+                            edge_market=edge_value,
+                            lmsr_execution_price=lmsr_execution_price,
+                            lmsr_inefficiency_signal=ineff_signal,
+                            lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
+                        ),
+                    )
                     trades_skipped_position += 1
                     _record_terminal_outcome(
                         state_manager,
@@ -2901,6 +3364,7 @@ def main() -> None:
 
                 bet_amount = _calculate_bet(settings.MAX_BET_USDC, bet_pct)
                 if bet_amount <= 0:
+                    _record_rejection_reason(rejection_breakdown, "bet_amount_zero")
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -2936,6 +3400,7 @@ def main() -> None:
                 if kelly_sub_floor_skipped:
                     trades_skipped_edge += 1
                     trades_skipped_kelly_sub_floor += 1
+                    _record_rejection_reason(rejection_breakdown, "kelly_sub_floor_skip")
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     logger.info(
                         "SKIP [%s] '%s' -> Kelly bet below min bet floor (raw=$%.2f < min=$%.2f)",
@@ -2999,13 +3464,6 @@ def main() -> None:
                             "kelly_min_bet_policy_applied": min_bet_policy_applied,
                         },
                     )
-
-                order = OrderRequest(
-                    market_id=market.id,
-                    outcome=decision.outcome,
-                    amount_usdc=bet_amount,
-                    confidence=decision_for_edge.confidence,
-                )
 
                 # Skip order placement if in analysis-only mode (insufficient balance)
                 if analysis_only_mode:
@@ -3092,7 +3550,22 @@ def main() -> None:
 
                 question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
                 active_market = market
-                if settings.PRE_ORDER_MARKET_REFRESH:
+                market_data_age_seconds: float | None = None
+                if isinstance(market_snapshot_monotonic, (int, float)):
+                    market_data_age_seconds = max(
+                        0.0,
+                        time.monotonic() - float(market_snapshot_monotonic),
+                    )
+                force_refresh_for_staleness = _requires_market_refresh(
+                    pre_order_market_refresh=False,
+                    market_data_age_seconds=market_data_age_seconds,
+                    max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
+                )
+                if _requires_market_refresh(
+                    pre_order_market_refresh=settings.PRE_ORDER_MARKET_REFRESH,
+                    market_data_age_seconds=market_data_age_seconds,
+                    max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
+                ):
                     try:
                         refreshed = kalshi_client.get_market(market.id)
                         if refreshed.outcomes:
@@ -3100,14 +3573,56 @@ def main() -> None:
                             logger.debug(
                                 "Using refreshed market snapshot for execution: market=%s",
                                 market.id,
-                                data={"market_id": market.id},
+                                data={
+                                    "market_id": market.id,
+                                    "market_data_age_seconds": market_data_age_seconds,
+                                    "force_refresh_for_staleness": force_refresh_for_staleness,
+                                },
                             )
                     except Exception as exc:
+                        if force_refresh_for_staleness:
+                            logger.warning(
+                                "SKIP [%s] '%s' -> stale market data and refresh failed",
+                                market.id,
+                                question_short,
+                                data={
+                                    "market_id": market.id,
+                                    "error": str(exc),
+                                    "market_data_age_seconds": market_data_age_seconds,
+                                    "max_market_data_age_seconds": settings.MAX_MARKET_DATA_AGE_SECONDS,
+                                },
+                            )
+                            trades_skipped_edge += 1
+                            log_trade_decision(
+                                market_id=market.id,
+                                question=market.question,
+                                decision=decision_for_edge.model_copy(
+                                    update={"bet_size_pct": bet_pct}
+                                ).model_dump(),
+                                execution_audit=_build_execution_audit(
+                                    decision_phase="post_market_refresh",
+                                    decision_terminal=True,
+                                    final_action="skip",
+                                    final_reason="stale_market_data_refresh_failed",
+                                    market_data_age_seconds=market_data_age_seconds,
+                                    max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
+                                ),
+                            )
+                            _record_terminal_outcome(
+                                state_manager,
+                                market.id,
+                                "stale_market_data_refresh_failed",
+                            )
+                            continue
                         logger.warning(
                             "Pre-order market refresh failed; using scheduled snapshot: market=%s error=%s",
                             market.id,
                             exc,
-                            data={"market_id": market.id, "error": str(exc)},
+                            data={
+                                "market_id": market.id,
+                                "error": str(exc),
+                                "market_data_age_seconds": market_data_age_seconds,
+                            },
                         )
                 if active_market is not market:
                     entry_price = _get_outcome_entry_price(active_market, decision.outcome)
@@ -3192,6 +3707,31 @@ def main() -> None:
                                         data=spread_payload,
                                     )
                                 trades_skipped_edge += 1
+                                _record_rejection_reason(
+                                    rejection_breakdown,
+                                    "orderbook_spread_too_wide",
+                                )
+                                log_trade_decision(
+                                    market_id=market.id,
+                                    question=market.question,
+                                    decision=decision_for_edge.model_copy(
+                                        update={"bet_size_pct": bet_pct}
+                                    ).model_dump(),
+                                    execution_audit=_build_execution_audit(
+                                        decision_phase="pre_orderbook_precheck",
+                                        decision_terminal=True,
+                                        final_action="skip",
+                                        final_reason="orderbook_spread_too_wide",
+                                        best_sell_price=best_sell,
+                                        entry_price=entry_price_for_check,
+                                        option_index=option_index,
+                                    ),
+                                )
+                                _record_terminal_outcome(
+                                    state_manager,
+                                    market.id,
+                                    "orderbook_spread_too_wide",
+                                )
                                 logger.info(
                                     "SKIP [%s] '%s' -> orderbook precheck failed (best_sell=%.3f > entry=%.3f)",
                                     market.id,
@@ -3213,6 +3753,81 @@ def main() -> None:
                                 exc,
                                 data={"market_id": market.id, "error": str(exc)},
                             )
+                execution_entry_price = _get_outcome_entry_price(
+                    active_market,
+                    decision_for_edge.outcome,
+                )
+                if not _is_within_order_submission_band(
+                    execution_entry_price,
+                    settings,
+                ):
+                    trades_skipped_edge += 1
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "order_price_outside_submission_band",
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="pre_order_submission_price_band",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="order_price_outside_submission_band",
+                            entry_price=execution_entry_price,
+                            min_submission_price=settings.ORDER_SUBMISSION_MIN_PRICE,
+                            max_submission_price=settings.ORDER_SUBMISSION_MAX_PRICE,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "order_price_outside_submission_band",
+                    )
+                    logger.info(
+                        "SKIP [%s] '%s' -> entry price outside submission band (price=%s, min=%.2f, max=%.2f)",
+                        market.id,
+                        question_short,
+                        f"{execution_entry_price:.3f}" if execution_entry_price is not None else "n/a",
+                        settings.ORDER_SUBMISSION_MIN_PRICE,
+                        settings.ORDER_SUBMISSION_MAX_PRICE,
+                        data={
+                            "market_id": market.id,
+                            "entry_price": execution_entry_price,
+                            "min_submission_price": settings.ORDER_SUBMISSION_MIN_PRICE,
+                            "max_submission_price": settings.ORDER_SUBMISSION_MAX_PRICE,
+                        },
+                    )
+                    continue
+                if trades_attempted >= settings.MAX_TRADES_PER_CYCLE:
+                    trades_skipped_edge += 1
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "max_trades_per_cycle_reached",
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="pre_order_submission_cap",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="max_trades_per_cycle_reached",
+                            max_trades_per_cycle=settings.MAX_TRADES_PER_CYCLE,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "max_trades_per_cycle_reached",
+                    )
+                    continue
                 logger.info(
                     "TRADE: [%s] '%s' -> %s @ $%.2f (conf=%.2f)",
                     market.id,
@@ -3248,11 +3863,17 @@ def main() -> None:
                             final_action="skip",
                             final_reason="market_closed_during_cycle",
                             bet_amount_usdc=bet_amount,
+                            market_data_age_seconds=market_data_age_seconds,
                         ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "market_closed_during_cycle")
                     continue
 
+                order = _build_order_request_from_market(
+                    active_market,
+                    decision_for_edge,
+                    bet_amount,
+                )
                 try:
                     order_response = kalshi_client.submit_order(
                         order,
@@ -3285,6 +3906,7 @@ def main() -> None:
                             final_action="skip",
                             final_reason="insufficient_balance",
                             bet_amount_usdc=bet_amount,
+                            market_data_age_seconds=market_data_age_seconds,
                         ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "insufficient_balance")
@@ -3310,6 +3932,7 @@ def main() -> None:
                             final_reason="market_closed",
                             bet_amount_usdc=bet_amount,
                             order_error=str(closed_exc),
+                            market_data_age_seconds=market_data_age_seconds,
                         ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "market_closed")
@@ -3342,6 +3965,7 @@ def main() -> None:
                             final_reason="order_submission_failed",
                             bet_amount_usdc=bet_amount,
                             order_error=error_msg,
+                            market_data_age_seconds=market_data_age_seconds,
                         ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "order_submission_failed")
@@ -3387,11 +4011,57 @@ def main() -> None:
                     normalized_order_status in {"cancelled", "canceled"}
                     and (order_fill_count is None or order_fill_count <= 0.0)
                 )
+                fallback_attempted = False
+                fallback_order_response = None
+                if (
+                    unfilled_canceled_order
+                    and settings.ORDER_FALLBACK_TO_MARKET
+                    and decision_for_edge.confidence >= settings.ORDER_FALLBACK_MIN_CONFIDENCE
+                ):
+                    fallback_attempted = True
+                    fallback_order = _build_order_request_from_market(
+                        active_market,
+                        decision_for_edge,
+                        bet_amount,
+                    ).model_copy(update={"order_type": "market"})
+                    try:
+                        fallback_order_response = kalshi_client.submit_order(
+                            fallback_order,
+                            market=active_market,
+                            retry_suffix="fb",
+                        )
+                        order_response = fallback_order_response
+                        normalized_order_status = (order_response.status or "").strip().lower()
+                        order_cancel_reason = None
+                        order_fill_count = None
+                        if normalized_order_status in {"cancelled", "canceled"}:
+                            if isinstance(order_response.raw, dict):
+                                order_cancel_reason = _extract_order_cancel_reason(
+                                    order_response.raw
+                                )
+                                order_fill_count = _extract_order_fill_count(
+                                    order_response.raw
+                                )
+                        unfilled_canceled_order = (
+                            normalized_order_status in {"cancelled", "canceled"}
+                            and (order_fill_count is None or order_fill_count <= 0.0)
+                        )
+                    except Exception as fallback_exc:
+                        logger.warning(
+                            "Order fallback attempt failed: market=%s error=%s",
+                            market.id,
+                            fallback_exc,
+                            data={"market_id": market.id, "error": str(fallback_exc)},
+                        )
                 final_reason = "order_submitted"
                 terminal_outcome = "order_submitted"
                 if unfilled_canceled_order:
+                    trades_canceled_unfilled += 1
                     final_reason = "order_canceled_unfilled"
                     terminal_outcome = "order_canceled_unfilled"
+                else:
+                    trades_filled += 1
+                    total_usd_deployed += bet_amount
                 log_trade_decision(
                     market_id=market.id,
                     question=market.question,
@@ -3408,6 +4078,18 @@ def main() -> None:
                         order_status=order_response.status,
                         order_cancel_reason=order_cancel_reason,
                         order_fill_count=order_fill_count,
+                        fallback_attempted=fallback_attempted,
+                        fallback_order_id=(
+                            fallback_order_response.id
+                            if fallback_order_response is not None
+                            else None
+                        ),
+                        fallback_order_status=(
+                            fallback_order_response.status
+                            if fallback_order_response is not None
+                            else None
+                        ),
+                        market_data_age_seconds=market_data_age_seconds,
                     ),
                 )
                 _record_terminal_outcome(state_manager, market.id, terminal_outcome)
@@ -3476,9 +4158,13 @@ def main() -> None:
                 "eligible_markets": len(markets),
                 "analysis_candidates": analysis_candidates_count,
                 "analyzed_markets": markets_analyzed,
+                "decisions_made": decisions_made,
                 "refined_markets": markets_refined,
                 "execution_candidates": execution_candidates,
                 "order_attempts": trades_attempted,
+                "orders_filled": trades_filled,
+                "orders_canceled_unfilled": trades_canceled_unfilled,
+                "total_usd_deployed": round(total_usd_deployed, 2),
                 "skip_counts": {
                     "no_trade": trades_skipped_no_trade,
                     "confidence": trades_skipped_confidence,
@@ -3487,6 +4173,7 @@ def main() -> None:
                     "balance": trades_skipped_balance,
                     "kelly_sub_floor": trades_skipped_kelly_sub_floor,
                 },
+                "rejection_breakdown": rejection_breakdown,
                 "analysis_only_mode": analysis_only_mode,
             }
             logger.info(
@@ -3503,6 +4190,16 @@ def main() -> None:
                     "bucket_mid": price_bucket_stats[_PRICE_BUCKET_MID],
                     "bucket_high": price_bucket_stats[_PRICE_BUCKET_HIGH],
                 },
+            )
+            logger.info(
+                "Rejections summary: %s",
+                ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(rejection_breakdown.items())
+                )
+                if rejection_breakdown
+                else "none",
+                data={"rejection_breakdown": rejection_breakdown},
             )
             if settings.CALIBRATION_MODE_ENABLED and calibration_samples:
                 recommendation = compute_adaptive_thresholds(
@@ -3521,7 +4218,7 @@ def main() -> None:
                     data=recommendation,
                 )
             logger.info(
-                "Cycle funnel: fetched=%d filtered=%d skipped_resolved=%d scheduler_skips=%d "
+                "Cycle funnel: fetched=%d filtered=%d skipped_resolved=%d skipped_likely_resolved_by_ticker=%d scheduler_skips=%d "
                 "(closed=%d recently=%d other=%d) "
                 "analyzed=%d refined=%d flip_precheck_skipped=%d flip_guard_triggered=%d "
                 "flip_guard_blocked=%d execution_candidates=%d order_attempts=%d "
@@ -3529,6 +4226,7 @@ def main() -> None:
                 fetched_count,
                 len(markets),
                 filter_stats.get("skipped_resolved", 0),
+                filter_stats.get("skipped_likely_resolved_by_ticker", 0),
                 scheduler_skipped_closed + scheduler_skipped_recently + scheduler_skipped_other,
                 scheduler_skipped_closed,
                 scheduler_skipped_recently,
@@ -3545,6 +4243,10 @@ def main() -> None:
                     "fetched": fetched_count,
                     "filtered": len(markets),
                     "skipped_resolved": filter_stats.get("skipped_resolved", 0),
+                    "skipped_likely_resolved_by_ticker": filter_stats.get(
+                        "skipped_likely_resolved_by_ticker",
+                        0,
+                    ),
                     "scheduler_skipped_closed": scheduler_skipped_closed,
                     "scheduler_skipped_recently_analyzed": scheduler_skipped_recently,
                     "scheduler_skipped_other": scheduler_skipped_other,
@@ -3561,6 +4263,9 @@ def main() -> None:
                     "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "execution_candidates": execution_candidates,
                     "order_attempts": trades_attempted,
+                    "orders_filled": trades_filled,
+                    "orders_canceled_unfilled": trades_canceled_unfilled,
+                    "total_usd_deployed": round(total_usd_deployed, 2),
                     "skipped_kelly_sub_floor": trades_skipped_kelly_sub_floor,
                 },
             )
@@ -3596,7 +4301,11 @@ def main() -> None:
                     "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "execution_candidates": execution_candidates,
                     "score_gate_blocked": score_gate_blocked,
+                    "decisions_made": decisions_made,
                     "order_attempts": trades_attempted,
+                    "orders_filled": trades_filled,
+                    "orders_canceled_unfilled": trades_canceled_unfilled,
+                    "total_usd_deployed": round(total_usd_deployed, 2),
                     "skipped_no_trade": trades_skipped_no_trade,
                     "skipped_confidence": trades_skipped_confidence,
                     "skipped_edge": trades_skipped_edge,

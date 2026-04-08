@@ -9,19 +9,31 @@ from models import Market, MarketState
 logger = get_logger(__name__)
 
 _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS = 0.25
-_NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_SECOND = 1.0
+_NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_SECOND = 2.0
+_NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_THIRD = 4.0
 _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
+    "abstain_low_evidence",
+    "analysis_failure",
     "analysis_only_insufficient_balance",
     "bet_amount_zero",
     "confidence_below_min",
+    "evidence_quality_below_min",
     "edge_gate_blocked",
     "kelly_sub_floor_skip",
     "lmsr_gate_blocked",
+    "max_trades_per_cycle_reached",
     "no_trade_recommended",
+    "orderbook_spread_too_wide",
+    "order_price_outside_submission_band",
     "position_adjustment_blocked",
     "score_gate_blocked",
+    "stale_market_data_refresh_failed",
     "uniform_implied_probability",
     "zero_bet_after_sizing",
+}
+_HARD_BACKOFF_TERMINAL_OUTCOMES = {
+    "abstain_low_evidence",
+    "analysis_failure",
 }
 _PRIORITY_STALENESS_WEIGHT = 2.0
 _PRIORITY_PRICE_OPPORTUNITY_WEIGHT = 1.5
@@ -75,10 +87,16 @@ def resolve_reanalysis_cooldown_hours(
     if terminal_outcome in _NON_ACTIONABLE_TERMINAL_OUTCOMES:
         non_actionable_streak = _effective_non_actionable_streak(state)
         if non_actionable_streak <= 1:
-            return min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS)
-        if non_actionable_streak == 2:
-            return min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_SECOND)
-        return base_cooldown
+            cooldown_hours = min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS)
+        elif non_actionable_streak == 2:
+            cooldown_hours = min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_SECOND)
+        elif non_actionable_streak >= 3:
+            cooldown_hours = min(base_cooldown, _NON_ACTIONABLE_TERMINAL_COOLDOWN_HOURS_THIRD)
+        else:
+            cooldown_hours = base_cooldown
+        if terminal_outcome in _HARD_BACKOFF_TERMINAL_OUTCOMES:
+            cooldown_hours = min(base_cooldown, cooldown_hours * 2.0)
+        return cooldown_hours
     return base_cooldown
 
 

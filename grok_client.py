@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
-from tenacity import before_sleep_log, retry, stop_after_attempt, wait_fixed
 
 from config import SearchConfig, Settings
 from logging_config import get_logger
@@ -33,25 +30,43 @@ _RE_LOW_INFORMATION = re.compile(
     re.IGNORECASE,
 )
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
-_XAI_CLIENT_TIMEOUT_SECONDS = 600
-_STREAM_TIMEOUT_SECONDS = 300
+_DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS = 120
+_DEFAULT_STREAM_TIMEOUT_SECONDS = 120
 _EDGE_CONSISTENCY_TOLERANCE = 0.03
 _PROB_CONSISTENCY_TOLERANCE = 0.08
 _MIN_MARKET_EDGE_FOR_TRADE = 0.05
 _LOW_QUALITY_EDGE_BUFFER = 0.08
 _LOW_QUALITY_EVIDENCE_THRESHOLD = 0.45
+_EVIDENCE_OVERRIDE_MIN_CONFIDENCE = 0.90
+_EVIDENCE_OVERRIDE_MIN_MARKET_EDGE = 0.15
+_EVIDENCE_OVERRIDE_MIN_QUALITY = 0.60
+_VERIFIABLE_EVIDENCE_KEYWORDS = (
+    "official",
+    "nws",
+    "weather.gov",
+    "cli",
+    "asos",
+    "metar",
+    "observation",
+    "confirmed",
+    "resolved",
+    "settlement",
+    "exchange",
+)
 _MAX_MODEL_RESPONSE_LOG_CHARS = 500
+_ANALYSIS_MAX_ATTEMPTS = 3
+_ANALYSIS_RETRY_WAIT_SECONDS = 2
+_DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 180
+_SLOW_FAILURE_THRESHOLD_MS = 15_000
 _SYSTEM_PROMPT_SHARED = (
     "Output must strictly match the response schema.\n"
     "Respond with a single valid JSON object only; use double-quoted keys and no trailing commas.\n"
     "The `outcome` field must exactly match one of the provided market outcomes.\n"
-    "If edge is below 5%, uncertain, or unsupported by verified sources, set should_trade=false and bet_size_pct=0.0.\n"
     "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
     "For narrow-bin markets (temperature bins, price bins), confidence should reflect certainty in your analysis "
     "direction, not just raw bin hit probability.\n"
-    "Set evidence_quality below 0.50 when evidence is sparse, conflicting, or proxy-based; reserve evidence_quality "
-    "above 0.80 for verified primary-source evidence.\n"
-    "When search results are empty or irrelevant, reduce confidence and keep evidence quality below 0.50.\n"
+    "When evidence is sparse, conflicting, or proxy-based, lower confidence and explicitly explain uncertainty.\n"
+    "When search results are empty or irrelevant, avoid strong claims and explain the evidence gap.\n"
     "Absence of evidence is not evidence of absence; treat sparse evidence as lower conviction.\n"
 )
 _SYSTEM_PROMPT_ANALYZE = (
@@ -116,6 +131,37 @@ def _response_preview(text: str, max_chars: int = _MAX_MODEL_RESPONSE_LOG_CHARS)
     if len(preview) <= max_chars:
         return preview
     return preview[:max_chars] + "..."
+
+
+def _is_timeout_class_error(exc: Exception) -> bool:
+    """Server-side gRPC deadline or our own stream timeout — both transient."""
+    error_text = str(exc).lower()
+    if "deadline_exceeded" in error_text or "deadline exceeded" in error_text:
+        return True
+    if isinstance(exc, TimeoutError) and "grok stream exceeded" in error_text:
+        return True
+    return False
+
+
+def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
+    """Classify transient failures that should be retried.
+
+    Timeout-class errors (gRPC DEADLINE_EXCEEDED and our own stream timeout)
+    are always retriable regardless of duration, since they indicate the
+    model ran out of time — not a content failure.
+    """
+    if _is_timeout_class_error(exc):
+        return True
+    if duration_ms >= _SLOW_FAILURE_THRESHOLD_MS:
+        return False
+    error_text = str(exc).lower()
+    retriable_markers = (
+        "statuscode.internal",
+        "internal server error",
+        "503",
+        "temporarily unavailable",
+    )
+    return any(marker in error_text for marker in retriable_markers)
 
 
 def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
@@ -201,8 +247,12 @@ def _category_research_hint(profile_name: str, market: Market | None = None) -> 
         )
     if profile_name == "weather":
         return (
-            "Weather guidance: prioritize official weather sources (weather.gov/NWS) and hourly forecast tables. "
-            "Use location and threshold hints from ticker context to anchor the query."
+            "Weather guidance: prioritize official weather sources (weather.gov/NWS), hourly forecast tables, "
+            "and observed station reports (METAR/ASOS). Distinguish observed data vs forecast data, and use "
+            "location and threshold hints from ticker context to anchor the query. Calibrate confidence by lead "
+            "time (highest inside ~72 hours), check model consensus/divergence (e.g., GFS vs ECMWF), and lower "
+            "confidence when guidance diverges or ensemble spread is high. Include climatological base rates for "
+            "the location/time of year and explicitly account for higher uncertainty in precipitation or severe events."
         )
     if market is not None and is_commodity_market(market):
         return (
@@ -229,23 +279,64 @@ class GrokClient:
         settings: Settings | None = None,
         provider: XAIProvider | None = None,
     ) -> None:
+        resolved_settings = settings or Settings()
+        self.settings = resolved_settings
+        self.xai_client_timeout_seconds = max(
+            1,
+            int(
+                getattr(
+                    resolved_settings,
+                    "XAI_CLIENT_TIMEOUT_SECONDS",
+                    _DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        self.stream_timeout_seconds = max(
+            1,
+            int(
+                getattr(
+                    resolved_settings,
+                    "GROK_STREAM_TIMEOUT_SECONDS",
+                    _DEFAULT_STREAM_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        self.analysis_budget_seconds = max(
+            1,
+            int(
+                getattr(
+                    resolved_settings,
+                    "GROK_ANALYSIS_MAX_BUDGET_SECONDS",
+                    _DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS,
+                )
+            ),
+        )
         self.provider = provider or XAIProvider(
             api_key=api_key,
-            timeout_seconds=_XAI_CLIENT_TIMEOUT_SECONDS,
+            timeout_seconds=self.xai_client_timeout_seconds,
         )
-        self.settings = settings
         self.model = model
         self.model_deep = model_deep or model
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
         self.default_search_config = search_config or _default_search_config(settings)
-        if not GrokClient._init_log_emitted:
-            logger.debug(
-                "GrokClient initialized with model=%s model_deep=%s",
-                model,
-                self.model_deep,
-            )
-            GrokClient._init_log_emitted = True
+        log_fn = logger.info if not GrokClient._init_log_emitted else logger.debug
+        GrokClient._init_log_emitted = True
+        log_fn(
+            "GrokClient initialized: model=%s model_deep=%s stream_timeout=%ds analysis_budget=%ds xai_client_timeout=%ds",
+            model,
+            self.model_deep,
+            self.stream_timeout_seconds,
+            self.analysis_budget_seconds,
+            self.xai_client_timeout_seconds,
+            data={
+                "model": model,
+                "model_deep": self.model_deep,
+                "stream_timeout_seconds": self.stream_timeout_seconds,
+                "analysis_budget_seconds": self.analysis_budget_seconds,
+                "xai_client_timeout_seconds": self.xai_client_timeout_seconds,
+            },
+        )
 
     @property
     def client(self):
@@ -375,6 +466,11 @@ class GrokClient:
             return max(-1.0, min(1.0, fallback_edge)), "fallback"
         return None, "none"
 
+    @staticmethod
+    def _has_verifiable_source_signal(reasoning: str) -> bool:
+        normalized_reasoning = (reasoning or "").lower()
+        return any(keyword in normalized_reasoning for keyword in _VERIFIABLE_EVIDENCE_KEYWORDS)
+
     def _validate_and_enrich_decision(
         self,
         market: Market,
@@ -426,6 +522,7 @@ class GrokClient:
 
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
         low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
+        has_verifiable_signal = self._has_verifiable_source_signal(decision.reasoning)
         prob_component = 0.0
         if implied is not None and my_prob is not None:
             prob_component = 0.55
@@ -441,15 +538,13 @@ class GrokClient:
             source_component = min(source_component, 0.05)
 
         consistency_component = 0.2
-        if edge_source == "fallback":
-            consistency_component -= 0.05
         if not consistency_ok:
             consistency_component -= 0.15
         if not prob_consistency_ok:
             consistency_component -= 0.10
 
         evidence_quality = prob_component + source_component + max(0.0, consistency_component)
-        if no_external_odds:
+        if no_external_odds and not has_verifiable_signal:
             evidence_quality = min(evidence_quality, 0.5)
         if low_information:
             evidence_quality = min(evidence_quality, 0.5)
@@ -468,6 +563,20 @@ class GrokClient:
             if market_implied is not None
             else None
         )
+        if has_verifiable_signal and not low_information:
+            evidence_floor = 0.60
+            if market_edge is None or abs(market_edge) < _LOW_QUALITY_EDGE_BUFFER:
+                evidence_floor = 0.55
+            evidence_quality = max(evidence_quality, evidence_floor)
+        active_settings = self.settings or Settings()
+        if (
+            active_settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE
+            and market_edge is not None
+            and decision.confidence >= _EVIDENCE_OVERRIDE_MIN_CONFIDENCE
+            and market_edge >= _EVIDENCE_OVERRIDE_MIN_MARKET_EDGE
+            and self._has_verifiable_source_signal(decision.reasoning)
+        ):
+            evidence_quality = max(evidence_quality, _EVIDENCE_OVERRIDE_MIN_QUALITY)
 
         should_trade = decision.should_trade
         gate_reasons: list[str] = []
@@ -775,10 +884,12 @@ class GrokClient:
             "reasoning_tokens": None,
             "cached_tokens": None,
         }
-        deadline = time.monotonic() + _STREAM_TIMEOUT_SECONDS
+        deadline = time.monotonic() + self.stream_timeout_seconds
         for response, chunk in chat.stream():
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Grok stream exceeded {_STREAM_TIMEOUT_SECONDS}s for market {market_id}")
+                raise TimeoutError(
+                    f"Grok stream exceeded {self.stream_timeout_seconds}s for market {market_id}"
+                )
             usage_metrics = _extract_usage_metrics(response)
             if chunk.content:
                 content += chunk.content
@@ -794,6 +905,67 @@ class GrokClient:
         search_config: SearchConfig | None,
         previous_analysis: TradeDecision | None,
         deep: bool,
+    ) -> TradeDecision:
+        budget_deadline = time.monotonic() + self.analysis_budget_seconds
+        last_error: Exception | None = None
+        for attempt in range(1, _ANALYSIS_MAX_ATTEMPTS + 1):
+            budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
+            if budget_remaining_ms <= 0:
+                break
+            try:
+                return self._run_analysis_once(
+                    market=market,
+                    search_config=search_config,
+                    previous_analysis=previous_analysis,
+                    deep=deep,
+                    retry_attempt=attempt,
+                    budget_remaining_ms=budget_remaining_ms,
+                )
+            except Exception as exc:
+                last_error = exc
+                duration_ms = float(getattr(exc, "_grok_duration_ms", 0.0))
+                retriable = _is_retriable_grok_error(exc, duration_ms)
+                budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
+                if (
+                    not retriable
+                    or attempt >= _ANALYSIS_MAX_ATTEMPTS
+                    or budget_remaining_ms <= 0
+                ):
+                    raise
+                sleep_seconds = min(
+                    _ANALYSIS_RETRY_WAIT_SECONDS,
+                    budget_remaining_ms / 1000.0,
+                )
+                logger.warning(
+                    "Retrying %s for market=%s (attempt=%d/%d)",
+                    "deep market analysis" if deep else "market analysis",
+                    market.id,
+                    attempt + 1,
+                    _ANALYSIS_MAX_ATTEMPTS,
+                    data={
+                        "market_id": market.id,
+                        "deep": deep,
+                        "retry_attempt": attempt + 1,
+                        "max_attempts": _ANALYSIS_MAX_ATTEMPTS,
+                        "budget_remaining_ms": round(budget_remaining_ms, 2),
+                        "retriable": retriable,
+                    },
+                )
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+        raise TimeoutError(
+            f"Grok analysis budget exhausted for market {market.id}"
+        ) from last_error
+
+    def _run_analysis_once(
+        self,
+        market: Market,
+        *,
+        search_config: SearchConfig | None,
+        previous_analysis: TradeDecision | None,
+        deep: bool,
+        retry_attempt: int,
+        budget_remaining_ms: float,
     ) -> TradeDecision:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
@@ -845,6 +1017,7 @@ class GrokClient:
             )
             content, chunk_count, usage_metrics = self._stream_chat_content(chat, market.id)
             data = self._parse_response_payload(market.id, content, deep=deep)
+            raw_payload = dict(data)
 
             deep_likelihood_ratio_provided = False
             if deep:
@@ -859,6 +1032,35 @@ class GrokClient:
                 market,
                 decision,
                 profile_name=active_config.profile_name,
+            )
+            decision = decision.model_copy(
+                update={
+                    "raw_should_trade": (
+                        bool(raw_payload.get("should_trade"))
+                        if isinstance(raw_payload.get("should_trade"), bool)
+                        else None
+                    ),
+                    "raw_outcome": (
+                        str(raw_payload.get("outcome"))
+                        if raw_payload.get("outcome") is not None
+                        else None
+                    ),
+                    "raw_confidence": (
+                        float(raw_payload.get("confidence"))
+                        if isinstance(raw_payload.get("confidence"), (int, float))
+                        else None
+                    ),
+                    "raw_bet_size_pct": (
+                        float(raw_payload.get("bet_size_pct"))
+                        if isinstance(raw_payload.get("bet_size_pct"), (int, float))
+                        else None
+                    ),
+                    "raw_reasoning": (
+                        str(raw_payload.get("reasoning"))
+                        if raw_payload.get("reasoning") is not None
+                        else None
+                    ),
+                }
             )
 
             likelihood_ratio_source = "missing"
@@ -934,17 +1136,16 @@ class GrokClient:
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                     "duration_ms": round(duration, 2),
+                    "retriable": _is_retriable_grok_error(exc, duration),
+                    "retry_attempt": retry_attempt,
+                    "budget_remaining_ms": round(max(0.0, budget_remaining_ms - duration), 2),
                     "previous_analysis": previous_summary if deep else None,
                     "search_profile": active_config.profile_name,
                 },
             )
+            setattr(exc, "_grok_duration_ms", duration)
             raise
 
-    @retry(
-        wait=wait_fixed(2),
-        stop=stop_after_attempt(3),
-        before_sleep=before_sleep_log(logger.logger, logging.WARNING),
-    )
     def analyze_market(
         self,
         market: Market,
@@ -958,11 +1159,6 @@ class GrokClient:
             deep=False,
         )
 
-    @retry(
-        wait=wait_fixed(2),
-        stop=stop_after_attempt(3),
-        before_sleep=before_sleep_log(logger.logger, logging.WARNING),
-    )
     def analyze_market_deep(
         self,
         market: Market,

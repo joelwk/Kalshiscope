@@ -203,6 +203,11 @@ def test_record_terminal_outcome_persists_on_market_state(tmp_path) -> None:
         assert state is not None
         assert state.non_actionable_streak == 2
 
+        manager.record_terminal_outcome(market_id, "analysis_failure")
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.non_actionable_streak == 3
+
         manager.record_terminal_outcome(market_id, "order_submitted")
         state = manager.get_market_state(market_id)
         assert state is not None
@@ -286,5 +291,29 @@ def test_get_outcome_flip_count_counts_transitions(tmp_path) -> None:
         manager.record_analysis(market_id, _decision(0.64, outcome="YES"), is_refined=False)
         manager.record_analysis(market_id, _decision(0.66, outcome="NO"), is_refined=False)
         assert manager.get_outcome_flip_count(market_id) == 3
+    finally:
+        manager.close()
+
+
+def test_get_last_trade_entry_price_returns_latest(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-last-entry"
+        manager.record_analysis(market_id, _decision(0.60, outcome="YES"), is_refined=False)
+        manager.record_trade(
+            market_id,
+            OrderResponse(id="o-entry-1", raw={"outcome": "YES"}),
+            5.0,
+            outcome="YES",
+            entry_price=0.44,
+        )
+        manager.record_trade(
+            market_id,
+            OrderResponse(id="o-entry-2", raw={"outcome": "YES"}),
+            5.0,
+            outcome="YES",
+            entry_price=0.51,
+        )
+        assert manager.get_last_trade_entry_price(market_id) == 0.51
     finally:
         manager.close()

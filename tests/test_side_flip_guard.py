@@ -84,3 +84,22 @@ def test_flip_guard_bypasses_low_confidence_anchor() -> None:
     assert blocked is False
     assert guarded.should_trade is True
     assert guarded.outcome == "NO"
+
+
+def test_flip_guard_allows_high_evidence_override() -> None:
+    settings = Settings()
+    market = _market()
+    decision = _decision("NO", 0.92, evidence_quality=0.95)
+    anchor = {"outcome": "YES", "confidence": 0.90}
+
+    guarded, triggered, blocked = _apply_flip_guard(
+        market,
+        decision,
+        anchor,
+        settings,
+    )
+
+    assert triggered is True
+    assert blocked is False
+    assert guarded.should_trade is True
+    assert guarded.outcome == "NO"

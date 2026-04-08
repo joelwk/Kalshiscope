@@ -148,6 +148,61 @@ def test_should_skip_non_actionable_terminal_outcome_on_second_streak() -> None:
     assert reason == "recently analyzed"
 
 
+def test_should_skip_non_actionable_terminal_outcome_on_third_streak() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    market = _market("m8c-third", now + timedelta(days=4))
+    state = MarketState(
+        market_id="m8c-third",
+        last_analysis=now - timedelta(hours=3),
+        analysis_count=3,
+        last_confidence=0.58,
+        confidence_trend=[0.58, 0.57, 0.56],
+        last_terminal_outcome="no_trade_recommended",
+        non_actionable_streak=3,
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is True
+    assert reason == "recently analyzed"
+
+
+def test_should_not_skip_orderbook_spread_terminal_outcome_after_short_cooldown() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    market = _market("m8c", now + timedelta(days=4))
+    state = MarketState(
+        market_id="m8c",
+        last_analysis=now - timedelta(minutes=20),
+        analysis_count=1,
+        last_confidence=0.58,
+        confidence_trend=[0.58],
+        last_terminal_outcome="orderbook_spread_too_wide",
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is False
+    assert reason == ""
+
+
+def test_hard_backoff_doubles_cooldown_for_abstain_low_evidence() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
+    market = _market("m-hard-backoff", now + timedelta(days=4))
+    state = MarketState(
+        market_id="m-hard-backoff",
+        last_analysis=now - timedelta(minutes=20),
+        analysis_count=1,
+        last_confidence=0.55,
+        confidence_trend=[0.55],
+        last_terminal_outcome="abstain_low_evidence",
+    )
+
+    should_skip, reason = scheduler.should_skip(market, state)
+    assert should_skip is True
+    assert reason == "recently analyzed"
+
+
 def test_should_skip_actionable_terminal_outcome_under_full_cooldown() -> None:
     now = datetime.now(timezone.utc)
     scheduler = MarketScheduler(reanalysis_cooldown_hours=6, urgent_days_before_close=2)
