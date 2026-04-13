@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import requests
 
-from kalshi_client import KalshiClient, _parse_market
+from kalshi_client import KalshiClient, _normalize_time_in_force, _parse_market
 from models import Market, MarketClosedError, OrderRequest
 
 
@@ -106,7 +106,22 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(market.volume, 33)
         self.assertEqual(market.open_interest, 21)
         self.assertEqual(market.volume_24h, 12)
-        self.assertEqual(market.liquidity_usdc, 33)
+        self.assertEqual(market.liquidity_usdc, 21)
+
+    def test_parse_market_uses_open_interest_fallback_when_liquidity_missing(self) -> None:
+        market = _parse_market(
+            {
+                "ticker": "KXBTC-26APR06-T87500",
+                "title": "Will BTC close above 87.5k?",
+                "status": "open",
+                "yes_ask_dollars": 0.42,
+                "volume_fp": 33,
+                "open_interest_fp": 21,
+            }
+        )
+        self.assertEqual(market.volume, 33)
+        self.assertEqual(market.open_interest, 21)
+        self.assertEqual(market.liquidity_usdc, 21)
 
     def test_parse_market_enriches_weather_question_and_resolution(self) -> None:
         market = _parse_market(
@@ -287,7 +302,7 @@ class TestKalshiClient(unittest.TestCase):
         sent_payload = req_mock.call_args.kwargs["json"]
         self.assertEqual(sent_payload["ticker"], "MKT-3")
         self.assertEqual(sent_payload["side"], "yes")
-        self.assertEqual(sent_payload["time_in_force"], "immediate_or_cancel")
+        self.assertEqual(sent_payload["time_in_force"], "good_till_canceled")
         self.assertEqual(sent_payload["count"], 10)
         self.assertEqual(sent_payload["yes_price"], 50)
         self.assertNotIn("no_price", sent_payload)
@@ -344,6 +359,14 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(sent_payload["yes_price"], 97)
         self.assertTrue(sent_payload["client_order_id"].endswith("-fb"))
         self.assertEqual(response.id, "ord-6")
+
+    def test_normalize_time_in_force_maps_legacy_values_to_valid_rest_values(self) -> None:
+        self.assertEqual(_normalize_time_in_force(None), "good_till_canceled")
+        self.assertEqual(_normalize_time_in_force("day"), "good_till_canceled")
+        self.assertEqual(_normalize_time_in_force("gtc"), "good_till_canceled")
+        self.assertEqual(_normalize_time_in_force("good_till_canceled"), "good_till_canceled")
+        self.assertEqual(_normalize_time_in_force("ioc"), "immediate_or_cancel")
+        self.assertEqual(_normalize_time_in_force("fok"), "fill_or_kill")
 
     def test_submit_order_rejects_untradeable_price_band(self) -> None:
         client = self._client()

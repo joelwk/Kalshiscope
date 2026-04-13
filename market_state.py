@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,6 +21,7 @@ _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
     "analysis_failure",
     "analysis_only_insufficient_balance",
     "bet_amount_zero",
+    "coinflip_market",
     "confidence_below_min",
     "evidence_quality_below_min",
     "edge_gate_blocked",
@@ -57,7 +59,8 @@ class MarketStateManager:
                     close_time TEXT,
                     category TEXT,
                     last_terminal_outcome TEXT,
-                    non_actionable_streak INTEGER DEFAULT 0
+                    non_actionable_streak INTEGER DEFAULT 0,
+                    fill_failure_count INTEGER DEFAULT 0
                 )
                 """
             )
@@ -153,6 +156,33 @@ class MarketStateManager:
                 """
             )
             self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cycle_receipts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_id TEXT,
+                    cycle_number INTEGER,
+                    timestamp TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS decision_receipts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_id TEXT,
+                    market_id TEXT NOT NULL,
+                    final_action TEXT,
+                    final_reason TEXT,
+                    timestamp TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    order_json TEXT,
+                    audit_json TEXT,
+                    score_json TEXT
+                )
+                """
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_analyses_market_id ON analyses (market_id)"
             )
             self._conn.execute(
@@ -167,6 +197,12 @@ class MarketStateManager:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bayesian_state_market_id ON bayesian_state (market_id)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cycle_receipts_cycle_id ON cycle_receipts (cycle_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_decision_receipts_market_id ON decision_receipts (market_id)"
+            )
             self._run_migrations()
             self._backfill_resolution_state()
 
@@ -174,6 +210,7 @@ class MarketStateManager:
         market_row = self._conn.execute(
             """
             SELECT last_terminal_outcome, non_actionable_streak
+                , fill_failure_count
             FROM markets
             WHERE id = ?
             """,
@@ -187,6 +224,11 @@ class MarketStateManager:
         non_actionable_streak = (
             int(market_row["non_actionable_streak"] or 0)
             if market_row and market_row["non_actionable_streak"] is not None
+            else 0
+        )
+        fill_failure_count = (
+            int(market_row["fill_failure_count"] or 0)
+            if market_row and market_row["fill_failure_count"] is not None
             else 0
         )
         latest_row = self._conn.execute(
@@ -213,6 +255,7 @@ class MarketStateManager:
                 market_id=market_id,
                 last_terminal_outcome=last_terminal_outcome,
                 non_actionable_streak=non_actionable_streak,
+                fill_failure_count=fill_failure_count,
             )
 
         trend_rows = self._conn.execute(
@@ -235,6 +278,7 @@ class MarketStateManager:
             confidence_trend=confidence_trend,
             last_terminal_outcome=last_terminal_outcome,
             non_actionable_streak=non_actionable_streak,
+            fill_failure_count=fill_failure_count,
         )
 
     def get_position(self, market_id: str) -> Position | None:
@@ -282,6 +326,21 @@ class MarketStateManager:
             first_trade=first_trade,
             last_trade=last_trade,
         )
+
+    def get_open_position_market_ids_for_event(self, event_ticker_prefix: str) -> list[str]:
+        normalized_prefix = str(event_ticker_prefix or "").strip().upper()
+        if not normalized_prefix:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT market_id
+            FROM positions
+            WHERE total_amount > 0
+              AND UPPER(COALESCE(market_id, '')) LIKE ?
+            """,
+            (f"{normalized_prefix}%",),
+        ).fetchall()
+        return [str(row["market_id"]) for row in rows if row["market_id"]]
 
     def get_last_trade_entry_price(self, market_id: str) -> float | None:
         row = self._conn.execute(
@@ -507,6 +566,136 @@ class MarketStateManager:
                 (market_id, terminal_outcome, next_streak),
             )
 
+    def record_cycle_receipt(self, cycle_id: str, cycle_number: int, payload: dict[str, Any]) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload, sort_keys=True, default=str)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO cycle_receipts (
+                    cycle_id, cycle_number, timestamp, payload_json
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (cycle_id, cycle_number, timestamp, payload_json),
+            )
+
+    def record_decision_receipt(
+        self,
+        *,
+        cycle_id: str,
+        market_id: str,
+        decision: dict[str, Any],
+        order: dict[str, Any] | None = None,
+        execution_audit: dict[str, Any] | None = None,
+        score_breakdown: dict[str, Any] | None = None,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        normalized_score_breakdown = score_breakdown
+        if normalized_score_breakdown is None and isinstance(execution_audit, dict):
+            candidate_score = execution_audit.get("score_breakdown")
+            if isinstance(candidate_score, dict):
+                normalized_score_breakdown = candidate_score
+        final_action = (
+            str((execution_audit or {}).get("final_action", "")).strip() or None
+        )
+        final_reason = (
+            str((execution_audit or {}).get("final_reason", "")).strip() or None
+        )
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO decision_receipts (
+                    cycle_id, market_id, final_action, final_reason, timestamp,
+                    decision_json, order_json, audit_json, score_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cycle_id,
+                    market_id,
+                    final_action,
+                    final_reason,
+                    timestamp,
+                    json.dumps(decision or {}, sort_keys=True, default=str),
+                    json.dumps(order, sort_keys=True, default=str) if order is not None else None,
+                    json.dumps(execution_audit, sort_keys=True, default=str)
+                    if execution_audit is not None
+                    else None,
+                    json.dumps(normalized_score_breakdown, sort_keys=True, default=str)
+                    if normalized_score_breakdown is not None
+                    else None,
+                ),
+            )
+
+    def upsert_position_snapshot(
+        self,
+        *,
+        market_id: str,
+        outcome: str,
+        total_amount_usdc: float,
+    ) -> None:
+        normalized_market_id = str(market_id or "").strip()
+        if not normalized_market_id:
+            return
+        normalized_outcome = str(outcome or "").strip().upper()
+        if normalized_outcome not in {"YES", "NO"}:
+            return
+        normalized_total = max(0.0, float(total_amount_usdc or 0.0))
+        with self._conn:
+            row = self._conn.execute(
+                """
+                SELECT avg_confidence, order_ids
+                FROM positions
+                WHERE market_id = ?
+                """,
+                (normalized_market_id,),
+            ).fetchone()
+            avg_confidence = float(row["avg_confidence"] or 0.0) if row else 0.0
+            order_ids_raw = row["order_ids"] if row else "[]"
+            self._conn.execute(
+                """
+                INSERT INTO positions (market_id, outcome, total_amount, avg_confidence, order_ids)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(market_id) DO UPDATE SET
+                    outcome = excluded.outcome,
+                    total_amount = excluded.total_amount,
+                    avg_confidence = excluded.avg_confidence,
+                    order_ids = excluded.order_ids
+                """,
+                (
+                    normalized_market_id,
+                    normalized_outcome,
+                    normalized_total,
+                    avg_confidence,
+                    order_ids_raw if order_ids_raw else "[]",
+                ),
+            )
+
+    def increment_fill_failure_count(self, market_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (id, fill_failure_count)
+                VALUES (?, 1)
+                ON CONFLICT(id) DO UPDATE SET
+                    fill_failure_count = COALESCE(markets.fill_failure_count, 0) + 1
+                """,
+                (market_id,),
+            )
+
+    def reset_fill_failure_count(self, market_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (id, fill_failure_count)
+                VALUES (?, 0)
+                ON CONFLICT(id) DO UPDATE SET
+                    fill_failure_count = 0
+                """,
+                (market_id,),
+            )
+
     def record_trade(
         self,
         market_id: str,
@@ -646,6 +835,186 @@ class MarketStateManager:
             "SELECT DISTINCT market_id FROM trade_log"
         ).fetchall()
         return [row["market_id"] for row in rows]
+
+    def get_unresolved_traded_market_ids(self) -> list[str]:
+        rows = self._conn.execute(
+            """
+            SELECT market_id
+            FROM trade_outcomes
+            WHERE COALESCE(resolution_state, 'unresolved') = 'unresolved'
+            """
+        ).fetchall()
+        return [str(row["market_id"]) for row in rows if row["market_id"]]
+
+    def market_has_recent_fallback_edge(self, market_id: str, lookback: int = 3) -> bool:
+        window = max(1, int(lookback))
+        rows = self._conn.execute(
+            """
+            SELECT reasoning
+            FROM analyses
+            WHERE market_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (market_id, window),
+        ).fetchall()
+        for row in rows:
+            reasoning = str(row["reasoning"] or "").lower()
+            if "edge_source=fallback" in reasoning or "edge_source=none" in reasoning:
+                return True
+        return False
+
+    def get_family_fallback_edge_rate(
+        self,
+        family: str,
+        *,
+        lookback: int = 200,
+    ) -> tuple[float, int]:
+        normalized_family = str(family or "").strip().lower()
+        window = max(1, int(lookback))
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(json_extract(decision_json, '$.edge_source'), '')) IN ('fallback', 'none')
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS fallback_count
+            FROM (
+                SELECT decision_json
+                FROM decision_receipts
+                WHERE LOWER(COALESCE(json_extract(audit_json, '$.market_family'), 'unknown')) = ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            """,
+            (normalized_family, window),
+        ).fetchone()
+        total_count = int(row["total_count"] or 0) if row else 0
+        fallback_count = int(row["fallback_count"] or 0) if row and row["fallback_count"] is not None else 0
+        if total_count <= 0:
+            return 0.0, 0
+        return fallback_count / total_count, total_count
+
+    def get_family_outcome_snapshot(
+        self,
+        *,
+        lookback: int = 400,
+    ) -> dict[str, dict[str, float | int]]:
+        """Return resolved trade performance by inferred market family."""
+        window = max(1, int(lookback))
+        rows = self._conn.execute(
+            """
+            SELECT
+                t.market_id AS market_id,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category,
+                t.won AS won,
+                t.pnl_estimate AS pnl_estimate
+            FROM trade_outcomes t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE COALESCE(t.resolution_state, '') LIKE 'resolved%'
+              AND t.won IS NOT NULL
+            ORDER BY COALESCE(t.resolved_at, t.last_updated, '') DESC
+            LIMIT ?
+            """,
+            (window,),
+        ).fetchall()
+        grouped: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {"sample_size": 0, "wins": 0, "pnl_total": 0.0}
+        )
+        for row in rows:
+            family = self._infer_family_from_state_row(
+                market_id=str(row["market_id"] or ""),
+                question=str(row["question"] or ""),
+                category=str(row["category"] or ""),
+            )
+            bucket = grouped[family]
+            bucket["sample_size"] = int(bucket["sample_size"]) + 1
+            if int(row["won"] or 0) == 1:
+                bucket["wins"] = int(bucket["wins"]) + 1
+            bucket["pnl_total"] = float(bucket["pnl_total"]) + float(row["pnl_estimate"] or 0.0)
+        snapshot: dict[str, dict[str, float | int]] = {}
+        for family, values in grouped.items():
+            sample_size = int(values["sample_size"])
+            wins = int(values["wins"])
+            pnl_total = float(values["pnl_total"])
+            snapshot[family] = {
+                "sample_size": sample_size,
+                "wins": wins,
+                "win_rate": (wins / sample_size) if sample_size > 0 else 0.0,
+                "pnl_total": pnl_total,
+            }
+        return snapshot
+
+    def get_family_action_snapshot(
+        self,
+        *,
+        lookback: int = 400,
+    ) -> dict[str, dict[str, float | int]]:
+        """Return decision action rates grouped by inferred family."""
+        window = max(1, int(lookback))
+        rows = self._conn.execute(
+            """
+            SELECT
+                LOWER(COALESCE(json_extract(audit_json, '$.market_family'), 'generic')) AS market_family,
+                LOWER(COALESCE(final_action, '')) AS final_action,
+                LOWER(COALESCE(final_reason, '')) AS final_reason
+            FROM decision_receipts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (window,),
+        ).fetchall()
+        grouped: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {"sample_size": 0, "order_attempts": 0}
+        )
+        for row in rows:
+            family = str(row["market_family"] or "generic").strip().lower() or "generic"
+            final_action = str(row["final_action"] or "").strip().lower()
+            final_reason = str(row["final_reason"] or "").strip().lower()
+            bucket = grouped[family]
+            bucket["sample_size"] = int(bucket["sample_size"]) + 1
+            if final_action == "order_attempt" and final_reason != "dry_run":
+                bucket["order_attempts"] = int(bucket["order_attempts"]) + 1
+        snapshot: dict[str, dict[str, float | int]] = {}
+        for family, values in grouped.items():
+            sample_size = int(values["sample_size"])
+            order_attempts = int(values["order_attempts"])
+            snapshot[family] = {
+                "sample_size": sample_size,
+                "order_attempts": order_attempts,
+                "action_rate": (order_attempts / sample_size) if sample_size > 0 else 0.0,
+            }
+        return snapshot
+
+    @staticmethod
+    def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:
+        text = f"{market_id} {question} {category}".upper()
+        if any(token in text for token in ("KXKBOGAME", "KXNPBGAME", "SPORT", "MATCH", "WINNER")):
+            return "sports"
+        if any(token in text for token in ("KXBTC", "KXETH", "KXSOL", "KXXRP", "KXDOGE", "KXBNB", "CRYPTO")):
+            return "crypto"
+        if any(token in text for token in ("MENTION", "SPEECH", "TRANSCRIPT", "LASTWORD", "TRUTHSOCIAL")):
+            return "speech"
+        if any(token in text for token in ("STREAM", "SPOTIFY", "ARTIST", "SONG", "MUSIC", "LUMINATE")):
+            return "music"
+        if any(
+            token in text
+            for token in ("KXHIGH", "KXLOW", "KXTEMP", "KXRAIN", "WEATHER", "TEMPERATURE")
+        ):
+            return "weather"
+        if any(
+            token in text
+            for token in ("KXGOLD", "KXSILVER", "KXNATGAS", "KXBRENT", "KXHOIL", "KXSUGAR", "KXCOFFEE", "KXCORN", "KXSOYBEAN")
+        ):
+            return "commodities"
+        if any(token in text for token in ("KXINX", "KXNASDAQ", "S&P", "NASDAQ", "DOW")):
+            return "index"
+        return "generic"
 
     def record_resolution(
         self,
@@ -871,6 +1240,15 @@ class MarketStateManager:
         trade_outcome_events = _rows_to_dicts(
             self._conn.execute("SELECT * FROM trade_outcome_events").fetchall()
         )
+        bayesian_state = _rows_to_dicts(
+            self._conn.execute("SELECT * FROM bayesian_state").fetchall()
+        )
+        cycle_receipts = _rows_to_dicts(
+            self._conn.execute("SELECT * FROM cycle_receipts ORDER BY id ASC").fetchall()
+        )
+        decision_receipts = _rows_to_dicts(
+            self._conn.execute("SELECT * FROM decision_receipts ORDER BY id ASC").fetchall()
+        )
 
         for row in positions:
             row["order_ids"] = _parse_order_ids(row.get("order_ids"))
@@ -886,6 +1264,9 @@ class MarketStateManager:
             "trade_log": trade_log,
             "trade_outcomes": trade_outcomes,
             "trade_outcome_events": trade_outcome_events,
+            "bayesian_state": bayesian_state,
+            "cycle_receipts": cycle_receipts,
+            "decision_receipts": decision_receipts,
         }
 
         export_path.write_text(
@@ -976,6 +1357,8 @@ class MarketStateManager:
         self._ensure_column("analyses", "reasoning_hash", "TEXT")
         self._ensure_column("markets", "last_terminal_outcome", "TEXT")
         self._ensure_column("markets", "non_actionable_streak", "INTEGER DEFAULT 0")
+        self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
+        self._ensure_column("decision_receipts", "score_json", "TEXT")
         self._ensure_column(
             "trade_outcomes",
             "resolution_state",

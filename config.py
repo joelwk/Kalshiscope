@@ -20,31 +20,41 @@ class Settings:
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.10
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
-    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.50
-    MIN_LIQUIDITY_USDC: float = 5.0
+    CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
+    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.75
+    MIN_LIQUIDITY_USDC: float = 15.0
     POLL_INTERVAL_SEC: int = 300
 
     # Edge gating / sizing
-    MIN_EDGE: float = 0.05
+    MIN_EDGE: float = 0.07
     LOW_PRICE_THRESHOLD: float = 0.50
+    VERY_LOW_PRICE_THRESHOLD: float = 0.25
     HIGH_PRICE_THRESHOLD: float = 0.65
-    LOW_PRICE_MIN_EDGE: float = 0.08
-    COINFLIP_PRICE_LOWER: float = 0.45
-    COINFLIP_PRICE_UPPER: float = 0.55
+    LOW_PRICE_MIN_EDGE: float = 0.15
+    VERY_LOW_PRICE_MIN_EDGE: float = 0.25
+    COINFLIP_PRICE_LOWER: float = 0.48
+    COINFLIP_PRICE_UPPER: float = 0.52
     EDGE_SCALING_RANGE: float = 0.15
     LOW_PRICE_BET_PENALTY: float = 0.50
-    FALLBACK_EDGE_MIN_EDGE: float = 0.08
-    WEATHER_MIN_EDGE: float = 0.08
+    FALLBACK_EDGE_MIN_EDGE: float = 0.15
+    WEATHER_MIN_EDGE: float = 0.14
+    WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.20
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
-    MAX_SPORTS_CONFIDENCE: float = 0.80  # Cap sports bets at 80% confidence
-    MAX_ESPORTS_CONFIDENCE: float = 0.75  # Cap esports at 75%
-    MAX_WEATHER_CONFIDENCE: float = 0.80  # Cap weather at 80%
+    MAX_GLOBAL_CONFIDENCE: float = 0.85
+    MAX_SPORTS_CONFIDENCE: float = 0.80
+    MAX_ESPORTS_CONFIDENCE: float = 0.75
+    MAX_WEATHER_CONFIDENCE: float = 0.70
+    MAX_INDEX_CONFIDENCE: float = 0.70
+    MAX_COMMODITY_CONFIDENCE: float = 0.78
+    MAX_CRYPTO_CONFIDENCE: float = 0.80
+    MAX_SPEECH_CONFIDENCE: float = 0.65
 
     # Filtering
     MARKET_CATEGORIES_ALLOWLIST: tuple[str, ...] = ()
     MARKET_CATEGORIES_BLOCKLIST: tuple[str, ...] = ()
+    MARKET_FAMILY_BLOCKLIST: tuple[str, ...] = ()
     MARKET_TICKER_BLOCKLIST_PREFIXES: tuple[str, ...] = (
         "KXBTC15M-",
         "KXETH15M-",
@@ -56,14 +66,27 @@ class Settings:
         "KXNETFLIX",
         "KXSPOTIFY",
         "KXMADDOW",
+        "KXPOLITICSMENTION-",
+        "KXPERSONMENTION-",
+        "KXSURVIVORMENTION-",
+        "KXKHANNAMENTION-",
+        "KXCARNEYMENTION-",
+        "KXSNLMENTION-",
+        "KXLASTWORDCOUNT-",
+        "KXVANCEMENTION-",
+        "KXALBUMSTREAMSU-",
+        "KXSPOTSTREAMGLOBAL-",
+        "KXARTISTSTREAMSU-",
     )
     SKIP_WEATHER_BIN_MARKETS: bool = True
-    MIN_VOLUME_24H: float = 0.0
+    CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED: bool = True
+    MIN_VOLUME_24H: float = 10.0
+    MIN_OPEN_INTEREST: float = 25.0
     EXTREME_YES_PRICE_LOWER: float = 0.02
     EXTREME_YES_PRICE_UPPER: float = 0.98
-    MIN_TRADEABLE_IMPLIED_PRICE: float = 0.05
+    MIN_TRADEABLE_IMPLIED_PRICE: float = 0.12
     MAX_TRADEABLE_IMPLIED_PRICE: float = 0.95
-    LADDER_COLLAPSE_THRESHOLD: int = 5
+    LADDER_COLLAPSE_THRESHOLD: int = 3
     MAX_BRACKETS_PER_EVENT: int = 3
     # Date range filtering: only consider markets closing within this window (days from now)
     # Set to 0 or None to disable the filter
@@ -191,6 +214,41 @@ class Settings:
         "WSJ",
         "FT",
     )
+    SPEECH_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "c-span.org",
+        "youtube.com",
+        "whitehouse.gov",
+        "pm.gc.ca",
+        "parl.ca",
+        "politico.com",
+        "reuters.com",
+        "apnews.com",
+    )
+    SPEECH_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "CSPAN",
+        "WhiteHouse",
+        "POTUS",
+        "CanadianPM",
+        "Reuters",
+        "AP",
+        "politico",
+        "CBCNews",
+        "BBCWorld",
+        "WSJ",
+    )
+    MUSIC_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "billboard.com",
+        "hitsdailydouble.com",
+        "luminate.com",
+        "spotifycharts.com",
+        "chartmasters.org",
+    )
+    MUSIC_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "Billboard",
+        "SpotifyCharts",
+        "LuminateData",
+        "HitsDailyDouble",
+    )
     WEATHER_ALLOWED_DOMAINS: tuple[str, ...] = (
         "weather.gov",
         "forecast.weather.gov",
@@ -231,19 +289,24 @@ class Settings:
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
     KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
-    KALSHI_MAX_FETCH_PAGES: int = 0
+    KALSHI_MAX_FETCH_PAGES: int = 10
 
     # Execution
     DRY_RUN: bool = True
+    POSITION_SYNC_ENABLED: bool = True
+    POSITION_SYNC_INTERVAL_CYCLES: int = 3
     PRE_ORDER_MARKET_REFRESH: bool = True
     MAX_MARKET_DATA_AGE_SECONDS: int = 120
     ORDERBOOK_PRECHECK_ENABLED: bool = True
     ORDERBOOK_PRECHECK_MIN_CONFIDENCE: float = 0.75
+    ORDERBOOK_MIN_RESTING_VOLUME: int = 3
     ORDER_PRICE_IMPROVEMENT_CENTS: int = 1
+    ORDER_DEFAULT_TIF: str = "gtc"
     ORDER_SUBMISSION_MIN_PRICE: float = 0.03
     ORDER_SUBMISSION_MAX_PRICE: float = 0.97
     ORDER_FALLBACK_TO_MARKET: bool = True
     ORDER_FALLBACK_MIN_CONFIDENCE: float = 0.85
+    ORDER_FALLBACK_MIN_LIQUIDITY_USDC: float = 200.0
     CALIBRATION_MODE_ENABLED: bool = False
     CALIBRATION_MIN_SAMPLES: int = 20
 
@@ -258,8 +321,15 @@ class Settings:
     URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 3
-    MAX_MARKETS_PER_CYCLE: int = 20
+    MAX_MARKETS_PER_CYCLE: int = 6
+    MAX_WEATHER_CANDIDATES_PER_CYCLE: int = 2
+    MAX_CRYPTO_CANDIDATES_PER_CYCLE: int = 3
+    MAX_SPEECH_CANDIDATES_PER_CYCLE: int = 0
+    MAX_MUSIC_CANDIDATES_PER_CYCLE: int = 0
     MAX_TRADES_PER_CYCLE: int = 5
+    MAX_BETS_PER_EVENT: int = 2
+    MAX_TRADES_PER_DAY: int = 15
+    MAX_DAILY_DRAWDOWN_USDC: float = 30.0
     XAI_CIRCUIT_BREAKER_MAX_FAILURES: int = 3
     XAI_CLIENT_TIMEOUT_SECONDS: int = 120
     GROK_STREAM_TIMEOUT_SECONDS: int = 120
@@ -278,8 +348,69 @@ class Settings:
 
     # Score gate (phase A/B can run in shadow mode)
     SCORE_GATE_MODE: str = "active"  # off|shadow|active
-    SCORE_GATE_THRESHOLD: float = 0.12
-    WEATHER_SCORE_PENALTY: float = 0.03
+    SCORE_GATE_THRESHOLD: float = 0.38
+    SCORE_GATE_THRESHOLD_WEATHER_DIRECT: float = 0.12
+    SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.60
+    SCORE_LOW_INFO_PENALTY_BASE: float = 0.08
+    SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.10
+    SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT: int = 1
+    SCORE_CONFIDENCE_CALIBRATION_FLOOR: float = 0.55
+    SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE: float = 0.10
+    SCORE_FALLBACK_EDGE_PENALTY_BASE: float = 0.08
+    SCORE_OVERCONFIDENCE_PENALTY_BASE: float = 0.08
+    SCORE_COMPUTED_EDGE_BONUS: float = 0.03
+    SCORE_PROXY_EVIDENCE_PENALTY_BASE: float = 0.09
+    SCORE_GENERIC_BIN_PENALTY_BASE: float = 0.04
+    SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE: float = 0.08
+    MENTION_MARKET_SCORE_PENALTY: float = 0.10
+    WEATHER_SCORE_PENALTY: float = 0.12
+    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.80
+    PRE_ANALYSIS_OPPORTUNITY_ENABLED: bool = True
+    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.45
+    PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY: float = 0.10
+    PRE_ANALYSIS_NON_ACTIONABLE_STREAK_CAP: int = 8
+    PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY: float = 0.03
+    PRE_ANALYSIS_ANALYSIS_COUNT_START: int = 2
+    PRE_ANALYSIS_FAMILY_PENALTY_SPEECH: float = 0.10
+    PRE_ANALYSIS_FAMILY_PENALTY_MUSIC: float = 0.08
+    PRE_ANALYSIS_FAMILY_PENALTY_SPORTS: float = 0.0
+    PRE_ANALYSIS_FAMILY_PENALTY_WEATHER_BIN: float = 0.05
+    PRE_ANALYSIS_FAMILY_PENALTY_GENERIC_BIN: float = 0.10
+    PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN: float = 0.06
+    PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD: float = 0.80
+    PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY: float = 0.12
+    PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES: int = 20
+    PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES: int = 10
+    PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD: float = 0.45
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY: float = 0.12
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES: int = 20
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD: float = -10.0
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY: float = 0.10
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD: float = -15.0
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY: float = 0.15
+    PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED: bool = True
+    PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_THRESHOLD: float = 0.0
+    PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD: float = 0.55
+    PRE_ANALYSIS_CRYPTO_MIN_SAMPLES: int = 20
+    PRE_ANALYSIS_HARD_REJECTION_ENABLED: bool = True
+    PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK: int = 3
+    PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES: int = 5
+    PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED: bool = True
+    PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES: int = 20
+    PRE_ANALYSIS_HARD_REJECTION_FAMILIES: tuple[str, ...] = (
+        "speech",
+        "music",
+        "mention",
+        "generic",
+        "crypto",
+        "weather",
+    )
+    GROK_PROXY_CONFIDENCE_CAP: float = 0.78
+    GROK_LOW_INFO_CONFIDENCE_CAP: float = 0.70
+    GROK_FALLBACK_MIN_EVIDENCE_QUALITY: float = 0.50
+    GROK_ABSTAIN_EVIDENCE_THRESHOLD: float = 0.35
+    CONFIDENCE_SHRINKAGE_FLOOR: float = 0.52
+    CONFIDENCE_SHRINKAGE_FACTOR: float = 0.30
 
     # Bayesian + LMSR + Kelly experimental layers
     BAYESIAN_ENABLED: bool = False
@@ -287,6 +418,7 @@ class Settings:
     BAYESIAN_PRIOR_DEFAULT: float = 0.50
     BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
     BAYESIAN_MAX_POSTERIOR: float = 0.97
+    BAYESIAN_MAX_CONFIDENCE_BOOST: float = 0.15
     LMSR_ENABLED: bool = False
     LMSR_LIQUIDITY_PARAM_B: float = 100000.0
     LMSR_MIN_INEFFICIENCY: float = 0.05
@@ -296,7 +428,7 @@ class Settings:
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
     KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
-    KELLY_MIN_BANKROLL_USDC: float = 50.0
+    KELLY_MIN_BANKROLL_USDC: float = 40.0
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -315,6 +447,8 @@ class Settings:
     ENABLE_FILE_LOGGING: bool = True
     ENABLE_JSON_LOGGING: bool = True
     ENABLE_COLORED_LOGGING: bool = True
+    API_COST_INPUT_PER_1K_TOKENS_USD: float = 0.0
+    API_COST_OUTPUT_PER_1K_TOKENS_USD: float = 0.0
 
 
 BASE_REQUIRED_ENV_VARS = (
@@ -428,6 +562,10 @@ def load_settings() -> Settings:
             "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY",
             Settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
         ),
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=_read_env_float(
+            "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE",
+            Settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE,
+        ),
         MIN_EVIDENCE_QUALITY_FOR_TRADE=_read_env_float(
             "MIN_EVIDENCE_QUALITY_FOR_TRADE",
             Settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
@@ -436,11 +574,17 @@ def load_settings() -> Settings:
         LOW_PRICE_THRESHOLD=_read_env_float(
             "LOW_PRICE_THRESHOLD", Settings.LOW_PRICE_THRESHOLD
         ),
+        VERY_LOW_PRICE_THRESHOLD=_read_env_float(
+            "VERY_LOW_PRICE_THRESHOLD", Settings.VERY_LOW_PRICE_THRESHOLD
+        ),
         HIGH_PRICE_THRESHOLD=_read_env_float(
             "HIGH_PRICE_THRESHOLD", Settings.HIGH_PRICE_THRESHOLD
         ),
         LOW_PRICE_MIN_EDGE=_read_env_float(
             "LOW_PRICE_MIN_EDGE", Settings.LOW_PRICE_MIN_EDGE
+        ),
+        VERY_LOW_PRICE_MIN_EDGE=_read_env_float(
+            "VERY_LOW_PRICE_MIN_EDGE", Settings.VERY_LOW_PRICE_MIN_EDGE
         ),
         COINFLIP_PRICE_LOWER=_read_env_float(
             "COINFLIP_PRICE_LOWER", Settings.COINFLIP_PRICE_LOWER
@@ -460,8 +604,15 @@ def load_settings() -> Settings:
         WEATHER_MIN_EDGE=_read_env_float(
             "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
         ),
+        WEATHER_FALLBACK_EDGE_MIN_EDGE=_read_env_float(
+            "WEATHER_FALLBACK_EDGE_MIN_EDGE",
+            Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
+        ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE
+        ),
+        MAX_GLOBAL_CONFIDENCE=_read_env_float(
+            "MAX_GLOBAL_CONFIDENCE", Settings.MAX_GLOBAL_CONFIDENCE
         ),
         MAX_SPORTS_CONFIDENCE=_read_env_float(
             "MAX_SPORTS_CONFIDENCE", Settings.MAX_SPORTS_CONFIDENCE
@@ -471,6 +622,18 @@ def load_settings() -> Settings:
         ),
         MAX_WEATHER_CONFIDENCE=_read_env_float(
             "MAX_WEATHER_CONFIDENCE", Settings.MAX_WEATHER_CONFIDENCE
+        ),
+        MAX_INDEX_CONFIDENCE=_read_env_float(
+            "MAX_INDEX_CONFIDENCE", Settings.MAX_INDEX_CONFIDENCE
+        ),
+        MAX_COMMODITY_CONFIDENCE=_read_env_float(
+            "MAX_COMMODITY_CONFIDENCE", Settings.MAX_COMMODITY_CONFIDENCE
+        ),
+        MAX_CRYPTO_CONFIDENCE=_read_env_float(
+            "MAX_CRYPTO_CONFIDENCE", Settings.MAX_CRYPTO_CONFIDENCE
+        ),
+        MAX_SPEECH_CONFIDENCE=_read_env_float(
+            "MAX_SPEECH_CONFIDENCE", Settings.MAX_SPEECH_CONFIDENCE
         ),
         MIN_LIQUIDITY_USDC=_read_env_float(
             "MIN_LIQUIDITY_USDC", Settings.MIN_LIQUIDITY_USDC
@@ -484,6 +647,10 @@ def load_settings() -> Settings:
         MARKET_CATEGORIES_BLOCKLIST=_split_csv(
             os.getenv("MARKET_CATEGORIES_BLOCKLIST")
         ),
+        MARKET_FAMILY_BLOCKLIST=_read_env_csv(
+            "MARKET_FAMILY_BLOCKLIST",
+            Settings.MARKET_FAMILY_BLOCKLIST,
+        ),
         MARKET_TICKER_BLOCKLIST_PREFIXES=_read_env_csv(
             "MARKET_TICKER_BLOCKLIST_PREFIXES",
             Settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
@@ -491,7 +658,14 @@ def load_settings() -> Settings:
         SKIP_WEATHER_BIN_MARKETS=_read_env_bool(
             "SKIP_WEATHER_BIN_MARKETS", Settings.SKIP_WEATHER_BIN_MARKETS
         ),
+        CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED=_read_env_bool(
+            "CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED",
+            Settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED,
+        ),
         MIN_VOLUME_24H=_read_env_float("MIN_VOLUME_24H", Settings.MIN_VOLUME_24H),
+        MIN_OPEN_INTEREST=_read_env_float(
+            "MIN_OPEN_INTEREST", Settings.MIN_OPEN_INTEREST
+        ),
         EXTREME_YES_PRICE_LOWER=_read_env_float(
             "EXTREME_YES_PRICE_LOWER",
             Settings.EXTREME_YES_PRICE_LOWER,
@@ -568,6 +742,18 @@ def load_settings() -> Settings:
         POLITICS_ALLOWED_X_HANDLES=_read_env_csv(
             "POLITICS_ALLOWED_X_HANDLES", Settings.POLITICS_ALLOWED_X_HANDLES
         ),
+        SPEECH_ALLOWED_DOMAINS=_read_env_csv(
+            "SPEECH_ALLOWED_DOMAINS", Settings.SPEECH_ALLOWED_DOMAINS
+        ),
+        SPEECH_ALLOWED_X_HANDLES=_read_env_csv(
+            "SPEECH_ALLOWED_X_HANDLES", Settings.SPEECH_ALLOWED_X_HANDLES
+        ),
+        MUSIC_ALLOWED_DOMAINS=_read_env_csv(
+            "MUSIC_ALLOWED_DOMAINS", Settings.MUSIC_ALLOWED_DOMAINS
+        ),
+        MUSIC_ALLOWED_X_HANDLES=_read_env_csv(
+            "MUSIC_ALLOWED_X_HANDLES", Settings.MUSIC_ALLOWED_X_HANDLES
+        ),
         WEATHER_ALLOWED_DOMAINS=_read_env_csv(
             "WEATHER_ALLOWED_DOMAINS", Settings.WEATHER_ALLOWED_DOMAINS
         ),
@@ -597,6 +783,13 @@ def load_settings() -> Settings:
             "KALSHI_MAX_FETCH_PAGES", Settings.KALSHI_MAX_FETCH_PAGES
         ),
         DRY_RUN=_read_env_bool("DRY_RUN", Settings.DRY_RUN),
+        POSITION_SYNC_ENABLED=_read_env_bool(
+            "POSITION_SYNC_ENABLED", Settings.POSITION_SYNC_ENABLED
+        ),
+        POSITION_SYNC_INTERVAL_CYCLES=_read_env_int(
+            "POSITION_SYNC_INTERVAL_CYCLES",
+            Settings.POSITION_SYNC_INTERVAL_CYCLES,
+        ),
         PRE_ORDER_MARKET_REFRESH=_read_env_bool(
             "PRE_ORDER_MARKET_REFRESH", Settings.PRE_ORDER_MARKET_REFRESH
         ),
@@ -611,9 +804,17 @@ def load_settings() -> Settings:
             "ORDERBOOK_PRECHECK_MIN_CONFIDENCE",
             Settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE,
         ),
+        ORDERBOOK_MIN_RESTING_VOLUME=_read_env_int(
+            "ORDERBOOK_MIN_RESTING_VOLUME",
+            Settings.ORDERBOOK_MIN_RESTING_VOLUME,
+        ),
         ORDER_PRICE_IMPROVEMENT_CENTS=_read_env_int(
             "ORDER_PRICE_IMPROVEMENT_CENTS",
             Settings.ORDER_PRICE_IMPROVEMENT_CENTS,
+        ),
+        ORDER_DEFAULT_TIF=_read_env_str(
+            "ORDER_DEFAULT_TIF",
+            Settings.ORDER_DEFAULT_TIF,
         ),
         ORDER_SUBMISSION_MIN_PRICE=_read_env_float(
             "ORDER_SUBMISSION_MIN_PRICE",
@@ -630,6 +831,10 @@ def load_settings() -> Settings:
         ORDER_FALLBACK_MIN_CONFIDENCE=_read_env_float(
             "ORDER_FALLBACK_MIN_CONFIDENCE",
             Settings.ORDER_FALLBACK_MIN_CONFIDENCE,
+        ),
+        ORDER_FALLBACK_MIN_LIQUIDITY_USDC=_read_env_float(
+            "ORDER_FALLBACK_MIN_LIQUIDITY_USDC",
+            Settings.ORDER_FALLBACK_MIN_LIQUIDITY_USDC,
         ),
         CALIBRATION_MODE_ENABLED=_read_env_bool(
             "CALIBRATION_MODE_ENABLED", Settings.CALIBRATION_MODE_ENABLED
@@ -667,9 +872,37 @@ def load_settings() -> Settings:
         MAX_MARKETS_PER_CYCLE=_read_env_int(
             "MAX_MARKETS_PER_CYCLE", Settings.MAX_MARKETS_PER_CYCLE
         ),
+        MAX_WEATHER_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_WEATHER_CANDIDATES_PER_CYCLE",
+            Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE,
+        ),
+        MAX_CRYPTO_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_CRYPTO_CANDIDATES_PER_CYCLE",
+            Settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE,
+        ),
+        MAX_SPEECH_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_SPEECH_CANDIDATES_PER_CYCLE",
+            Settings.MAX_SPEECH_CANDIDATES_PER_CYCLE,
+        ),
+        MAX_MUSIC_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_MUSIC_CANDIDATES_PER_CYCLE",
+            Settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
+        ),
         MAX_TRADES_PER_CYCLE=_read_env_int(
             "MAX_TRADES_PER_CYCLE",
             Settings.MAX_TRADES_PER_CYCLE,
+        ),
+        MAX_BETS_PER_EVENT=_read_env_int(
+            "MAX_BETS_PER_EVENT",
+            Settings.MAX_BETS_PER_EVENT,
+        ),
+        MAX_TRADES_PER_DAY=_read_env_int(
+            "MAX_TRADES_PER_DAY",
+            Settings.MAX_TRADES_PER_DAY,
+        ),
+        MAX_DAILY_DRAWDOWN_USDC=_read_env_float(
+            "MAX_DAILY_DRAWDOWN_USDC",
+            Settings.MAX_DAILY_DRAWDOWN_USDC,
         ),
         XAI_CIRCUIT_BREAKER_MAX_FAILURES=_read_env_int(
             "XAI_CIRCUIT_BREAKER_MAX_FAILURES",
@@ -723,9 +956,223 @@ def load_settings() -> Settings:
             "SCORE_GATE_THRESHOLD",
             Settings.SCORE_GATE_THRESHOLD,
         ),
+        SCORE_GATE_THRESHOLD_WEATHER_DIRECT=_read_env_float(
+            "SCORE_GATE_THRESHOLD_WEATHER_DIRECT",
+            Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT,
+        ),
+        SCORE_LOW_INFO_PENALTY_THRESHOLD=_read_env_float(
+            "SCORE_LOW_INFO_PENALTY_THRESHOLD",
+            Settings.SCORE_LOW_INFO_PENALTY_THRESHOLD,
+        ),
+        SCORE_LOW_INFO_PENALTY_BASE=_read_env_float(
+            "SCORE_LOW_INFO_PENALTY_BASE",
+            Settings.SCORE_LOW_INFO_PENALTY_BASE,
+        ),
+        SCORE_REPEATED_ANALYSIS_PENALTY_BASE=_read_env_float(
+            "SCORE_REPEATED_ANALYSIS_PENALTY_BASE",
+            Settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE,
+        ),
+        SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT=_read_env_int(
+            "SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT",
+            Settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT,
+        ),
+        SCORE_CONFIDENCE_CALIBRATION_FLOOR=_read_env_float(
+            "SCORE_CONFIDENCE_CALIBRATION_FLOOR",
+            Settings.SCORE_CONFIDENCE_CALIBRATION_FLOOR,
+        ),
+        SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE=_read_env_float(
+            "SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE",
+            Settings.SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE,
+        ),
+        SCORE_FALLBACK_EDGE_PENALTY_BASE=_read_env_float(
+            "SCORE_FALLBACK_EDGE_PENALTY_BASE",
+            Settings.SCORE_FALLBACK_EDGE_PENALTY_BASE,
+        ),
+        SCORE_OVERCONFIDENCE_PENALTY_BASE=_read_env_float(
+            "SCORE_OVERCONFIDENCE_PENALTY_BASE",
+            Settings.SCORE_OVERCONFIDENCE_PENALTY_BASE,
+        ),
+        SCORE_COMPUTED_EDGE_BONUS=_read_env_float(
+            "SCORE_COMPUTED_EDGE_BONUS",
+            Settings.SCORE_COMPUTED_EDGE_BONUS,
+        ),
+        SCORE_PROXY_EVIDENCE_PENALTY_BASE=_read_env_float(
+            "SCORE_PROXY_EVIDENCE_PENALTY_BASE",
+            Settings.SCORE_PROXY_EVIDENCE_PENALTY_BASE,
+        ),
+        SCORE_GENERIC_BIN_PENALTY_BASE=_read_env_float(
+            "SCORE_GENERIC_BIN_PENALTY_BASE",
+            Settings.SCORE_GENERIC_BIN_PENALTY_BASE,
+        ),
+        SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE=_read_env_float(
+            "SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE",
+            Settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE,
+        ),
+        MENTION_MARKET_SCORE_PENALTY=_read_env_float(
+            "MENTION_MARKET_SCORE_PENALTY",
+            Settings.MENTION_MARKET_SCORE_PENALTY,
+        ),
         WEATHER_SCORE_PENALTY=_read_env_float(
             "WEATHER_SCORE_PENALTY",
             Settings.WEATHER_SCORE_PENALTY,
+        ),
+        WEATHER_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "WEATHER_MIN_EVIDENCE_QUALITY",
+            Settings.WEATHER_MIN_EVIDENCE_QUALITY,
+        ),
+        PRE_ANALYSIS_OPPORTUNITY_ENABLED=_read_env_bool(
+            "PRE_ANALYSIS_OPPORTUNITY_ENABLED",
+            Settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED,
+        ),
+        PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=_read_env_float(
+            "PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE",
+            Settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+        ),
+        PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY=_read_env_float(
+            "PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY",
+            Settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY,
+        ),
+        PRE_ANALYSIS_NON_ACTIONABLE_STREAK_CAP=_read_env_int(
+            "PRE_ANALYSIS_NON_ACTIONABLE_STREAK_CAP",
+            Settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_CAP,
+        ),
+        PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY=_read_env_float(
+            "PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY",
+            Settings.PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY,
+        ),
+        PRE_ANALYSIS_ANALYSIS_COUNT_START=_read_env_int(
+            "PRE_ANALYSIS_ANALYSIS_COUNT_START",
+            Settings.PRE_ANALYSIS_ANALYSIS_COUNT_START,
+        ),
+        PRE_ANALYSIS_FAMILY_PENALTY_SPEECH=_read_env_float(
+            "PRE_ANALYSIS_FAMILY_PENALTY_SPEECH",
+            Settings.PRE_ANALYSIS_FAMILY_PENALTY_SPEECH,
+        ),
+        PRE_ANALYSIS_FAMILY_PENALTY_MUSIC=_read_env_float(
+            "PRE_ANALYSIS_FAMILY_PENALTY_MUSIC",
+            Settings.PRE_ANALYSIS_FAMILY_PENALTY_MUSIC,
+        ),
+        PRE_ANALYSIS_FAMILY_PENALTY_SPORTS=_read_env_float(
+            "PRE_ANALYSIS_FAMILY_PENALTY_SPORTS",
+            Settings.PRE_ANALYSIS_FAMILY_PENALTY_SPORTS,
+        ),
+        PRE_ANALYSIS_FAMILY_PENALTY_WEATHER_BIN=_read_env_float(
+            "PRE_ANALYSIS_FAMILY_PENALTY_WEATHER_BIN",
+            Settings.PRE_ANALYSIS_FAMILY_PENALTY_WEATHER_BIN,
+        ),
+        PRE_ANALYSIS_FAMILY_PENALTY_GENERIC_BIN=_read_env_float(
+            "PRE_ANALYSIS_FAMILY_PENALTY_GENERIC_BIN",
+            Settings.PRE_ANALYSIS_FAMILY_PENALTY_GENERIC_BIN,
+        ),
+        PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN=_read_env_float(
+            "PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN",
+            Settings.PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN,
+        ),
+        PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD=_read_env_float(
+            "PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD",
+            Settings.PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD,
+        ),
+        PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY=_read_env_float(
+            "PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY",
+            Settings.PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY,
+        ),
+        PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES=_read_env_int(
+            "PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES",
+            Settings.PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=_read_env_int(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES=_read_env_int(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY,
+        ),
+        PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED=_read_env_bool(
+            "PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED",
+            Settings.PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED,
+        ),
+        PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_THRESHOLD=_read_env_float(
+            "PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_THRESHOLD",
+            Settings.PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_THRESHOLD,
+        ),
+        PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD=_read_env_float(
+            "PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD",
+            Settings.PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD,
+        ),
+        PRE_ANALYSIS_CRYPTO_MIN_SAMPLES=_read_env_int(
+            "PRE_ANALYSIS_CRYPTO_MIN_SAMPLES",
+            Settings.PRE_ANALYSIS_CRYPTO_MIN_SAMPLES,
+        ),
+        PRE_ANALYSIS_HARD_REJECTION_ENABLED=_read_env_bool(
+            "PRE_ANALYSIS_HARD_REJECTION_ENABLED",
+            Settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED,
+        ),
+        PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK=_read_env_int(
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK",
+            Settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK,
+        ),
+        PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES=_read_env_int(
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES",
+            Settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES,
+        ),
+        PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED=_read_env_bool(
+            "PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED",
+            Settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED,
+        ),
+        PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES=_read_env_int(
+            "PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES",
+            Settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES,
+        ),
+        PRE_ANALYSIS_HARD_REJECTION_FAMILIES=_read_env_csv(
+            "PRE_ANALYSIS_HARD_REJECTION_FAMILIES",
+            Settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
+        ),
+        GROK_PROXY_CONFIDENCE_CAP=_read_env_float(
+            "GROK_PROXY_CONFIDENCE_CAP",
+            Settings.GROK_PROXY_CONFIDENCE_CAP,
+        ),
+        GROK_LOW_INFO_CONFIDENCE_CAP=_read_env_float(
+            "GROK_LOW_INFO_CONFIDENCE_CAP",
+            Settings.GROK_LOW_INFO_CONFIDENCE_CAP,
+        ),
+        GROK_FALLBACK_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "GROK_FALLBACK_MIN_EVIDENCE_QUALITY",
+            Settings.GROK_FALLBACK_MIN_EVIDENCE_QUALITY,
+        ),
+        GROK_ABSTAIN_EVIDENCE_THRESHOLD=_read_env_float(
+            "GROK_ABSTAIN_EVIDENCE_THRESHOLD",
+            Settings.GROK_ABSTAIN_EVIDENCE_THRESHOLD,
+        ),
+        CONFIDENCE_SHRINKAGE_FLOOR=_read_env_float(
+            "CONFIDENCE_SHRINKAGE_FLOOR", Settings.CONFIDENCE_SHRINKAGE_FLOOR
+        ),
+        CONFIDENCE_SHRINKAGE_FACTOR=_read_env_float(
+            "CONFIDENCE_SHRINKAGE_FACTOR", Settings.CONFIDENCE_SHRINKAGE_FACTOR
         ),
         BAYESIAN_ENABLED=_read_env_bool(
             "BAYESIAN_ENABLED",
@@ -749,6 +1196,10 @@ def load_settings() -> Settings:
         BAYESIAN_MAX_POSTERIOR=_read_env_float(
             "BAYESIAN_MAX_POSTERIOR",
             Settings.BAYESIAN_MAX_POSTERIOR,
+        ),
+        BAYESIAN_MAX_CONFIDENCE_BOOST=_read_env_float(
+            "BAYESIAN_MAX_CONFIDENCE_BOOST",
+            Settings.BAYESIAN_MAX_CONFIDENCE_BOOST,
         ),
         LMSR_ENABLED=_read_env_bool(
             "LMSR_ENABLED",
@@ -833,6 +1284,14 @@ def load_settings() -> Settings:
         ),
         ENABLE_COLORED_LOGGING=_read_env_bool(
             "ENABLE_COLORED_LOGGING", Settings.ENABLE_COLORED_LOGGING
+        ),
+        API_COST_INPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_INPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_INPUT_PER_1K_TOKENS_USD,
+        ),
+        API_COST_OUTPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_OUTPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_OUTPUT_PER_1K_TOKENS_USD,
         ),
     )
     strategy = settings.OPPOSITE_OUTCOME_STRATEGY.strip().lower()

@@ -73,6 +73,16 @@ _POLITICS_KEYWORDS = (
     "poll",
     "referendum",
 )
+_SPEECH_KEYWORDS = (
+    "mention",
+    "will say",
+    "say ",
+    "speak",
+    "speech",
+    "press conference",
+    "briefing",
+    "transcript",
+)
 _WEATHER_KEYWORDS = (
     "temperature",
     "temp",
@@ -115,7 +125,20 @@ _COMMODITY_KEYWORDS = (
     "oil",
     "gas prices",
 )
+_MUSIC_KEYWORDS = (
+    "streams",
+    "streaming",
+    "spotify",
+    "luminate",
+    "album sales",
+    "pure sales",
+    "activity sales",
+    "billboard",
+    "hits daily double",
+    "hot 100",
+)
 _LONG_HORIZON_HINTS = ("election", "presidential", "winner", "nominee")
+_SPEECH_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -165,6 +188,18 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
             domains=settings.POLITICS_ALLOWED_DOMAINS,
             x_handles=settings.POLITICS_ALLOWED_X_HANDLES,
         )
+    if family == "speech":
+        return ResearchProfile(
+            name=family,
+            domains=settings.SPEECH_ALLOWED_DOMAINS,
+            x_handles=settings.SPEECH_ALLOWED_X_HANDLES,
+        )
+    if family == "music":
+        return ResearchProfile(
+            name=family,
+            domains=settings.MUSIC_ALLOWED_DOMAINS,
+            x_handles=settings.MUSIC_ALLOWED_X_HANDLES,
+        )
     if family == "weather":
         return ResearchProfile(
             name=family,
@@ -189,6 +224,10 @@ def market_family(market: Market) -> str:
         return "crypto"
     if _has_keyword_match(text, _POLITICS_KEYWORDS):
         return "politics"
+    if _SPEECH_TICKER_PATTERN.search(market.id or "") or _has_keyword_match(text, _SPEECH_KEYWORDS):
+        return "speech"
+    if _has_keyword_match(text, _MUSIC_KEYWORDS):
+        return "music"
     if _has_keyword_match(text, _WEATHER_KEYWORDS):
         return "weather"
     return "generic"
@@ -215,8 +254,25 @@ def market_category_flags(market: Market) -> tuple[bool, bool]:
 
 
 def _lookback_hours(settings: Settings, market: Market, now: datetime) -> int:
-    if market_family(market) == "weather":
+    family = market_family(market)
+    if family == "weather":
         return _weather_lookback_hours(settings, market, now)
+    if family == "speech":
+        if market.close_time:
+            close_time = market.close_time
+            if close_time.tzinfo is None:
+                close_time = close_time.replace(tzinfo=timezone.utc)
+            if close_time - now <= timedelta(days=2):
+                return settings.SEARCH_LOOKBACK_SHORT_HOURS
+        return min(settings.SEARCH_LOOKBACK_MEDIUM_HOURS, 36)
+    if family == "music":
+        if market.close_time:
+            close_time = market.close_time
+            if close_time.tzinfo is None:
+                close_time = close_time.replace(tzinfo=timezone.utc)
+            if close_time - now <= timedelta(days=2):
+                return settings.SEARCH_LOOKBACK_SHORT_HOURS
+        return min(settings.SEARCH_LOOKBACK_LONG_HOURS, 168)
 
     if market.close_time:
         close_time = market.close_time

@@ -92,6 +92,10 @@ class TradeDecision(BaseModel):
         default=None,
         description="Source of edge calculation (computed, fallback, or none).",
     )
+    evidence_basis: str | None = Field(
+        default=None,
+        description="Evidence basis class (direct, proxy, or absence_only).",
+    )
     likelihood_ratio: float | None = Field(
         default=None,
         gt=0.0,
@@ -130,6 +134,26 @@ class TradeDecision(BaseModel):
         default=None,
         description="Raw model reasoning before validator annotations.",
     )
+    prompt_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Prompt token usage captured from provider response.",
+    )
+    completion_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Completion token usage captured from provider response.",
+    )
+    reasoning_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Reasoning token usage captured from provider response.",
+    )
+    cached_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Cached prompt token usage captured from provider response.",
+    )
 
 
 class OrderRequest(BaseModel):
@@ -139,6 +163,7 @@ class OrderRequest(BaseModel):
     amount_usdc: float
     action: str = "buy"
     order_type: str = "limit"
+    time_in_force: str | None = None
     count: int | None = None
     yes_price: int | None = None
     side: str = "BUY"
@@ -181,6 +206,7 @@ class MarketState(BaseModel):
     confidence_trend: list[float] = Field(default_factory=list)
     last_terminal_outcome: str | None = None
     non_actionable_streak: int = 0
+    fill_failure_count: int = 0
 
 
 class Position(BaseModel):

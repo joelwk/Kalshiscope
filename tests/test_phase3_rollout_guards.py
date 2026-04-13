@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from config import Settings
 from main import (
     _applied_bayesian_posterior,
+    _cap_bayesian_confidence_boost,
     _compute_lmsr_execution_price_for_outcome,
     _resolve_min_bet_floor,
     _should_skip_flip_refinement,
@@ -17,6 +18,15 @@ def test_applied_bayesian_posterior_respects_min_updates() -> None:
     assert _applied_bayesian_posterior(0.62, bayesian_update_count=0, min_updates_for_trade=2) is None
     assert _applied_bayesian_posterior(0.62, bayesian_update_count=1, min_updates_for_trade=2) is None
     assert _applied_bayesian_posterior(0.62, bayesian_update_count=2, min_updates_for_trade=2) == 0.62
+
+
+def test_cap_bayesian_confidence_boost_limits_uplift() -> None:
+    capped = _cap_bayesian_confidence_boost(
+        base_confidence=0.53,
+        candidate_confidence=0.97,
+        max_boost=0.15,
+    )
+    assert capped == 0.68
 
 
 def test_lmsr_execution_price_increases_with_trade_size() -> None:

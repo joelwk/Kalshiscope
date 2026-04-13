@@ -32,7 +32,7 @@ _MIN_VALID_PRICE = 0.01
 _MAX_VALID_PRICE = 0.99
 _DEFAULT_PRICE = 0.50
 _DEFAULT_LIMIT = 1000
-_DEFAULT_TIME_IN_FORCE = "immediate_or_cancel"
+_DEFAULT_LIMIT_TIME_IN_FORCE = "good_till_canceled"
 _MARKET_TIME_IN_FORCE = "fill_or_kill"
 _MARKET_FALLBACK_YES_PRICE_CENTS = 97
 _MARKET_FALLBACK_NO_PRICE_CENTS = 3
@@ -77,12 +77,14 @@ class KalshiClient:
         private_key_path: str,
         timeout_sec: int = 20,
         order_price_improvement_cents: int = 0,
+        default_time_in_force: str = _DEFAULT_LIMIT_TIME_IN_FORCE,
         max_fetch_pages: int | None = 10,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key_id = api_key_id
         self.timeout_sec = timeout_sec
         self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
+        self.default_time_in_force = _normalize_time_in_force(default_time_in_force)
         self.max_fetch_pages = (
             None if max_fetch_pages is None or int(max_fetch_pages) <= 0
             else max(1, int(max_fetch_pages))
@@ -90,10 +92,11 @@ class KalshiClient:
         self.private_key = self._load_private_key(private_key_path)
         self.session = self._create_session()
         logger.debug(
-            "KalshiClient initialized: base_url=%s timeout=%ds order_price_improvement_cents=%d",
+            "KalshiClient initialized: base_url=%s timeout=%ds order_price_improvement_cents=%d default_time_in_force=%s",
             self.base_url,
             self.timeout_sec,
             self.order_price_improvement_cents,
+            self.default_time_in_force,
             data={"max_fetch_pages": self.max_fetch_pages},
         )
 
@@ -357,7 +360,11 @@ class KalshiClient:
                 suffix=retry_suffix,
             ),
             "type": "market" if is_market_order else "limit",
-            "time_in_force": _MARKET_TIME_IN_FORCE if is_market_order else _DEFAULT_TIME_IN_FORCE,
+            "time_in_force": (
+                _MARKET_TIME_IN_FORCE
+                if is_market_order
+                else _normalize_time_in_force(order.time_in_force or self.default_time_in_force)
+            ),
             "action": action,
             "side": side,
             "count": count,
@@ -457,6 +464,19 @@ def _build_client_order_id(market_id: str, suffix: str | None = None) -> str:
     return client_order_id
 
 
+def _normalize_time_in_force(value: str | None) -> str:
+    if not value:
+        return _DEFAULT_LIMIT_TIME_IN_FORCE
+    normalized = value.strip().lower()
+    if normalized in {"ioc", "immediate_or_cancel"}:
+        return "immediate_or_cancel"
+    if normalized in {"fok", "fill_or_kill"}:
+        return "fill_or_kill"
+    if normalized in {"day", "gtc", "good_till_canceled", "good_til_cancelled"}:
+        return "good_till_canceled"
+    return _DEFAULT_LIMIT_TIME_IN_FORCE
+
+
 def _parse_market(raw: dict[str, Any]) -> Market:
     ticker = str(raw.get("ticker") or raw.get("id") or "")
     title = _clean_text(raw.get("title"))
@@ -490,11 +510,16 @@ def _parse_market(raw: dict[str, Any]) -> Market:
     if liquidity_value is None:
         liquidity_value = _coerce_float(raw.get("liquidity_dollars"))
 
-    liquidity_usdc = volume_value
+    # Preserve semantic meaning for downstream filters: liquidity_usdc should reflect
+    # exchange liquidity first, then fall back to open interest / volume when missing.
+    liquidity_usdc = liquidity_value
+    if liquidity_usdc is not None and liquidity_usdc <= 0:
+        # Some feeds report 0 for liquidity while OI/volume are populated.
+        liquidity_usdc = None
     if liquidity_usdc is None:
         liquidity_usdc = open_interest_value
-    if liquidity_usdc is None:
-        liquidity_usdc = liquidity_value
+    if liquidity_usdc is None or liquidity_usdc <= 0:
+        liquidity_usdc = volume_value
 
     volume_24h = _coerce_float(raw.get("volume_24h"))
     if volume_24h is None:
