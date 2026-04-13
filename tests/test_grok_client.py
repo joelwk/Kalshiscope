@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from config import SearchConfig
+from config import SearchConfig, Settings
 from grok_client import GrokClient, _category_research_hint, _extract_json, _is_timeout_class_error, _is_retriable_grok_error
 from models import Market, MarketOutcome, TradeDecision
 
@@ -123,6 +123,23 @@ class TestGrokClient(unittest.TestCase):
         hint = _category_research_hint("speech")
         self.assertIn("Speech/event guidance", hint)
         self.assertIn("transcripts", hint)
+
+    def test_category_research_hint_speech_mention_market(self) -> None:
+        market = Market(
+            id="KXGOVERNORMENTION-26APR09-OIL",
+            question="Will the governor mention oil today?",
+            category="politics",
+        )
+        hint = _category_research_hint("speech", market=market)
+        self.assertIn("Word-mention guidance", hint)
+        self.assertIn("scheduled events", hint)
+        self.assertIn("vocabulary base rates", hint)
+
+    def test_category_research_hint_music_profile(self) -> None:
+        hint = _category_research_hint("music")
+        self.assertIn("Music/streaming guidance", hint)
+        self.assertIn("Spotify charts", hint)
+        self.assertIn("Billboard", hint)
 
     def test_analyze_market_parses_markdown_fenced_json(self) -> None:
         market = Market(
@@ -646,6 +663,41 @@ class TestGrokClient(unittest.TestCase):
             profile_name="generic",
         )
         self.assertAlmostEqual(validated.edge_external or 0.0, 0.06, places=6)
+
+    def test_validate_and_enrich_applies_configured_fallback_caps(self) -> None:
+        market = Market(
+            id="m-fallback-caps",
+            question="Will event happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.70), MarketOutcome(name="NO", price=0.30)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.90,
+            bet_size_pct=0.3,
+            reasoning="No external odds found. Implied prob: unknown. No data available.",
+            implied_prob_external=None,
+            my_prob=0.80,
+            edge_external=0.15,
+            edge_source="fallback",
+            evidence_quality=0.1,
+        )
+        client = GrokClient(
+            api_key="x",
+            settings=Settings(
+                GROK_PROXY_CONFIDENCE_CAP=0.67,
+                GROK_LOW_INFO_CONFIDENCE_CAP=0.59,
+                GROK_FALLBACK_MIN_EVIDENCE_QUALITY=0.72,
+            ),
+        )
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertLessEqual(validated.confidence, 0.59)
+        self.assertFalse(validated.should_trade)
+        self.assertIn("fallback_edge_without_verifiable_signal", validated.reasoning)
 
     def test_validate_and_enrich_verifiable_fallback_not_capped_to_half(self) -> None:
         market = Market(

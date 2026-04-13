@@ -510,11 +510,16 @@ def _parse_market(raw: dict[str, Any]) -> Market:
     if liquidity_value is None:
         liquidity_value = _coerce_float(raw.get("liquidity_dollars"))
 
-    liquidity_usdc = volume_value
+    # Preserve semantic meaning for downstream filters: liquidity_usdc should reflect
+    # exchange liquidity first, then fall back to open interest / volume when missing.
+    liquidity_usdc = liquidity_value
+    if liquidity_usdc is not None and liquidity_usdc <= 0:
+        # Some feeds report 0 for liquidity while OI/volume are populated.
+        liquidity_usdc = None
     if liquidity_usdc is None:
         liquidity_usdc = open_interest_value
-    if liquidity_usdc is None:
-        liquidity_usdc = liquidity_value
+    if liquidity_usdc is None or liquidity_usdc <= 0:
+        liquidity_usdc = volume_value
 
     volume_24h = _coerce_float(raw.get("volume_24h"))
     if volume_24h is None:

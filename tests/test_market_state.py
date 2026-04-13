@@ -102,6 +102,9 @@ def test_export_to_json(tmp_path) -> None:
             "trade_log",
             "trade_outcomes",
             "trade_outcome_events",
+            "bayesian_state",
+            "cycle_receipts",
+            "decision_receipts",
         }
         assert payload["analyses"]
         assert payload["positions"]
@@ -109,6 +112,47 @@ def test_export_to_json(tmp_path) -> None:
         assert payload["trade_outcomes"]
         assert payload["trade_outcome_events"]
         assert payload["positions"][0]["order_ids"] == ["o9"]
+    finally:
+        manager.close()
+
+
+def test_receipt_persistence_tables(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_cycle_receipt(
+            cycle_id="cycle-1",
+            cycle_number=1,
+            payload={"analyzed_markets": 3, "order_attempts": 1},
+        )
+        manager.record_decision_receipt(
+            cycle_id="cycle-1",
+            market_id="m-receipt",
+            decision={"should_trade": False, "confidence": 0.61},
+            execution_audit={
+                "final_action": "skip",
+                "final_reason": "score_gate_blocked",
+                "score_breakdown": {"final_score": 0.28, "score_threshold": 0.38},
+            },
+        )
+
+        cycle_row = manager._conn.execute(
+            "SELECT cycle_id, cycle_number, payload_json FROM cycle_receipts LIMIT 1"
+        ).fetchone()
+        assert cycle_row is not None
+        assert cycle_row["cycle_id"] == "cycle-1"
+        assert cycle_row["cycle_number"] == 1
+
+        decision_row = manager._conn.execute(
+            "SELECT market_id, final_action, final_reason, score_json FROM decision_receipts LIMIT 1"
+        ).fetchone()
+        assert decision_row is not None
+        assert decision_row["market_id"] == "m-receipt"
+        assert decision_row["final_action"] == "skip"
+        assert decision_row["final_reason"] == "score_gate_blocked"
+        assert decision_row["score_json"] is not None
+        score_payload = json.loads(decision_row["score_json"])
+        assert score_payload["final_score"] == 0.28
+        assert score_payload["score_threshold"] == 0.38
     finally:
         manager.close()
 
@@ -123,6 +167,33 @@ def test_record_resolution_idempotent(tmp_path) -> None:
         assert updated is True
         updated_again = manager.record_resolution(market_id, "YES", datetime.now(timezone.utc))
         assert updated_again is False
+    finally:
+        manager.close()
+
+
+def test_upsert_position_snapshot_updates_existing_row(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-sync"
+        manager.upsert_position_snapshot(
+            market_id=market_id,
+            outcome="YES",
+            total_amount_usdc=7.5,
+        )
+        position = manager.get_position(market_id)
+        assert position is not None
+        assert position.outcome == "YES"
+        assert position.total_amount_usdc == 7.5
+
+        manager.upsert_position_snapshot(
+            market_id=market_id,
+            outcome="NO",
+            total_amount_usdc=3.25,
+        )
+        position = manager.get_position(market_id)
+        assert position is not None
+        assert position.outcome == "NO"
+        assert position.total_amount_usdc == 3.25
     finally:
         manager.close()
 

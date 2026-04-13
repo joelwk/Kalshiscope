@@ -91,6 +91,28 @@ def test_market_family_speech_detected_from_ticker() -> None:
     assert market_family(market) == "speech"
 
 
+def test_market_family_music_detected_from_streaming_keywords() -> None:
+    market = Market(
+        id="KXARTISTSTREAMS-YEEZY26APR09-479.0M",
+        question="Will Kanye West have above 479000000 Streams on Luminate from Apr 1 to Apr 7?",
+        category="entertainment",
+    )
+    assert market_family(market) == "music"
+
+
+def test_profile_for_market_returns_music_profile() -> None:
+    settings = Settings()
+    market = Market(
+        id="KXALBUMSALES-THU-ACT-5000",
+        question="Will Distracted have at least 5,000 Activity sales this week?",
+        category="music",
+    )
+    profile = profile_for_market(settings, market)
+    assert profile.name == "music"
+    assert "billboard.com" in profile.domains
+    assert "SpotifyCharts" in profile.x_handles
+
+
 def test_profile_for_market_returns_speech_profile() -> None:
     settings = Settings()
     market = Market(

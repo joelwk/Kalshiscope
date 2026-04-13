@@ -57,6 +57,7 @@ class TestConfig(unittest.TestCase):
             "EXTREME_YES_PRICE_UPPER": "0.96",
             "MIN_TRADEABLE_IMPLIED_PRICE": "0.06",
             "MAX_TRADEABLE_IMPLIED_PRICE": "0.94",
+            "MARKET_FAMILY_BLOCKLIST": "weather, crypto",
             "LADDER_COLLAPSE_THRESHOLD": "7",
             "MAX_BRACKETS_PER_EVENT": "4",
             "MAX_MARKETS_PER_CYCLE": "80",
@@ -69,6 +70,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.EXTREME_YES_PRICE_UPPER, 0.96)
         self.assertEqual(settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.06)
         self.assertEqual(settings.MAX_TRADEABLE_IMPLIED_PRICE, 0.94)
+        self.assertEqual(settings.MARKET_FAMILY_BLOCKLIST, ("weather", "crypto"))
         self.assertEqual(settings.LADDER_COLLAPSE_THRESHOLD, 7)
         self.assertEqual(settings.MAX_BRACKETS_PER_EVENT, 4)
         self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 80)
@@ -139,11 +141,33 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KELLY_FRACTION_WEATHER, 0.45)
 
     def test_weather_profitability_defaults_are_conservative(self) -> None:
-        self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.80)
-        self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.10)
-        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.50)
-        self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.15)
-        self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 3)
+        self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.70)
+        self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
+        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.80)
+        self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
+        self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.20)
+        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.12)
+        self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 2)
+
+    def test_profit_tuning_defaults_are_loaded(self) -> None:
+        self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.VERY_LOW_PRICE_THRESHOLD, 0.25)
+        self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.25)
+        self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
+        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.38)
+
+    def test_historical_family_penalty_settings_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES": "12",
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD": "0.40",
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY": "0.15",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES, 12)
+        self.assertEqual(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD, 0.40)
+        self.assertEqual(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY, 0.15)
 
     def test_weather_profile_defaults_include_official_sources(self) -> None:
         self.assertIn("weather.gov", config.Settings.WEATHER_ALLOWED_DOMAINS)
@@ -203,6 +227,9 @@ class TestConfig(unittest.TestCase):
             "ANALYSIS_MAX_WORKERS": "4",
             "MAX_MARKETS_PER_CYCLE": "25",
             "MAX_TRADES_PER_CYCLE": "6",
+            "MAX_BETS_PER_EVENT": "3",
+            "MAX_TRADES_PER_DAY": "18",
+            "MAX_DAILY_DRAWDOWN_USDC": "22",
             "XAI_CIRCUIT_BREAKER_MAX_FAILURES": "4",
             "KALSHI_MAX_FETCH_PAGES": "12",
             "XAI_CLIENT_TIMEOUT_SECONDS": "75",
@@ -226,6 +253,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.ANALYSIS_MAX_WORKERS, 4)
         self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 25)
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 6)
+        self.assertEqual(settings.MAX_BETS_PER_EVENT, 3)
+        self.assertEqual(settings.MAX_TRADES_PER_DAY, 18)
+        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 22.0)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 4)
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 12)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 75)
@@ -285,18 +315,27 @@ class TestConfig(unittest.TestCase):
 
     def test_profit_guardrail_defaults(self) -> None:
         settings = config.Settings()
-        self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.60)
+        self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.75)
         self.assertEqual(settings.SCORE_GATE_MODE, "active")
-        self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.12)
-        self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.55)
-        self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.05)
-        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 20)
+        self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.38)
+        self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.60)
+        self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.45)
+        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 6)
+        self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 3)
+        self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 0)
+        self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 0)
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 5)
+        self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
+        self.assertEqual(settings.MAX_TRADES_PER_DAY, 15)
+        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
+        self.assertTrue(settings.POSITION_SYNC_ENABLED)
+        self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
         self.assertEqual(settings.ORDER_PRICE_IMPROVEMENT_CENTS, 1)
         self.assertEqual(settings.ORDER_DEFAULT_TIF, "gtc")
         self.assertEqual(settings.ORDER_SUBMISSION_MIN_PRICE, 0.03)
         self.assertEqual(settings.ORDER_SUBMISSION_MAX_PRICE, 0.97)
-        self.assertEqual(settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.05)
+        self.assertEqual(settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(settings.MAX_TRADEABLE_IMPLIED_PRICE, 0.95)
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 10)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
@@ -304,12 +343,34 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 180)
         self.assertTrue(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
-        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.50)
-        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.05)
+        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
+        self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 40.0)
+        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.10)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
-        self.assertEqual(settings.MENTION_MARKET_SCORE_PENALTY, 0.05)
+        self.assertEqual(settings.SCORE_GENERIC_BIN_PENALTY_BASE, 0.04)
+        self.assertEqual(settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.SCORE_OVERCONFIDENCE_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.MENTION_MARKET_SCORE_PENALTY, 0.10)
         self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
+        self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.10)
+        self.assertIn("generic", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
+        self.assertIn("crypto", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
+        self.assertEqual(settings.GROK_PROXY_CONFIDENCE_CAP, 0.78)
+        self.assertEqual(settings.GROK_LOW_INFO_CONFIDENCE_CAP, 0.70)
+        self.assertEqual(settings.MAX_GLOBAL_CONFIDENCE, 0.85)
+        self.assertEqual(settings.MAX_INDEX_CONFIDENCE, 0.70)
+        self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
+        self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.80)
+        self.assertEqual(settings.MAX_SPEECH_CONFIDENCE, 0.65)
+        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FLOOR, 0.52)
+        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FACTOR, 0.30)
         self.assertIn("KXPERSONMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertIn("KXSURVIVORMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertIn("KXSNLMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertIn("KXLASTWORDCOUNT-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertIn("KXVANCEMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertIn("billboard.com", settings.MUSIC_ALLOWED_DOMAINS)
+        self.assertIn("SpotifyCharts", settings.MUSIC_ALLOWED_X_HANDLES)
 
     def test_tennis_sources_present_in_sports_profile_defaults(self) -> None:
         self.assertIn("atptour.com", config.Settings.SPORTS_ALLOWED_DOMAINS)

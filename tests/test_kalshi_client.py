@@ -106,7 +106,22 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(market.volume, 33)
         self.assertEqual(market.open_interest, 21)
         self.assertEqual(market.volume_24h, 12)
-        self.assertEqual(market.liquidity_usdc, 33)
+        self.assertEqual(market.liquidity_usdc, 21)
+
+    def test_parse_market_uses_open_interest_fallback_when_liquidity_missing(self) -> None:
+        market = _parse_market(
+            {
+                "ticker": "KXBTC-26APR06-T87500",
+                "title": "Will BTC close above 87.5k?",
+                "status": "open",
+                "yes_ask_dollars": 0.42,
+                "volume_fp": 33,
+                "open_interest_fp": 21,
+            }
+        )
+        self.assertEqual(market.volume, 33)
+        self.assertEqual(market.open_interest, 21)
+        self.assertEqual(market.liquidity_usdc, 21)
 
     def test_parse_market_enriches_weather_question_and_resolution(self) -> None:
         market = _parse_market(

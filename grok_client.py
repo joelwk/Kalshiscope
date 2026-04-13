@@ -34,12 +34,16 @@ _RE_WEATHER_OBS_LOCKED = re.compile(
     r"physically impossible|threshold (?:already )?(?:met|exceeded)|high already reached)",
     re.IGNORECASE,
 )
+_RE_DEFINITIVE_OUTCOME_SIGNAL = re.compile(
+    r"(final score|game (?:completed|concluded|final)|confirmed|official recap|box score)",
+    re.IGNORECASE,
+)
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
 _DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS = 120
 _DEFAULT_STREAM_TIMEOUT_SECONDS = 120
 _EDGE_CONSISTENCY_TOLERANCE = 0.03
 _PROB_CONSISTENCY_TOLERANCE = 0.08
-_MIN_MARKET_EDGE_FOR_TRADE = 0.05
+_MIN_MARKET_EDGE_FOR_TRADE = 0.03
 _LOW_QUALITY_EDGE_BUFFER = 0.08
 _LOW_QUALITY_EVIDENCE_THRESHOLD = 0.45
 _DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD = 0.50
@@ -86,9 +90,28 @@ _SYSTEM_PROMPT_ANALYZE = (
     + "For speech/mention markets (e.g. 'will person X say Y'), default to should_trade=false unless "
     + "you have direct evidence from transcripts, official statements, or primary-source reporting.\n"
     + "Treat rumor, commentary, and speculative social chatter as weak evidence.\n"
-    + "A tradable edge requires at least a 10 percentage point gap between your probability and market implied probability, "
-    + "plus evidence the market likely has not fully priced in.\n"
-    + "Set should_trade=true only when edge is meaningful and evidence-backed.\n"
+    + "A tradable edge requires at least a 5 percentage point gap between your probability and market implied probability, "
+    + "plus evidence the market may not have fully priced in.\n"
+    + "Proxy evidence can support a trade when combined with directional conviction and reasonable edge.\n"
+    + "Always classify evidence basis as direct, proxy, or absence-only in your reasoning.\n"
+    + "For repeated/noisy bin markets without direct source confirmation, default to no-action.\n"
+    + "If you cannot find external odds, bookmaker lines, or settlement-aligned primary data, reduce evidence_quality "
+    + "but still consider trading if your directional analysis has strong backing from recent data.\n"
+    + "Historical calibration rule: confidence values above 0.90 have materially underperformed; keep confidence <= 0.85.\n"
+    + "For entry prices below 0.20 implied probability, require extraordinary direct evidence tied to settlement criteria.\n"
+    + "For weather markets, require direct NWS/NOAA observation evidence before recommending should_trade=true.\n"
+    + "Set evidence_basis to one of: direct, proxy, or absence_only.\n"
+    + "Do not claim tradable edge from proxy-only evidence when direct settlement-aligned evidence is unavailable.\n"
+    + "For crypto threshold markets, include current spot price, threshold, and buffer_to_threshold_pct in reasoning. "
+    + "When the buffer is large relative to typical volatility, this is a strong trading signal.\n"
+    + "Set should_trade=true when you have directional conviction backed by evidence.\n"
+    + "Set should_trade=true when you have a reasonable information advantage: "
+    + "(1) your probability differs from market implied probability by at least 5pp, "
+    + "(2) you found specific, recent, source-backed evidence, "
+    + "(3) evidence_quality >= 0.50.\n"
+    + "When evidence_basis is direct, lower thresholds are acceptable -- a 5pp edge with direct evidence is tradable.\n"
+    + "If your only evidence is absence of information with no directional signal, "
+    + "set should_trade=false.\n"
     + "Provide concise reasoning that includes implied probability, your probability, and edge.\n"
     + "Include likelihood_ratio as a positive decimal equal to "
     + "P(evidence|predicted_outcome)/P(evidence|alternative_outcome). "
@@ -272,6 +295,22 @@ def _category_research_hint(profile_name: str, market: Market | None = None) -> 
             "treat this as high-certainty evidence and set evidence_quality >= 0.85."
         )
     if profile_name == "speech":
+        is_mention_market = bool(
+            market is not None and re.search(r"MENTION", market.id or "", re.IGNORECASE)
+        )
+        if is_mention_market:
+            return (
+                "Word-mention guidance: this market asks whether a specific person will use a specific "
+                "word or phrase in a public statement or event. Identify today's scheduled events for "
+                "this speaker (press conferences, testimony, interviews, briefings) using official "
+                "schedules and reputable reporting. Search recent public statements by this person on the "
+                "topic to estimate vocabulary base rates and assess whether the event format and agenda "
+                "make the topic likely to arise. Use X search for live event coverage, but require "
+                "transcript-level or direct-quote evidence before setting confidence > 0.70. If no event "
+                "is scheduled or concluded today, default should_trade=false. If evidence is indirect or "
+                "speculative, keep evidence_quality <= 0.45 and confidence <= 0.60. "
+                "Absence-only evidence (no transcript/no mentions) must be treated as non-tradeable."
+            )
         return (
             "Speech/event guidance: this market asks whether a specific person will say a specific word "
             "during an event. First confirm event status (scheduled/live/concluded) using official schedules "
@@ -279,7 +318,18 @@ def _category_research_hint(profile_name: str, market: Market | None = None) -> 
             "or clip-level evidence. For upcoming events, model probability from speaker vocabulary history, "
             "event agenda, and setting-specific language norms. Use X search for real-time reporter/attendee "
             "coverage, and prefer primary sources over commentary. If transcript-quality evidence exists, score "
-            "evidence_quality >= 0.80; if only sparse proxy evidence exists, keep evidence_quality <= 0.45."
+            "evidence_quality >= 0.80; if only sparse proxy evidence exists, keep evidence_quality <= 0.45 "
+            "and default should_trade=false."
+        )
+    if profile_name == "music":
+        return (
+            "Music/streaming guidance: this market resolves on chart or tracking data such as weekly "
+            "streams, album sales, or aggregate activity. Prioritize Spotify charts, Billboard, Luminate, "
+            "and Hits Daily Double style sources. Find the latest published chart position and weekly totals, "
+            "then compare against the market threshold and recent trend (last 2-4 weeks). Require primary "
+            "source chart figures before setting evidence_quality >= 0.65. If no chart-quality data is "
+            "available, keep evidence_quality <= 0.40 and default should_trade=false. "
+            "Do not treat missing chart data as a positive edge."
         )
     if market is not None and is_commodity_market(market):
         return (
@@ -500,6 +550,31 @@ class GrokClient:
         normalized_reasoning = (reasoning or "").lower()
         return any(keyword in normalized_reasoning for keyword in _VERIFIABLE_EVIDENCE_KEYWORDS)
 
+    @staticmethod
+    def _evidence_basis_class(
+        reasoning: str,
+        edge_source: str,
+        has_verifiable_signal: bool,
+        low_information: bool,
+    ) -> str:
+        normalized_reasoning = (reasoning or "").lower()
+        has_absence_signal = any(
+            token in normalized_reasoning
+            for token in (
+                "no transcript",
+                "no mentions",
+                "no evidence",
+                "no chart",
+                "no data",
+                "no external odds",
+            )
+        )
+        if has_absence_signal and edge_source in {"fallback", "none"}:
+            return "absence_only"
+        if has_verifiable_signal and not low_information:
+            return "direct"
+        return "proxy"
+
     def _validate_and_enrich_decision(
         self,
         market: Market,
@@ -592,17 +667,60 @@ class GrokClient:
                 edge = abs(my_prob - market_implied)
             else:
                 edge = 0.0
+        evidence_basis_class = self._evidence_basis_class(
+            reasoning=decision.reasoning,
+            edge_source=edge_source,
+            has_verifiable_signal=has_verifiable_signal,
+            low_information=low_information,
+        )
+        active_settings = self.settings or Settings()
+        proxy_confidence_cap = max(0.0, min(1.0, active_settings.GROK_PROXY_CONFIDENCE_CAP))
+        low_info_confidence_cap = max(
+            0.0,
+            min(1.0, active_settings.GROK_LOW_INFO_CONFIDENCE_CAP),
+        )
+        fallback_min_evidence_quality = max(
+            0.0,
+            min(1.0, active_settings.GROK_FALLBACK_MIN_EVIDENCE_QUALITY),
+        )
+        abstain_evidence_threshold = max(
+            0.0,
+            min(1.0, active_settings.GROK_ABSTAIN_EVIDENCE_THRESHOLD),
+        )
+        validated_confidence = float(max(0.0, min(1.0, decision.confidence)))
+        if (
+            decision.should_trade
+            and edge_source in {"fallback", "none"}
+            and evidence_basis_class != "direct"
+            and validated_confidence > proxy_confidence_cap
+        ):
+            validated_confidence = proxy_confidence_cap
+        if (
+            decision.should_trade
+            and edge_source in {"fallback", "none"}
+            and low_information
+            and validated_confidence > low_info_confidence_cap
+        ):
+            validated_confidence = low_info_confidence_cap
         market_edge = (
-            (decision.confidence - market_implied)
+            (validated_confidence - market_implied)
             if market_implied is not None
             else None
         )
         if has_verifiable_signal and not low_information:
             evidence_floor = 0.60
+            has_definitive_outcome_signal = bool(
+                _RE_DEFINITIVE_OUTCOME_SIGNAL.search(decision.reasoning or "")
+            )
+            if (
+                has_definitive_outcome_signal
+                and decision.likelihood_ratio is not None
+                and decision.likelihood_ratio >= 10.0
+            ):
+                evidence_floor = 0.72
             if market_edge is None or abs(market_edge) < _LOW_QUALITY_EDGE_BUFFER:
-                evidence_floor = 0.55
+                evidence_floor = max(evidence_floor, 0.55)
             evidence_quality = max(evidence_quality, evidence_floor)
-        active_settings = self.settings or Settings()
         if (
             active_settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE
             and market_edge is not None
@@ -645,15 +763,27 @@ class GrokClient:
             ):
                 should_trade = False
                 gate_reasons.append("probability_inconsistent")
+            if evidence_basis_class == "absence_only":
+                should_trade = False
+                gate_reasons.append("absence_only_evidence")
+            if (
+                edge_source in {"fallback", "none"}
+                and evidence_quality < fallback_min_evidence_quality
+            ):
+                should_trade = False
+                gate_reasons.append("fallback_edge_without_verifiable_signal")
 
         gate_status = "allow" if should_trade else "block"
         reason_code = ",".join(gate_reasons) if gate_reasons else "ok"
+        gate_edge_required = max(_MIN_MARKET_EDGE_FOR_TRADE, _LOW_QUALITY_EDGE_BUFFER)
+        gate_edge_actual = market_edge if market_edge is not None else edge
         double_blind_information_gap = no_external_odds and low_information
         abstain = (
             evidence_quality < 0.20
             or (
                 double_blind_information_gap
-                and evidence_quality < _DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD
+                and evidence_quality
+                < max(_DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD, abstain_evidence_threshold)
             )
         )
         if abstain:
@@ -663,11 +793,30 @@ class GrokClient:
                 gate_reasons.append("abstain_low_evidence")
             if (
                 double_blind_information_gap
-                and evidence_quality < _DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD
+                and evidence_quality
+                < max(_DOUBLE_BLIND_ABSTAIN_EVIDENCE_THRESHOLD, abstain_evidence_threshold)
                 and "abstain_double_blind_information_gap" not in gate_reasons
             ):
                 gate_reasons.append("abstain_double_blind_information_gap")
             reason_code = ",".join(gate_reasons)
+        if gate_status != "allow":
+            logger.debug(
+                "Decision validation blocked trade: market=%s reasons=%s gate_edge_required=%.4f gate_edge_actual=%s",
+                market.id,
+                reason_code,
+                gate_edge_required,
+                f"{gate_edge_actual:.4f}" if gate_edge_actual is not None else "n/a",
+                data={
+                    "market_id": market.id,
+                    "gate_status": gate_status,
+                    "gate_reasons": gate_reasons,
+                    "gate_edge_required": gate_edge_required,
+                    "gate_edge_actual": gate_edge_actual,
+                    "evidence_quality": evidence_quality,
+                    "edge_source": edge_source,
+                    "evidence_basis_class": evidence_basis_class,
+                },
+            )
         bet_size_pct = decision.bet_size_pct if should_trade else 0.0
 
         return decision.model_copy(
@@ -676,14 +825,19 @@ class GrokClient:
                 "abstain": abstain,
                 "bet_size_pct": bet_size_pct,
                 "outcome": canonical_outcome,
+                "confidence": validated_confidence,
                 "implied_prob_external": implied,
                 "my_prob": my_prob,
                 "edge_external": edge,
                 "edge_source": edge_source,
+                "evidence_basis": evidence_basis_class,
                 "evidence_quality": evidence_quality,
                 "reasoning": (
                     f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
+                    f"basis={evidence_basis_class} "
                     f"edge_market={market_edge if market_edge is not None else 'n/a'} "
+                    f"gate_edge_required={gate_edge_required:.4f} "
+                    f"gate_edge_actual={gate_edge_actual if gate_edge_actual is not None else 'n/a'} "
                     f"edge_source={edge_source}] {decision.reasoning}"
                 ),
             }
@@ -740,7 +894,9 @@ class GrokClient:
 
         if "should_trade" not in data:
             edge_external = merged.get("edge_external")
-            if edge_external is not None and edge_external < _MIN_MARKET_EDGE_FOR_TRADE:
+            if edge_external is not None and edge_external <= (
+                _MIN_MARKET_EDGE_FOR_TRADE + 1e-9
+            ):
                 merged["should_trade"] = False
         if not merged.get("should_trade", False):
             merged["bet_size_pct"] = 0.0
@@ -870,11 +1026,22 @@ class GrokClient:
     ) -> str:
         outcome_prices = _format_market_outcome_prices(market)
         constraints = [f"{_category_research_hint(active_config.profile_name, market)}"]
+        constraints.extend(
+            [
+                "Classify your evidence basis as direct, proxy, or absence-only in reasoning.",
+                "Direct evidence means transcript-level, settlement-aligned, or official primary sources.",
+                "If evidence is proxy or absence-only, default should_trade=false unless edge and source quality are both exceptional.",
+                "Do not use absence of mentions alone as a high-confidence trading signal.",
+                "If external odds are unavailable, keep evidence_quality < 0.50 and default should_trade=false.",
+                "For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.",
+            ]
+        )
         if deep:
             constraints.extend(
                 [
                     "Re-check implied probability and edge from multiple sources.",
                     "If edge < 5%, return should_trade=false and bet_size_pct=0.0.",
+                    "If your confidence would exceed 0.72 without direct evidence, lower confidence and avoid trade.",
                 ]
             )
         else:
@@ -1113,6 +1280,10 @@ class GrokClient:
                         if raw_payload.get("reasoning") is not None
                         else None
                     ),
+                    "prompt_tokens": usage_metrics["prompt_tokens"],
+                    "completion_tokens": usage_metrics["completion_tokens"],
+                    "reasoning_tokens": usage_metrics["reasoning_tokens"],
+                    "cached_tokens": usage_metrics["cached_tokens"],
                 }
             )
 
