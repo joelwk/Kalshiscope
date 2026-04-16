@@ -2061,10 +2061,10 @@ def _parse_exchange_position_row(row: dict[str, Any]) -> tuple[str, str, float, 
     ).strip()
     if not market_id:
         return None
-    contracts_raw = row.get("position")
+    contracts_raw = row.get("position") or row.get("position_fp")
     if contracts_raw is None:
-        yes_count = float(row.get("yes_count") or 0.0)
-        no_count = float(row.get("no_count") or 0.0)
+        yes_count = float(row.get("yes_count") or row.get("yes_count_fp") or 0.0)
+        no_count = float(row.get("no_count") or row.get("no_count_fp") or 0.0)
         contracts_raw = yes_count - no_count
     try:
         contracts = int(float(contracts_raw or 0.0))
@@ -2073,14 +2073,11 @@ def _parse_exchange_position_row(row: dict[str, Any]) -> tuple[str, str, float, 
     if contracts == 0:
         return None
     outcome = "YES" if contracts > 0 else "NO"
-    exposure = row.get("market_exposure_dollars")
-    if isinstance(exposure, (int, float)):
-        amount_usdc = abs(float(exposure))
-    else:
-        amount_usdc = 0.0
+    exposure_raw = row.get("market_exposure_dollars")
+    amount_usdc = _coerce_float(exposure_raw) or 0.0
     if amount_usdc <= 0:
         amount_usdc = float(abs(contracts))
-    return market_id, outcome, amount_usdc, abs(contracts)
+    return market_id, outcome, abs(amount_usdc), abs(contracts)
 
 
 def _sync_positions_from_exchange(
@@ -2160,36 +2157,73 @@ def _parse_exchange_settlement_row(row: dict[str, Any]) -> dict[str, Any] | None
     ).strip().upper()
     winning_outcome = winning_outcome_raw if winning_outcome_raw in {"YES", "NO"} else None
     yes_contracts = int(
-        _coerce_float(row.get("yes_count") or row.get("yes_contracts_owned") or 0) or 0.0
+        _coerce_float(
+            row.get("yes_count")
+            or row.get("yes_count_fp")
+            or row.get("yes_contracts_owned")
+            or 0
+        ) or 0.0
     )
     no_contracts = int(
-        _coerce_float(row.get("no_count") or row.get("no_contracts_owned") or 0) or 0.0
+        _coerce_float(
+            row.get("no_count")
+            or row.get("no_count_fp")
+            or row.get("no_contracts_owned")
+            or 0
+        ) or 0.0
     )
     predicted_outcome: str | None = None
     contracts = 0
     avg_price: float | None = None
+    cost_dollars: float = 0.0
     if yes_contracts > 0:
         predicted_outcome = "YES"
         contracts = yes_contracts
-        avg_price = _coerce_float(row.get("yes_total_cost") or row.get("yes_contracts_average_price"))
-        if avg_price is None:
-            avg_price = _coerce_float(row.get("yes_contracts_average_price_in_cents"))
-            if avg_price is not None and avg_price > 1.0:
-                avg_price /= 100.0
+        cost_dollars_raw = _coerce_float(row.get("yes_total_cost_dollars"))
+        if cost_dollars_raw is not None:
+            cost_dollars = cost_dollars_raw
+            avg_price = cost_dollars / yes_contracts if yes_contracts > 0 else None
+        else:
+            avg_price = _coerce_float(
+                row.get("yes_total_cost") or row.get("yes_contracts_average_price")
+            )
+            if avg_price is None:
+                avg_price = _coerce_float(row.get("yes_contracts_average_price_in_cents"))
+                if avg_price is not None and avg_price > 1.0:
+                    avg_price /= 100.0
+            if avg_price is not None:
+                cost_dollars = avg_price * yes_contracts
     elif no_contracts > 0:
         predicted_outcome = "NO"
         contracts = no_contracts
-        avg_price = _coerce_float(row.get("no_total_cost") or row.get("no_contracts_average_price"))
-        if avg_price is None:
-            avg_price = _coerce_float(row.get("no_contracts_average_price_in_cents"))
-            if avg_price is not None and avg_price > 1.0:
-                avg_price /= 100.0
+        cost_dollars_raw = _coerce_float(row.get("no_total_cost_dollars"))
+        if cost_dollars_raw is not None:
+            cost_dollars = cost_dollars_raw
+            avg_price = cost_dollars / no_contracts if no_contracts > 0 else None
+        else:
+            avg_price = _coerce_float(
+                row.get("no_total_cost") or row.get("no_contracts_average_price")
+            )
+            if avg_price is None:
+                avg_price = _coerce_float(row.get("no_contracts_average_price_in_cents"))
+                if avg_price is not None and avg_price > 1.0:
+                    avg_price /= 100.0
+            if avg_price is not None:
+                cost_dollars = avg_price * no_contracts
+
     profit = _coerce_float(
         row.get("profit")
         or row.get("profit_in_dollars")
         or row.get("pnl")
         or row.get("realized_pnl")
     )
+    if profit is None:
+        revenue_raw = _coerce_float(row.get("revenue"))
+        fee_raw = _coerce_float(row.get("fee_cost"))
+        revenue_dollars = (revenue_raw / 100.0) if revenue_raw is not None else 0.0
+        fee_dollars = fee_raw if fee_raw is not None else 0.0
+        profit = revenue_dollars - cost_dollars - fee_dollars
+
     settled_at = (
         _coerce_datetime(row.get("settled_time"))
         or _coerce_datetime(row.get("created_time"))
