@@ -168,6 +168,22 @@ class MarketStateManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS exchange_settlements (
+                    settlement_id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    predicted_outcome TEXT,
+                    winning_outcome TEXT,
+                    won INTEGER,
+                    pnl_realized REAL,
+                    contracts INTEGER,
+                    avg_price REAL,
+                    settled_at TEXT,
+                    raw_json TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS decision_receipts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     cycle_id TEXT,
@@ -202,6 +218,9 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_decision_receipts_market_id ON decision_receipts (market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exchange_settlements_market_id ON exchange_settlements (market_id)"
             )
             self._run_migrations()
             self._backfill_resolution_state()
@@ -836,6 +855,16 @@ class MarketStateManager:
         ).fetchall()
         return [row["market_id"] for row in rows]
 
+    def get_known_order_ids(self) -> set[str]:
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT order_id
+            FROM trade_log
+            WHERE order_id IS NOT NULL AND TRIM(order_id) <> ''
+            """
+        ).fetchall()
+        return {str(row["order_id"]) for row in rows if row["order_id"]}
+
     def get_unresolved_traded_market_ids(self) -> list[str]:
         rows = self._conn.execute(
             """
@@ -949,6 +978,17 @@ class MarketStateManager:
                 "pnl_total": pnl_total,
             }
         return snapshot
+
+    def get_exchange_realized_pnl_total(self) -> float:
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl_realized), 0.0) AS pnl_total
+            FROM exchange_settlements
+            """
+        ).fetchone()
+        if not row:
+            return 0.0
+        return float(row["pnl_total"] or 0.0)
 
     def get_family_action_snapshot(
         self,
@@ -1083,6 +1123,119 @@ class MarketStateManager:
             pnl_estimate if pnl_estimate is not None else 0.0,
         )
         return True
+
+    def record_exchange_settlement(
+        self,
+        *,
+        settlement_id: str,
+        market_id: str,
+        winning_outcome: str | None,
+        predicted_outcome: str | None,
+        pnl_realized: float | None,
+        contracts: int | None,
+        avg_price: float | None,
+        settled_at: datetime | None,
+        raw: dict[str, Any],
+    ) -> None:
+        normalized_settlement_id = str(settlement_id or "").strip()
+        normalized_market_id = str(market_id or "").strip()
+        if not normalized_settlement_id or not normalized_market_id:
+            return
+        normalized_winning_outcome = str(winning_outcome or "").strip().upper() or None
+        if normalized_winning_outcome not in {None, "YES", "NO"}:
+            normalized_winning_outcome = None
+        normalized_predicted_outcome = str(predicted_outcome or "").strip().upper() or None
+        if normalized_predicted_outcome not in {None, "YES", "NO"}:
+            normalized_predicted_outcome = None
+        won: int | None = None
+        if normalized_winning_outcome and normalized_predicted_outcome:
+            won = int(normalized_winning_outcome == normalized_predicted_outcome)
+        timestamp = (settled_at or datetime.now(timezone.utc)).isoformat()
+        realized_pnl = float(pnl_realized or 0.0)
+        normalized_contracts = int(contracts or 0)
+        normalized_avg_price = (
+            max(0.0, min(1.0, float(avg_price)))
+            if avg_price is not None
+            else None
+        )
+        amount_usdc: float | None = None
+        if normalized_avg_price is not None and normalized_contracts > 0:
+            amount_usdc = float(normalized_contracts) * normalized_avg_price
+        resolution_state = (
+            "resolved_exchange"
+            if normalized_winning_outcome is not None
+            else "unresolved_exchange"
+        )
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO exchange_settlements (
+                    settlement_id, market_id, predicted_outcome, winning_outcome, won,
+                    pnl_realized, contracts, avg_price, settled_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(settlement_id) DO UPDATE SET
+                    market_id = excluded.market_id,
+                    predicted_outcome = excluded.predicted_outcome,
+                    winning_outcome = excluded.winning_outcome,
+                    won = excluded.won,
+                    pnl_realized = excluded.pnl_realized,
+                    contracts = excluded.contracts,
+                    avg_price = excluded.avg_price,
+                    settled_at = excluded.settled_at,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    normalized_settlement_id,
+                    normalized_market_id,
+                    normalized_predicted_outcome,
+                    normalized_winning_outcome,
+                    won,
+                    realized_pnl,
+                    normalized_contracts,
+                    normalized_avg_price,
+                    timestamp,
+                    json.dumps(raw or {}, sort_keys=True, default=str),
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO trade_outcomes (
+                    market_id, predicted_outcome, entry_price, implied_prob, confidence, amount_usdc, shares,
+                    resolved_winning_outcome, won, pnl_estimate, resolved_at, last_updated, resolution_state
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(market_id) DO UPDATE SET
+                    predicted_outcome = COALESCE(trade_outcomes.predicted_outcome, excluded.predicted_outcome),
+                    entry_price = COALESCE(trade_outcomes.entry_price, excluded.entry_price),
+                    amount_usdc = COALESCE(trade_outcomes.amount_usdc, excluded.amount_usdc),
+                    shares = COALESCE(trade_outcomes.shares, excluded.shares),
+                    resolved_winning_outcome = COALESCE(excluded.resolved_winning_outcome, trade_outcomes.resolved_winning_outcome),
+                    won = COALESCE(excluded.won, trade_outcomes.won),
+                    pnl_estimate = COALESCE(excluded.pnl_estimate, trade_outcomes.pnl_estimate),
+                    resolved_at = COALESCE(excluded.resolved_at, trade_outcomes.resolved_at),
+                    last_updated = excluded.last_updated,
+                    resolution_state = CASE
+                        WHEN excluded.resolution_state LIKE 'resolved%' THEN excluded.resolution_state
+                        ELSE trade_outcomes.resolution_state
+                    END
+                """,
+                (
+                    normalized_market_id,
+                    normalized_predicted_outcome,
+                    normalized_avg_price,
+                    normalized_avg_price,
+                    None,
+                    amount_usdc,
+                    float(normalized_contracts) if normalized_contracts > 0 else None,
+                    normalized_winning_outcome,
+                    won,
+                    realized_pnl,
+                    timestamp if normalized_winning_outcome else None,
+                    datetime.now(timezone.utc).isoformat(),
+                    resolution_state,
+                ),
+            )
 
     def _upsert_trade_outcome_entry(
         self,

@@ -52,8 +52,16 @@ _EVIDENCE_OVERRIDE_MIN_MARKET_EDGE = 0.15
 _EVIDENCE_OVERRIDE_MIN_QUALITY = 0.60
 _WEATHER_OBS_CONFIDENCE_FLOOR = 0.85
 _WEATHER_OBS_EVIDENCE_FLOOR = 0.75
+_DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE = 0.65
+_DEFINITIVE_OUTCOME_EVIDENCE_FLOOR = 0.72
 _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "official",
+    "official recap",
+    "reuters",
+    "associated press",
+    "ap ",
+    "box score",
+    "final score",
     "nws",
     "weather.gov",
     "cli",
@@ -109,6 +117,10 @@ _SYSTEM_PROMPT_ANALYZE = (
     + "(1) your probability differs from market implied probability by at least 5pp, "
     + "(2) you found specific, recent, source-backed evidence, "
     + "(3) evidence_quality >= 0.50.\n"
+    + "For decisive entries, prefer should_trade=true only when edge >= 7pp, evidence_quality >= 0.65, "
+    + "and confidence >= 0.60 unless direct settlement evidence strongly justifies a tighter edge.\n"
+    + "If analysis does not produce a clear directional advantage, set should_trade=false and keep "
+    + "no-trade reasoning concise (under 100 words).\n"
     + "When evidence_basis is direct, lower thresholds are acceptable -- a 5pp edge with direct evidence is tradable.\n"
     + "If your only evidence is absence of information with no directional signal, "
     + "set should_trade=false.\n"
@@ -624,9 +636,13 @@ class GrokClient:
         if my_prob is not None and abs(my_prob - decision.confidence) > _PROB_CONSISTENCY_TOLERANCE:
             prob_consistency_ok = False
 
+        raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
         low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
         has_verifiable_signal = self._has_verifiable_source_signal(decision.reasoning)
+        has_definitive_outcome_signal = bool(
+            _RE_DEFINITIVE_OUTCOME_SIGNAL.search(decision.reasoning or "")
+        )
         prob_component = 0.0
         if implied is not None and my_prob is not None:
             prob_component = 0.55
@@ -707,20 +723,23 @@ class GrokClient:
             if market_implied is not None
             else None
         )
+        evidence_quality_floor_applied: str | None = None
         if has_verifiable_signal and not low_information:
             evidence_floor = 0.60
-            has_definitive_outcome_signal = bool(
-                _RE_DEFINITIVE_OUTCOME_SIGNAL.search(decision.reasoning or "")
-            )
             if (
                 has_definitive_outcome_signal
                 and decision.likelihood_ratio is not None
                 and decision.likelihood_ratio >= 10.0
             ):
-                evidence_floor = 0.72
+                evidence_floor = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
             if market_edge is None or abs(market_edge) < _LOW_QUALITY_EDGE_BUFFER:
                 evidence_floor = max(evidence_floor, 0.55)
-            evidence_quality = max(evidence_quality, evidence_floor)
+            if evidence_quality < evidence_floor:
+                evidence_quality = evidence_floor
+                if evidence_floor >= _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR:
+                    evidence_quality_floor_applied = "definitive_outcome_floor"
+                else:
+                    evidence_quality_floor_applied = "verifiable_signal_floor"
         if (
             active_settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE
             and market_edge is not None
@@ -728,13 +747,35 @@ class GrokClient:
             and market_edge >= _EVIDENCE_OVERRIDE_MIN_MARKET_EDGE
             and self._has_verifiable_source_signal(decision.reasoning)
         ):
-            evidence_quality = max(evidence_quality, _EVIDENCE_OVERRIDE_MIN_QUALITY)
+            if evidence_quality < _EVIDENCE_OVERRIDE_MIN_QUALITY:
+                evidence_quality = _EVIDENCE_OVERRIDE_MIN_QUALITY
+                evidence_quality_floor_applied = "high_confidence_override_floor"
         if (
             profile_name == "weather"
             and (decision.raw_confidence or decision.confidence) >= _WEATHER_OBS_CONFIDENCE_FLOOR
             and _RE_WEATHER_OBS_LOCKED.search(decision.reasoning or "")
         ):
-            evidence_quality = max(evidence_quality, _WEATHER_OBS_EVIDENCE_FLOOR)
+            if evidence_quality < _WEATHER_OBS_EVIDENCE_FLOOR:
+                evidence_quality = _WEATHER_OBS_EVIDENCE_FLOOR
+                evidence_quality_floor_applied = "weather_observed_floor"
+        definitive_outcome_detected = (
+            has_verifiable_signal
+            and has_definitive_outcome_signal
+            and decision.likelihood_ratio is not None
+            and decision.likelihood_ratio >= 10.0
+            and not low_information
+        )
+        if (
+            definitive_outcome_detected
+            and evidence_quality < _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
+        ):
+            evidence_quality = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
+            evidence_quality_floor_applied = "definitive_outcome_floor"
+        direct_fallback_gate_override = (
+            evidence_basis_class == "direct"
+            and has_verifiable_signal
+            and evidence_quality >= _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE
+        )
 
         should_trade = decision.should_trade
         gate_reasons: list[str] = []
@@ -769,6 +810,7 @@ class GrokClient:
             if (
                 edge_source in {"fallback", "none"}
                 and evidence_quality < fallback_min_evidence_quality
+                and not direct_fallback_gate_override
             ):
                 should_trade = False
                 gate_reasons.append("fallback_edge_without_verifiable_signal")
@@ -832,6 +874,9 @@ class GrokClient:
                 "edge_source": edge_source,
                 "evidence_basis": evidence_basis_class,
                 "evidence_quality": evidence_quality,
+                "raw_evidence_quality": raw_evidence_quality,
+                "definitive_outcome_detected": definitive_outcome_detected,
+                "evidence_quality_floor_applied": evidence_quality_floor_applied,
                 "reasoning": (
                     f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
                     f"basis={evidence_basis_class} "
@@ -1278,6 +1323,11 @@ class GrokClient:
                     "raw_reasoning": (
                         str(raw_payload.get("reasoning"))
                         if raw_payload.get("reasoning") is not None
+                        else None
+                    ),
+                    "raw_evidence_quality": (
+                        float(raw_payload.get("evidence_quality"))
+                        if isinstance(raw_payload.get("evidence_quality"), (int, float))
                         else None
                     ),
                     "prompt_tokens": usage_metrics["prompt_tokens"],

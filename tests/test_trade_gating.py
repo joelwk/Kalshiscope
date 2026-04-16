@@ -310,8 +310,9 @@ def test_effective_score_gate_threshold_uses_weather_direct_threshold() -> None:
 
 def test_effective_score_gate_threshold_defaults_for_non_direct_or_non_weather() -> None:
     settings = Settings(
-        SCORE_GATE_THRESHOLD=0.25,
+        SCORE_GATE_THRESHOLD=0.38,
         SCORE_GATE_THRESHOLD_WEATHER_DIRECT=0.10,
+        SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25,
     )
     weather_market = Market(
         id="KXHIGHCHI-26APR10-T50",
@@ -333,5 +334,25 @@ def test_effective_score_gate_threshold_defaults_for_non_direct_or_non_weather()
         market=crypto_market,
         evidence_basis_class="direct",
     )
-    assert weather_proxy_threshold == 0.25
-    assert crypto_direct_threshold == 0.25
+    assert weather_proxy_threshold == 0.38
+    assert crypto_direct_threshold == 0.38
+
+
+def test_effective_score_gate_threshold_uses_direct_high_quality_override() -> None:
+    settings = Settings(
+        SCORE_GATE_THRESHOLD=0.38,
+        SCORE_GATE_THRESHOLD_WEATHER_DIRECT=0.10,
+        SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25,
+    )
+    crypto_market = Market(
+        id="KXBTCD-26APR1001-T71999.99",
+        question="Bitcoin price on Apr 10, 2026?",
+        category="crypto",
+    )
+    threshold = _effective_score_gate_threshold(
+        settings=settings,
+        market=crypto_market,
+        evidence_basis_class="direct",
+        evidence_quality=0.85,
+    )
+    assert threshold == 0.25

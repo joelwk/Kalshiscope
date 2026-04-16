@@ -699,6 +699,72 @@ class TestGrokClient(unittest.TestCase):
         self.assertFalse(validated.should_trade)
         self.assertIn("fallback_edge_without_verifiable_signal", validated.reasoning)
 
+    def test_validate_and_enrich_applies_definitive_outcome_evidence_floor(self) -> None:
+        market = Market(
+            id="m-definitive-floor",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap from Reuters confirms settlement outcome."
+            ),
+            implied_prob_external=None,
+            my_prob=0.85,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertTrue(validated.definitive_outcome_detected)
+        self.assertGreaterEqual(validated.evidence_quality, 0.72)
+        self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+
+    def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
+        market = Market(
+            id="m-definitive-bypass",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap from Reuters confirms settlement outcome."
+            ),
+            implied_prob_external=None,
+            my_prob=0.85,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.10,
+        )
+        client = GrokClient(
+            api_key="x",
+            settings=Settings(
+                GROK_FALLBACK_MIN_EVIDENCE_QUALITY=0.90,
+            ),
+        )
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertTrue(validated.should_trade)
+        self.assertNotIn("fallback_edge_without_verifiable_signal", validated.reasoning)
+
     def test_validate_and_enrich_verifiable_fallback_not_capped_to_half(self) -> None:
         market = Market(
             id="m11b",

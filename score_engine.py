@@ -343,13 +343,18 @@ def calibrate_confidence(
     shrinkage_floor: float = _CONFIDENCE_SHRINKAGE_FLOOR,
     shrinkage_factor: float = _CONFIDENCE_SHRINKAGE_FACTOR,
     evidence_basis_class: str = "",
+    definitive_outcome: bool = False,
 ) -> float:
     """Shrink high confidence values toward a neutral baseline."""
     bounded_confidence = max(0.0, min(1.0, raw_confidence))
     bounded_floor = max(0.0, min(1.0, shrinkage_floor))
     bounded_factor = max(0.0, min(1.0, shrinkage_factor))
     if str(evidence_basis_class or "").strip().lower() == "direct":
+        bounded_floor = max(bounded_floor, 0.55)
         bounded_factor = min(1.0, bounded_factor * 1.5)
+    if definitive_outcome:
+        bounded_floor = max(bounded_floor, 0.60)
+        bounded_factor = min(1.0, bounded_factor * 2.5)
     if bounded_confidence <= bounded_floor:
         return bounded_confidence
     calibrated = bounded_floor + ((bounded_confidence - bounded_floor) * bounded_factor)

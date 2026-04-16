@@ -56,7 +56,7 @@ def test_analyze_market_candidate_end_to_end_no_refinement() -> None:
         grok_client=DummyGrokClient(decision),
     )
     assert result["decision"].outcome == "Team A"
-    assert result["decision"].confidence == pytest.approx(0.619)
+    assert result["decision"].confidence == pytest.approx(0.652)
     assert result["confidence_calibration_applied"] is True
     assert result["decision"].bet_size_pct > 0
     assert result["was_refined"] is False

@@ -134,6 +134,20 @@ class TradeDecision(BaseModel):
         default=None,
         description="Raw model reasoning before validator annotations.",
     )
+    raw_evidence_quality: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Raw model evidence quality before validation recalibration.",
+    )
+    definitive_outcome_detected: bool | None = Field(
+        default=None,
+        description="True when definitive settlement-aligned evidence is detected.",
+    )
+    evidence_quality_floor_applied: str | None = Field(
+        default=None,
+        description="Name of the evidence-quality floor rule applied during validation.",
+    )
     prompt_tokens: int | None = Field(
         default=None,
         ge=0,

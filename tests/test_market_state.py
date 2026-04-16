@@ -320,6 +320,53 @@ def test_reasoning_hash_and_stale_bayesian_update(tmp_path) -> None:
         manager.close()
 
 
+def test_record_exchange_settlement_upserts_trade_outcome_and_pnl(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_exchange_settlement(
+            settlement_id="settle-1",
+            market_id="KXWTI-26APR13-T94.99",
+            winning_outcome="YES",
+            predicted_outcome="YES",
+            pnl_realized=2.15,
+            contracts=5,
+            avg_price=0.57,
+            settled_at=datetime.now(timezone.utc),
+            raw={"market_result": "yes"},
+        )
+        row = manager._conn.execute(
+            """
+            SELECT resolved_winning_outcome, won, pnl_estimate, resolution_state
+            FROM trade_outcomes
+            WHERE market_id = ?
+            """,
+            ("KXWTI-26APR13-T94.99",),
+        ).fetchone()
+        assert row is not None
+        assert row["resolved_winning_outcome"] == "YES"
+        assert row["won"] == 1
+        assert round(float(row["pnl_estimate"]), 2) == 2.15
+        assert row["resolution_state"] == "resolved_exchange"
+        assert round(manager.get_exchange_realized_pnl_total(), 2) == 2.15
+    finally:
+        manager.close()
+
+
+def test_get_known_order_ids_returns_logged_orders(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_trade(
+            "m-known-order",
+            OrderResponse(id="ord-known", raw={"outcome": "YES"}),
+            3.0,
+            outcome="YES",
+        )
+        known_order_ids = manager.get_known_order_ids()
+        assert "ord-known" in known_order_ids
+    finally:
+        manager.close()
+
+
 def test_reasoning_hash_ignores_validated_prefix_variation(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:

@@ -83,8 +83,27 @@ def test_calibrate_confidence_relaxes_shrinkage_for_direct_evidence() -> None:
         evidence_basis_class="direct",
     )
     assert baseline == pytest.approx(0.619, rel=1e-9)
-    assert direct == pytest.approx(0.6685, rel=1e-9)
+    assert direct == pytest.approx(0.685, rel=1e-9)
     assert direct > baseline
+
+
+def test_calibrate_confidence_relaxes_shrinkage_for_definitive_outcome() -> None:
+    baseline = calibrate_confidence(
+        0.85,
+        shrinkage_floor=0.52,
+        shrinkage_factor=0.30,
+        evidence_basis_class="direct",
+    )
+    definitive = calibrate_confidence(
+        0.85,
+        shrinkage_floor=0.52,
+        shrinkage_factor=0.30,
+        evidence_basis_class="direct",
+        definitive_outcome=True,
+    )
+    assert baseline == pytest.approx(0.685, rel=1e-9)
+    assert definitive == pytest.approx(0.85, rel=1e-9)
+    assert definitive > baseline
 
 
 def test_compute_final_score_adds_overconfidence_penalty() -> None:

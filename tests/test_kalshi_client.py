@@ -176,6 +176,41 @@ class TestKalshiClient(unittest.TestCase):
             markets = client.get_markets()
         self.assertEqual([m.id for m in markets], ["MKT-1", "MKT-2"])
 
+    def test_get_portfolio_balance_reads_cash_and_total_value(self) -> None:
+        client = self._client()
+        payload = {
+            "available_balance": 8305,
+            "position_value": 1364,
+            "total_portfolio_value": 9669,
+        }
+        with patch.object(client, "_request", return_value=_DummyResponse(payload)):
+            balance = client.get_portfolio_balance()
+        self.assertAlmostEqual(balance.available_balance, 83.05)
+        self.assertAlmostEqual(balance.position_value, 13.64)
+        self.assertAlmostEqual(balance.total_portfolio_value, 96.69)
+
+    def test_get_portfolio_balance_falls_back_to_available_plus_pnl(self) -> None:
+        client = self._client()
+        payload = {
+            "available_balance": 4505,
+            "portfolio_pnl": 5164,
+        }
+        with patch.object(client, "_request", return_value=_DummyResponse(payload)):
+            balance = client.get_portfolio_balance()
+        self.assertAlmostEqual(balance.available_balance, 45.05)
+        self.assertAlmostEqual(balance.position_value, 51.64)
+        self.assertAlmostEqual(balance.total_portfolio_value, 96.69)
+
+    def test_get_settlements_and_fills_return_payload(self) -> None:
+        client = self._client()
+        settlements_payload = {"settlements": [{"id": "s1"}]}
+        fills_payload = {"fills": [{"id": "f1"}]}
+        with patch.object(client, "_request", side_effect=[_DummyResponse(settlements_payload), _DummyResponse(fills_payload)]):
+            settlements = client.get_settlements(limit=50, cursor="abc")
+            fills = client.get_fills(limit=25)
+        self.assertEqual(settlements, settlements_payload)
+        self.assertEqual(fills, fills_payload)
+
     def test_get_markets_passes_close_time_window_filters(self) -> None:
         client = self._client()
         pages = [
