@@ -108,6 +108,52 @@ See `.env.example` for the full set of runtime controls.
 - Resolution tracking runs on a configurable cycle interval.
 - Logs are written under `LOG_DIR` (default `logs/`), including standard and error-focused outputs.
 
+## Monitoring and Analytics
+
+### PnL Report
+
+View total realized PnL with category and monthly breakdowns:
+
+```bash
+poetry run python scripts/pnl_report.py
+```
+
+Sync latest settlements from Kalshi before reporting:
+
+```bash
+poetry run python scripts/pnl_report.py --sync
+```
+
+Run in offline mode (database only, no API calls):
+
+```bash
+poetry run python scripts/pnl_report.py --no-api
+```
+
+### Account Balance and Positions
+
+Quick diagnostic of current balance and open positions:
+
+```bash
+poetry run python check_balance.py
+```
+
+### Calibration Analytics
+
+Detailed calibration metrics, win rates, and decision quality diagnostics:
+
+```bash
+poetry run python analytics.py
+```
+
+### Tuning Recommendations
+
+Generate threshold tuning recommendations from recent logs:
+
+```bash
+poetry run python scripts/daily_tuning_recommendations.py
+```
+
 ## Troubleshooting
 
 ### Missing required environment variables

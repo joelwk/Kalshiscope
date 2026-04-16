@@ -328,6 +328,7 @@ class KalshiClient:
                 (
                     "position_value",
                     "positions_value",
+                    "portfolio_value",
                     "payout",
                     "portfolio_pnl",
                     "unrealized_pnl",
@@ -341,7 +342,6 @@ class KalshiClient:
                 payload,
                 (
                     "total_portfolio_value",
-                    "portfolio_value",
                     "account_value",
                     "equity",
                     "portfolio_balance",
