@@ -66,6 +66,8 @@ _RESOLVED_MARKET_STATUS = {
 }
 _ADAPTIVE_SLEEP_CAP_SECONDS = 1800
 _ORDERBOOK_SPREAD_CUTOFF_DEFAULT = 0.08
+_STALE_REFRESH_RETRY_DELAY_SECONDS = 1.0
+_STALE_REFRESH_LENIENT_AGE_MULTIPLIER = 2.5
 _MAX_CONFIDENCE = 1.0
 _INDEX_MARKET_PREFIXES = ("KXNASDAQ100U-", "KXINXU-")
 _COMMODITY_MARKET_TOKENS = (
@@ -877,8 +879,8 @@ def _passes_edge_threshold(
         decision.edge_source,
         market=market,
     )
-    if edge < min_edge:
-        return False, edge, f"edge {edge:.2f} below min {min_edge:.2f}"
+    if edge < min_edge - 1e-9:
+        return False, edge, f"edge {edge:.4f} below min {min_edge:.4f}"
     return True, edge, ""
 
 
@@ -1327,6 +1329,23 @@ def _coerce_float(value: object) -> float | None:
         return None
 
 
+def _coerce_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def _decision_edge_for_outcome(
     market: Market,
     outcome: str,
@@ -1356,6 +1375,18 @@ def _apply_flip_guard(
         return decision, False, False
 
     anchor_confidence = _coerce_float(anchor_analysis.get("confidence")) or 0.0
+    evidence_basis_class = str(decision.evidence_basis or "").strip().lower()
+    likelihood_ratio = _coerce_float(decision.likelihood_ratio) or 0.0
+    use_raw_confidence_for_flip_guard = (
+        evidence_basis_class == "direct"
+        and decision.raw_confidence is not None
+        and likelihood_ratio >= 5.0
+    )
+    evaluated_confidence = (
+        max(0.0, min(1.0, float(decision.raw_confidence)))
+        if use_raw_confidence_for_flip_guard
+        else decision.confidence
+    )
     if anchor_confidence < settings.MIN_CONFIDENCE:
         logger.debug(
             "FlipGuard bypassed due to low-confidence anchor: market=%s anchor_conf=%.3f threshold=%.3f",
@@ -1368,12 +1399,13 @@ def _apply_flip_guard(
                 "proposed_outcome": decision.outcome,
                 "anchor_confidence": anchor_confidence,
                 "min_confidence_threshold": settings.MIN_CONFIDENCE,
+                "use_raw_confidence_for_flip_guard": use_raw_confidence_for_flip_guard,
             },
         )
         return decision, False, False
 
-    confidence_delta = decision.confidence - anchor_confidence
-    new_edge = _decision_edge_for_outcome(market, decision.outcome, decision.confidence)
+    confidence_delta = evaluated_confidence - anchor_confidence
+    new_edge = _decision_edge_for_outcome(market, decision.outcome, evaluated_confidence)
     anchor_edge = _decision_edge_for_outcome(market, anchor_outcome, anchor_confidence)
     edge_delta = None
     edge_gain_ok = True
@@ -1381,7 +1413,7 @@ def _apply_flip_guard(
         edge_delta = abs(new_edge) - abs(anchor_edge)
         edge_gain_ok = edge_delta >= settings.FLIP_GUARD_MIN_EDGE_GAIN
 
-    abs_conf_ok = decision.confidence >= settings.FLIP_GUARD_MIN_ABS_CONFIDENCE
+    abs_conf_ok = evaluated_confidence >= settings.FLIP_GUARD_MIN_ABS_CONFIDENCE
     conf_gain_ok = confidence_delta >= settings.FLIP_GUARD_MIN_CONF_GAIN
     evidence_quality = decision.evidence_quality or 0.0
     evidence_ok = evidence_quality >= settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY
@@ -1393,6 +1425,7 @@ def _apply_flip_guard(
         "proposed_outcome": decision.outcome,
         "anchor_confidence": anchor_confidence,
         "proposed_confidence": decision.confidence,
+        "flip_guard_evaluated_confidence": evaluated_confidence,
         "confidence_delta": confidence_delta,
         "anchor_edge": anchor_edge,
         "proposed_edge": new_edge,
@@ -1403,6 +1436,7 @@ def _apply_flip_guard(
         "edge_gain_ok": edge_gain_ok,
         "evidence_ok": evidence_ok,
         "high_evidence_flip_override": high_evidence_flip_override,
+        "use_raw_confidence_for_flip_guard": use_raw_confidence_for_flip_guard,
     }
 
     if high_evidence_flip_override or (abs_conf_ok and conf_gain_ok and edge_gain_ok and evidence_ok):
@@ -1420,7 +1454,7 @@ def _apply_flip_guard(
     reasons: list[str] = []
     if not abs_conf_ok:
         reasons.append(
-            f"abs_conf {decision.confidence:.2f} < {settings.FLIP_GUARD_MIN_ABS_CONFIDENCE:.2f}"
+            f"abs_conf {evaluated_confidence:.2f} < {settings.FLIP_GUARD_MIN_ABS_CONFIDENCE:.2f}"
         )
     if not conf_gain_ok:
         reasons.append(
@@ -1924,6 +1958,28 @@ def _requires_market_refresh(
     return market_data_age_seconds > max_market_data_age_seconds
 
 
+def _can_use_lenient_stale_refresh_fallback(
+    *,
+    evidence_basis_class: str,
+    pre_execution_final_score: float,
+    market_data_age_seconds: float | None,
+    settings: Settings,
+) -> bool:
+    if market_data_age_seconds is None:
+        return False
+    if market_data_age_seconds <= float(settings.MAX_MARKET_DATA_AGE_SECONDS):
+        return False
+    if str(evidence_basis_class or "").strip().lower() != "direct":
+        return False
+    if float(pre_execution_final_score) < float(settings.SCORE_GATE_THRESHOLD):
+        return False
+    lenient_max_age_seconds = (
+        float(settings.MAX_MARKET_DATA_AGE_SECONDS)
+        * _STALE_REFRESH_LENIENT_AGE_MULTIPLIER
+    )
+    return market_data_age_seconds <= lenient_max_age_seconds
+
+
 def _confidence_gate_override_metrics(
     market: Market,
     decision: TradeDecision,
@@ -2067,6 +2123,138 @@ def _sync_positions_from_exchange(
             },
         )
     return synced, local_updates
+
+
+def _iter_exchange_settlement_rows(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    for key in ("settlements", "market_settlements", "data"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _parse_exchange_settlement_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    settlement_id = str(
+        row.get("settlement_id")
+        or row.get("id")
+        or row.get("trade_id")
+        or row.get("market_ticker")
+        or row.get("ticker")
+        or ""
+    ).strip()
+    market_id = str(
+        row.get("market_ticker")
+        or row.get("ticker")
+        or row.get("market_id")
+        or ""
+    ).strip()
+    if not settlement_id or not market_id:
+        return None
+    winning_outcome_raw = str(
+        row.get("market_result")
+        or row.get("result")
+        or row.get("winning_outcome")
+        or ""
+    ).strip().upper()
+    winning_outcome = winning_outcome_raw if winning_outcome_raw in {"YES", "NO"} else None
+    yes_contracts = int(
+        _coerce_float(row.get("yes_count") or row.get("yes_contracts_owned") or 0) or 0.0
+    )
+    no_contracts = int(
+        _coerce_float(row.get("no_count") or row.get("no_contracts_owned") or 0) or 0.0
+    )
+    predicted_outcome: str | None = None
+    contracts = 0
+    avg_price: float | None = None
+    if yes_contracts > 0:
+        predicted_outcome = "YES"
+        contracts = yes_contracts
+        avg_price = _coerce_float(row.get("yes_total_cost") or row.get("yes_contracts_average_price"))
+        if avg_price is None:
+            avg_price = _coerce_float(row.get("yes_contracts_average_price_in_cents"))
+            if avg_price is not None and avg_price > 1.0:
+                avg_price /= 100.0
+    elif no_contracts > 0:
+        predicted_outcome = "NO"
+        contracts = no_contracts
+        avg_price = _coerce_float(row.get("no_total_cost") or row.get("no_contracts_average_price"))
+        if avg_price is None:
+            avg_price = _coerce_float(row.get("no_contracts_average_price_in_cents"))
+            if avg_price is not None and avg_price > 1.0:
+                avg_price /= 100.0
+    profit = _coerce_float(
+        row.get("profit")
+        or row.get("profit_in_dollars")
+        or row.get("pnl")
+        or row.get("realized_pnl")
+    )
+    settled_at = (
+        _coerce_datetime(row.get("settled_time"))
+        or _coerce_datetime(row.get("created_time"))
+        or _coerce_datetime(row.get("created_at"))
+    )
+    return {
+        "settlement_id": settlement_id,
+        "market_id": market_id,
+        "winning_outcome": winning_outcome,
+        "predicted_outcome": predicted_outcome,
+        "pnl_realized": float(profit or 0.0),
+        "contracts": contracts if contracts > 0 else None,
+        "avg_price": avg_price,
+        "settled_at": settled_at,
+        "raw": row,
+    }
+
+
+def _sync_settlements_from_exchange(
+    *,
+    state_manager: MarketStateManager,
+    kalshi_client: KalshiClient,
+    limit: int = 200,
+) -> int:
+    payload = kalshi_client.get_settlements(limit=limit)
+    rows = _iter_exchange_settlement_rows(payload)
+    imported = 0
+    for row in rows:
+        parsed = _parse_exchange_settlement_row(row)
+        if parsed is None:
+            continue
+        state_manager.record_exchange_settlement(**parsed)
+        imported += 1
+    return imported
+
+
+def _detect_external_fills(
+    *,
+    state_manager: MarketStateManager,
+    kalshi_client: KalshiClient,
+    limit: int = 200,
+) -> int:
+    payload = kalshi_client.get_fills(limit=limit)
+    rows = payload.get("fills")
+    if not isinstance(rows, list):
+        rows = payload.get("data")
+    if not isinstance(rows, list):
+        return 0
+    known_order_ids = state_manager.get_known_order_ids()
+    external_count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        order_id = str(
+            row.get("order_id")
+            or row.get("orderId")
+            or row.get("id")
+            or row.get("trade_id")
+            or ""
+        ).strip()
+        if not order_id:
+            continue
+        if order_id not in known_order_ids:
+            external_count += 1
+    return external_count
 
 
 def _is_coinflip_signal(decision: TradeDecision) -> bool:
@@ -2331,9 +2519,12 @@ def _effective_score_gate_threshold(
     settings: Settings,
     market: Market,
     evidence_basis_class: str,
+    evidence_quality: float = 0.0,
 ) -> float:
     if market_family(market) == "weather" and evidence_basis_class == "direct":
         return settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT
+    if evidence_basis_class == "direct" and evidence_quality >= 0.80:
+        return settings.SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY
     return settings.SCORE_GATE_THRESHOLD
 
 
@@ -2498,6 +2689,7 @@ def _pre_analysis_opportunity_score(
     historical_family_stats: dict[str, float | int] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Estimate opportunity quality before expensive enrichment/analysis."""
+    now_utc = datetime.now(timezone.utc)
     implied_prob_yes = _get_implied_probability(market, "YES")
     implied_prob_no = _get_implied_probability(market, "NO")
     implied_prob = implied_prob_yes if implied_prob_yes is not None else implied_prob_no
@@ -2510,13 +2702,13 @@ def _pre_analysis_opportunity_score(
     if implied_prob is not None:
         price_center_score = max(0.0, 1.0 - (abs(implied_prob - 0.5) / 0.5))
     horizon_score = 0.5
+    raw_hours_to_close: float | None = None
     if market.close_time is not None:
         close_time = market.close_time
         if close_time.tzinfo is None:
             close_time = close_time.replace(tzinfo=timezone.utc)
-        hours_to_close = max(
-            0.0, (close_time - datetime.now(timezone.utc)).total_seconds() / 3600.0
-        )
+        raw_hours_to_close = (close_time - now_utc).total_seconds() / 3600.0
+        hours_to_close = max(0.0, raw_hours_to_close)
         if hours_to_close <= 24:
             horizon_score = 1.0
         elif hours_to_close <= 48:
@@ -2525,6 +2717,9 @@ def _pre_analysis_opportunity_score(
             horizon_score = 0.6
         else:
             horizon_score = 0.35
+    post_event_bonus = 0.0
+    if raw_hours_to_close is not None and -6.0 <= raw_hours_to_close <= 0.0:
+        post_event_bonus = 0.10
     family = market_family(market)
     analysis_count = int(state.analysis_count) if state is not None and state.analysis_count is not None else 0
     non_actionable_streak = int(state.non_actionable_streak) if state is not None else 0
@@ -2578,6 +2773,7 @@ def _pre_analysis_opportunity_score(
     historical_family_win_rate = 0.0
     historical_family_sample_size = 0
     historical_family_pnl = 0.0
+    fallback_family_penalty_scale = 1.0
     if historical_family_stats:
         historical_family_win_rate = max(
             0.0, min(1.0, float(historical_family_stats.get("win_rate", 0.0) or 0.0))
@@ -2619,6 +2815,13 @@ def _pre_analysis_opportunity_score(
                     historical_family_pnl_penalty,
                     max(0.0, settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY),
                 )
+    if (
+        fallback_family_penalty > 0.0
+        and historical_family_pnl > 0.0
+        and historical_family_win_rate > 0.55
+    ):
+        fallback_family_penalty *= 0.5
+        fallback_family_penalty_scale = 0.5
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
         ambiguous_resolution_penalty = 0.08
@@ -2631,6 +2834,7 @@ def _pre_analysis_opportunity_score(
         (0.40 * price_center_score)
         + (0.35 * liquidity_score)
         + (0.25 * horizon_score)
+        + post_event_bonus
         - repeated_analysis_penalty
         - non_actionable_penalty
         - family_penalty
@@ -2647,12 +2851,14 @@ def _pre_analysis_opportunity_score(
         "pre_score_price_center": price_center_score,
         "pre_score_liquidity": liquidity_score,
         "pre_score_horizon": horizon_score,
+        "pre_score_post_event_bonus": post_event_bonus,
         "pre_score_repeated_analysis_penalty": repeated_analysis_penalty,
         "pre_score_non_actionable_penalty": non_actionable_penalty,
         "pre_score_family_penalty": family_penalty,
         "pre_score_generic_bin_penalty": generic_bin_penalty,
         "pre_score_crypto_bin_penalty": crypto_bin_penalty,
         "pre_score_fallback_family_penalty": fallback_family_penalty,
+        "pre_score_fallback_family_penalty_scale": fallback_family_penalty_scale,
         "pre_score_fallback_family_rate": fallback_rate,
         "pre_score_fallback_family_samples": float(fallback_samples),
         "pre_score_historical_family_penalty": historical_family_penalty,
@@ -2666,6 +2872,9 @@ def _pre_analysis_opportunity_score(
         "pre_score_analysis_count": float(analysis_count),
         "pre_score_non_actionable_streak": float(non_actionable_streak),
         "pre_score_traded_before": 1.0 if traded_before else 0.0,
+        "pre_score_hours_to_close": (
+            float(raw_hours_to_close) if raw_hours_to_close is not None else 0.0
+        ),
     }
 
 
@@ -2776,6 +2985,15 @@ def _pre_analysis_hard_rejection(
             "pre_analysis_hard_reject_traded_before": traded_before,
         }
         return True, f"pre_analysis_{hard_reject_reason}", metadata
+    if analysis_count >= 4 and non_actionable_streak >= 3 and not traded_before:
+        metadata = {
+            "pre_analysis_hard_reject": True,
+            "pre_analysis_hard_reject_reason": "repeated_churn_market",
+            "pre_analysis_hard_reject_non_actionable_streak": non_actionable_streak,
+            "pre_analysis_hard_reject_analysis_count": analysis_count,
+            "pre_analysis_hard_reject_traded_before": traded_before,
+        }
+        return True, "pre_analysis_repeated_churn_market", metadata
     return False, None, {}
 
 
@@ -2873,6 +3091,22 @@ def _cap_analysis_candidates(
         if not progressed:
             break
     return selected
+
+
+def _resolve_dynamic_analysis_candidate_cap(
+    *,
+    settings: Settings,
+    best_pre_analysis_score: float,
+) -> tuple[int, bool]:
+    dynamic_max_markets_per_cycle = settings.MAX_MARKETS_PER_CYCLE
+    reduced_candidate_cap_applied = False
+    if best_pre_analysis_score < settings.PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD:
+        dynamic_max_markets_per_cycle = min(
+            dynamic_max_markets_per_cycle,
+            max(1, settings.PRE_ANALYSIS_REDUCED_MAX_CANDIDATES),
+        )
+        reduced_candidate_cap_applied = True
+    return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied
 
 
 def _build_speech_reanalysis_search_config(base_config: SearchConfig) -> SearchConfig:
@@ -3026,11 +3260,15 @@ def _analyze_market_candidate(
     decision = _cap_confidence_for_category(decision, market, settings)
     confidence_before_calibration = decision.confidence
     evidence_basis_for_calibration = _decision_evidence_basis(decision)
+    definitive_outcome_for_calibration = bool(
+        getattr(decision, "definitive_outcome_detected", False)
+    )
     calibrated_confidence = calibrate_confidence(
         decision.confidence,
         shrinkage_floor=settings.CONFIDENCE_SHRINKAGE_FLOOR,
         shrinkage_factor=settings.CONFIDENCE_SHRINKAGE_FACTOR,
         evidence_basis_class=evidence_basis_for_calibration,
+        definitive_outcome=definitive_outcome_for_calibration,
     )
     calibration_delta = confidence_before_calibration - calibrated_confidence
     historical_win_rate_at_bucket = _historical_win_rate_at_bucket(confidence_before_calibration)
@@ -3072,10 +3310,14 @@ def _analyze_market_candidate(
         "confidence_calibration_applied": confidence_calibration_applied,
         "raw_vs_calibrated_delta": calibration_delta,
         "historical_win_rate_at_bucket": historical_win_rate_at_bucket,
+        "definitive_outcome_for_calibration": definitive_outcome_for_calibration,
     }
 
 
-def main() -> None:
+def main(max_cycles: int | None = None) -> None:
+    if max_cycles is not None and max_cycles <= 0:
+        raise ValueError("max_cycles must be greater than zero when provided")
+
     settings = load_settings()
 
     setup_logging(
@@ -3125,11 +3367,16 @@ def main() -> None:
     )
     logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
 
-    logger.info("PredictBot started (dry_run=%s)", settings.DRY_RUN)
+    logger.info(
+        "PredictBot started (dry_run=%s, max_cycles=%s)",
+        settings.DRY_RUN,
+        max_cycles if max_cycles is not None else "unlimited",
+    )
     cycle_count = 0
     current_trade_day = datetime.now(timezone.utc).date()
     daily_trade_count = 0
     daily_start_balance: float | None = None
+    cumulative_api_cost_estimate_usd = 0.0
 
     while True:
         cycle_count += 1
@@ -3191,8 +3438,13 @@ def main() -> None:
             markets = scheduler.prioritize_markets(markets, state_manager)
 
             cycle_bankroll: float | None = None
+            cycle_cash_balance: float | None = None
+            cycle_portfolio_value: float | None = None
             try:
-                cycle_bankroll = kalshi_client.get_balance()
+                portfolio_balance = kalshi_client.get_portfolio_balance()
+                cycle_cash_balance = portfolio_balance.available_balance
+                cycle_portfolio_value = portfolio_balance.total_portfolio_value
+                cycle_bankroll = cycle_portfolio_value
             except Exception as exc:
                 logger.debug(
                     "Kalshi balance lookup failed for position cap: %s",
@@ -3242,6 +3494,40 @@ def main() -> None:
                             exc,
                             data={"error": str(exc)},
                         )
+                    try:
+                        synced_settlements = _sync_settlements_from_exchange(
+                            state_manager=state_manager,
+                            kalshi_client=kalshi_client,
+                        )
+                        if synced_settlements > 0:
+                            logger.info(
+                                "Kalshi settlement sync complete: imported=%d",
+                                synced_settlements,
+                                data={"synced_settlements": synced_settlements},
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Kalshi settlement sync failed: %s",
+                            exc,
+                            data={"error": str(exc)},
+                        )
+                    try:
+                        external_fill_count = _detect_external_fills(
+                            state_manager=state_manager,
+                            kalshi_client=kalshi_client,
+                        )
+                        if external_fill_count > 0:
+                            logger.info(
+                                "Detected external fills not present in local trade log: count=%d",
+                                external_fill_count,
+                                data={"external_fill_count": external_fill_count},
+                            )
+                    except Exception as exc:
+                        logger.debug(
+                            "External fill detection failed: %s",
+                            exc,
+                            data={"error": str(exc)},
+                        )
 
             trades_attempted = 0
             trades_filled = 0
@@ -3281,6 +3567,7 @@ def main() -> None:
             rejection_breakdown: dict[str, int] = {}
             score_rejection_reason_breakdown: dict[str, int] = {}
             score_near_misses: list[dict[str, Any]] = []
+            rejection_funnel_summary: list[dict[str, Any]] = []
             pre_analysis_rejection_breakdown: dict[str, int] = {}
             execution_family_stats: dict[str, dict[str, float]] = {}
             evidence_basis_breakdown: dict[str, int] = {}
@@ -3296,15 +3583,17 @@ def main() -> None:
             confidence_calibration_delta_sum = 0.0
             confidence_calibration_historical_win_rates: list[float] = []
             cycle_balance_start = cycle_bankroll
-            last_known_balance = cycle_bankroll
+            last_known_balance = cycle_cash_balance
+            last_known_portfolio_value = cycle_bankroll
 
             def _refresh_last_known_balance() -> None:
-                nonlocal last_known_balance
+                nonlocal last_known_balance, last_known_portfolio_value
                 try:
-                    refreshed_balance = kalshi_client.get_balance()
+                    refreshed_portfolio = kalshi_client.get_portfolio_balance()
                 except Exception:
                     return
-                last_known_balance = refreshed_balance
+                last_known_balance = refreshed_portfolio.available_balance
+                last_known_portfolio_value = refreshed_portfolio.total_portfolio_value
 
             def log_trade_decision(
                 *,
@@ -3335,6 +3624,18 @@ def main() -> None:
                         market_id,
                         receipt_exc,
                         data={"market_id": market_id, "error": str(receipt_exc)},
+                    )
+                audit = execution_audit if isinstance(execution_audit, dict) else {}
+                if str(audit.get("final_action") or "").strip().lower() == "skip":
+                    rejection_funnel_summary.append(
+                        {
+                            "market_id": market_id,
+                            "market_family": audit.get("market_family"),
+                            "evidence_basis": audit.get("evidence_basis_class"),
+                            "score": audit.get("pre_execution_final_score"),
+                            "rejection_stage": audit.get("rejection_stage"),
+                            "rejection_reason": audit.get("final_reason"),
+                        }
                     )
 
             def _record_should_trade_blocked(reason: str) -> None:
@@ -3624,10 +3925,6 @@ def main() -> None:
             available_family_distribution = _analysis_candidate_family_counts(
                 analysis_candidates
             )
-            analysis_candidate_attempt_limit = settings.MAX_MARKETS_PER_CYCLE + max(
-                0,
-                settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
-            )
             pre_analysis_scores = {
                 str(getattr(candidate.get("market"), "id", "")): float(
                     candidate.get("pre_analysis_score") or 0.0
@@ -3635,6 +3932,18 @@ def main() -> None:
                 for candidate in analysis_candidates
                 if isinstance(candidate.get("market"), Market)
             }
+            best_pre_analysis_score = max(pre_analysis_scores.values(), default=0.0)
+            (
+                dynamic_max_markets_per_cycle,
+                reduced_candidate_cap_applied,
+            ) = _resolve_dynamic_analysis_candidate_cap(
+                settings=settings,
+                best_pre_analysis_score=best_pre_analysis_score,
+            )
+            analysis_candidate_attempt_limit = dynamic_max_markets_per_cycle + max(
+                0,
+                settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+            )
             analysis_candidates = _cap_analysis_candidates(
                 analysis_candidates,
                 analysis_candidate_attempt_limit,
@@ -3655,8 +3964,10 @@ def main() -> None:
                     data={
                         "analysis_candidates_original": original_analysis_candidates_count,
                         "analysis_candidates_capped": len(analysis_candidates),
-                        "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+                        "max_markets_per_cycle": dynamic_max_markets_per_cycle,
                         "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
+                        "best_pre_analysis_score": best_pre_analysis_score,
+                        "reduced_candidate_cap_applied": reduced_candidate_cap_applied,
                     },
                 )
             logger.info(
@@ -3675,8 +3986,10 @@ def main() -> None:
                     "position_skipped_anchor_opposite": position_skipped_anchor_opposite,
                     "pre_analysis_blocked": pre_analysis_blocked,
                     "pre_analysis_rejection_breakdown": pre_analysis_rejection_breakdown,
-                    "max_markets_per_cycle": settings.MAX_MARKETS_PER_CYCLE,
+                    "max_markets_per_cycle": dynamic_max_markets_per_cycle,
                     "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
+                    "best_pre_analysis_score": best_pre_analysis_score,
+                    "reduced_candidate_cap_applied": reduced_candidate_cap_applied,
                 },
             )
 
@@ -4070,7 +4383,7 @@ def main() -> None:
                 correlated_positions_count = len(correlated_position_market_ids)
                 daily_pnl_estimate = _daily_balance_delta_usdc(
                     day_start_balance=daily_start_balance,
-                    current_balance=last_known_balance,
+                    current_balance=last_known_portfolio_value,
                 )
                 audit_context: dict[str, Any] = {
                     "market_family": market_family_name,
@@ -4095,6 +4408,23 @@ def main() -> None:
                     ),
                     "historical_win_rate_at_bucket": analysis_result.get(
                         "historical_win_rate_at_bucket"
+                    ),
+                    "definitive_outcome_for_calibration": analysis_result.get(
+                        "definitive_outcome_for_calibration"
+                    ),
+                    "evidence_quality_raw": getattr(
+                        decision,
+                        "raw_evidence_quality",
+                        None,
+                    ),
+                    "evidence_quality_validated": decision.evidence_quality,
+                    "definitive_outcome_detected": bool(
+                        getattr(decision, "definitive_outcome_detected", False)
+                    ),
+                    "evidence_quality_floor_applied": getattr(
+                        decision,
+                        "evidence_quality_floor_applied",
+                        None,
                     ),
                     "event_ticker_prefix": event_ticker_prefix,
                     "correlated_positions_count": correlated_positions_count,
@@ -4796,6 +5126,7 @@ def main() -> None:
                     settings=settings,
                     market=market,
                     evidence_basis_class=evidence_basis,
+                    evidence_quality=decision_for_edge.evidence_quality,
                 )
                 score_payload: dict[str, Any] | None = None
                 if score_mode != "off":
@@ -4805,6 +5136,7 @@ def main() -> None:
                         "score_threshold": score_threshold_effective,
                         "score_threshold_default": settings.SCORE_GATE_THRESHOLD,
                         "score_threshold_weather_direct": settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT,
+                        "score_threshold_direct_high_quality": settings.SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY,
                         "final_score": score_result.final_score,
                         "edge_market": score_result.edge_market,
                         "edge_external": score_result.edge_external,
@@ -5420,6 +5752,7 @@ def main() -> None:
 
                 question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
                 active_market = market
+                audit_context["stale_refresh_lenient_fallback_used"] = False
                 market_data_age_seconds: float | None = None
                 if isinstance(market_snapshot_monotonic, (int, float)):
                     market_data_age_seconds = max(
@@ -5436,30 +5769,68 @@ def main() -> None:
                     market_data_age_seconds=market_data_age_seconds,
                     max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
                 ):
-                    try:
-                        refreshed = kalshi_client.get_market(market.id)
-                        if refreshed.outcomes:
-                            active_market = refreshed
-                            logger.debug(
-                                "Using refreshed market snapshot for execution: market=%s",
+                    refresh_exception: Exception | None = None
+                    refresh_attempts = 0
+                    for refresh_attempt in range(2):
+                        refresh_attempts = refresh_attempt + 1
+                        try:
+                            refreshed = kalshi_client.get_market(market.id)
+                            if refreshed.outcomes:
+                                active_market = refreshed
+                            refresh_exception = None
+                            break
+                        except Exception as exc:
+                            refresh_exception = exc
+                            if refresh_attempt == 0:
+                                time.sleep(_STALE_REFRESH_RETRY_DELAY_SECONDS)
+                    if refresh_exception is None:
+                        logger.debug(
+                            "Using refreshed market snapshot for execution: market=%s",
+                            market.id,
+                            data={
+                                "market_id": market.id,
+                                "market_data_age_seconds": market_data_age_seconds,
+                                "force_refresh_for_staleness": force_refresh_for_staleness,
+                                "refresh_attempts": refresh_attempts,
+                            },
+                        )
+                    elif force_refresh_for_staleness:
+                        lenient_stale_refresh_allowed = _can_use_lenient_stale_refresh_fallback(
+                            evidence_basis_class=evidence_basis,
+                            pre_execution_final_score=pre_execution_final_score,
+                            market_data_age_seconds=market_data_age_seconds,
+                            settings=settings,
+                        )
+                        if lenient_stale_refresh_allowed:
+                            audit_context["stale_refresh_lenient_fallback_used"] = True
+                            logger.warning(
+                                "Proceeding with stale market snapshot after refresh failures: market=%s",
                                 market.id,
                                 data={
                                     "market_id": market.id,
+                                    "error": str(refresh_exception),
                                     "market_data_age_seconds": market_data_age_seconds,
-                                    "force_refresh_for_staleness": force_refresh_for_staleness,
+                                    "max_market_data_age_seconds": settings.MAX_MARKET_DATA_AGE_SECONDS,
+                                    "lenient_max_age_seconds": (
+                                        settings.MAX_MARKET_DATA_AGE_SECONDS
+                                        * _STALE_REFRESH_LENIENT_AGE_MULTIPLIER
+                                    ),
+                                    "refresh_attempts": refresh_attempts,
+                                    "evidence_basis_class": evidence_basis,
+                                    "pre_execution_final_score": pre_execution_final_score,
                                 },
                             )
-                    except Exception as exc:
-                        if force_refresh_for_staleness:
+                        else:
                             logger.warning(
                                 "SKIP [%s] '%s' -> stale market data and refresh failed",
                                 market.id,
                                 question_short,
                                 data={
                                     "market_id": market.id,
-                                    "error": str(exc),
+                                    "error": str(refresh_exception),
                                     "market_data_age_seconds": market_data_age_seconds,
                                     "max_market_data_age_seconds": settings.MAX_MARKET_DATA_AGE_SECONDS,
+                                    "refresh_attempts": refresh_attempts,
                                 },
                             )
                             trades_skipped_edge += 1
@@ -5477,6 +5848,7 @@ def main() -> None:
                                     final_reason="stale_market_data_refresh_failed",
                                     market_data_age_seconds=market_data_age_seconds,
                                     max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
+                                    refresh_attempts=refresh_attempts,
                                     **audit_context,
                                     **score_receipt_fields,
                                 ),
@@ -5487,14 +5859,16 @@ def main() -> None:
                                 "stale_market_data_refresh_failed",
                             )
                             continue
+                    else:
                         logger.warning(
                             "Pre-order market refresh failed; using scheduled snapshot: market=%s error=%s",
                             market.id,
-                            exc,
+                            refresh_exception,
                             data={
                                 "market_id": market.id,
-                                "error": str(exc),
+                                "error": str(refresh_exception),
                                 "market_data_age_seconds": market_data_age_seconds,
+                                "refresh_attempts": refresh_attempts,
                             },
                         )
                 if active_market is not market:
@@ -5810,9 +6184,7 @@ def main() -> None:
                             final_reason="event_concentration_blocked",
                             max_bets_per_event=settings.MAX_BETS_PER_EVENT,
                             total_other_event_exposures=total_other_event_exposures,
-                            correlated_positions_count=correlated_positions_count,
                             correlated_cycle_positions_count=correlated_cycle_other_count,
-                            event_ticker_prefix=event_ticker_prefix,
                             **audit_context,
                             **score_receipt_fields,
                         ),
@@ -5841,7 +6213,6 @@ def main() -> None:
                             decision_terminal=True,
                             final_action="skip",
                             final_reason="daily_limit_reached",
-                            daily_trade_count=daily_trade_count,
                             max_trades_per_day=settings.MAX_TRADES_PER_DAY,
                             **audit_context,
                             **score_receipt_fields,
@@ -5851,7 +6222,7 @@ def main() -> None:
                     continue
                 daily_balance_delta = _daily_balance_delta_usdc(
                     day_start_balance=daily_start_balance,
-                    current_balance=last_known_balance,
+                    current_balance=last_known_portfolio_value,
                 )
                 daily_drawdown = max(
                     0.0,
@@ -5878,8 +6249,6 @@ def main() -> None:
                             decision_terminal=True,
                             final_action="skip",
                             final_reason="daily_drawdown_limit",
-                            daily_trade_count=daily_trade_count,
-                            daily_pnl_estimate=daily_balance_delta,
                             daily_drawdown_usdc=daily_drawdown,
                             max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
                             **audit_context,
@@ -6328,6 +6697,7 @@ def main() -> None:
                 cached_tokens=cycle_cached_tokens,
                 settings=settings,
             )
+            cumulative_api_cost_estimate_usd += api_cost_estimate_usd
             execution_family_breakdown = {
                 family_name: {
                     "order_attempts": int(stats.get("order_attempts", 0)),
@@ -6340,6 +6710,17 @@ def main() -> None:
                 for family_name, stats in sorted(execution_family_stats.items())
             }
             cumulative_cycle_pnl_estimate = _resolved_pnl_estimate_total(state_manager)
+            exchange_realized_pnl_total = state_manager.get_exchange_realized_pnl_total()
+            api_cost_per_fill = (
+                round(api_cost_estimate_usd / trades_filled, 6)
+                if trades_filled > 0
+                else None
+            )
+            api_cost_per_usd_deployed = (
+                round(api_cost_estimate_usd / total_usd_deployed, 6)
+                if total_usd_deployed > 0
+                else None
+            )
             cycle_receipt = {
                 "cycle": cycle_count,
                 "cycle_id": cycle_id,
@@ -6383,6 +6764,9 @@ def main() -> None:
                 "api_reasoning_tokens": cycle_reasoning_tokens,
                 "api_cached_tokens": cycle_cached_tokens,
                 "api_cost_estimate_usd": round(api_cost_estimate_usd, 6),
+                "api_cost_per_fill": api_cost_per_fill,
+                "api_cost_per_usd_deployed": api_cost_per_usd_deployed,
+                "cumulative_api_cost_estimate_usd": round(cumulative_api_cost_estimate_usd, 6),
                 "grok_tokens_per_trade": round(
                     (api_tokens_consumed / trades_filled),
                     2,
@@ -6408,7 +6792,11 @@ def main() -> None:
                 else None,
                 "analysis_only_mode": analysis_only_mode,
                 "balance_at_cycle_start": cycle_balance_start,
+                "cash_balance_at_cycle_start": cycle_cash_balance,
+                "total_portfolio_value_at_cycle_start": cycle_balance_start,
                 "cumulative_cycle_pnl_estimate": round(cumulative_cycle_pnl_estimate, 2),
+                "exchange_realized_pnl_total": round(exchange_realized_pnl_total, 2),
+                "rejection_funnel_summary": rejection_funnel_summary[:50],
             }
             logger.info(
                 "Cycle receipt",
@@ -6659,6 +7047,14 @@ def main() -> None:
             data={"sleep_seconds": sleep_seconds, "cycle_id": cycle_id},
         )
         time.sleep(sleep_seconds)
+        if max_cycles is not None and cycle_count >= max_cycles:
+            logger.info(
+                "Reached max cycles (%d/%d) - shutting down",
+                cycle_count,
+                max_cycles,
+                data={"cycle_count": cycle_count, "max_cycles": max_cycles},
+            )
+            break
 
 
 if __name__ == "__main__":

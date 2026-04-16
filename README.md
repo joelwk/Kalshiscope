@@ -51,6 +51,12 @@ You can also run:
 poetry run kalshi
 ```
 
+To run a fixed number of cycles and stop automatically:
+
+```bash
+poetry run kalshi --cycles 30
+```
+
 ## pip Fallback
 
 ```bash

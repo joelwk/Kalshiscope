@@ -12,6 +12,7 @@ from main import (
     _build_kalshi_market_fetch_window,
     _build_execution_audit,
     _build_reasoning_hash,
+    _can_use_lenient_stale_refresh_fallback,
     _cap_analysis_candidates,
     _cap_effective_confidence_for_market,
     _calculate_bet,
@@ -38,6 +39,7 @@ from main import (
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
+    _resolve_dynamic_analysis_candidate_cap,
     _should_skip_for_balance,
     _ticker_resolution_date,
     _should_adjust_position,
@@ -414,6 +416,30 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(reason, "pre_analysis_fallback_edge_high_churn")
         self.assertTrue(metadata["pre_analysis_hard_reject_had_recent_fallback_edge"])
 
+    def test_pre_analysis_hard_rejection_blocks_repeated_churn_market(self) -> None:
+        market = Market(
+            id="KXWTI-26APR14-T96.99",
+            question="WTI settlement threshold",
+            category="commodities",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=1200.0,
+        )
+        state = MarketState(
+            market_id=market.id,
+            analysis_count=5,
+            non_actionable_streak=3,
+            last_terminal_outcome="manual_skip",
+        )
+        rejected, reason, metadata = _pre_analysis_hard_rejection(
+            market=market,
+            state=state,
+            settings=Settings(),
+            traded_before=False,
+        )
+        self.assertTrue(rejected)
+        self.assertEqual(reason, "pre_analysis_repeated_churn_market")
+        self.assertEqual(metadata["pre_analysis_hard_reject_analysis_count"], 5)
+
     def test_pre_analysis_hard_rejection_blocks_unprofitable_crypto_fallback_family(self) -> None:
         market = Market(
             id="KXBTCD-26APR1217-T70999.99",
@@ -504,6 +530,99 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertLess(penalized_score, clean_score)
         self.assertGreater(breakdown["pre_score_fallback_family_penalty"], 0.0)
+
+    def test_pre_analysis_opportunity_score_scales_fallback_penalty_for_profitable_family(self) -> None:
+        market = Market(
+            id="KXBTCD-26APR0917-T70499.99",
+            question="Bitcoin threshold",
+            category="crypto",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings()
+        _, baseline_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            fallback_family_edge_rate=0.92,
+            fallback_family_sample_size=120,
+            historical_family_stats={"sample_size": 40, "win_rate": 0.45, "pnl_total": -5.0},
+        )
+        _, profitable_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            fallback_family_edge_rate=0.92,
+            fallback_family_sample_size=120,
+            historical_family_stats={"sample_size": 40, "win_rate": 0.60, "pnl_total": 12.0},
+        )
+        self.assertGreater(baseline_breakdown["pre_score_fallback_family_penalty"], 0.0)
+        self.assertEqual(profitable_breakdown["pre_score_fallback_family_penalty_scale"], 0.5)
+        self.assertAlmostEqual(
+            profitable_breakdown["pre_score_fallback_family_penalty"],
+            baseline_breakdown["pre_score_fallback_family_penalty"] * 0.5,
+            places=6,
+        )
+
+    def test_pre_analysis_opportunity_score_adds_post_event_bonus(self) -> None:
+        settings = Settings()
+        market_past = Market(
+            id="KXMLBGAME-PAST",
+            question="Post-event market",
+            category="sports",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.52), MarketOutcome(name="NO", price=0.48)],
+            close_time=datetime.now(timezone.utc) - timedelta(hours=3),
+            resolution_criteria="Official box score",
+        )
+        market_future = market_past.model_copy(
+            update={"id": "KXMLBGAME-FUTURE", "close_time": datetime.now(timezone.utc) + timedelta(hours=3)}
+        )
+        past_score, past_breakdown = _pre_analysis_opportunity_score(
+            market_past,
+            None,
+            settings,
+            traded_before=False,
+        )
+        future_score, future_breakdown = _pre_analysis_opportunity_score(
+            market_future,
+            None,
+            settings,
+            traded_before=False,
+        )
+        self.assertEqual(past_breakdown["pre_score_post_event_bonus"], 0.10)
+        self.assertEqual(future_breakdown["pre_score_post_event_bonus"], 0.0)
+        self.assertGreater(past_score, future_score)
+
+    def test_resolve_dynamic_analysis_candidate_cap_reduces_when_best_score_low(self) -> None:
+        settings = Settings(
+            MAX_MARKETS_PER_CYCLE=6,
+            PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=0.50,
+            PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=3,
+        )
+        cap, applied = _resolve_dynamic_analysis_candidate_cap(
+            settings=settings,
+            best_pre_analysis_score=0.42,
+        )
+        self.assertEqual(cap, 3)
+        self.assertTrue(applied)
+
+    def test_resolve_dynamic_analysis_candidate_cap_keeps_default_when_score_high(self) -> None:
+        settings = Settings(
+            MAX_MARKETS_PER_CYCLE=6,
+            PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=0.50,
+            PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=3,
+        )
+        cap, applied = _resolve_dynamic_analysis_candidate_cap(
+            settings=settings,
+            best_pre_analysis_score=0.75,
+        )
+        self.assertEqual(cap, 6)
+        self.assertFalse(applied)
 
     def test_pre_analysis_opportunity_score_penalizes_weak_historical_family_performance(self) -> None:
         market = Market(
@@ -1600,6 +1719,47 @@ class TestMainUtils(unittest.TestCase):
                 pre_order_market_refresh=False,
                 market_data_age_seconds=121.0,
                 max_market_data_age_seconds=120,
+            )
+        )
+
+    def test_can_use_lenient_stale_refresh_fallback_requires_direct_high_score(self) -> None:
+        settings = Settings(
+            MAX_MARKET_DATA_AGE_SECONDS=120,
+            SCORE_GATE_THRESHOLD=0.38,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        self.assertTrue(
+            _can_use_lenient_stale_refresh_fallback(
+                evidence_basis_class="direct",
+                pre_execution_final_score=0.45,
+                market_data_age_seconds=180.0,
+                settings=settings,
+            )
+        )
+        self.assertFalse(
+            _can_use_lenient_stale_refresh_fallback(
+                evidence_basis_class="proxy",
+                pre_execution_final_score=0.45,
+                market_data_age_seconds=180.0,
+                settings=settings,
+            )
+        )
+        self.assertFalse(
+            _can_use_lenient_stale_refresh_fallback(
+                evidence_basis_class="direct",
+                pre_execution_final_score=0.30,
+                market_data_age_seconds=180.0,
+                settings=settings,
+            )
+        )
+        self.assertFalse(
+            _can_use_lenient_stale_refresh_fallback(
+                evidence_basis_class="direct",
+                pre_execution_final_score=0.45,
+                market_data_age_seconds=360.0,
+                settings=settings,
             )
         )
 

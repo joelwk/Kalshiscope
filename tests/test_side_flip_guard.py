@@ -103,3 +103,28 @@ def test_flip_guard_allows_high_evidence_override() -> None:
     assert blocked is False
     assert guarded.should_trade is True
     assert guarded.outcome == "NO"
+
+
+def test_flip_guard_uses_raw_confidence_for_direct_high_likelihood_flips() -> None:
+    settings = Settings()
+    market = _market()
+    decision = _decision("NO", 0.60, evidence_quality=0.92).model_copy(
+        update={
+            "raw_confidence": 0.88,
+            "evidence_basis": "direct",
+            "likelihood_ratio": 10.0,
+        }
+    )
+    anchor = {"outcome": "YES", "confidence": 0.70}
+
+    guarded, triggered, blocked = _apply_flip_guard(
+        market,
+        decision,
+        anchor,
+        settings,
+    )
+
+    assert triggered is True
+    assert blocked is False
+    assert guarded.should_trade is True
+    assert guarded.outcome == "NO"

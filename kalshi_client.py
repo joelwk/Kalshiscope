@@ -4,6 +4,7 @@ import base64
 import hashlib
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,14 @@ _TICKER_CITY_MAP = {
     "SEA": "Seattle",
     "SFO": "San Francisco",
 }
+
+
+@dataclass(frozen=True)
+class PortfolioBalance:
+    available_balance: float
+    position_value: float
+    total_portfolio_value: float
+    raw_payload: dict[str, Any]
 
 
 class KalshiClient:
@@ -294,24 +303,108 @@ class KalshiClient:
 
     def get_balance(self) -> float:
         """Return available balance in dollars."""
+        return self.get_portfolio_balance().available_balance
+
+    def get_portfolio_balance(self) -> PortfolioBalance:
+        """Return normalized cash/position/total portfolio balances in dollars."""
         response = self._request("GET", "/portfolio/balance")
         payload = response.json()
         if not isinstance(payload, dict):
-            return 0.0
-        value_cents = (
-            payload.get("available_balance")
-            or payload.get("available")
-            or payload.get("balance")
-            or payload.get("portfolio_balance")
-            or 0
+            return PortfolioBalance(
+                available_balance=0.0,
+                position_value=0.0,
+                total_portfolio_value=0.0,
+                raw_payload={},
+            )
+        available_balance = _coerce_money_to_dollars(
+            _first_present_value(
+                payload,
+                ("available_balance", "available", "cash_balance", "balance"),
+            )
         )
-        return _coerce_money_to_dollars(value_cents)
+        position_value = _coerce_money_to_dollars(
+            _first_present_value(
+                payload,
+                (
+                    "position_value",
+                    "positions_value",
+                    "payout",
+                    "portfolio_pnl",
+                    "unrealized_pnl",
+                    "market_exposure",
+                    "positions_market_value",
+                ),
+            )
+        )
+        total_portfolio_value = _coerce_money_to_dollars(
+            _first_present_value(
+                payload,
+                (
+                    "total_portfolio_value",
+                    "portfolio_value",
+                    "account_value",
+                    "equity",
+                    "portfolio_balance",
+                ),
+            )
+        )
+        logger.debug(
+            "Portfolio balance parsed: available=%.2f position=%.2f total=%.2f",
+            available_balance,
+            position_value,
+            total_portfolio_value,
+            data={"raw_payload": payload, "parsed_available": available_balance, "parsed_position": position_value, "parsed_total": total_portfolio_value},
+        )
+        if total_portfolio_value <= 0.0:
+            total_portfolio_value = max(0.0, available_balance + position_value)
+        if position_value <= 0.0:
+            position_value = max(0.0, total_portfolio_value - available_balance)
+        return PortfolioBalance(
+            available_balance=available_balance,
+            position_value=position_value,
+            total_portfolio_value=total_portfolio_value,
+            raw_payload=payload,
+        )
 
     def get_positions(self) -> dict[str, Any]:
         response = self._request("GET", "/portfolio/positions")
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Positions response is not a JSON object")
+        return payload
+
+    def get_settlements(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if limit is not None and limit > 0:
+            params["limit"] = int(limit)
+        if cursor:
+            params["cursor"] = cursor
+        response = self._request("GET", "/portfolio/settlements", params=params or None)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Settlements response is not a JSON object")
+        return payload
+
+    def get_fills(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if limit is not None and limit > 0:
+            params["limit"] = int(limit)
+        if cursor:
+            params["cursor"] = cursor
+        response = self._request("GET", "/portfolio/fills", params=params or None)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Fills response is not a JSON object")
         return payload
 
     def create_order(self, order: OrderRequest, market: Market | None = None) -> OrderResponse:
@@ -672,6 +765,17 @@ def _coerce_money_to_dollars(value: Any) -> float:
     if numeric >= _ONE_HUNDRED:
         return numeric / _ONE_HUNDRED
     return numeric
+
+
+def _first_present_value(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is None:
+            continue
+        return value
+    return 0
 
 
 def _coerce_float(value: Any) -> float | None:
