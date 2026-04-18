@@ -10,6 +10,7 @@ from typing import Any
 from config import SearchConfig, Settings
 from logging_config import get_logger
 from models import Market, TradeDecision
+from prompts.loader import load_lines, load_prompt, render
 from research_profiles import is_commodity_market
 from xai_provider import XAIProvider
 
@@ -78,63 +79,9 @@ _ANALYSIS_MAX_ATTEMPTS = 3
 _ANALYSIS_RETRY_WAIT_SECONDS = 2
 _DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 180
 _SLOW_FAILURE_THRESHOLD_MS = 15_000
-_SYSTEM_PROMPT_SHARED = (
-    "Output must strictly match the response schema.\n"
-    "Respond with a single valid JSON object only; use double-quoted keys and no trailing commas.\n"
-    "The `outcome` field must exactly match one of the provided market outcomes.\n"
-    "Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.\n"
-    "For narrow-bin markets (temperature bins, price bins), confidence should reflect certainty in your analysis "
-    "direction, not just raw bin hit probability.\n"
-    "When evidence is sparse, conflicting, or proxy-based, lower confidence and explicitly explain uncertainty.\n"
-    "When search results are empty or irrelevant, avoid strong claims and explain the evidence gap.\n"
-    "Absence of evidence is not evidence of absence; treat sparse evidence as lower conviction.\n"
-)
-_SYSTEM_PROMPT_ANALYZE = (
-    "You are an autonomous prediction market analyst focused on finding tradable edge, not picking winners.\n"
-    "Use web search and X search to gather recent, source-backed evidence.\n\n"
-    + _SYSTEM_PROMPT_SHARED
-    + "Calibrate confidence: 0.50 means no information advantage over market pricing. "
-    + "Use confidence >0.70 only with specific, source-backed evidence that is directly relevant.\n"
-    + "For speech/mention markets (e.g. 'will person X say Y'), default to should_trade=false unless "
-    + "you have direct evidence from transcripts, official statements, or primary-source reporting.\n"
-    + "Treat rumor, commentary, and speculative social chatter as weak evidence.\n"
-    + "A tradable edge requires at least a 5 percentage point gap between your probability and market implied probability, "
-    + "plus evidence the market may not have fully priced in.\n"
-    + "Proxy evidence can support a trade when combined with directional conviction and reasonable edge.\n"
-    + "Always classify evidence basis as direct, proxy, or absence-only in your reasoning.\n"
-    + "For repeated/noisy bin markets without direct source confirmation, default to no-action.\n"
-    + "If you cannot find external odds, bookmaker lines, or settlement-aligned primary data, reduce evidence_quality "
-    + "but still consider trading if your directional analysis has strong backing from recent data.\n"
-    + "Historical calibration rule: confidence values above 0.90 have materially underperformed; keep confidence <= 0.85.\n"
-    + "For entry prices below 0.20 implied probability, require extraordinary direct evidence tied to settlement criteria.\n"
-    + "For weather markets, require direct NWS/NOAA observation evidence before recommending should_trade=true.\n"
-    + "Set evidence_basis to one of: direct, proxy, or absence_only.\n"
-    + "Do not claim tradable edge from proxy-only evidence when direct settlement-aligned evidence is unavailable.\n"
-    + "For crypto threshold markets, include current spot price, threshold, and buffer_to_threshold_pct in reasoning. "
-    + "When the buffer is large relative to typical volatility, this is a strong trading signal.\n"
-    + "Set should_trade=true when you have directional conviction backed by evidence.\n"
-    + "Set should_trade=true when you have a reasonable information advantage: "
-    + "(1) your probability differs from market implied probability by at least 5pp, "
-    + "(2) you found specific, recent, source-backed evidence, "
-    + "(3) evidence_quality >= 0.50.\n"
-    + "For decisive entries, prefer should_trade=true only when edge >= 7pp, evidence_quality >= 0.65, "
-    + "and confidence >= 0.60 unless direct settlement evidence strongly justifies a tighter edge.\n"
-    + "If analysis does not produce a clear directional advantage, set should_trade=false and keep "
-    + "no-trade reasoning concise (under 100 words).\n"
-    + "When evidence_basis is direct, lower thresholds are acceptable -- a 5pp edge with direct evidence is tradable.\n"
-    + "If your only evidence is absence of information with no directional signal, "
-    + "set should_trade=false.\n"
-    + "Provide concise reasoning that includes implied probability, your probability, and edge.\n"
-    + "Include likelihood_ratio as a positive decimal equal to "
-    + "P(evidence|predicted_outcome)/P(evidence|alternative_outcome). "
-    + "Use likelihood_ratio=1.0 when evidence is neutral."
-)
-_SYSTEM_PROMPT_DEEP = (
-    "You are performing deeper value validation on a prior market analysis.\n"
-    "Do not flip outcomes unless evidence and edge are materially stronger than the prior analysis.\n"
-    + _SYSTEM_PROMPT_SHARED
-    + "If you change outcome, explain the stronger evidence and materially better edge."
-)
+_SYSTEM_PROMPT_SHARED = load_prompt("system/shared_output_rules")
+_SYSTEM_PROMPT_ANALYZE = load_prompt("system/analyze_market")
+_SYSTEM_PROMPT_DEEP = load_prompt("system/analyze_market_deep")
 
 
 def _default_search_config(settings: Settings | None = None) -> SearchConfig:
@@ -250,11 +197,8 @@ def _format_previous_analysis(previous: TradeDecision | None) -> str:
     reasoning = reasoning.replace("\n", " ").strip()
     if len(reasoning) > 400:
         reasoning = reasoning[:400] + "..."
-    return (
-        "should_trade={should_trade}, outcome={outcome}, confidence={confidence:.2f}, "
-        "bet_size_pct={bet_size_pct:.2f}, edge_external={edge_external}, evidence_quality={evidence_quality:.2f}, "
-        "reasoning='{reasoning}'"
-    ).format(
+    return render(
+        "user/fragments/previous_analysis_summary",
         should_trade=previous.should_trade,
         outcome=previous.outcome,
         confidence=previous.confidence,
@@ -281,76 +225,25 @@ def _format_market_outcome_prices(market: Market) -> str:
 
 def _category_research_hint(profile_name: str, market: Market | None = None) -> str:
     if profile_name == "sports":
-        return (
-            "Sports guidance: prioritize current injury reports, lineup/rotation news, schedule fatigue, "
-            "home-away splits, and credible odds consensus."
-        )
+        return load_prompt("user/category_hints/sports")
     if profile_name == "politics":
-        return (
-            "Politics guidance: prioritize reputable polling, official filings/statements, and base-rate priors; "
-            "discount unverified viral claims."
-        )
+        return load_prompt("user/category_hints/politics")
     if profile_name == "crypto":
-        return (
-            "Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, and "
-            "time-sensitive catalysts over rumor accounts."
-        )
+        return load_prompt("user/category_hints/crypto")
     if profile_name == "weather":
-        return (
-            "Weather guidance: prioritize official weather sources (weather.gov/NWS), hourly forecast tables, "
-            "and observed station reports (METAR/ASOS). Distinguish observed data vs forecast data, and use "
-            "location and threshold hints from ticker context to anchor the query. Calibrate confidence by lead "
-            "time (highest inside ~72 hours), check model consensus/divergence (e.g., GFS vs ECMWF), and lower "
-            "confidence when guidance diverges or ensemble spread is high. Include climatological base rates for "
-            "the location/time of year and explicitly account for higher uncertainty in precipitation or severe events. "
-            "When observed station data confirms the threshold is already exceeded (or physically unreachable), "
-            "treat this as high-certainty evidence and set evidence_quality >= 0.85."
-        )
+        return load_prompt("user/category_hints/weather")
     if profile_name == "speech":
         is_mention_market = bool(
             market is not None and re.search(r"MENTION", market.id or "", re.IGNORECASE)
         )
         if is_mention_market:
-            return (
-                "Word-mention guidance: this market asks whether a specific person will use a specific "
-                "word or phrase in a public statement or event. Identify today's scheduled events for "
-                "this speaker (press conferences, testimony, interviews, briefings) using official "
-                "schedules and reputable reporting. Search recent public statements by this person on the "
-                "topic to estimate vocabulary base rates and assess whether the event format and agenda "
-                "make the topic likely to arise. Use X search for live event coverage, but require "
-                "transcript-level or direct-quote evidence before setting confidence > 0.70. If no event "
-                "is scheduled or concluded today, default should_trade=false. If evidence is indirect or "
-                "speculative, keep evidence_quality <= 0.45 and confidence <= 0.60. "
-                "Absence-only evidence (no transcript/no mentions) must be treated as non-tradeable."
-            )
-        return (
-            "Speech/event guidance: this market asks whether a specific person will say a specific word "
-            "during an event. First confirm event status (scheduled/live/concluded) using official schedules "
-            "and livestream links. For concluded events, prioritize transcripts, detailed live-blog coverage, "
-            "or clip-level evidence. For upcoming events, model probability from speaker vocabulary history, "
-            "event agenda, and setting-specific language norms. Use X search for real-time reporter/attendee "
-            "coverage, and prefer primary sources over commentary. If transcript-quality evidence exists, score "
-            "evidence_quality >= 0.80; if only sparse proxy evidence exists, keep evidence_quality <= 0.45 "
-            "and default should_trade=false."
-        )
+            return load_prompt("user/category_hints/speech_mention")
+        return load_prompt("user/category_hints/speech_general")
     if profile_name == "music":
-        return (
-            "Music/streaming guidance: this market resolves on chart or tracking data such as weekly "
-            "streams, album sales, or aggregate activity. Prioritize Spotify charts, Billboard, Luminate, "
-            "and Hits Daily Double style sources. Find the latest published chart position and weekly totals, "
-            "then compare against the market threshold and recent trend (last 2-4 weeks). Require primary "
-            "source chart figures before setting evidence_quality >= 0.65. If no chart-quality data is "
-            "available, keep evidence_quality <= 0.40 and default should_trade=false. "
-            "Do not treat missing chart data as a positive edge."
-        )
+        return load_prompt("user/category_hints/music")
     if market is not None and is_commodity_market(market):
-        return (
-            "Commodities guidance: prioritize exchange settlement/last prices, front-month contract data, "
-            "and time-specific catalysts over opinion commentary."
-        )
-    return (
-        "Generic guidance: prefer primary sources and high-credibility reporting; penalize stale or weakly corroborated claims."
-    )
+        return load_prompt("user/category_hints/commodities")
+    return load_prompt("user/category_hints/generic")
 
 
 class GrokClient:
@@ -1070,43 +963,32 @@ class GrokClient:
         deep: bool,
     ) -> str:
         outcome_prices = _format_market_outcome_prices(market)
-        constraints = [f"{_category_research_hint(active_config.profile_name, market)}"]
-        constraints.extend(
-            [
-                "Classify your evidence basis as direct, proxy, or absence-only in reasoning.",
-                "Direct evidence means transcript-level, settlement-aligned, or official primary sources.",
-                "If evidence is proxy or absence-only, default should_trade=false unless edge and source quality are both exceptional.",
-                "Do not use absence of mentions alone as a high-confidence trading signal.",
-                "If external odds are unavailable, keep evidence_quality < 0.50 and default should_trade=false.",
-                "For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.",
-            ]
-        )
+        constraints = [_category_research_hint(active_config.profile_name, market)]
+        constraints.extend(load_lines("user/fragments/constraints_base"))
         if deep:
-            constraints.extend(
-                [
-                    "Re-check implied probability and edge from multiple sources.",
-                    "If edge < 5%, return should_trade=false and bet_size_pct=0.0.",
-                    "If your confidence would exceed 0.72 without direct evidence, lower confidence and avoid trade.",
-                ]
-            )
+            constraints.extend(load_lines("user/fragments/constraints_deep"))
         else:
-            constraints.insert(0, f"bet_range=${self.min_bet_usdc:.2f}-${self.max_bet_usdc:.2f}")
-        return (
-            "<market_data>\n"
-            f"ticker={market.id}\n"
-            f"question={market.question}\n"
-            f"subtitle={market.subtitle or 'N/A'}\n"
-            f"resolution_criteria={market.resolution_criteria or 'N/A'}\n"
-            f"outcomes={', '.join([o.name for o in market.outcomes])}\n"
-            f"market_outcome_prices={outcome_prices}\n"
-            f"liquidity_usdc={market.liquidity_usdc}\n"
-            f"research_profile={active_config.profile_name}\n"
-            f"lookback_hours={active_config.lookback_hours}\n"
-            f"previous_analysis={previous_summary}\n"
-            "</market_data>\n"
-            "<constraints>\n"
-            + "\n".join(constraints)
-            + "\n</constraints>\n"
+            constraints.insert(
+                0,
+                render(
+                    "user/fragments/bet_range",
+                    min_bet_usdc=self.min_bet_usdc,
+                    max_bet_usdc=self.max_bet_usdc,
+                ),
+            )
+        return render(
+            "user/market_analysis_request",
+            ticker=market.id,
+            question=market.question,
+            subtitle=market.subtitle or "N/A",
+            resolution_criteria=market.resolution_criteria or "N/A",
+            outcomes=", ".join([o.name for o in market.outcomes]),
+            market_outcome_prices=outcome_prices,
+            liquidity_usdc=market.liquidity_usdc,
+            research_profile=active_config.profile_name,
+            lookback_hours=active_config.lookback_hours,
+            previous_analysis=previous_summary,
+            constraints="\n".join(constraints),
         )
 
     def _parse_response_payload(self, market_id: str, content: str, deep: bool) -> dict[str, Any]:

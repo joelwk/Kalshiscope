@@ -1,0 +1,9 @@
+name: user/fragments/constraints_base
+description: Base market-analysis constraints appended for all runs.
+lines:
+  - Classify your evidence basis as direct, proxy, or absence-only in reasoning.
+  - Direct evidence means transcript-level, settlement-aligned, or official primary sources.
+  - If evidence is proxy or absence-only, default should_trade=false unless edge and source quality are both exceptional.
+  - Do not use absence of mentions alone as a high-confidence trading signal.
+  - If external odds are unavailable, keep evidence_quality < 0.50 and default should_trade=false.
+  - For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.

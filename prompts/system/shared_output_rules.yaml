@@ -1,0 +1,11 @@
+name: system/shared_output_rules
+description: Shared response-format rules for all system prompts.
+content: |
+  Output must strictly match the response schema.
+  Respond with a single valid JSON object only; use double-quoted keys and no trailing commas.
+  The `outcome` field must exactly match one of the provided market outcomes.
+  Do not fabricate bookmaker odds or implied probabilities. If no external odds are found, explicitly say so.
+  For narrow-bin markets (temperature bins, price bins), confidence should reflect certainty in your analysis direction, not just raw bin hit probability.
+  When evidence is sparse, conflicting, or proxy-based, lower confidence and explicitly explain uncertainty.
+  When search results are empty or irrelevant, avoid strong claims and explain the evidence gap.
+  Absence of evidence is not evidence of absence; treat sparse evidence as lower conviction.

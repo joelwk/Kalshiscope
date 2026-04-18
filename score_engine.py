@@ -342,6 +342,7 @@ def calibrate_confidence(
     *,
     shrinkage_floor: float = _CONFIDENCE_SHRINKAGE_FLOOR,
     shrinkage_factor: float = _CONFIDENCE_SHRINKAGE_FACTOR,
+    family_shrinkage_override: float | None = None,
     evidence_basis_class: str = "",
     definitive_outcome: bool = False,
 ) -> float:
@@ -355,6 +356,11 @@ def calibrate_confidence(
     if definitive_outcome:
         bounded_floor = max(bounded_floor, 0.60)
         bounded_factor = min(1.0, bounded_factor * 2.5)
+    if family_shrinkage_override is not None:
+        bounded_factor = min(
+            bounded_factor,
+            max(0.0, min(1.0, float(family_shrinkage_override))),
+        )
     if bounded_confidence <= bounded_floor:
         return bounded_confidence
     calibrated = bounded_floor + ((bounded_confidence - bounded_floor) * bounded_factor)

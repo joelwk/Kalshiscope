@@ -1,0 +1,4 @@
+name: user/category_hints/speech_mention
+description: Mention-market speech guidance.
+content: >-
+  Word-mention guidance: this market asks whether a specific person will use a specific word or phrase in a public statement or event. Identify today's scheduled events for this speaker (press conferences, testimony, interviews, briefings) using official schedules and reputable reporting. Search recent public statements by this person on the topic to estimate vocabulary base rates and assess whether the event format and agenda make the topic likely to arise. Use X search for live event coverage, but require transcript-level or direct-quote evidence before setting confidence > 0.70. If no event is scheduled or concluded today, default should_trade=false. If evidence is indirect or speculative, keep evidence_quality <= 0.45 and confidence <= 0.60. Absence-only evidence (no transcript/no mentions) must be treated as non-tradeable.

@@ -48,6 +48,9 @@ class Settings:
     MAX_WEATHER_CONFIDENCE: float = 0.70
     MAX_INDEX_CONFIDENCE: float = 0.70
     MAX_COMMODITY_CONFIDENCE: float = 0.78
+    MAX_LIVESTOCK_CONFIDENCE: float = 0.65
+    MAX_HEATING_OIL_CONFIDENCE: float = 0.70
+    MAX_CORN_CONFIDENCE: float = 0.70
     MAX_CRYPTO_CONFIDENCE: float = 0.80
     MAX_SPEECH_CONFIDENCE: float = 0.65
 
@@ -631,6 +634,15 @@ def load_settings() -> Settings:
         ),
         MAX_COMMODITY_CONFIDENCE=_read_env_float(
             "MAX_COMMODITY_CONFIDENCE", Settings.MAX_COMMODITY_CONFIDENCE
+        ),
+        MAX_LIVESTOCK_CONFIDENCE=_read_env_float(
+            "MAX_LIVESTOCK_CONFIDENCE", Settings.MAX_LIVESTOCK_CONFIDENCE
+        ),
+        MAX_HEATING_OIL_CONFIDENCE=_read_env_float(
+            "MAX_HEATING_OIL_CONFIDENCE", Settings.MAX_HEATING_OIL_CONFIDENCE
+        ),
+        MAX_CORN_CONFIDENCE=_read_env_float(
+            "MAX_CORN_CONFIDENCE", Settings.MAX_CORN_CONFIDENCE
         ),
         MAX_CRYPTO_CONFIDENCE=_read_env_float(
             "MAX_CRYPTO_CONFIDENCE", Settings.MAX_CRYPTO_CONFIDENCE

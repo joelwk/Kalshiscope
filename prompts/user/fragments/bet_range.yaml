@@ -1,0 +1,3 @@
+name: user/fragments/bet_range
+description: Constraint line for the configured bet range.
+content: bet_range=${min_bet_usdc:.2f}-${max_bet_usdc:.2f}

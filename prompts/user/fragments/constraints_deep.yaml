@@ -1,0 +1,6 @@
+name: user/fragments/constraints_deep
+description: Additional constraints used in deep refinement mode.
+lines:
+  - Re-check implied probability and edge from multiple sources.
+  - If edge < 5%, return should_trade=false and bet_size_pct=0.0.
+  - If your confidence would exceed 0.72 without direct evidence, lower confidence and avoid trade.

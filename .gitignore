@@ -10,3 +10,4 @@ data/market_state.json
 *.txt
 *.pem
 kalshi-scope.txt
+.cursor/

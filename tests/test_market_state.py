@@ -367,6 +367,32 @@ def test_get_known_order_ids_returns_logged_orders(tmp_path) -> None:
         manager.close()
 
 
+def test_get_confidence_tier_outcomes_returns_bucketed_stats(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager._conn.execute(
+            """
+            INSERT INTO trade_outcomes (
+                market_id, predicted_outcome, confidence, won, pnl_estimate, resolution_state
+            )
+            VALUES
+                ('m-tier-1', 'YES', 0.91, 1, 3.2, 'resolved_exchange'),
+                ('m-tier-2', 'YES', 0.83, 0, -1.7, 'resolved_exchange'),
+                ('m-tier-3', 'NO', 0.74, 1, 2.1, 'resolved_exchange'),
+                ('m-tier-4', 'NO', 0.62, 0, -0.9, 'resolved_exchange')
+            """
+        )
+        manager._conn.commit()
+
+        tiers = manager.get_confidence_tier_outcomes()
+        tier_names = [row["tier"] for row in tiers]
+        assert tier_names == ["0.90+", "0.80-0.89", "0.70-0.79", "0.60-0.69"]
+        assert tiers[0]["wins"] == 1
+        assert tiers[1]["losses"] == 1
+    finally:
+        manager.close()
+
+
 def test_reasoning_hash_ignores_validated_prefix_variation(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:
