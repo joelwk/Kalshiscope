@@ -1,4 +1,6 @@
 import unittest
+import inspect
+import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -22,8 +24,10 @@ from main import (
     _daily_balance_delta_usdc,
     _daily_drawdown_cap_reached,
     _daily_trade_cap_reached,
+    _dry_streak_sleep_seconds,
     _edge_threshold_for_market,
     _event_concentration_blocked,
+    _event_side_conflict_blocked,
     _event_ticker_prefix,
     _effective_position_override_threshold,
     _extract_order_cancel_reason,
@@ -40,6 +44,7 @@ from main import (
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
     _resolve_dynamic_analysis_candidate_cap,
+    _score_breakdown_from_execution_audit,
     _should_skip_for_balance,
     _ticker_resolution_date,
     _should_adjust_position,
@@ -178,6 +183,24 @@ class TestMainUtils(unittest.TestCase):
             )
         )
 
+    def test_event_side_conflict_blocks_opposite_outcome(self) -> None:
+        blocked, outcomes = _event_side_conflict_blocked(
+            proposed_outcome="YES",
+            open_event_outcomes={"no"},
+            cycle_event_outcomes=set(),
+        )
+        self.assertTrue(blocked)
+        self.assertEqual(outcomes, ["no"])
+
+    def test_event_side_conflict_allows_same_outcome(self) -> None:
+        blocked, outcomes = _event_side_conflict_blocked(
+            proposed_outcome="NO",
+            open_event_outcomes={"no"},
+            cycle_event_outcomes={"no"},
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(outcomes, ["no"])
+
     def test_daily_trade_and_drawdown_caps(self) -> None:
         self.assertTrue(
             _daily_trade_cap_reached(daily_trade_count=15, max_trades_per_day=15)
@@ -252,6 +275,7 @@ class TestMainUtils(unittest.TestCase):
             final_reason="score_gate_blocked",
         )
         self.assertEqual(payload.get("rejection_stage"), "score_gate")
+        self.assertEqual(payload.get("rejection_reason"), "score_gate_blocked")
 
     def test_build_execution_audit_keeps_explicit_score_breakdown(self) -> None:
         payload = _build_execution_audit(
@@ -266,6 +290,20 @@ class TestMainUtils(unittest.TestCase):
             {"final_score": 0.28, "score_threshold": 0.38},
         )
         self.assertEqual(payload.get("score_final"), 0.28)
+
+    def test_score_breakdown_from_execution_audit_infers_score_fields(self) -> None:
+        score_breakdown = _score_breakdown_from_execution_audit(
+            execution_audit={
+                "score_final": 0.42,
+                "score_edge_market": 0.11,
+                "final_reason": "score_gate_blocked",
+            },
+            explicit_score_breakdown=None,
+        )
+        self.assertIsNotNone(score_breakdown)
+        assert score_breakdown is not None
+        self.assertEqual(score_breakdown["score_final"], 0.42)
+        self.assertEqual(score_breakdown["score_edge_market"], 0.11)
 
     def test_parse_exchange_position_row_extracts_signed_position(self) -> None:
         parsed = _parse_exchange_position_row(
@@ -683,7 +721,16 @@ class TestMainUtils(unittest.TestCase):
                 "pnl_total": -21.0,
             },
         )
-        self.assertEqual(breakdown["pre_score_historical_family_pnl_penalty"], 0.15)
+        self.assertAlmostEqual(
+            breakdown["pre_score_historical_family_pnl_penalty"],
+            0.21,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            breakdown["pre_score_historical_family_pnl_ratio"],
+            2.1,
+            places=6,
+        )
 
     def test_is_coinflip_signal_detects_low_information_decision(self) -> None:
         weak_decision = TradeDecision(
@@ -1544,6 +1591,54 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(_max_confidence_for_market(market, settings), 0.67)
 
+    def test_max_confidence_for_heating_oil_market_uses_subcategory_cap(self) -> None:
+        settings = Settings(
+            MAX_GLOBAL_CONFIDENCE=0.90,
+            MAX_COMMODITY_CONFIDENCE=0.80,
+            MAX_HEATING_OIL_CONFIDENCE=0.70,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXHOILW-26APR1717-T3.649",
+            question="Heating oil threshold",
+            category="commodities",
+        )
+        self.assertEqual(_max_confidence_for_market(market, settings), 0.70)
+
+    def test_max_confidence_for_livestock_market_uses_subcategory_cap(self) -> None:
+        settings = Settings(
+            MAX_GLOBAL_CONFIDENCE=0.90,
+            MAX_COMMODITY_CONFIDENCE=0.80,
+            MAX_LIVESTOCK_CONFIDENCE=0.65,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXLCATTLEW-26APR1717-T249.99",
+            question="Live cattle threshold",
+            category="commodities",
+        )
+        self.assertEqual(_max_confidence_for_market(market, settings), 0.65)
+
+    def test_max_confidence_for_corn_market_uses_subcategory_cap(self) -> None:
+        settings = Settings(
+            MAX_GLOBAL_CONFIDENCE=0.90,
+            MAX_COMMODITY_CONFIDENCE=0.80,
+            MAX_CORN_CONFIDENCE=0.70,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXCORNW-26APR1717-T448.99",
+            question="Corn threshold",
+            category="commodities",
+        )
+        self.assertEqual(_max_confidence_for_market(market, settings), 0.70)
+
     def test_max_confidence_for_generic_market_uses_global_cap(self) -> None:
         settings = Settings(
             MAX_GLOBAL_CONFIDENCE=0.83,
@@ -1594,11 +1689,35 @@ class TestMainUtils(unittest.TestCase):
         calibrated = result["decision"]
         self.assertTrue(result["confidence_calibration_applied"])
         self.assertAlmostEqual(result["confidence_before_calibration"], 0.90)
-        self.assertAlmostEqual(result["confidence_after_calibration"], 0.66)
-        self.assertAlmostEqual(result["raw_vs_calibrated_delta"], 0.24)
-        self.assertAlmostEqual(calibrated.confidence, 0.66)
+        self.assertAlmostEqual(result["confidence_after_calibration"], 0.62)
+        self.assertAlmostEqual(result["raw_vs_calibrated_delta"], 0.28)
+        self.assertAlmostEqual(calibrated.confidence, 0.62)
         self.assertLess(calibrated.bet_size_pct, decision.bet_size_pct)
         self.assertIn("Confidence calibrated", calibrated.reasoning)
+
+    def test_dry_streak_sleep_seconds_applies_after_three_zero_order_cycles(self) -> None:
+        self.assertIsNone(
+            _dry_streak_sleep_seconds(
+                base_poll_interval_sec=300,
+                consecutive_zero_order_cycles=2,
+            )
+        )
+        self.assertEqual(
+            _dry_streak_sleep_seconds(
+                base_poll_interval_sec=300,
+                consecutive_zero_order_cycles=3,
+            ),
+            600,
+        )
+
+    def test_entry_price_too_low_skip_uses_decision_payload(self) -> None:
+        import main as main_module
+
+        source = inspect.getsource(main_module)
+        pattern = re.compile(
+            r"entry_price_too_low[\s\S]{0,260}decision=decision\.model_dump\(\)",
+        )
+        self.assertRegex(source, pattern)
 
     def test_kelly_fraction_weather_multiplier_applies(self) -> None:
         now = datetime.now(timezone.utc)

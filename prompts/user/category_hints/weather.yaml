@@ -1,0 +1,4 @@
+name: user/category_hints/weather
+description: Weather-specific research guidance.
+content: >-
+  Weather guidance: prioritize official weather sources (weather.gov/NWS), hourly forecast tables, and observed station reports (METAR/ASOS). Distinguish observed data vs forecast data, and use location and threshold hints from ticker context to anchor the query. Calibrate confidence by lead time (highest inside ~72 hours), check model consensus/divergence (e.g., GFS vs ECMWF), and lower confidence when guidance diverges or ensemble spread is high. Include climatological base rates for the location/time of year and explicitly account for higher uncertainty in precipitation or severe events. When observed station data confirms the threshold is already exceeded (or physically unreachable), treat this as high-certainty evidence and set evidence_quality >= 0.85.

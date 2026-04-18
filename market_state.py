@@ -979,6 +979,52 @@ class MarketStateManager:
             }
         return snapshot
 
+    def get_confidence_tier_outcomes(self) -> list[dict[str, float | int | str]]:
+        rows = self._conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN confidence >= 0.90 THEN '0.90+'
+                    WHEN confidence >= 0.80 THEN '0.80-0.89'
+                    WHEN confidence >= 0.70 THEN '0.70-0.79'
+                    WHEN confidence >= 0.60 THEN '0.60-0.69'
+                    ELSE '<0.60'
+                END AS tier,
+                COUNT(*) AS sample_size,
+                SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN won = 0 THEN 1 ELSE 0 END) AS losses,
+                ROUND(SUM(COALESCE(pnl_estimate, 0.0)), 4) AS pnl_total
+            FROM trade_outcomes
+            WHERE confidence IS NOT NULL
+              AND won IS NOT NULL
+            GROUP BY tier
+            ORDER BY
+                CASE tier
+                    WHEN '0.90+' THEN 1
+                    WHEN '0.80-0.89' THEN 2
+                    WHEN '0.70-0.79' THEN 3
+                    WHEN '0.60-0.69' THEN 4
+                    ELSE 5
+                END
+            """
+        ).fetchall()
+        snapshot: list[dict[str, float | int | str]] = []
+        for row in rows:
+            sample_size = int(row["sample_size"] or 0)
+            wins = int(row["wins"] or 0)
+            losses = int(row["losses"] or 0)
+            snapshot.append(
+                {
+                    "tier": str(row["tier"]),
+                    "sample_size": sample_size,
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": (wins / sample_size) if sample_size > 0 else 0.0,
+                    "pnl_total": float(row["pnl_total"] or 0.0),
+                }
+            )
+        return snapshot
+
     def get_exchange_realized_pnl_total(self) -> float:
         row = self._conn.execute(
             """

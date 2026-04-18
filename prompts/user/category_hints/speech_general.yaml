@@ -1,0 +1,4 @@
+name: user/category_hints/speech_general
+description: General speech/event guidance.
+content: >-
+  Speech/event guidance: this market asks whether a specific person will say a specific word during an event. First confirm event status (scheduled/live/concluded) using official schedules and livestream links. For concluded events, prioritize transcripts, detailed live-blog coverage, or clip-level evidence. For upcoming events, model probability from speaker vocabulary history, event agenda, and setting-specific language norms. Use X search for real-time reporter/attendee coverage, and prefer primary sources over commentary. If transcript-quality evidence exists, score evidence_quality >= 0.80; if only sparse proxy evidence exists, keep evidence_quality <= 0.45 and default should_trade=false.

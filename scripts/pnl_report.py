@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +20,16 @@ from market_state import MarketStateManager
 DEFAULT_DB_PATH = "data/market_state.db"
 DEFAULT_SETTLEMENT_PAGE_SIZE = 200
 DEFAULT_MAX_SYNC_PAGES = 0
+DEFAULT_ROLLING_DAYS = 14
 SUMMARY_SEPARATOR_WIDTH = 72
 CATEGORY_HEADER = (
     f"{'Category':<14} {'Trades':>7} {'Wins':>6} {'Losses':>7} "
     f"{'WinRate':>8} {'TotalPnL':>12} {'AvgPnL':>12}"
 )
 MONTHLY_HEADER = f"{'Month':<10} {'Trades':>7} {'PnL':>12} {'Cumulative':>12}"
+DAILY_HISTORY_HEADER = (
+    f"{'Date':<12} {'Trades':>7} {'W':>5} {'L':>5} {'WR':>7} {'PnL':>12}"
+)
 POSITIONS_HEADER = f"{'Ticker':<28} {'Side':<4} {'Contracts':>10} {'Exposure':>12}"
 
 
@@ -53,6 +58,19 @@ def _coerce_float(value: object) -> float | None:
         return None
 
 
+def _normalize_fractional_seconds(text: str) -> str:
+    """Pad or truncate fractional seconds to 6 digits (microseconds).
+
+    Python 3.10's fromisoformat only accepts 0, 3, or 6 fractional-second
+    digits; Kalshi timestamps often have 5.
+    """
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d+)(.*)", text)
+    if not match:
+        return text
+    base, frac, suffix = match.groups()
+    return f"{base}.{frac[:6].ljust(6, '0')}{suffix}"
+
+
 def _coerce_datetime(value: object) -> datetime | None:
     if value is None:
         return None
@@ -61,6 +79,7 @@ def _coerce_datetime(value: object) -> datetime | None:
         return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    text = _normalize_fractional_seconds(text)
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -368,12 +387,16 @@ def _read_settlement_report_rows(db_path: str) -> list[sqlite3.Row]:
                 s.won,
                 s.pnl_realized,
                 s.contracts,
-                s.settled_at,
+                COALESCE(
+                    json_extract(s.raw_json, '$.settled_time'),
+                    s.settled_at
+                ) AS settled_at,
                 COALESCE(m.question, '') AS question,
                 COALESCE(m.category, '') AS category
             FROM exchange_settlements s
             LEFT JOIN markets m ON m.id = s.market_id
-            ORDER BY s.settled_at ASC, s.settlement_id ASC
+            WHERE s.won IN (0, 1)
+            ORDER BY settled_at ASC, s.settlement_id ASC
             """
         ).fetchall()
     finally:
@@ -427,15 +450,30 @@ def _print_total_realized_pnl(rows: list[sqlite3.Row], state_manager: MarketStat
     total_trades = len(rows)
     wins = sum(1 for row in rows if row["won"] == 1)
     losses = sum(1 for row in rows if row["won"] == 0)
-    win_rate_denominator = wins + losses
-    win_rate = (wins / win_rate_denominator) if win_rate_denominator > 0 else 0.0
+    win_rate = (wins / total_trades) if total_trades > 0 else 0.0
     contracts_total = sum(int(row["contracts"] or 0) for row in rows)
+
+    pnl_values = [float(row["pnl_realized"] or 0.0) for row in rows]
+    avg_pnl = total_pnl / total_trades if total_trades > 0 else 0.0
+    best_trade = max(pnl_values) if pnl_values else 0.0
+    worst_trade = min(pnl_values) if pnl_values else 0.0
+    winning_pnl = sum(p for p in pnl_values if p > 0)
+    losing_pnl = sum(p for p in pnl_values if p < 0)
+    avg_win = (winning_pnl / wins) if wins > 0 else 0.0
+    avg_loss = (losing_pnl / losses) if losses > 0 else 0.0
+    profit_factor = (winning_pnl / abs(losing_pnl)) if losing_pnl != 0 else float("inf")
 
     print(f"Settled trades:       {total_trades}")
     print(f"Wins / losses:        {wins} / {losses}")
     print(f"Win rate:             {win_rate:.2%}")
     print(f"Total contracts:      {contracts_total}")
     print(f"Realized PnL:         ${_format_currency(total_pnl, signed=True)}")
+    print(f"Avg PnL / trade:      ${_format_currency(avg_pnl, signed=True)}")
+    print(f"Avg win:              ${_format_currency(avg_win, signed=True)}")
+    print(f"Avg loss:             ${_format_currency(avg_loss, signed=True)}")
+    print(f"Best trade:           ${_format_currency(best_trade, signed=True)}")
+    print(f"Worst trade:          ${_format_currency(worst_trade, signed=True)}")
+    print(f"Profit factor:        {profit_factor:.2f}")
 
 
 def _print_category_breakdown(rows: list[sqlite3.Row]) -> None:
@@ -508,6 +546,68 @@ def _print_monthly_breakdown(rows: list[sqlite3.Row]) -> None:
         print(f"{month:<10} {trades:>7} {pnl:>12,.2f} {cumulative:>12,.2f}")
 
 
+def _print_daily_run_history(rows: list[sqlite3.Row], *, rolling_days: int) -> None:
+    _print_section(f"Run History (Last {rolling_days} Days)")
+    if not rows:
+        print("No settlements to display.")
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=rolling_days)
+    daily: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if row["won"] not in (0, 1):
+            continue
+        settled_at = _coerce_datetime(row["settled_at"])
+        if settled_at is None or settled_at < cutoff:
+            continue
+        day_key = settled_at.strftime("%m/%d")
+        bucket = daily.setdefault(day_key, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        bucket["trades"] += 1
+        if row["won"] == 1:
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+        bucket["pnl"] += float(row["pnl_realized"] or 0.0)
+
+    if not daily:
+        print(f"No settlements in the last {rolling_days} days.")
+        return
+
+    print(DAILY_HISTORY_HEADER)
+    print("-" * len(DAILY_HISTORY_HEADER))
+
+    total_trades = 0
+    total_wins = 0
+    total_losses = 0
+    total_pnl = 0.0
+
+    for day_key in sorted(daily):
+        stats = daily[day_key]
+        trades = int(stats["trades"])
+        wins = int(stats["wins"])
+        losses = int(stats["losses"])
+        pnl = stats["pnl"]
+        decided = wins + losses
+        win_rate = (wins / decided) if decided > 0 else 0.0
+
+        total_trades += trades
+        total_wins += wins
+        total_losses += losses
+        total_pnl += pnl
+
+        pnl_str = f"{'-' if pnl < 0 else '+'}${abs(pnl):,.2f}"
+        print(f"{day_key:<12} {trades:>7} {wins:>5} {losses:>5} {win_rate:>6.0%} {pnl_str:>12}")
+
+    print("-" * len(DAILY_HISTORY_HEADER))
+    cumulative_decided = total_wins + total_losses
+    cumulative_wr = (total_wins / cumulative_decided) if cumulative_decided > 0 else 0.0
+    cum_pnl_str = f"{'-' if total_pnl < 0 else '+'}${abs(total_pnl):,.2f}"
+    print(
+        f"{'Cumulative':<12} {total_trades:>7} {total_wins:>5} {total_losses:>5} "
+        f"{cumulative_wr:>6.0%} {cum_pnl_str:>12}"
+    )
+
+
 def _print_open_positions(positions: list[PositionRow], *, live_api_available: bool) -> None:
     _print_section("Open Positions (Unrealized Exposure)")
     if not live_api_available:
@@ -569,6 +669,12 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_SYNC_PAGES,
         help="Cap synced settlement pages; 0 means no cap.",
+    )
+    parser.add_argument(
+        "--rolling-days",
+        type=int,
+        default=DEFAULT_ROLLING_DAYS,
+        help=f"Number of trailing days for the Run History Map (default: {DEFAULT_ROLLING_DAYS}).",
     )
     args = parser.parse_args()
 
@@ -636,6 +742,7 @@ def main() -> None:
             open_positions_count=len(open_positions) if live_api_available else None,
         )
         _print_total_realized_pnl(report_rows, state_manager)
+        _print_daily_run_history(report_rows, rolling_days=max(1, args.rolling_days))
         _print_category_breakdown(report_rows)
         _print_monthly_breakdown(report_rows)
         _print_open_positions(open_positions, live_api_available=live_api_available)

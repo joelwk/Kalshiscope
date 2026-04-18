@@ -1,0 +1,4 @@
+name: user/category_hints/music
+description: Music and streaming guidance.
+content: >-
+  Music/streaming guidance: this market resolves on chart or tracking data such as weekly streams, album sales, or aggregate activity. Prioritize Spotify charts, Billboard, Luminate, and Hits Daily Double style sources. Find the latest published chart position and weekly totals, then compare against the market threshold and recent trend (last 2-4 weeks). Require primary source chart figures before setting evidence_quality >= 0.65. If no chart-quality data is available, keep evidence_quality <= 0.40 and default should_trade=false. Do not treat missing chart data as a positive edge.

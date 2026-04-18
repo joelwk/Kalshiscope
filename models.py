@@ -4,6 +4,10 @@ from datetime import datetime
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from prompts.loader import load_schema
+
+
+_TRADE_DECISION_DESCRIPTIONS = load_schema("schema/trade_decision")
 
 
 class MarketOutcome(BaseModel):
@@ -49,124 +53,118 @@ class Market(BaseModel):
 
 class TradeDecision(BaseModel):
     should_trade: bool = Field(
-        description="Only true if YOUR probability exceeds implied odds probability by 5%+ (meaningful edge)"
+        description=_TRADE_DECISION_DESCRIPTIONS["should_trade"]
     )
     outcome: str = Field(
-        description="The outcome you predict will win"
+        description=_TRADE_DECISION_DESCRIPTIONS["outcome"]
     )
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description="Your probability estimate (0.0-1.0).",
+        description=_TRADE_DECISION_DESCRIPTIONS["confidence"],
     )
     bet_size_pct: float = Field(
         ge=0.0,
         le=1.0,
-        description="Fraction of max bet (0.0-1.0). Scale with edge size, not just confidence.",
+        description=_TRADE_DECISION_DESCRIPTIONS["bet_size_pct"],
     )
     reasoning: str = Field(
-        description=(
-            "MUST include: 1) Implied prob from odds, 2) Your prob estimate, "
-            "3) Calculated edge (your prob - implied prob), 4) Why edge exists"
-        ),
+        description=_TRADE_DECISION_DESCRIPTIONS["reasoning"],
     )
     implied_prob_external: float | None = Field(
         default=None,
         ge=0.0,
         le=1.0,
-        description="Optional externally sourced implied probability from books/polls/markets.",
+        description=_TRADE_DECISION_DESCRIPTIONS["implied_prob_external"],
     )
     my_prob: float | None = Field(
         default=None,
         ge=0.0,
         le=1.0,
-        description="Optional explicit analyst probability estimate.",
+        description=_TRADE_DECISION_DESCRIPTIONS["my_prob"],
     )
     edge_external: float | None = Field(
         default=None,
         ge=-1.0,
         le=1.0,
-        description="Optional explicit edge from external implied probability (my_prob - implied_prob_external).",
+        description=_TRADE_DECISION_DESCRIPTIONS["edge_external"],
     )
     edge_source: str | None = Field(
         default=None,
-        description="Source of edge calculation (computed, fallback, or none).",
+        description=_TRADE_DECISION_DESCRIPTIONS["edge_source"],
     )
     evidence_basis: str | None = Field(
         default=None,
-        description="Evidence basis class (direct, proxy, or absence_only).",
+        description=_TRADE_DECISION_DESCRIPTIONS["evidence_basis"],
     )
     likelihood_ratio: float | None = Field(
         default=None,
         gt=0.0,
-        description=(
-            "Optional likelihood ratio P(evidence|predicted_outcome) / "
-            "P(evidence|alternative_outcome)."
-        ),
+        description=_TRADE_DECISION_DESCRIPTIONS["likelihood_ratio"],
     )
     evidence_quality: float = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="Evidence quality score (0-1), set by validation layer.",
+        description=_TRADE_DECISION_DESCRIPTIONS["evidence_quality"],
     )
     abstain: bool = Field(
         default=False,
-        description="True when evidence quality is too weak to act on this cycle.",
+        description=_TRADE_DECISION_DESCRIPTIONS["abstain"],
     )
     raw_should_trade: bool | None = Field(
         default=None,
-        description="Raw model value before validation and enforcement.",
+        description=_TRADE_DECISION_DESCRIPTIONS["raw_should_trade"],
     )
     raw_outcome: str | None = Field(
         default=None,
-        description="Raw model outcome before canonical normalization.",
+        description=_TRADE_DECISION_DESCRIPTIONS["raw_outcome"],
     )
     raw_confidence: float | None = Field(
         default=None,
-        description="Raw model confidence before normalization and capping.",
+        description=_TRADE_DECISION_DESCRIPTIONS["raw_confidence"],
     )
     raw_bet_size_pct: float | None = Field(
         default=None,
-        description="Raw model bet size before validation and policy gates.",
+        description=_TRADE_DECISION_DESCRIPTIONS["raw_bet_size_pct"],
     )
     raw_reasoning: str | None = Field(
         default=None,
-        description="Raw model reasoning before validator annotations.",
+        description=_TRADE_DECISION_DESCRIPTIONS["raw_reasoning"],
     )
     raw_evidence_quality: float | None = Field(
         default=None,
         ge=0.0,
         le=1.0,
-        description="Raw model evidence quality before validation recalibration.",
+        description=_TRADE_DECISION_DESCRIPTIONS["raw_evidence_quality"],
     )
     definitive_outcome_detected: bool | None = Field(
         default=None,
-        description="True when definitive settlement-aligned evidence is detected.",
+        description=_TRADE_DECISION_DESCRIPTIONS["definitive_outcome_detected"],
     )
     evidence_quality_floor_applied: str | None = Field(
         default=None,
-        description="Name of the evidence-quality floor rule applied during validation.",
+        description=_TRADE_DECISION_DESCRIPTIONS["evidence_quality_floor_applied"],
     )
     prompt_tokens: int | None = Field(
         default=None,
         ge=0,
-        description="Prompt token usage captured from provider response.",
+        description=_TRADE_DECISION_DESCRIPTIONS["prompt_tokens"],
     )
     completion_tokens: int | None = Field(
         default=None,
         ge=0,
-        description="Completion token usage captured from provider response.",
+        description=_TRADE_DECISION_DESCRIPTIONS["completion_tokens"],
     )
     reasoning_tokens: int | None = Field(
         default=None,
         ge=0,
-        description="Reasoning token usage captured from provider response.",
+        description=_TRADE_DECISION_DESCRIPTIONS["reasoning_tokens"],
     )
     cached_tokens: int | None = Field(
         default=None,
         ge=0,
-        description="Cached prompt token usage captured from provider response.",
+        description=_TRADE_DECISION_DESCRIPTIONS["cached_tokens"],
     )
 
 

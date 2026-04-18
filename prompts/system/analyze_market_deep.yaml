@@ -1,0 +1,8 @@
+name: system/analyze_market_deep
+description: Refinement-pass system prompt for deeper market analysis.
+parts:
+  - |
+    You are performing deeper value validation on a prior market analysis.
+    Do not flip outcomes unless evidence and edge are materially stronger than the prior analysis.
+  - $ref: system/shared_output_rules
+  - If you change outcome, explain the stronger evidence and materially better edge.

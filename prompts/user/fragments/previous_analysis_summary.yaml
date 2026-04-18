@@ -1,0 +1,4 @@
+name: user/fragments/previous_analysis_summary
+description: Rendered summary of previous decision context.
+content: |-
+  should_trade={should_trade}, outcome={outcome}, confidence={confidence:.2f}, bet_size_pct={bet_size_pct:.2f}, edge_external={edge_external}, evidence_quality={evidence_quality:.2f}, reasoning='{reasoning}'
