@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
 import hashlib
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from bayesian_engine import (
     BayesianState,
@@ -13,7 +17,27 @@ from bayesian_engine import (
     log_likelihood_from_ratio,
     posterior_from_state,
 )
-from calibration import build_counterfactual_flags, compute_adaptive_thresholds
+from calibration_gates import (
+    evaluate_market,
+    evaluate_market_tiered,
+    evaluate_short_prefix_penalty,
+    load_family_stats,
+    load_short_prefix_stats,
+    load_ticker_prefix_stats,
+)
+from participation import (
+    HistoricalGateResult,
+    ParticipationDecision,
+    ParticipationTier,
+    TimeoutState,
+    bayesian_shrunk_pnl,
+    classify_participation,
+)
+from calibration import (
+    build_counterfactual_flags,
+    compute_adaptive_thresholds,
+    historical_confidence_shrink,
+)
 from config import SearchConfig, Settings, load_settings
 from grok_client import GrokClient
 from kelly import kelly_bet_pct, kelly_fraction
@@ -44,8 +68,14 @@ from models import (
 from kalshi_client import KalshiClient
 from refinement import RefinementStrategy
 from research_profiles import build_market_search_config, market_category_flags, market_family
-from score_engine import calibrate_confidence, compute_final_score
+from bootstrap_checks import BootstrapError, run_bootstrap_checks
+from score_engine import calibrate_confidence, compute_final_score, score_breakdown_explanation
 from xai_provider import XAIProvider
+
+try:
+    import certifi
+except Exception:  # pragma: no cover - optional runtime diagnostic
+    certifi = None
 
 logger = get_logger("predictbot")
 
@@ -123,6 +153,63 @@ _PRE_ANALYSIS_HARD_REJECTION_TERMINAL_OUTCOMES = {
     "confidence_below_min",
     "abstain_low_evidence",
 }
+_MLB_PRIORITY_PREFIXES = (
+    "KXMLBGAME-",
+    "KXMLBSPREAD-",
+    "KXMLBTEAMTOTAL-",
+    "KXMLBF5SPREAD-",
+    "KXMLBKS-",
+)
+_MLB_SUBFAMILY_PREFIXES = (
+    "KXMLBHRR-",
+    "KXMLBKS-",
+    "KXMLBSPREAD-",
+    "KXMLBTEAMTOTAL-",
+    "KXMLBF5TOTAL-",
+    "KXMLBF5-",
+    "KXMLBTOTAL-",
+)
+_RESEARCH_QUEUE_MAXLEN = 200
+_RESEARCH_QUEUE_EVIDENCE_GAP_MAX = 0.08
+_RESEARCH_QUEUE_EDGE_GAP_MAX = 0.08
+_SCORE_GATE_ALWAYS_BLOCK_REASONS = frozenset(
+    {
+        "non_positive_market_edge",
+        "low_evidence_quality",
+        "low_information_penalty",
+        "hallucinated_edge",
+        "extreme_market_edge_penalty",
+        "ambiguous_resolution_penalty",
+    }
+)
+_SCORE_GATE_SOURCE_BLOCK_REASONS = frozenset(
+    {
+        "fallback_edge_penalty",
+        "fallback_without_external_odds",
+        "proxy_evidence_penalty",
+        "no_external_odds_penalty",
+    }
+)
+_PRE_ANALYSIS_RESEARCH_ONLY_SCORE = 0.0
+_PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES = {
+    "crypto": 0.08,
+    "generic": 0.06,
+    "politics": 0.08,
+    "speech": 0.12,
+    "weather": 0.10,
+}
+_PRE_ANALYSIS_AMBIGUOUS_MARKET_PENALTY = 0.08
+_PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS = 0.06
+_PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
+_AMBIGUOUS_MARKET_TOKENS = (
+    "attend",
+    "mention",
+    "say ",
+    "speech",
+    "stream",
+    "album",
+    "views",
+)
 
 
 def _normalize_outcome_key(outcome: str | None) -> str:
@@ -134,6 +221,35 @@ def _is_retriable_xai_error(error_text: str | None) -> bool:
     if not normalized:
         return False
     return any(marker in normalized for marker in _XAI_RETRIABLE_ERROR_MARKERS)
+
+
+@dataclass(frozen=True)
+class _CryptoPreflightResult:
+    should_skip: bool = False
+    reason: str = ""
+    spot_price: float | None = None
+    threshold: float | None = None
+    buffer_pct: float | None = None
+
+
+def _crypto_threshold_preflight(
+    market: Market,
+    settings: Settings,
+) -> _CryptoPreflightResult:
+    """Lightweight preflight for crypto threshold markets (default OFF).
+
+    When enabled, parses the threshold from the ticker and compares to
+    a cached spot price to skip Grok when the buffer is too wide.
+    Currently a stub — full implementation requires an HTTP call to
+    CoinDesk/Coinbase for spot prices.
+    """
+    if not settings.CRYPTO_PREFLIGHT_ENABLED:
+        return _CryptoPreflightResult()
+    market_id = (market.id or "").upper()
+    threshold_match = re.search(r"-T([\d.]+)$", market_id)
+    if not threshold_match:
+        return _CryptoPreflightResult()
+    return _CryptoPreflightResult()
 
 
 def _build_reasoning_hash(decision: TradeDecision) -> str:
@@ -839,18 +955,28 @@ def _edge_threshold_for_market(
     settings: Settings,
     edge_source: str | None = None,
     market: Market | None = None,
+    definitive_outcome_eligible: bool = False,
 ) -> float:
+    """Effective minimum edge threshold for the edge gate.
+
+    For definitive-outcome cases (game settled per whitelisted primary
+    source) the FALLBACK_EDGE_MIN_EDGE / VERY_LOW_PRICE_MIN_EDGE /
+    LOW_PRICE_MIN_EDGE bumps are bypassed — those bumps exist because of
+    uncertain pricing, but a settled-game read against a whitelisted
+    source has ground-truth pricing semantics.
+    """
     min_edge = settings.MIN_EDGE
     is_weather_market = market is not None and market_family(market) == "weather"
-    if is_weather_market:
+    if is_weather_market and not definitive_outcome_eligible:
         min_edge = max(min_edge, settings.WEATHER_MIN_EDGE)
-    if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
-        min_edge = max(min_edge, settings.VERY_LOW_PRICE_MIN_EDGE)
-    if implied_prob < settings.LOW_PRICE_THRESHOLD:
-        min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
-    if settings.COINFLIP_PRICE_LOWER <= implied_prob <= settings.COINFLIP_PRICE_UPPER:
-        min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
-    if (edge_source or "").lower() == "fallback":
+    if not definitive_outcome_eligible:
+        if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
+            min_edge = max(min_edge, settings.VERY_LOW_PRICE_MIN_EDGE)
+        if implied_prob < settings.LOW_PRICE_THRESHOLD:
+            min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
+        if settings.COINFLIP_PRICE_LOWER <= implied_prob <= settings.COINFLIP_PRICE_UPPER:
+            min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
+    if (edge_source or "").lower() == "fallback" and not definitive_outcome_eligible:
         min_edge = max(min_edge, settings.FALLBACK_EDGE_MIN_EDGE)
         if is_weather_market:
             min_edge = max(min_edge, settings.WEATHER_FALLBACK_EDGE_MIN_EDGE)
@@ -867,18 +993,40 @@ def _passes_edge_threshold(
         if settings.REQUIRE_IMPLIED_PRICE:
             return False, None, "missing implied probability"
         return True, None, ""
-    # Use uncapped model confidence for edge gating so category caps only affect sizing.
     effective_confidence = (
         decision.raw_confidence
         if decision.raw_confidence is not None
         else decision.confidence
     )
     edge = effective_confidence - implied_prob
+    is_definitive = _is_definitive_outcome_eligible(decision, settings)
+    max_reasonable_edge = (
+        max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX)))
+        if is_definitive
+        else max(0.0, min(1.0, float(settings.MAX_REASONABLE_EDGE)))
+    )
+    if abs(edge) > max_reasonable_edge + 1e-9 and not is_definitive:
+        return False, edge, "edge_above_reasonable_max"
+    if abs(edge) > max_reasonable_edge + 1e-9 and is_definitive:
+        # Definitive outcomes can have legitimate huge edges (game over,
+        # market hasn't caught up). Allow up to the definitive cap; only
+        # block on truly absurd values (>0.95).
+        if abs(edge) > 0.95:
+            return False, edge, "edge_above_reasonable_max"
+    if (
+        market is not None
+        and settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE
+        and market_family(market) != "sports"
+    ):
+        evidence_basis = _decision_evidence_basis(decision)
+        if evidence_basis != "direct":
+            return False, edge, "non_sports_needs_direct_evidence"
     min_edge = _edge_threshold_for_market(
         implied_prob,
         settings,
         decision.edge_source,
         market=market,
+        definitive_outcome_eligible=is_definitive,
     )
     if edge < min_edge - 1e-9:
         return False, edge, f"edge {edge:.4f} below min {min_edge:.4f}"
@@ -981,15 +1129,192 @@ def _max_confidence_for_market(market: Market | None, settings: Settings) -> flo
     return settings.MAX_GLOBAL_CONFIDENCE
 
 
+def _non_definitive_confidence_ceiling(
+    decision: TradeDecision,
+    settings: Settings,
+) -> float:
+    """Hard ceiling for non-definitive trades per historical calibration data.
+
+    The 0.90+ confidence tier historically wins only ~43% vs 60% at 0.85-0.89.
+    Allow definitive-outcome-eligible decisions to bypass this cap since they
+    are backed by settlement-aligned primary sources.
+    """
+    if _is_definitive_outcome_eligible(decision, settings):
+        return 1.0
+    evidence_basis = str(getattr(decision, "evidence_basis", "") or "").strip().lower()
+    if evidence_basis == "direct":
+        return min(1.0, max(0.0, settings.MAX_GLOBAL_CONFIDENCE_DIRECT))
+    return min(1.0, max(0.0, settings.MAX_GLOBAL_CONFIDENCE_DIRECT))
+
+
 def _historical_win_rate_at_bucket(confidence: float) -> float | None:
     rounded = round(max(0.0, min(1.0, confidence)) * 10.0) / 10.0
     return _HISTORICAL_WIN_RATE_BY_BUCKET.get(rounded)
 
 
-def _min_evidence_quality_for_market(market: Market, settings: Settings) -> float:
-    if market_family(market) == "weather":
-        return settings.WEATHER_MIN_EVIDENCE_QUALITY
-    return settings.MIN_EVIDENCE_QUALITY_FOR_TRADE
+def _is_whitelisted_primary_source_url(url: str, settings: Settings) -> bool:
+    normalized_url = str(url or "").strip().lower()
+    if not normalized_url:
+        return False
+    parsed = urlparse(normalized_url)
+    host = (parsed.netloc or "").split("@")[-1].split(":")[0].lower()
+    for whitelist_entry in settings.DIRECT_SOURCE_WHITELIST:
+        normalized_entry = str(whitelist_entry or "").strip().lower()
+        if not normalized_entry:
+            continue
+        if "/" in normalized_entry and normalized_entry in normalized_url:
+            return True
+        if host and (host == normalized_entry or host.endswith(f".{normalized_entry}")):
+            return True
+    return False
+
+
+def _should_suppress_hallucinated_edge_penalty(
+    *,
+    decision: TradeDecision,
+    evidence_basis: str,
+    settings: Settings,
+) -> bool:
+    if str(evidence_basis or "").strip().lower() != "direct":
+        return False
+    if not bool(getattr(decision, "definitive_outcome_detected", False)):
+        return False
+    primary_source_url = str(getattr(decision, "primary_source_url", "") or "").strip()
+    if not primary_source_url:
+        return False
+    return _is_whitelisted_primary_source_url(primary_source_url, settings)
+
+
+def _is_definitive_outcome_eligible(
+    decision: TradeDecision,
+    settings: Settings,
+) -> bool:
+    """Check whether a decision qualifies for definitive-outcome floor overrides.
+
+    A decision is eligible when EITHER:
+    - The model explicitly set ``definitive_outcome_detected=True`` AND has a
+      whitelisted primary_source_url + direct evidence_basis, OR
+    - The decision cites a whitelisted primary source URL with direct
+      evidence basis AND ``my_prob`` is in the near-binary range
+      ``[0.95, 1.0]`` or ``[0.0, 0.05]`` (auto-detect for cases where the
+      model forgot to flag a clearly-resolved outcome).
+    """
+    evidence_basis = _decision_evidence_basis(decision)
+    if evidence_basis != "direct":
+        return False
+    primary_source_url = str(getattr(decision, "primary_source_url", "") or "").strip()
+    if not primary_source_url:
+        return False
+    if not _is_whitelisted_primary_source_url(primary_source_url, settings):
+        return False
+    if bool(getattr(decision, "definitive_outcome_detected", False)):
+        return True
+    my_prob = getattr(decision, "my_prob", None)
+    if my_prob is None:
+        return False
+    try:
+        my_prob_value = float(my_prob)
+    except (TypeError, ValueError):
+        return False
+    return my_prob_value >= 0.95 or my_prob_value <= 0.05
+
+
+def _apply_definitive_outcome_floors(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> tuple[TradeDecision, bool]:
+    """Floor evidence_quality when the decision is definitive-eligible.
+
+    Returns ``(possibly_modified_decision, floor_was_applied)``. When the
+    decision qualifies, the returned copy has ``evidence_quality`` raised
+    to at least ``settings.DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR`` and
+    ``definitive_outcome_detected`` set to True so downstream consumers
+    pick up the auto-detection.
+    """
+    if not _is_definitive_outcome_eligible(decision, settings):
+        return decision, False
+    floor = max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR)))
+    current_eq = float(decision.evidence_quality or 0.0)
+    if current_eq >= floor and bool(getattr(decision, "definitive_outcome_detected", False)):
+        return decision, False
+    updated = decision.model_copy(
+        update={
+            "evidence_quality": max(current_eq, floor),
+            "definitive_outcome_detected": True,
+            "evidence_quality_floor_applied": "definitive_outcome",
+        }
+    )
+    return updated, True
+
+
+def _min_evidence_quality_for_market(
+    market: Market,
+    settings: Settings,
+    decision: TradeDecision | None = None,
+) -> float:
+    base_minimum = (
+        settings.WEATHER_MIN_EVIDENCE_QUALITY
+        if market_family(market) == "weather"
+        else settings.MIN_EVIDENCE_QUALITY_FOR_TRADE
+    )
+    if decision is None:
+        return base_minimum
+    evidence_basis = _decision_evidence_basis(decision)
+    primary_source_url = str(getattr(decision, "primary_source_url", "") or "").strip()
+    if evidence_basis != "direct" or not primary_source_url:
+        return base_minimum
+    if not _is_whitelisted_primary_source_url(primary_source_url, settings):
+        return base_minimum
+    direct_source_minimum = (
+        settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER
+        if market_family(market) == "weather"
+        else settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT
+    )
+    return min(base_minimum, max(0.0, min(1.0, float(direct_source_minimum))))
+
+
+def _should_queue_research_for_blocked_trade(
+    *,
+    settings: Settings,
+    decision: TradeDecision,
+    evidence_basis: str,
+    gate_name: str,
+    threshold_gap: float,
+    edge_reason: str | None = None,
+) -> bool:
+    if not settings.RESEARCH_QUEUE_ENABLED:
+        return False
+    if not decision.should_trade or decision.abstain:
+        return False
+    if evidence_basis != "direct":
+        return False
+    normalized_gap = max(0.0, float(threshold_gap))
+    if gate_name == "evidence":
+        return normalized_gap <= _RESEARCH_QUEUE_EVIDENCE_GAP_MAX
+    if gate_name == "edge":
+        if str(edge_reason or "") == "edge_above_reasonable_max":
+            return True
+        return normalized_gap <= _RESEARCH_QUEUE_EDGE_GAP_MAX
+    if gate_name in {"hallucinated_edge", "extreme_market_edge"}:
+        return True
+    return False
+
+
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    normalized_quantile = max(0.0, min(1.0, float(quantile)))
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = normalized_quantile * (len(ordered) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    interpolation = position - lower_index
+    return ordered[lower_index] + ((ordered[upper_index] - ordered[lower_index]) * interpolation)
 
 
 def _cap_effective_confidence_for_market(
@@ -2022,19 +2347,43 @@ def _is_confidence_override_allowed(
     settings: Settings,
     decision: TradeDecision,
     override_edge: float | None,
-) -> tuple[bool, float]:
+) -> tuple[bool, float, str]:
     override_min_confidence = max(
         0.0,
         min(1.0, settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE),
     )
-    allowed = (
+    edge_default_allowed = (
         settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED
         and override_edge is not None
         and override_edge >= settings.CONFIDENCE_GATE_MIN_EDGE
         and decision.evidence_quality >= settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY
         and decision.confidence >= override_min_confidence
     )
-    return allowed, override_min_confidence
+    if edge_default_allowed:
+        return True, override_min_confidence, "edge_default"
+
+    strong_floor = max(0.0, min(1.0, settings.STRONG_EVIDENCE_CONFIDENCE_FLOOR))
+    strong_eq_min = max(0.0, settings.STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY)
+    source_url = str(getattr(decision, "primary_source_url", "") or "").strip().lower()
+    source_whitelisted = any(
+        domain in source_url
+        for domain in settings.DIRECT_SOURCE_WHITELIST
+    ) if source_url else False
+    evidence_basis = str(getattr(decision, "evidence_basis", "") or "").strip().lower()
+    edge_source = str(getattr(decision, "edge_source", "") or "").strip().lower()
+    strong_evidence_allowed = (
+        evidence_basis == "direct"
+        and decision.evidence_quality >= strong_eq_min
+        and source_whitelisted
+        and edge_source == "computed"
+        and override_edge is not None
+        and abs(override_edge) >= settings.CONFIDENCE_GATE_MIN_EDGE
+        and decision.confidence >= strong_floor
+    )
+    if strong_evidence_allowed:
+        return True, strong_floor, "strong_direct_evidence"
+
+    return False, override_min_confidence, "none"
 
 
 def _record_terminal_outcome(
@@ -2318,18 +2667,64 @@ def _is_coinflip_signal(decision: TradeDecision) -> bool:
     return decision.confidence <= 0.55 and decision.evidence_quality < 0.60
 
 
-def _analysis_result_rank(result: dict[str, Any] | None) -> tuple[float, float, float, float]:
+def _analysis_result_rank(
+    result: dict[str, Any] | None,
+    *,
+    historical_family_pnl_total: float | None = None,
+    historical_family_sample_size: int = 0,
+    historical_family_win_rate: float | None = None,
+) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
     if not result:
-        return (0.0, 0.0, 0.0, 0.0)
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     decision = result.get("decision")
     if not isinstance(decision, TradeDecision):
-        return (0.0, 0.0, 0.0, 0.0)
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     should_trade_rank = 1.0 if decision.should_trade and not decision.abstain else 0.0
     final_score_rank = float(result.get("pre_execution_final_score", 0.0) or 0.0)
     score_rank = final_score_rank + (0.02 * should_trade_rank)
+    critical_rejection_rank = 0.0
+    critical_rejection_reasons = _score_gate_critical_rejection_reasons(
+        rejection_reasons=result.get("pre_execution_rejection_reasons", ()),
+        evidence_basis_class=_decision_evidence_basis(decision),
+        edge_source=decision.edge_source,
+        definitive_outcome_eligible=bool(
+            getattr(decision, "definitive_outcome_detected", False)
+        ),
+    )
+    if critical_rejection_reasons:
+        critical_rejection_rank = -1.0
+    profitable_family_rank = 1.0 if (
+        historical_family_pnl_total is not None
+        and int(historical_family_sample_size) >= 8
+        and float(historical_family_pnl_total) > 10.0
+    ) else 0.0
+    historical_family_win_rate_rank = 0.0
+    if int(historical_family_sample_size) >= 8:
+        historical_family_win_rate_rank = max(
+            0.0,
+            min(1.0, float(historical_family_win_rate or 0.0)),
+        )
+    overconfidence_gap_penalty_rank = -max(0.0, decision.confidence - decision.evidence_quality)
+    evidence_basis_rank = 1.0 if _decision_evidence_basis(decision) == "direct" else 0.0
+    primary_source_rank = (
+        1.0 if str(getattr(decision, "primary_source_url", "") or "").strip() else 0.0
+    )
+    edge_external_rank = float(decision.edge_external or 0.0)
     evidence_rank = max(0.0, min(1.0, decision.evidence_quality))
     confidence_rank = max(0.0, min(1.0, decision.confidence))
-    return (score_rank, evidence_rank, confidence_rank, should_trade_rank)
+    return (
+        score_rank,
+        critical_rejection_rank,
+        profitable_family_rank,
+        historical_family_win_rate_rank,
+        overconfidence_gap_penalty_rank,
+        evidence_basis_rank,
+        primary_source_rank,
+        edge_external_rank,
+        evidence_rank,
+        confidence_rank,
+        should_trade_rank,
+    )
 
 
 def _event_ticker_prefix(market: Market) -> str:
@@ -2340,6 +2735,10 @@ def _event_ticker_prefix(market: Market) -> str:
     if "-" in market_id:
         return market_id.rsplit("-", maxsplit=1)[0]
     return market_id
+
+
+def _is_mlb_market_id(market_id: str) -> bool:
+    return str(market_id or "").strip().upper().startswith("KXMLB")
 
 
 def _daily_balance_delta_usdc(
@@ -2383,6 +2782,35 @@ def _event_side_conflict_blocked(
         return False, []
     has_conflict = any(outcome != normalized_proposed for outcome in existing_outcomes)
     return has_conflict, existing_outcomes
+
+
+def _should_apply_definitive_side_override(
+    *,
+    decision: TradeDecision,
+    evidence_basis: str,
+    primary_source_whitelisted: bool = False,
+    cycle_overrides_applied: int,
+    max_overrides_per_cycle: int,
+) -> bool:
+    """Allow an event-side-conflict override only under strict definitive conditions."""
+    if cycle_overrides_applied >= max_overrides_per_cycle:
+        return False
+    if not getattr(decision, "definitive_outcome_detected", False):
+        return False
+    if str(evidence_basis or "").strip().lower() != "direct":
+        return False
+    is_whitelisted = primary_source_whitelisted or getattr(
+        decision, "primary_source_whitelisted", False
+    )
+    if not is_whitelisted:
+        return False
+    lr = getattr(decision, "likelihood_ratio", None)
+    if lr is None or float(lr) < 10.0:
+        return False
+    raw_conf = float(getattr(decision, "raw_confidence", None) or decision.confidence)
+    if raw_conf < 0.80:
+        return False
+    return True
 
 
 def _daily_trade_cap_reached(*, daily_trade_count: int, max_trades_per_day: int) -> bool:
@@ -2439,6 +2867,7 @@ def _build_execution_audit(
         "audit_edge_source": "edge_source",
     }
     payload: dict[str, Any] = {}
+    normalized_final_action = str(final_action or "").strip().lower()
     if decision_phase is not None:
         payload["decision_phase"] = decision_phase
     if decision_terminal is not None:
@@ -2447,21 +2876,47 @@ def _build_execution_audit(
         payload["final_action"] = final_action
     if final_reason is not None:
         payload["final_reason"] = final_reason
-        if str(final_action or "").strip().lower() == "skip":
+        if normalized_final_action in {"skip", "research_queued"}:
             payload["rejection_reason"] = final_reason
+        if normalized_final_action in {"skip", "research_queued"}:
+            payload["skip_reasons"] = [str(final_reason)]
     for key, value in extra.items():
         if value is not None:
+            if key in payload and payload[key] != value:
+                logger.debug(
+                    "Execution audit key override: key=%s old=%r new=%r",
+                    key,
+                    payload[key],
+                    value,
+                    data={"key": key, "old_value": payload[key], "new_value": value},
+                )
             payload[key] = value
     if final_reason and "rejection_stage" not in payload:
         if str(final_reason).startswith("pre_analysis_"):
             payload["rejection_stage"] = "pre_analysis"
         elif str(final_reason) in {"no_trade_recommended", "abstain_low_evidence"}:
             payload["rejection_stage"] = "validation"
-        elif str(final_reason) in {"score_gate_blocked"}:
+        elif str(final_reason) in {"score_gate_blocked", "score_gate_critical_rejection"}:
             payload["rejection_stage"] = "score_gate"
         elif str(final_reason).endswith("_blocked") or str(final_reason).endswith("_below_min"):
             payload["rejection_stage"] = "execution_gate"
     for alias_key, canonical_key in alias_to_canonical.items():
+        if (
+            alias_key in payload
+            and canonical_key in payload
+            and payload[alias_key] != payload[canonical_key]
+        ):
+            logger.debug(
+                "Execution audit canonical key preferred over alias: alias=%s canonical=%s",
+                alias_key,
+                canonical_key,
+                data={
+                    "alias_key": alias_key,
+                    "canonical_key": canonical_key,
+                    "alias_value": payload[alias_key],
+                    "canonical_value": payload[canonical_key],
+                },
+            )
         if alias_key in payload and canonical_key not in payload:
             payload[canonical_key] = payload[alias_key]
         payload.pop(alias_key, None)
@@ -2534,14 +2989,56 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         "score_overconfidence_penalty": float(
             getattr(score_result, "overconfidence_penalty", 0.0) or 0.0
         ),
+        "score_extreme_confidence_penalty": float(
+            getattr(score_result, "extreme_confidence_penalty", 0.0) or 0.0
+        ),
+        "score_late_stage_overconfidence_penalty": float(
+            getattr(score_result, "late_stage_overconfidence_penalty", 0.0) or 0.0
+        ),
+        "score_fallback_high_confidence_penalty": float(
+            getattr(score_result, "fallback_high_confidence_penalty", 0.0) or 0.0
+        ),
+        "score_extreme_market_edge_penalty": float(
+            getattr(score_result, "extreme_market_edge_penalty", 0.0) or 0.0
+        ),
+        "score_hallucinated_edge_penalty": float(
+            getattr(score_result, "hallucinated_edge_penalty", 0.0) or 0.0
+        ),
+        "score_hallucinated_edge_penalty_suppressed": bool(
+            getattr(score_result, "hallucinated_edge_penalty_suppressed", False)
+        ),
         "score_proxy_evidence_penalty": float(
             getattr(score_result, "proxy_evidence_penalty", 0.0) or 0.0
         ),
         "score_generic_bin_penalty": float(
             getattr(score_result, "generic_bin_penalty", 0.0) or 0.0
         ),
+        "score_numeric_strike_bin_penalty": float(
+            getattr(score_result, "numeric_strike_bin_penalty", 0.0) or 0.0
+        ),
+        "score_short_prefix_penalty": float(
+            getattr(score_result, "short_prefix_penalty", 0.0) or 0.0
+        ),
+        "score_historical_family_bonus": float(
+            getattr(score_result, "historical_family_bonus", 0.0) or 0.0
+        ),
         "score_ambiguous_resolution_penalty": float(
             getattr(score_result, "ambiguous_resolution_penalty", 0.0) or 0.0
+        ),
+        "score_historical_prefix_bonus": float(
+            getattr(score_result, "historical_prefix_bonus", 0.0) or 0.0
+        ),
+        "score_historical_prefix_penalty": float(
+            getattr(score_result, "historical_prefix_penalty", 0.0) or 0.0
+        ),
+        "score_extreme_confidence_band_penalty": float(
+            getattr(score_result, "extreme_confidence_band_penalty", 0.0) or 0.0
+        ),
+        "score_numeric_strike_computed_overconfidence_penalty": float(
+            getattr(score_result, "numeric_strike_computed_overconfidence_penalty", 0.0) or 0.0
+        ),
+        "score_coinflip_sports_penalty": float(
+            getattr(score_result, "coinflip_sports_penalty", 0.0) or 0.0
         ),
         "score_weather_penalty": weather_penalty,
         "score_bayesian_posterior": getattr(score_result, "bayesian_posterior", None),
@@ -2549,6 +3046,11 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         "score_inefficiency_signal": getattr(score_result, "inefficiency_signal", None),
         "score_kelly_raw": getattr(score_result, "kelly_raw", None),
         "score_rejection_reasons": list(getattr(score_result, "rejection_reasons", ()) or ()),
+        "score_breakdown_explanation": (
+            score_breakdown_explanation(score_result)
+            if hasattr(score_result, "final_score")
+            else None
+        ),
     }
 
 
@@ -2572,6 +3074,34 @@ def _score_breakdown_from_execution_audit(
     return inferred_score_breakdown or None
 
 
+def _compact_score_breakdown(score_fields: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(score_fields, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key, value in score_fields.items():
+        if key == "score_rejection_reasons":
+            reasons = [str(reason) for reason in (value or []) if str(reason).strip()]
+            if reasons:
+                compact[key] = reasons
+            continue
+        if isinstance(value, bool):
+            if value:
+                compact[key] = value
+            continue
+        if isinstance(value, (int, float)):
+            if key in {
+                "score_final",
+                "score_edge_market",
+                "score_edge_external",
+                "score_evidence_quality",
+            } or abs(float(value)) > 1e-9:
+                compact[key] = float(value)
+            continue
+        if value is not None:
+            compact[key] = value
+    return compact
+
+
 def _resolved_pnl_estimate_total(state_manager: MarketStateManager) -> float:
     """Estimate cumulative resolved PnL from family outcome snapshots."""
     try:
@@ -2591,6 +3121,14 @@ def _score_kwargs(
     is_weather_market: bool,
     evidence_basis_class: str,
     edge_source: str,
+    market_family: str = "",
+    short_prefix_penalty: float = 0.0,
+    suppress_hallucinated_edge_penalty: bool = False,
+    definitive_outcome_eligible: bool = False,
+    historical_family_pnl_total: float | None = None,
+    historical_family_sample_size: int = 0,
+    historical_prefix_pnl_per_trade: float | None = None,
+    historical_prefix_sample_size: int = 0,
 ) -> dict[str, Any]:
     return {
         "is_weather_market": is_weather_market,
@@ -2610,8 +3148,24 @@ def _score_kwargs(
         "proxy_evidence_penalty_base": settings.SCORE_PROXY_EVIDENCE_PENALTY_BASE,
         "generic_bin_penalty_base": settings.SCORE_GENERIC_BIN_PENALTY_BASE,
         "ambiguous_resolution_penalty_base": settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE,
+        "max_reasonable_edge": settings.MAX_REASONABLE_EDGE,
+        "hallucinated_edge_penalty_base": settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE,
+        "extreme_market_edge_penalty_base": settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE,
+        "late_stage_overconfidence_penalty_base": settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE,
+        "extreme_confidence_threshold": settings.SCORE_EXTREME_CONFIDENCE_THRESHOLD,
+        "extreme_confidence_penalty_base": settings.SCORE_EXTREME_CONFIDENCE_PENALTY_BASE,
+        "short_prefix_penalty": short_prefix_penalty,
         "evidence_basis_class": evidence_basis_class,
         "edge_source": edge_source,
+        "market_family": market_family,
+        "coinflip_price_lower": settings.COINFLIP_PRICE_LOWER,
+        "coinflip_price_upper": settings.COINFLIP_PRICE_UPPER,
+        "suppress_hallucinated_edge_penalty": suppress_hallucinated_edge_penalty,
+        "definitive_outcome_eligible": definitive_outcome_eligible,
+        "historical_family_pnl_total": historical_family_pnl_total,
+        "historical_family_sample_size": historical_family_sample_size,
+        "historical_prefix_pnl_per_trade": historical_prefix_pnl_per_trade,
+        "historical_prefix_sample_size": historical_prefix_sample_size,
     }
 
 
@@ -2629,6 +3183,60 @@ def _effective_score_gate_threshold(
     return settings.SCORE_GATE_THRESHOLD
 
 
+def _score_gate_critical_rejection_reasons(
+    *,
+    rejection_reasons: tuple[str, ...] | list[str] | set[str],
+    evidence_basis_class: str,
+    edge_source: str | None,
+    definitive_outcome_eligible: bool = False,
+) -> tuple[str, ...]:
+    """Identify score failures that should block execution even if bonuses lift the score.
+
+    When ``definitive_outcome_eligible`` is True (game already settled per
+    a whitelisted primary source), source-block penalties are suppressed —
+    a model citing AP/Reuters with my_prob~1.0 isn't relying on fallback
+    edges or proxy evidence; the outcome is observable.
+    """
+    normalized_reasons = {
+        str(reason or "").strip()
+        for reason in rejection_reasons
+        if str(reason or "").strip()
+    }
+    critical_reasons = set(normalized_reasons & _SCORE_GATE_ALWAYS_BLOCK_REASONS)
+    if definitive_outcome_eligible:
+        return tuple(sorted(critical_reasons))
+    normalized_evidence_basis = str(evidence_basis_class or "").strip().lower()
+    normalized_edge_source = str(edge_source or "").strip().lower()
+    if normalized_edge_source in {"fallback", "none"} or normalized_evidence_basis != "direct":
+        critical_reasons.update(normalized_reasons & _SCORE_GATE_SOURCE_BLOCK_REASONS)
+    return tuple(sorted(critical_reasons))
+
+
+def _order_response_receipt(order_response: Any | None) -> dict[str, Any] | None:
+    if order_response is None:
+        return None
+    if hasattr(order_response, "model_dump"):
+        payload = order_response.model_dump()
+    elif isinstance(order_response, dict):
+        payload = dict(order_response)
+    else:
+        return {"raw": str(order_response)}
+    raw_payload = payload.get("raw")
+    if isinstance(raw_payload, dict):
+        payload["raw_summary"] = {
+            key: raw_payload.get(key)
+            for key in (
+                "client_order_id",
+                "client_price",
+                "client_qty_shares",
+                "fill_count",
+                "status",
+            )
+            if key in raw_payload
+        }
+    return payload
+
+
 def _should_skip_for_balance(
     *,
     available_balance: float | None,
@@ -2642,6 +3250,33 @@ def _should_skip_for_balance(
 def _decision_evidence_basis(decision: TradeDecision) -> str:
     explicit_basis = str(getattr(decision, "evidence_basis", "") or "").strip().lower()
     if explicit_basis in {"direct", "proxy", "absence_only"}:
+        if explicit_basis == "direct":
+            reasoning = str(decision.reasoning or "").lower()
+            has_absence_marker = any(
+                token in reasoning
+                for token in (
+                    "absence-only",
+                    "absence_only",
+                    "absence of",
+                    "no direct",
+                    "no settlement-aligned",
+                    "no external odds",
+                    "no relevant",
+                )
+            )
+            has_proxy_marker = any(
+                token in reasoning
+                for token in (
+                    "proxy evidence",
+                    "proxy-only",
+                    "sparse evidence",
+                    "evidence gap",
+                )
+            )
+            if has_absence_marker and str(decision.edge_source or "").strip().lower() in {"fallback", "none"}:
+                return "absence_only"
+            if has_proxy_marker and not bool(getattr(decision, "definitive_outcome_detected", False)):
+                return "proxy"
         return explicit_basis
     reasoning = str(decision.reasoning or "").lower()
     for marker in ("basis=direct", "basis=proxy", "basis=absence_only"):
@@ -2754,7 +3389,10 @@ def _dry_streak_sleep_seconds(
     *,
     base_poll_interval_sec: int,
     consecutive_zero_order_cycles: int,
+    enabled: bool = True,
 ) -> int | None:
+    if not enabled:
+        return None
     if consecutive_zero_order_cycles < 3:
         return None
     return min(
@@ -2776,6 +3414,30 @@ def _build_grok_client_for_worker(
         max_bet_usdc=settings.MAX_BET_USDC,
         settings=settings,
         provider=provider,
+    )
+
+
+def _analyze_market_candidate_for_worker(
+    market: Market,
+    state: MarketState | None,
+    anchor_analysis: dict[str, Any] | None,
+    settings: Settings,
+    grok_client: GrokClient,
+    historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
+    correlation_id: str | None = None,
+    force_extended_research: bool = False,
+) -> dict[str, Any]:
+    """Worker-safe wrapper that restores cycle correlation context."""
+    if correlation_id:
+        set_correlation_id(correlation_id)
+    return _analyze_market_candidate(
+        market=market,
+        state=state,
+        anchor_analysis=anchor_analysis,
+        settings=settings,
+        grok_client=grok_client,
+        historical_confidence_buckets=historical_confidence_buckets,
+        force_extended_research=force_extended_research,
     )
 
 
@@ -2801,6 +3463,7 @@ def _pre_analysis_opportunity_score(
     fallback_family_edge_rate: float | None = None,
     fallback_family_sample_size: int = 0,
     historical_family_stats: dict[str, float | int] | None = None,
+    historical_prefix_stats: dict[str, Any] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Estimate opportunity quality before expensive enrichment/analysis."""
     now_utc = datetime.now(timezone.utc)
@@ -2835,6 +3498,7 @@ def _pre_analysis_opportunity_score(
     if raw_hours_to_close is not None and -6.0 <= raw_hours_to_close <= 0.0:
         post_event_bonus = 0.10
     family = market_family(market)
+    market_id_upper = (market.id or "").upper()
     analysis_count = int(state.analysis_count) if state is not None and state.analysis_count is not None else 0
     non_actionable_streak = int(state.non_actionable_streak) if state is not None else 0
     analysis_penalty_start = max(0, int(settings.PRE_ANALYSIS_ANALYSIS_COUNT_START))
@@ -2948,19 +3612,79 @@ def _pre_analysis_opportunity_score(
     ):
         fallback_family_penalty *= 0.5
         fallback_family_penalty_scale = 0.5
+    historical_profit_bonus = 0.0
+    if (
+        historical_family_sample_size >= max(1, settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES)
+        and historical_family_pnl > abs(float(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD))
+        and historical_family_win_rate >= 0.55
+    ):
+        historical_profit_bonus = _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS
+    source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(family, 0.0)
+    if _is_mlb_market_id(market_id_upper):
+        source_difficulty_penalty *= 0.25
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
         ambiguous_resolution_penalty = 0.08
+    ambiguous_market_penalty = 0.0
+    market_text = f"{market.id or ''} {market.question or ''} {market.resolution_criteria or ''}".lower()
+    if family not in {"sports", "weather"} and any(
+        token in market_text for token in _AMBIGUOUS_MARKET_TOKENS
+    ):
+        ambiguous_market_penalty = _PRE_ANALYSIS_AMBIGUOUS_MARKET_PENALTY
     churn_penalty = 0.0
     if analysis_count >= max(6, settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES // 2):
         churn_penalty = 0.05
         if not traded_before:
             churn_penalty += 0.03
+    mlb_priority_bonus = 0.0
+    mlb_subfamily_penalty = 0.0
+    zero_trade_rate_penalty = 0.0
+    negative_prefix_penalty = 0.0
+    if any(
+        market_id_upper.startswith(prefix)
+        for prefix in _MLB_PRIORITY_PREFIXES
+    ):
+        mlb_priority_bonus = 0.05
+    if (
+        settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED
+        and any(market_id_upper.startswith(prefix) for prefix in _MLB_SUBFAMILY_PREFIXES)
+    ):
+        mlb_subfamily_penalty = max(0.0, settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY)
+    if historical_prefix_stats and not traded_before:
+        prefix_len = max(1, int(settings.HISTORICAL_TICKER_PREFIX_LEN))
+        market_prefix = market_id_upper[:prefix_len]
+        prefix_snapshot = historical_prefix_stats.get(market_prefix)
+        if prefix_snapshot is not None:
+            prefix_sample_size = max(
+                0,
+                int(getattr(prefix_snapshot, "sample_size", 0) or 0),
+            )
+            prefix_wins = max(
+                0,
+                int(getattr(prefix_snapshot, "wins", 0) or 0),
+            )
+            prefix_pnl_total = float(getattr(prefix_snapshot, "pnl_total", 0.0) or 0.0)
+            if (
+                prefix_sample_size >= max(1, int(settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES))
+                and prefix_wins <= 0
+                and prefix_pnl_total <= 0.0
+            ):
+                zero_trade_rate_penalty = max(
+                    0.0,
+                    settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY,
+                )
+            elif (
+                prefix_sample_size >= max(1, int(settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES))
+                and prefix_pnl_total <= float(settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF)
+            ):
+                negative_prefix_penalty = _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY
     score = (
         (0.40 * price_center_score)
         + (0.35 * liquidity_score)
         + (0.25 * horizon_score)
         + post_event_bonus
+        + mlb_priority_bonus
+        + historical_profit_bonus
         - repeated_analysis_penalty
         - non_actionable_penalty
         - family_penalty
@@ -2969,8 +3693,13 @@ def _pre_analysis_opportunity_score(
         - fallback_family_penalty
         - historical_family_penalty
         - historical_family_pnl_penalty
+        - source_difficulty_penalty
         - ambiguous_resolution_penalty
+        - ambiguous_market_penalty
         - churn_penalty
+        - mlb_subfamily_penalty
+        - zero_trade_rate_penalty
+        - negative_prefix_penalty
         - coinflip_penalty
     )
     return score, {
@@ -2993,8 +3722,15 @@ def _pre_analysis_opportunity_score(
         "pre_score_historical_family_win_rate": historical_family_win_rate,
         "pre_score_historical_family_samples": float(historical_family_sample_size),
         "pre_score_historical_family_pnl_total": historical_family_pnl,
+        "pre_score_historical_profit_bonus": historical_profit_bonus,
+        "pre_score_source_difficulty_penalty": source_difficulty_penalty,
         "pre_score_ambiguous_resolution_penalty": ambiguous_resolution_penalty,
+        "pre_score_ambiguous_market_penalty": ambiguous_market_penalty,
         "pre_score_churn_penalty": churn_penalty,
+        "pre_score_mlb_priority_bonus": mlb_priority_bonus,
+        "pre_score_mlb_subfamily_penalty": mlb_subfamily_penalty,
+        "pre_score_zero_trade_rate_penalty": zero_trade_rate_penalty,
+        "pre_score_negative_prefix_penalty": negative_prefix_penalty,
         "pre_score_coinflip_penalty": coinflip_penalty,
         "pre_score_analysis_count": float(analysis_count),
         "pre_score_non_actionable_streak": float(non_actionable_streak),
@@ -3016,18 +3752,36 @@ def _pre_analysis_hard_rejection(
     historical_family_stats: dict[str, float | int] | None = None,
     fallback_family_edge_rate: float | None = None,
     fallback_family_sample_size: int = 0,
+    historical_gate_allowed: bool | None = None,
+    historical_gate_reason: str | None = None,
+    historical_gate_metrics: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None, dict[str, Any]]:
-    if not settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED or state is None:
+    if not settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED:
         return False, None, {}
-    analysis_count = int(state.analysis_count or 0)
-    non_actionable_streak = int(state.non_actionable_streak or 0)
+    analysis_count = int(state.analysis_count or 0) if state is not None else 0
+    non_actionable_streak = int(state.non_actionable_streak or 0) if state is not None else 0
+    if (
+        historical_gate_allowed is False
+        and historical_gate_reason
+        and not traded_before
+    ):
+        metadata = {
+            "legacy_pre_analysis_hard_reject": True,
+            "pre_analysis_hard_reject_reason": historical_gate_reason,
+            "pre_analysis_hard_reject_analysis_count": analysis_count,
+            "pre_analysis_hard_reject_traded_before": traded_before,
+            **(historical_gate_metrics or {}),
+        }
+        return True, f"pre_analysis_{historical_gate_reason}", metadata
+    if state is None:
+        return False, None, {}
     if (
         non_actionable_streak >= 3
         and had_recent_fallback_edge
         and not traded_before
     ):
         metadata = {
-            "pre_analysis_hard_reject": True,
+            "legacy_pre_analysis_hard_reject": True,
             "pre_analysis_hard_reject_reason": "fallback_edge_high_churn",
             "pre_analysis_hard_reject_non_actionable_streak": non_actionable_streak,
             "pre_analysis_hard_reject_analysis_count": analysis_count,
@@ -3052,7 +3806,7 @@ def _pre_analysis_hard_rejection(
             and not traded_before
         ):
             metadata = {
-                "pre_analysis_hard_reject": True,
+                "legacy_pre_analysis_hard_reject": True,
                 "pre_analysis_hard_reject_reason": "zero_action_family",
                 "pre_analysis_hard_reject_family": family,
                 "pre_analysis_hard_reject_family_sample_size": family_sample_size,
@@ -3080,7 +3834,7 @@ def _pre_analysis_hard_rejection(
             and fallback_rate >= settings.PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD
         ):
             metadata = {
-                "pre_analysis_hard_reject": True,
+                "legacy_pre_analysis_hard_reject": True,
                 "pre_analysis_hard_reject_reason": "crypto_historically_unprofitable",
                 "pre_analysis_hard_reject_family": family,
                 "pre_analysis_hard_reject_historical_pnl": historical_pnl_total,
@@ -3103,7 +3857,7 @@ def _pre_analysis_hard_rejection(
         if family in {"generic", "crypto"} and _WEATHER_BIN_TICKER_PATTERN.search(market.id or ""):
             hard_reject_reason = "repeated_non_actionable_bin_market"
         metadata = {
-            "pre_analysis_hard_reject": True,
+            "legacy_pre_analysis_hard_reject": True,
             "pre_analysis_hard_reject_reason": hard_reject_reason,
             "pre_analysis_hard_reject_family": family,
             "pre_analysis_hard_reject_terminal_outcome": terminal_outcome,
@@ -3114,7 +3868,7 @@ def _pre_analysis_hard_rejection(
         return True, f"pre_analysis_{hard_reject_reason}", metadata
     if analysis_count >= 4 and non_actionable_streak >= 3 and not traded_before:
         metadata = {
-            "pre_analysis_hard_reject": True,
+            "legacy_pre_analysis_hard_reject": True,
             "pre_analysis_hard_reject_reason": "repeated_churn_market",
             "pre_analysis_hard_reject_non_actionable_streak": non_actionable_streak,
             "pre_analysis_hard_reject_analysis_count": analysis_count,
@@ -3224,16 +3978,22 @@ def _resolve_dynamic_analysis_candidate_cap(
     *,
     settings: Settings,
     best_pre_analysis_score: float,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, bool]:
+    """Return (cap, reduced_applied, negative_score_floor_applied)."""
     dynamic_max_markets_per_cycle = settings.MAX_MARKETS_PER_CYCLE
     reduced_candidate_cap_applied = False
-    if best_pre_analysis_score < settings.PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD:
+    negative_score_floor_applied = False
+    if best_pre_analysis_score < settings.NEGATIVE_BEST_SCORE_DEEP_ANALYSIS_FLOOR:
+        dynamic_max_markets_per_cycle = 1
+        reduced_candidate_cap_applied = True
+        negative_score_floor_applied = True
+    elif best_pre_analysis_score < settings.PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD:
         dynamic_max_markets_per_cycle = min(
             dynamic_max_markets_per_cycle,
             max(1, settings.PRE_ANALYSIS_REDUCED_MAX_CANDIDATES),
         )
         reduced_candidate_cap_applied = True
-    return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied
+    return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied, negative_score_floor_applied
 
 
 def _build_speech_reanalysis_search_config(base_config: SearchConfig) -> SearchConfig:
@@ -3263,16 +4023,48 @@ def _build_speech_reanalysis_search_config(base_config: SearchConfig) -> SearchC
     )
 
 
+def _build_extended_reanalysis_search_config(base_config: SearchConfig) -> SearchConfig:
+    """Increase lookback and rotate sources for stale non-actionable markets."""
+    now = datetime.now(timezone.utc)
+    base_lookback_hours = base_config.lookback_hours or 24
+    expanded_lookback_hours = max(base_lookback_hours + 24, base_lookback_hours * 2)
+    rotated_domains = (
+        [*base_config.allowed_domains[1:], base_config.allowed_domains[0]]
+        if len(base_config.allowed_domains) > 1
+        else list(base_config.allowed_domains)
+    )
+    rotated_handles = (
+        [*base_config.allowed_x_handles[1:], base_config.allowed_x_handles[0]]
+        if len(base_config.allowed_x_handles) > 1
+        else list(base_config.allowed_x_handles)
+    )
+    return SearchConfig(
+        from_date=now - timedelta(hours=expanded_lookback_hours),
+        to_date=now,
+        allowed_domains=rotated_domains,
+        allowed_x_handles=rotated_handles,
+        enable_multimedia=True,
+        multimedia_confidence_range=base_config.multimedia_confidence_range,
+        profile_name=base_config.profile_name,
+        lookback_hours=expanded_lookback_hours,
+    )
+
+
 def _analyze_market_candidate(
     market: Market,
     state: MarketState | None,
     anchor_analysis: dict[str, Any] | None,
     settings: Settings,
     grok_client: GrokClient,
+    historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
+    force_extended_research: bool = False,
 ) -> dict[str, Any]:
     """Run analysis/refinement/guardrails for a market candidate."""
     previous_analysis = _build_previous_analysis(anchor_analysis)
     search_config = build_market_search_config(settings, market)
+    used_extended_research = bool(force_extended_research)
+    if used_extended_research:
+        search_config = _build_extended_reanalysis_search_config(search_config)
     try:
         decision = grok_client.analyze_market(
             market,
@@ -3281,6 +4073,10 @@ def _analyze_market_candidate(
         )
     except Exception as exc:
         error_text = str(exc)
+        is_timeout = (
+            isinstance(exc, TimeoutError)
+            or "grok stream exceeded" in error_text.lower()
+        )
         logger.error(
             "Initial market analysis failed for %s: %s",
             market.id,
@@ -3290,6 +4086,7 @@ def _analyze_market_candidate(
                 "error": error_text,
                 "error_type": type(exc).__name__,
                 "analysis_phase": "initial",
+                "is_timeout": is_timeout,
             },
         )
         return {
@@ -3297,8 +4094,11 @@ def _analyze_market_candidate(
             "analysis_error": error_text,
             "analysis_error_type": type(exc).__name__,
             "analysis_error_retriable_xai": _is_retriable_xai_error(error_text),
+            "analysis_is_timeout": is_timeout,
+            "analysis_search_profile": getattr(search_config, "profile_name", None),
             "was_refined": False,
             "refinement_reason_text": None,
+            "used_extended_research": used_extended_research,
             "flip_triggered": False,
             "flip_blocked": False,
             "refinement_skipped_by_flip_precheck": False,
@@ -3390,16 +4190,43 @@ def _analyze_market_candidate(
     definitive_outcome_for_calibration = bool(
         getattr(decision, "definitive_outcome_detected", False)
     )
-    calibrated_confidence = calibrate_confidence(
+    stage_one_confidence = calibrate_confidence(
         decision.confidence,
         shrinkage_floor=settings.CONFIDENCE_SHRINKAGE_FLOOR,
-        shrinkage_factor=settings.CONFIDENCE_SHRINKAGE_FACTOR,
+        shrinkage_factor=(
+            settings.CONFIDENCE_SHRINKAGE_FACTOR_HIGH
+            if confidence_before_calibration >= 0.88
+            else settings.CONFIDENCE_SHRINKAGE_FACTOR
+        ),
         family_shrinkage_override=_confidence_shrinkage_override_for_market(market),
         evidence_basis_class=evidence_basis_for_calibration,
         definitive_outcome=definitive_outcome_for_calibration,
+        has_primary_source_url=bool(
+            str(getattr(decision, "primary_source_url", "") or "").strip()
+        ),
+        direct_shrinkage_boost_factor=settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST,
     )
-    calibration_delta = confidence_before_calibration - calibrated_confidence
+    confidence_family = market_family(market)
     historical_win_rate_at_bucket = _historical_win_rate_at_bucket(confidence_before_calibration)
+    historical_bucket_sample_size = 0
+    historical_bucket_family = "none"
+    confidence_history_gap_applied = 0.0
+    if settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED:
+        historical_shrink = historical_confidence_shrink(
+            stage_one_confidence,
+            family=confidence_family,
+            calibration_buckets=historical_confidence_buckets,
+            min_samples=settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_SAMPLES,
+        )
+        calibrated_confidence = historical_shrink.calibrated_confidence
+        confidence_history_gap_applied = max(0.0, stage_one_confidence - calibrated_confidence)
+        historical_bucket_sample_size = historical_shrink.sample_size
+        historical_bucket_family = historical_shrink.family_used
+        if historical_shrink.observed_win_rate is not None:
+            historical_win_rate_at_bucket = historical_shrink.observed_win_rate
+    else:
+        calibrated_confidence = stage_one_confidence
+    calibration_delta = confidence_before_calibration - calibrated_confidence
     confidence_calibration_applied = calibration_delta > 0
     if confidence_calibration_applied:
         scaled_bet_size_pct = decision.bet_size_pct
@@ -3417,6 +4244,34 @@ def _analyze_market_candidate(
                 ),
             }
         )
+    _nd_ceiling = _non_definitive_confidence_ceiling(decision, settings)
+    if decision.confidence > _nd_ceiling:
+        _nd_original = decision.confidence
+        _nd_scaled_bet = decision.bet_size_pct
+        if _nd_original > 0:
+            _nd_scaled_bet = decision.bet_size_pct * (_nd_ceiling / _nd_original)
+        decision = decision.model_copy(
+            update={
+                "confidence": _nd_ceiling,
+                "bet_size_pct": max(0.0, min(1.0, _nd_scaled_bet)),
+                "reasoning": (
+                    f"[Confidence capped {_nd_original:.2f} -> {_nd_ceiling:.2f} "
+                    f"non-definitive ceiling] {decision.reasoning}"
+                ),
+            }
+        )
+        logger.info(
+            "Non-definitive confidence ceiling applied: market=%s original=%.2f capped=%.2f",
+            market.id,
+            _nd_original,
+            _nd_ceiling,
+            data={
+                "market_id": market.id,
+                "original_confidence": _nd_original,
+                "capped_confidence": _nd_ceiling,
+                "ceiling_source": "non_definitive_confidence_ceiling",
+            },
+        )
     decision, flip_triggered, flip_blocked = _apply_flip_guard(
         market,
         decision,
@@ -3428,6 +4283,7 @@ def _analyze_market_candidate(
         "decision": decision,
         "was_refined": was_refined,
         "refinement_reason_text": refinement_reason_text,
+        "used_extended_research": used_extended_research,
         "flip_triggered": flip_triggered,
         "flip_blocked": flip_blocked,
         "refinement_skipped_by_flip_precheck": refinement_skipped_by_flip_precheck,
@@ -3438,6 +4294,10 @@ def _analyze_market_candidate(
         "confidence_calibration_applied": confidence_calibration_applied,
         "raw_vs_calibrated_delta": calibration_delta,
         "historical_win_rate_at_bucket": historical_win_rate_at_bucket,
+        "historical_bucket_sample_size": historical_bucket_sample_size,
+        "historical_bucket_family": historical_bucket_family,
+        "confidence_history_gap_applied": confidence_history_gap_applied,
+        "historical_confidence_shrink_applied": confidence_history_gap_applied > 0.0,
         "definitive_outcome_for_calibration": definitive_outcome_for_calibration,
     }
 
@@ -3461,10 +4321,18 @@ def main(max_cycles: int | None = None) -> None:
     logger.info("PredictBot initializing...")
 
     state_manager = MarketStateManager(settings.STATE_DB_PATH)
+    backfilled = state_manager.backfill_outcomes_from_settlements()
+    if backfilled:
+        logger.info(
+            "Backfilled %d trade_outcomes from exchange_settlements",
+            backfilled,
+            data={"backfilled_outcomes": backfilled},
+        )
     scheduler = MarketScheduler(
         reanalysis_cooldown_hours=settings.REANALYSIS_COOLDOWN_HOURS,
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
         urgent_reanalysis_cooldown_hours=settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
+        max_reanalyses_per_market_per_day=settings.MAX_REANALYSES_PER_MARKET_PER_DAY,
     )
     shared_xai_provider = XAIProvider(
         api_key=settings.XAI_API_KEY,
@@ -3494,6 +4362,19 @@ def main(max_cycles: int | None = None) -> None:
         max_fetch_pages=settings.KALSHI_MAX_FETCH_PAGES,
     )
     logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
+
+    try:
+        run_bootstrap_checks(
+            kalshi_client=kalshi_client,
+            skip_api_checks=settings.DRY_RUN,
+        )
+    except BootstrapError as exc:
+        logger.critical(
+            "Bootstrap check failed — aborting to avoid wasting API tokens: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+        raise
 
     logger.info(
         "PredictBot started (dry_run=%s, max_cycles=%s)",
@@ -3684,6 +4565,7 @@ def main(max_cycles: int | None = None) -> None:
             trades_skipped_no_trade = 0
             trades_skipped_edge = 0
             trades_skipped_position = 0
+            cycle_definitive_overrides_applied = 0
             trades_skipped_kelly_sub_floor = 0
             scheduler_skipped_closed = 0
             scheduler_skipped_recently = 0
@@ -3717,8 +4599,16 @@ def main(max_cycles: int | None = None) -> None:
             pre_analysis_rejection_breakdown: dict[str, int] = {}
             execution_family_stats: dict[str, dict[str, float]] = {}
             evidence_basis_breakdown: dict[str, int] = {}
+            family_edge_samples: dict[str, list[float]] = {}
+            research_queue: deque[dict[str, Any]] = deque(maxlen=_RESEARCH_QUEUE_MAXLEN)
             pre_analysis_blocked = 0
+            pre_analysis_research_routed_count = 0
             should_trade_but_blocked = 0
+            blocked_direct_evidence_count = 0
+            participation_tier_breakdown: dict[str, int] = {}
+            definitive_outcome_floor_applied_count = 0
+            timeout_routed_to_monitor_only_count = 0
+            negative_best_score_skipped_count = 0
             should_trade_blocked_breakdown: dict[str, int] = {}
             cycle_prompt_tokens = 0
             cycle_completion_tokens = 0
@@ -3728,7 +4618,11 @@ def main(max_cycles: int | None = None) -> None:
             event_cycle_traded_outcomes: dict[str, set[str]] = {}
             confidence_calibration_applied_count = 0
             confidence_calibration_delta_sum = 0.0
+            confidence_delta_samples: list[float] = []
             confidence_calibration_historical_win_rates: list[float] = []
+            extended_research_market_ids: set[str] = set()
+            mlb_family_orders_attempted = 0
+            mlb_family_orders_filled = 0
             cycle_balance_start = cycle_bankroll
             last_known_balance = cycle_cash_balance
             last_known_portfolio_value = cycle_bankroll
@@ -3751,24 +4645,80 @@ def main(max_cycles: int | None = None) -> None:
                 execution_audit: dict[str, Any] | None = None,
                 score_breakdown: dict[str, Any] | None = None,
             ) -> None:
+                normalized_decision = dict(decision or {})
+                audit_payload = dict(execution_audit or {}) if isinstance(execution_audit, dict) else {}
+                normalized_score_breakdown = _score_breakdown_from_execution_audit(
+                    execution_audit=audit_payload,
+                    explicit_score_breakdown=score_breakdown,
+                )
+                if not audit_payload:
+                    inferred_action = "order_attempt" if order is not None else "decision_recorded"
+                    inferred_reason = "order_attempt" if order is not None else "missing_execution_audit"
+                    audit_payload = _build_execution_audit(
+                        decision_terminal=(order is None),
+                        final_action=inferred_action,
+                        final_reason=inferred_reason,
+                    )
+                if (
+                    isinstance(normalized_score_breakdown, dict)
+                    and "score_breakdown" not in audit_payload
+                ):
+                    audit_payload["score_breakdown"] = normalized_score_breakdown
+                if "analysis_prompt_tokens" not in audit_payload:
+                    audit_payload["analysis_prompt_tokens"] = normalized_decision.get("prompt_tokens")
+                if "analysis_completion_tokens" not in audit_payload:
+                    audit_payload["analysis_completion_tokens"] = normalized_decision.get("completion_tokens")
+                if "analysis_cached_tokens" not in audit_payload:
+                    audit_payload["analysis_cached_tokens"] = normalized_decision.get("cached_tokens")
+                if "source_requirement_status" not in audit_payload:
+                    normalized_family = str(audit_payload.get("market_family") or "").strip().lower()
+                    normalized_evidence_basis = str(
+                        normalized_decision.get("evidence_basis") or ""
+                    ).strip().lower()
+                    normalized_edge_source = str(
+                        normalized_decision.get("edge_source") or ""
+                    ).strip().lower()
+                    has_primary_source = bool(
+                        str(normalized_decision.get("primary_source_url") or "").strip()
+                    )
+                    audit_payload["source_requirement_status"] = {
+                        "evidence_basis": normalized_evidence_basis,
+                        "edge_source": normalized_edge_source,
+                        "primary_source_url_present": has_primary_source,
+                        "requires_primary_source": normalized_family not in {"sports", "generic"},
+                    }
+                if market_id in extended_research_market_ids:
+                    audit_payload["extended_research_used"] = True
+                normalized_final_action = str(audit_payload.get("final_action") or "").strip().lower()
+                inferred_edge_market = audit_payload.get("edge_market")
+                if inferred_edge_market is None:
+                    inferred_edge_market = audit_payload.get("score_edge_market")
+                inferred_edge_external = audit_payload.get("edge_external")
+                if inferred_edge_external is None:
+                    inferred_edge_external = audit_payload.get("score_edge_external")
+                if inferred_edge_market is not None and "edge" not in normalized_decision:
+                    normalized_decision["edge"] = inferred_edge_market
+                if inferred_edge_market is not None and "edge_market" not in normalized_decision:
+                    normalized_decision["edge_market"] = inferred_edge_market
+                if (
+                    inferred_edge_external is not None
+                    and "edge_external" not in normalized_decision
+                ):
+                    normalized_decision["edge_external"] = inferred_edge_external
                 _base_log_trade_decision(
                     market_id=market_id,
                     question=question,
-                    decision=decision,
+                    decision=normalized_decision,
                     order=order,
-                    execution_audit=execution_audit,
-                )
-                normalized_score_breakdown = _score_breakdown_from_execution_audit(
-                    execution_audit=execution_audit,
-                    explicit_score_breakdown=score_breakdown,
+                    execution_audit=audit_payload,
                 )
                 try:
                     state_manager.record_decision_receipt(
                         cycle_id=cycle_id,
                         market_id=market_id,
-                        decision=decision,
+                        decision=normalized_decision,
                         order=order,
-                        execution_audit=execution_audit,
+                        execution_audit=audit_payload,
                         score_breakdown=normalized_score_breakdown,
                     )
                 except Exception as receipt_exc:
@@ -3778,14 +4728,42 @@ def main(max_cycles: int | None = None) -> None:
                         receipt_exc,
                         data={"market_id": market_id, "error": str(receipt_exc)},
                     )
-                audit = execution_audit if isinstance(execution_audit, dict) else {}
-                if str(audit.get("final_action") or "").strip().lower() == "skip":
+                if market_id in extended_research_market_ids:
+                    next_eligible_cycle: int | None = None
+                    cooldown_cycles = max(
+                        0,
+                        int(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES),
+                    )
+                    if normalized_final_action in {"skip", "research_queued"}:
+                        if cooldown_cycles > 0:
+                            next_eligible_cycle = cycle_count + cooldown_cycles
+                            audit_payload["extended_research_next_eligible_cycle"] = (
+                                next_eligible_cycle
+                            )
+                    elif normalized_final_action in {"order_attempt", "order_submitted", "dry_run"}:
+                        next_eligible_cycle = 0
+                    if next_eligible_cycle is not None:
+                        try:
+                            state_manager.set_market_cooldown_cycle(
+                                market_id,
+                                next_eligible_cycle,
+                            )
+                        except Exception as cooldown_exc:
+                            logger.debug(
+                                "Extended research cooldown persistence failed: market=%s error=%s",
+                                market_id,
+                                cooldown_exc,
+                                data={"market_id": market_id, "error": str(cooldown_exc)},
+                            )
+                audit = audit_payload
+                if normalized_final_action in {"skip", "research_queued"}:
                     rejection_funnel_summary.append(
                         {
                             "market_id": market_id,
                             "market_family": audit.get("market_family"),
                             "evidence_basis": audit.get("evidence_basis_class"),
                             "score": audit.get("pre_execution_final_score"),
+                            "final_action": normalized_final_action,
                             "rejection_stage": audit.get("rejection_stage"),
                             "rejection_reason": audit.get("final_reason"),
                         }
@@ -3798,13 +4776,42 @@ def main(max_cycles: int | None = None) -> None:
                     should_trade_blocked_breakdown.get(reason, 0) + 1
                 )
 
+            def _enqueue_research_candidate(
+                *,
+                market: Market,
+                decision: TradeDecision,
+                reason: str,
+                gate_name: str,
+                threshold_gap: float,
+                edge_market: float | None = None,
+                edge_required: float | None = None,
+            ) -> int:
+                research_queue.append(
+                    {
+                        "market_id": market.id,
+                        "market_family": market_family(market),
+                        "gate_name": gate_name,
+                        "reason": reason,
+                        "threshold_gap": round(max(0.0, threshold_gap), 4),
+                        "edge_market": edge_market,
+                        "edge_required": edge_required,
+                        "confidence": decision.confidence,
+                        "evidence_quality": decision.evidence_quality,
+                        "edge_external": decision.edge_external,
+                        "primary_source_url": getattr(decision, "primary_source_url", None),
+                    }
+                )
+                return len(research_queue)
+
             def _register_order_attempt(
                 event_key: str,
                 market_id: str,
                 outcome: str,
             ) -> None:
-                nonlocal daily_trade_count
+                nonlocal daily_trade_count, mlb_family_orders_attempted
                 daily_trade_count += 1
+                if _is_mlb_market_id(market_id):
+                    mlb_family_orders_attempted += 1
                 if event_key:
                     event_cycle_traded_market_ids.setdefault(event_key, set()).add(market_id)
                     normalized_outcome = _normalize_outcome_key(outcome)
@@ -3827,6 +4834,10 @@ def main(max_cycles: int | None = None) -> None:
             fallback_family_rate_cache: dict[str, tuple[float, int]] = {}
             historical_family_outcome_snapshot: dict[str, dict[str, float | int]] = {}
             family_action_snapshot: dict[str, dict[str, float | int]] = {}
+            historical_prefix_stats: dict[str, Any] = {}
+            historical_short_prefix_stats: dict[str, Any] = {}
+            historical_family_stats_recent: dict[str, Any] = {}
+            historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] = {}
 
             try:
                 historical_family_outcome_snapshot = state_manager.get_family_outcome_snapshot(
@@ -3842,6 +4853,7 @@ def main(max_cycles: int | None = None) -> None:
             try:
                 family_action_snapshot = state_manager.get_family_action_snapshot(
                     lookback=max(100, settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES * 20),
+                    deep_only=settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_USE_DEEP_ANALYZED_DENOMINATOR,
                 )
             except Exception as exc:
                 logger.debug(
@@ -3850,6 +4862,83 @@ def main(max_cycles: int | None = None) -> None:
                     data={"error": str(exc)},
                 )
                 family_action_snapshot = {}
+            try:
+                historical_prefix_stats = load_ticker_prefix_stats(
+                    state_manager,
+                    prefix_len=settings.HISTORICAL_TICKER_PREFIX_LEN,
+                    lookback_days=settings.HISTORICAL_TICKER_PREFIX_LOOKBACK_DAYS,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Historical ticker-prefix snapshot lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
+                historical_prefix_stats = {}
+            try:
+                historical_short_prefix_stats = load_short_prefix_stats(
+                    state_manager,
+                    prefix_len=settings.HISTORICAL_SHORT_PREFIX_LEN,
+                    lookback_days=settings.HISTORICAL_TICKER_PREFIX_LOOKBACK_DAYS,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Historical short-prefix snapshot lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
+                historical_short_prefix_stats = {}
+            try:
+                historical_family_stats_recent = load_family_stats(
+                    state_manager,
+                    lookback_days=settings.HISTORICAL_FAMILY_LOOKBACK_DAYS,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Historical family snapshot lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
+            if settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED:
+                try:
+                    historical_confidence_buckets = (
+                        state_manager.load_confidence_calibration_buckets(
+                            days=settings.HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS,
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Historical confidence bucket calibration lookup failed: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+                historical_family_stats_recent = {}
+
+            recent_research_entries: dict[str, dict[str, Any]] = {}
+            if settings.RESEARCH_QUEUE_ENABLED and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                try:
+                    raw_entries = state_manager.get_active_research_entries(
+                        lookback_hours=max(1, settings.RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS),
+                        limit=200,
+                    )
+                    for entry in raw_entries:
+                        mid = str(entry.get("market_id") or "").strip()
+                        if mid and mid not in recent_research_entries:
+                            recent_research_entries[mid] = entry
+                except Exception as exc:
+                    logger.debug(
+                        "Research queue consumer lookup failed: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+                if recent_research_entries:
+                    logger.debug(
+                        "Research queue consumer loaded %d recent entries",
+                        len(recent_research_entries),
+                        data={"research_queue_consumer_loaded": len(recent_research_entries)},
+                    )
+
+            _RESEARCH_QUEUE_SCORE_BUMP = 0.05
 
             def _get_fallback_family_stats(family_name: str) -> tuple[float, int]:
                 normalized_family = str(family_name or "").strip().lower()
@@ -3886,6 +4975,45 @@ def main(max_cycles: int | None = None) -> None:
                     return {}
                 return dict(family_action_snapshot.get(normalized_family, {}))
 
+            def _evaluate_historical_gate(
+                *,
+                market_id: str,
+                family_name: str,
+            ) -> tuple[bool, str | None, dict[str, Any]]:
+                return evaluate_market(
+                    market_id=market_id,
+                    family=family_name,
+                    prefix_stats=historical_prefix_stats,
+                    family_stats=historical_family_stats_recent,
+                    prefix_len=settings.HISTORICAL_TICKER_PREFIX_LEN,
+                    prefix_gate_enabled=settings.HISTORICAL_TICKER_PREFIX_GATE_ENABLED,
+                    prefix_min_samples=settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES,
+                    prefix_hard_block_min_samples=settings.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES,
+                    prefix_pnl_cutoff=settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF,
+                    prefix_win_rate_cutoff=settings.HISTORICAL_TICKER_PREFIX_WIN_RATE_CUTOFF,
+                    prefix_shrinkage_enabled=settings.HISTORICAL_TICKER_PREFIX_SHRINKAGE_ENABLED,
+                    prefix_prior_win_rate=settings.HISTORICAL_TICKER_PREFIX_PRIOR_WIN_RATE,
+                    prefix_prior_strength=settings.HISTORICAL_TICKER_PREFIX_PRIOR_STRENGTH,
+                    prefix_shrunk_pnl_cutoff=settings.HISTORICAL_TICKER_PREFIX_SHRUNK_PNL_CUTOFF,
+                    family_gate_enabled=settings.HISTORICAL_FAMILY_GATE_ENABLED,
+                    family_min_samples=settings.HISTORICAL_FAMILY_MIN_SAMPLES,
+                    family_pnl_cutoff=settings.HISTORICAL_FAMILY_PNL_CUTOFF,
+                    family_win_rate_cutoff=settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
+                )
+
+            def _evaluate_short_prefix_score_penalty(
+                *,
+                market_id: str,
+            ) -> tuple[float, dict[str, Any]]:
+                return evaluate_short_prefix_penalty(
+                    market_id=market_id,
+                    short_prefix_stats=historical_short_prefix_stats,
+                    prefix_len=settings.HISTORICAL_SHORT_PREFIX_LEN,
+                    min_samples=settings.HISTORICAL_SHORT_PREFIX_MIN_SAMPLES,
+                    pnl_cutoff=settings.HISTORICAL_SHORT_PREFIX_PNL_CUTOFF,
+                    score_penalty=settings.HISTORICAL_SHORT_PREFIX_SCORE_PENALTY,
+                )
+
             for market in markets:
                 logger.debug(
                     "Analyzing market: id=%s, question='%s'",
@@ -3902,13 +5030,39 @@ def main(max_cycles: int | None = None) -> None:
                         data={"market_id": market.id, "error": str(exc)},
                     )
                     state = None
+                next_eligible_cycle = int(
+                    state.next_eligible_cycle if isinstance(state, MarketState) else 0
+                )
+                if next_eligible_cycle > cycle_count:
+                    pre_analysis_blocked += 1
+                    _record_rejection_reason(
+                        pre_analysis_rejection_breakdown,
+                        "extended_research_cooldown",
+                    )
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "extended_research_cooldown",
+                    )
+                    logger.debug(
+                        "Skipping %s: extended research cooldown until cycle %d",
+                        market.id,
+                        next_eligible_cycle,
+                        data={
+                            "market_id": market.id,
+                            "next_eligible_cycle": next_eligible_cycle,
+                            "current_cycle": cycle_count,
+                        },
+                    )
+                    continue
 
-                should_skip, skip_reason = scheduler.should_skip(market, state)
+                should_skip, skip_reason = scheduler.should_skip(market, state, state_manager=state_manager)
                 if should_skip:
                     if skip_reason == "market closed":
                         scheduler_skipped_closed += 1
                     elif skip_reason == "recently analyzed":
                         scheduler_skipped_recently += 1
+                    elif skip_reason == "daily_reanalysis_cap_reached":
+                        scheduler_skipped_other += 1
                     else:
                         scheduler_skipped_other += 1
                     logger.debug(
@@ -4005,6 +5159,25 @@ def main(max_cycles: int | None = None) -> None:
                     family_name
                 )
                 historical_family_stats = _get_historical_family_stats(family_name)
+                recent_family_stats = historical_family_stats_recent.get(family_name)
+                historical_family_pnl_total = float(
+                    getattr(recent_family_stats, "pnl_total", 0.0) or 0.0
+                )
+                historical_family_sample_size = int(
+                    getattr(recent_family_stats, "sample_size", 0) or 0
+                )
+                historical_family_win_rate = float(
+                    getattr(recent_family_stats, "win_rate", 0.0) or 0.0
+                )
+                historical_gate_allowed, historical_gate_reason, historical_gate_metrics = (
+                    _evaluate_historical_gate(
+                        market_id=market.id,
+                        family_name=family_name,
+                    )
+                )
+                short_prefix_score_penalty, short_prefix_metrics = (
+                    _evaluate_short_prefix_score_penalty(market_id=market.id)
+                )
                 pre_analysis_hard_reject, pre_analysis_hard_reject_reason, pre_analysis_hard_reject_data = (
                     _pre_analysis_hard_rejection(
                         market=market,
@@ -4016,6 +5189,9 @@ def main(max_cycles: int | None = None) -> None:
                         historical_family_stats=historical_family_stats,
                         fallback_family_edge_rate=family_fallback_rate,
                         fallback_family_sample_size=family_fallback_samples,
+                        historical_gate_allowed=historical_gate_allowed,
+                        historical_gate_reason=historical_gate_reason,
+                        historical_gate_metrics=historical_gate_metrics,
                     )
                 )
                 if pre_analysis_hard_reject:
@@ -4025,13 +5201,222 @@ def main(max_cycles: int | None = None) -> None:
                             pre_analysis_rejection_breakdown,
                             pre_analysis_hard_reject_reason,
                         )
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            pre_analysis_hard_reject_reason,
+                        )
+                    participation_result = classify_participation(
+                        historical_gate=HistoricalGateResult(
+                            allowed=historical_gate_allowed or False,
+                            reason=historical_gate_reason,
+                            metrics=historical_gate_metrics or {},
+                            sample_size=int(
+                                (historical_gate_metrics or {}).get(
+                                    "historical_gate_prefix_sample_size", 0
+                                )
+                                or 0
+                            ),
+                            wilson_win_rate_lower_bound=(
+                                (historical_gate_metrics or {}).get(
+                                    "historical_gate_wilson_lb"
+                                )
+                            ),
+                        ) if historical_gate_metrics else None,
+                        pre_analysis_rejection_reason=pre_analysis_hard_reject_reason,
+                        pre_analysis_metadata=pre_analysis_hard_reject_data,
+                    )
+                    participation_tier_str = str(participation_result.tier)
+                    _record_rejection_reason(
+                        participation_tier_breakdown,
+                        participation_tier_str,
+                    )
+                    default_outcome = market.outcomes[0].name if market.outcomes else "YES"
+                    research_only_decision = TradeDecision(
+                        should_trade=False,
+                        outcome=default_outcome,
+                        confidence=0.50,
+                        bet_size_pct=0.0,
+                        reasoning=(
+                            f"[ResearchOnly reason={pre_analysis_hard_reject_reason or 'pre_analysis_soft_research'}] "
+                            "Soft-demoted by historical or repeated no-action performance; queued for learning, not execution."
+                        ),
+                        edge_source="none",
+                        evidence_basis="absence_only",
+                        evidence_quality=0.0,
+                        abstain=True,
+                    )
+                    research_queue_position: int | None = None
+                    queue_for_pre_analysis_research = bool(settings.RESEARCH_QUEUE_ENABLED)
+                    if queue_for_pre_analysis_research:
+                        research_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=research_only_decision,
+                            reason=pre_analysis_hard_reject_reason
+                            or "pre_analysis_soft_research",
+                            gate_name="pre_analysis_performance",
+                            threshold_gap=0.0,
+                        )
+                    if queue_for_pre_analysis_research and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                        try:
+                            state_manager.record_research_queue_entry(
+                                market_id=market.id,
+                                cycle_id=cycle_id,
+                                gate_name="pre_analysis_performance",
+                                reason=pre_analysis_hard_reject_reason or "pre_analysis_soft_research",
+                                threshold_gap=0.0,
+                                what_to_learn_next=participation_result.what_to_learn_next,
+                            )
+                        except Exception:
+                            pass
+                    _deduped_reject_data = {
+                        k: v
+                        for k, v in pre_analysis_hard_reject_data.items()
+                        if k not in {
+                            "participation_tier",
+                            "participation_decision",
+                            "why_not_execution_eligible",
+                            "what_to_learn_next",
+                            "sample_size_signal",
+                            "pre_analysis_hard_reject",
+                            "legacy_pre_analysis_hard_reject",
+                            "pre_analysis_hard_reject_reason",
+                        }
+                    }
+                    _research_audit = _build_execution_audit(
+                        decision_terminal=not queue_for_pre_analysis_research,
+                        final_action=(
+                            "research_queued"
+                            if queue_for_pre_analysis_research
+                            else "skip"
+                        ),
+                        final_reason=pre_analysis_hard_reject_reason
+                        or "pre_analysis_soft_research",
+                        market_family=family_name,
+                        pre_analysis_score=_PRE_ANALYSIS_RESEARCH_ONLY_SCORE,
+                        pre_analysis_soft_research_only=True,
+                        pre_analysis_soft_research_reason=pre_analysis_hard_reject_reason,
+                        research_queue_position=research_queue_position,
+                        historical_gate_allowed=historical_gate_allowed,
+                        historical_gate_reason=historical_gate_reason,
+                        historical_gate_metrics=historical_gate_metrics,
+                        historical_family_pnl_total=historical_family_pnl_total,
+                        historical_family_sample_size=historical_family_sample_size,
+                        historical_family_win_rate=historical_family_win_rate,
+                        short_prefix_score_penalty=short_prefix_score_penalty,
+                        participation_tier=participation_tier_str,
+                        participation_decision=str(participation_result.primary_reason),
+                        why_not_execution_eligible=participation_result.why_not_execution_eligible,
+                        what_to_learn_next=participation_result.what_to_learn_next,
+                        pre_analysis_demotion_reason=pre_analysis_hard_reject_reason,
+                        counterfactual_required_confidence=settings.MIN_CONFIDENCE,
+                        counterfactual_required_evidence_quality=settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+                        **_deduped_reject_data,
+                    )
+                    _base_log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=research_only_decision.model_dump(),
+                        execution_audit=_research_audit,
+                    )
                     logger.debug(
-                        "Skipping %s: pre-analysis hard rejection (%s)",
+                        "Soft-demoted %s to research-only pre-analysis path (%s) tier=%s",
                         market.id,
                         pre_analysis_hard_reject_reason or "pre_analysis_hard_reject",
+                        participation_tier_str,
                         data={
                             "market_id": market.id,
-                            **pre_analysis_hard_reject_data,
+                            "final_action": (
+                                "research_queued"
+                                if queue_for_pre_analysis_research
+                                else "skip"
+                            ),
+                            "research_queue_position": research_queue_position,
+                            "participation_tier": participation_tier_str,
+                            "what_to_learn_next": participation_result.what_to_learn_next,
+                            **_deduped_reject_data,
+                        },
+                    )
+                    continue
+                _analysis_count_for_cap = (
+                    int(state.analysis_count)
+                    if isinstance(state, MarketState)
+                    and state.analysis_count is not None
+                    else 0
+                )
+                if (
+                    settings.MAX_LIFETIME_ANALYSES_PER_MARKET > 0
+                    and _analysis_count_for_cap >= settings.MAX_LIFETIME_ANALYSES_PER_MARKET
+                    and not traded_before
+                ):
+                    _cap_reason = "pre_analysis_lifetime_analysis_cap"
+                    pre_analysis_research_routed_count += 1
+                    _record_rejection_reason(rejection_breakdown, _cap_reason)
+                    _record_rejection_reason(pre_analysis_rejection_breakdown, _cap_reason)
+                    default_outcome = market.outcomes[0].name if market.outcomes else "YES"
+                    _cap_decision = TradeDecision(
+                        should_trade=False,
+                        outcome=default_outcome,
+                        confidence=0.50,
+                        bet_size_pct=0.0,
+                        reasoning=(
+                            f"[ResearchOnly reason={_cap_reason}] "
+                            f"Market has {_analysis_count_for_cap} lifetime analyses >= cap "
+                            f"{settings.MAX_LIFETIME_ANALYSES_PER_MARKET}; "
+                            "queued for outcome learning, not re-analysis."
+                        ),
+                        edge_source="none",
+                        evidence_basis="absence_only",
+                        evidence_quality=0.0,
+                        abstain=True,
+                    )
+                    _cap_rq_pos: int | None = None
+                    if settings.RESEARCH_QUEUE_ENABLED:
+                        _cap_rq_pos = _enqueue_research_candidate(
+                            market=market,
+                            decision=_cap_decision,
+                            reason=_cap_reason,
+                            gate_name="lifetime_analysis_cap",
+                            threshold_gap=0.0,
+                        )
+                    if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                        try:
+                            state_manager.record_research_queue_entry(
+                                market_id=market.id,
+                                cycle_id=cycle_id,
+                                gate_name="lifetime_analysis_cap",
+                                reason=_cap_reason,
+                                threshold_gap=0.0,
+                                what_to_learn_next=(
+                                    f"Reached {_analysis_count_for_cap} analyses (cap "
+                                    f"{settings.MAX_LIFETIME_ANALYSES_PER_MARKET}); "
+                                    "waiting for settlement outcome."
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    _base_log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=_cap_decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=False,
+                            final_action="research_queued",
+                            final_reason=_cap_reason,
+                            market_family=family_name,
+                            analysis_count=_analysis_count_for_cap,
+                            research_queue_position=_cap_rq_pos,
+                        ),
+                    )
+                    logger.debug(
+                        "Lifetime analysis cap reached for %s: %d >= %d",
+                        market.id,
+                        _analysis_count_for_cap,
+                        settings.MAX_LIFETIME_ANALYSES_PER_MARKET,
+                        data={
+                            "market_id": market.id,
+                            "analysis_count": _analysis_count_for_cap,
+                            "cap": settings.MAX_LIFETIME_ANALYSES_PER_MARKET,
+                            "research_queue_position": _cap_rq_pos,
                         },
                     )
                     continue
@@ -4046,26 +5431,144 @@ def main(max_cycles: int | None = None) -> None:
                         fallback_family_edge_rate=family_fallback_rate,
                         fallback_family_sample_size=family_fallback_samples,
                         historical_family_stats=historical_family_stats,
+                        historical_prefix_stats=historical_prefix_stats,
                     )
+                    research_entry = recent_research_entries.get(market.id)
+                    if research_entry is not None:
+                        pre_analysis_score += _RESEARCH_QUEUE_SCORE_BUMP
+                        if pre_analysis_breakdown is None:
+                            pre_analysis_breakdown = {}
+                        pre_analysis_breakdown["research_queue_bump"] = _RESEARCH_QUEUE_SCORE_BUMP
+                        pre_analysis_breakdown["previous_research_reason"] = str(
+                            research_entry.get("reason") or ""
+                        )
                     if pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:
-                        pre_analysis_blocked += 1
-                        _record_rejection_reason(
-                            pre_analysis_rejection_breakdown,
-                            "pre_analysis_score_below_min",
+                        _research_floor = (
+                            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                            - max(0.0, settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND)
                         )
-                        logger.debug(
-                            "Skipping %s: pre-analysis opportunity score %.4f < %.4f",
-                            market.id,
-                            pre_analysis_score,
-                            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
-                            data={
-                                "market_id": market.id,
-                                "pre_analysis_score": pre_analysis_score,
-                                "pre_analysis_threshold": settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
-                                **(pre_analysis_breakdown or {}),
-                            },
+                        _route_to_soft_research = (
+                            settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED
+                            and settings.RESEARCH_QUEUE_ENABLED
+                            and pre_analysis_score >= _research_floor
                         )
+                        if _route_to_soft_research:
+                            pre_analysis_research_routed_count += 1
+                            _rejection_tag = "pre_analysis_score_soft_research"
+                            _record_rejection_reason(
+                                pre_analysis_rejection_breakdown,
+                                _rejection_tag,
+                            )
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                _rejection_tag,
+                            )
+                            default_outcome = (
+                                market.outcomes[0].name if market.outcomes else "YES"
+                            )
+                            _soft_research_decision = TradeDecision(
+                                should_trade=False,
+                                outcome=default_outcome,
+                                confidence=0.50,
+                                bet_size_pct=0.0,
+                                reasoning=(
+                                    f"[ResearchOnly reason={_rejection_tag}] "
+                                    f"Pre-analysis score {pre_analysis_score:.4f} below "
+                                    f"min {settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:.4f} "
+                                    "but within research band; queued for learning."
+                                ),
+                                edge_source="none",
+                                evidence_basis="absence_only",
+                                evidence_quality=0.0,
+                                abstain=True,
+                            )
+                            _soft_rq_pos = _enqueue_research_candidate(
+                                market=market,
+                                decision=_soft_research_decision,
+                                reason=_rejection_tag,
+                                gate_name="pre_analysis_opportunity_score",
+                                threshold_gap=float(
+                                    settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                                    - pre_analysis_score
+                                ),
+                            )
+                            if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                                try:
+                                    state_manager.record_research_queue_entry(
+                                        market_id=market.id,
+                                        cycle_id=cycle_id,
+                                        gate_name="pre_analysis_opportunity_score",
+                                        reason=_rejection_tag,
+                                        threshold_gap=float(
+                                            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                                            - pre_analysis_score
+                                        ),
+                                        what_to_learn_next=(
+                                            f"Score {pre_analysis_score:.4f} near threshold "
+                                            f"{settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:.4f}; "
+                                            "monitor for improved conditions."
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
+                            _base_log_trade_decision(
+                                market_id=market.id,
+                                question=market.question,
+                                decision=_soft_research_decision.model_dump(),
+                                execution_audit=_build_execution_audit(
+                                    decision_terminal=False,
+                                    final_action="research_queued",
+                                    final_reason=_rejection_tag,
+                                    market_family=family_name,
+                                    pre_analysis_score=pre_analysis_score,
+                                    pre_analysis_breakdown=pre_analysis_breakdown,
+                                    research_queue_position=_soft_rq_pos,
+                                ),
+                            )
+                            logger.debug(
+                                "Soft-research routed %s: pre-analysis score %.4f in research band [%.4f, %.4f)",
+                                market.id,
+                                pre_analysis_score,
+                                _research_floor,
+                                settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+                                data={
+                                    "market_id": market.id,
+                                    "pre_analysis_score": pre_analysis_score,
+                                    "pre_analysis_threshold": settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+                                    "research_band_floor": _research_floor,
+                                    "research_queue_position": _soft_rq_pos,
+                                    **(pre_analysis_breakdown or {}),
+                                },
+                            )
+                        else:
+                            pre_analysis_blocked += 1
+                            _far_tag = (
+                                "pre_analysis_score_far_below_min"
+                                if pre_analysis_score < _research_floor
+                                else "pre_analysis_score_below_min"
+                            )
+                            _record_rejection_reason(
+                                pre_analysis_rejection_breakdown,
+                                _far_tag,
+                            )
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                _far_tag,
+                            )
+                            logger.debug(
+                                "Skipping %s: pre-analysis opportunity score %.4f < %.4f",
+                                market.id,
+                                pre_analysis_score,
+                                settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+                                data={
+                                    "market_id": market.id,
+                                    "pre_analysis_score": pre_analysis_score,
+                                    "pre_analysis_threshold": settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+                                    **(pre_analysis_breakdown or {}),
+                                },
+                            )
                         continue
+                _research_context = recent_research_entries.get(market.id)
                 analysis_candidates.append(
                     {
                         "market": market,
@@ -4078,7 +5581,27 @@ def main(max_cycles: int | None = None) -> None:
                         ),
                         "pre_analysis_score": pre_analysis_score,
                         "pre_analysis_breakdown": pre_analysis_breakdown,
+                        "historical_gate_allowed": historical_gate_allowed,
+                        "historical_gate_reason": historical_gate_reason,
+                        "historical_gate_metrics": historical_gate_metrics,
+                        "historical_family_pnl_total": historical_family_pnl_total,
+                        "historical_family_sample_size": historical_family_sample_size,
+                        "historical_family_win_rate": historical_family_win_rate,
+                        "short_prefix_score_penalty": short_prefix_score_penalty,
+                        "short_prefix_metrics": short_prefix_metrics,
+                        "force_extended_research": (
+                            int(state.non_actionable_streak if state else 0)
+                            >= settings.EXTENDED_RESEARCH_AFTER_STREAK
+                        ),
                         "market_snapshot_monotonic": time.monotonic(),
+                        "previous_research_reason": (
+                            str(_research_context.get("reason") or "")
+                            if _research_context else None
+                        ),
+                        "previous_research_what_to_learn": (
+                            str(_research_context.get("what_to_learn_next") or "")
+                            if _research_context else None
+                        ),
                     }
                 )
                 pre_analysis_passed += 1
@@ -4098,10 +5621,13 @@ def main(max_cycles: int | None = None) -> None:
             (
                 dynamic_max_markets_per_cycle,
                 reduced_candidate_cap_applied,
+                negative_score_floor_applied,
             ) = _resolve_dynamic_analysis_candidate_cap(
                 settings=settings,
                 best_pre_analysis_score=best_pre_analysis_score,
             )
+            if negative_score_floor_applied:
+                negative_best_score_skipped_count += 1
             analysis_candidate_attempt_limit = dynamic_max_markets_per_cycle + max(
                 0,
                 settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
@@ -4155,6 +5681,96 @@ def main(max_cycles: int | None = None) -> None:
                 },
             )
 
+            research_only_emissions = 0
+            if settings.RESEARCH_QUEUE_ENABLED and analysis_candidates:
+                analyzable_candidates: list[dict[str, Any]] = []
+                for candidate in analysis_candidates:
+                    market = candidate.get("market")
+                    if not isinstance(market, Market):
+                        continue
+                    candidate_state = candidate.get("state")
+                    analysis_count_for_research = int(
+                        candidate_state.analysis_count
+                        if isinstance(candidate_state, MarketState)
+                        and candidate_state.analysis_count is not None
+                        else 0
+                    )
+                    non_actionable_streak_for_research = int(
+                        candidate_state.non_actionable_streak
+                        if isinstance(candidate_state, MarketState)
+                        and candidate_state.non_actionable_streak is not None
+                        else 0
+                    )
+                    should_route_research_only = (
+                        analysis_count_for_research >= 5
+                        and non_actionable_streak_for_research >= 3
+                    )
+                    if not should_route_research_only:
+                        analyzable_candidates.append(candidate)
+                        continue
+                    candidate["research_only"] = True
+                    default_outcome = (
+                        market.outcomes[0].name
+                        if market.outcomes
+                        else "YES"
+                    )
+                    research_only_decision = TradeDecision(
+                        should_trade=False,
+                        outcome=default_outcome,
+                        confidence=0.50,
+                        bet_size_pct=0.0,
+                        reasoning=(
+                            "[ResearchOnly reason=repeated_non_actionable_research_only] "
+                            "Skipping repeated analysis for this cycle and queueing for future calibration learning."
+                        ),
+                        edge_source="none",
+                        evidence_basis="absence_only",
+                        evidence_quality=0.0,
+                        abstain=True,
+                    )
+                    research_queue_position = _enqueue_research_candidate(
+                        market=market,
+                        decision=research_only_decision,
+                        reason="repeated_non_actionable_research_only",
+                        gate_name="research_only",
+                        threshold_gap=0.0,
+                    )
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "research_only_repeated_non_actionable",
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=research_only_decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=False,
+                            final_action="research_queued",
+                            final_reason="repeated_non_actionable_research_only",
+                            market_family=str(candidate.get("market_family") or market_family(market)),
+                            analysis_count=analysis_count_for_research,
+                            non_actionable_streak=non_actionable_streak_for_research,
+                            pre_analysis_score=candidate.get("pre_analysis_score"),
+                            pre_analysis_breakdown=candidate.get("pre_analysis_breakdown"),
+                            historical_gate_allowed=candidate.get("historical_gate_allowed"),
+                            historical_gate_reason=candidate.get("historical_gate_reason"),
+                            historical_gate_metrics=candidate.get("historical_gate_metrics"),
+                            historical_family_pnl_total=candidate.get("historical_family_pnl_total"),
+                            historical_family_sample_size=candidate.get("historical_family_sample_size"),
+                            short_prefix_score_penalty=candidate.get("short_prefix_score_penalty"),
+                            research_only=True,
+                            research_queue_position=research_queue_position,
+                        ),
+                    )
+                    research_only_emissions += 1
+                if research_only_emissions > 0:
+                    logger.info(
+                        "Rerouted %d repetitive non-actionable markets to research-only queue",
+                        research_only_emissions,
+                        data={"research_only_emissions": research_only_emissions},
+                    )
+                analysis_candidates = analyzable_candidates
+
             analysis_results: dict[str, dict[str, Any]] = {}
             analysis_phase_start = time.monotonic()
             analysis_candidates_count = len(analysis_candidates)
@@ -4190,12 +5806,15 @@ def main(max_cycles: int | None = None) -> None:
                                 provider=shared_xai_provider,
                             )
                             future = executor.submit(
-                                _analyze_market_candidate,
+                                _analyze_market_candidate_for_worker,
                                 candidate["market"],
                                 candidate["state"],
                                 candidate["anchor_analysis"],
                                 settings,
                                 worker_client,
+                                historical_confidence_buckets,
+                                cycle_id,
+                                bool(candidate.get("force_extended_research")),
                             )
                             future_to_market[future] = candidate["market"]
 
@@ -4267,6 +5886,10 @@ def main(max_cycles: int | None = None) -> None:
                             anchor_analysis=candidate["anchor_analysis"],
                             settings=settings,
                             grok_client=grok_client,
+                            historical_confidence_buckets=historical_confidence_buckets,
+                            force_extended_research=bool(
+                                candidate.get("force_extended_research")
+                            ),
                         )
                         analysis_results[market.id] = result
                         if result.get("analysis_failed"):
@@ -4390,6 +6013,14 @@ def main(max_cycles: int | None = None) -> None:
                 cycle_reasoning_tokens += int(decision_for_usage.reasoning_tokens or 0)
                 cycle_cached_tokens += int(decision_for_usage.cached_tokens or 0)
 
+            _prefix_pnl_cache: dict[str, dict[str, float | int]] = {}
+
+            def _get_prefix_pnl(market_id: str) -> dict[str, float | int]:
+                prefix = market_id[:settings.HISTORICAL_TICKER_PREFIX_LEN].upper()
+                if prefix not in _prefix_pnl_cache:
+                    _prefix_pnl_cache[prefix] = state_manager.get_prefix_pnl_stats(prefix)
+                return _prefix_pnl_cache[prefix]
+
             for candidate in analysis_candidates:
                 market = candidate.get("market")
                 if not isinstance(market, Market):
@@ -4408,7 +6039,20 @@ def main(max_cycles: int | None = None) -> None:
                     else 0
                 )
                 evidence_basis_for_rank = _decision_evidence_basis(decision)
+                suppress_hallucinated_edge_penalty = _should_suppress_hallucinated_edge_penalty(
+                    decision=decision,
+                    evidence_basis=evidence_basis_for_rank,
+                    settings=settings,
+                )
+                definitive_eligible_for_rank = _is_definitive_outcome_eligible(decision, settings)
                 implied_prob_for_rank = _get_implied_probability(market, decision.outcome)
+                short_prefix_penalty_for_rank = float(
+                    candidate.get("short_prefix_score_penalty", 0.0) or 0.0
+                )
+                pfx_stats = _get_prefix_pnl(market.id or "")
+                pfx_n = int(pfx_stats.get("n", 0))
+                pfx_pnl = float(pfx_stats.get("total_pnl", 0.0))
+                pfx_shrunk = bayesian_shrunk_pnl(pfx_pnl, pfx_n) if pfx_n > 0 else None
                 rank_score = compute_final_score(
                     market=market,
                     decision=decision,
@@ -4425,7 +6069,22 @@ def main(max_cycles: int | None = None) -> None:
                         is_weather_market=(market_family(market) == "weather"),
                         evidence_basis_class=evidence_basis_for_rank,
                         edge_source=decision.edge_source or "",
+                        market_family=market_family(market),
+                        short_prefix_penalty=short_prefix_penalty_for_rank,
+                        suppress_hallucinated_edge_penalty=suppress_hallucinated_edge_penalty,
+                        definitive_outcome_eligible=definitive_eligible_for_rank,
+                        historical_family_pnl_total=float(
+                            candidate.get("historical_family_pnl_total", 0.0) or 0.0
+                        ),
+                        historical_family_sample_size=int(
+                            candidate.get("historical_family_sample_size", 0) or 0
+                        ),
+                        historical_prefix_pnl_per_trade=pfx_shrunk,
+                        historical_prefix_sample_size=pfx_n,
                     ),
+                )
+                analysis_result["historical_family_win_rate"] = float(
+                    candidate.get("historical_family_win_rate", 0.0) or 0.0
                 )
                 analysis_result["pre_execution_final_score"] = rank_score.final_score
                 analysis_result["pre_execution_rejection_reasons"] = list(
@@ -4440,17 +6099,37 @@ def main(max_cycles: int | None = None) -> None:
                     "fallback_edge_penalty": rank_score.fallback_edge_penalty,
                     "proxy_evidence_penalty": rank_score.proxy_evidence_penalty,
                     "overconfidence_penalty": rank_score.overconfidence_penalty,
+                    "late_stage_overconfidence_penalty": rank_score.late_stage_overconfidence_penalty,
+                    "fallback_high_confidence_penalty": rank_score.fallback_high_confidence_penalty,
+                    "extreme_market_edge_penalty": rank_score.extreme_market_edge_penalty,
+                    "hallucinated_edge_penalty": rank_score.hallucinated_edge_penalty,
+                    "hallucinated_edge_penalty_suppressed": (
+                        rank_score.hallucinated_edge_penalty_suppressed
+                    ),
                     "liquidity_penalty": rank_score.liquidity_penalty,
                     "staleness_penalty": rank_score.staleness_penalty,
                     "evidence_basis_bonus": rank_score.evidence_basis_bonus,
                     "generic_bin_penalty": rank_score.generic_bin_penalty,
+                    "numeric_strike_bin_penalty": rank_score.numeric_strike_bin_penalty,
+                    "extreme_confidence_penalty": rank_score.extreme_confidence_penalty,
+                    "short_prefix_penalty": rank_score.short_prefix_penalty,
+                    "historical_family_bonus": rank_score.historical_family_bonus,
                     "ambiguous_resolution_penalty": rank_score.ambiguous_resolution_penalty,
                 }
 
             analysis_candidates = sorted(
                 analysis_candidates,
                 key=lambda candidate: _analysis_result_rank(
-                    analysis_results.get(candidate["market"].id)
+                    analysis_results.get(candidate["market"].id),
+                    historical_family_pnl_total=float(
+                        candidate.get("historical_family_pnl_total", 0.0) or 0.0
+                    ),
+                    historical_family_sample_size=int(
+                        candidate.get("historical_family_sample_size", 0) or 0
+                    ),
+                    historical_family_win_rate=float(
+                        candidate.get("historical_family_win_rate", 0.0) or 0.0
+                    ),
                 ),
                 reverse=True,
             )
@@ -4483,7 +6162,8 @@ def main(max_cycles: int | None = None) -> None:
                 },
             )
 
-            for candidate in analysis_candidates:
+            ranking_total_candidates = len(analysis_candidates)
+            for ranking_rank, candidate in enumerate(analysis_candidates, start=1):
                 if markets_analyzed >= settings.MAX_MARKETS_PER_CYCLE:
                     break
                 market = candidate["market"]
@@ -4495,30 +6175,98 @@ def main(max_cycles: int | None = None) -> None:
                 if analysis_result is None:
                     continue
                 if analysis_result.get("analysis_failed"):
-                    _record_terminal_outcome(
-                        state_manager,
-                        market.id,
-                        "analysis_failure",
-                    )
-                    logger.info(
-                        "Market %s skipped due to initial analysis failure: %s",
-                        market.id,
-                        analysis_result.get("analysis_error"),
-                        data={
-                            "market_id": market.id,
-                            "final_action": "skip",
-                            "final_reason": "analysis_failure_after_retries",
-                            "error_type": analysis_result.get("analysis_error_type"),
-                        },
-                    )
+                    is_timeout_failure = bool(analysis_result.get("analysis_is_timeout"))
+                    if (
+                        is_timeout_failure
+                        and settings.TIMEOUT_RETRY_AS_MONITOR_ONLY_ENABLED
+                    ):
+                        timeout_routed_to_monitor_only_count += 1
+                        _record_rejection_reason(
+                            participation_tier_breakdown,
+                            str(ParticipationTier.MONITOR_ONLY),
+                        )
+                        _record_terminal_outcome(
+                            state_manager,
+                            market.id,
+                            "monitor_only_timeout",
+                        )
+                        if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                            try:
+                                state_manager.record_research_queue_entry(
+                                    market_id=market.id,
+                                    cycle_id=cycle_id,
+                                    gate_name="grok_timeout",
+                                    reason="grok_stream_timeout",
+                                    what_to_learn_next=(
+                                        f"Retry with extended timeout; "
+                                        f"profile={analysis_result.get('analysis_search_profile')}"
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                        logger.info(
+                            "Market %s routed to MONITOR_ONLY due to Grok timeout: %s",
+                            market.id,
+                            analysis_result.get("analysis_error"),
+                            data={
+                                "market_id": market.id,
+                                "final_action": "monitor_only",
+                                "final_reason": "grok_stream_timeout",
+                                "participation_tier": str(ParticipationTier.MONITOR_ONLY),
+                                "search_profile": analysis_result.get("analysis_search_profile"),
+                            },
+                        )
+                    else:
+                        is_retriable = bool(analysis_result.get("analysis_error_retriable"))
+                        if is_timeout_failure:
+                            _failure_tier = str(ParticipationTier.MONITOR_ONLY)
+                            _failure_reason = "grok_stream_timeout"
+                        elif is_retriable:
+                            _failure_tier = str(ParticipationTier.OPERATIONAL_ERROR_RETRY)
+                            _failure_reason = "analysis_failure_retriable"
+                        else:
+                            _failure_tier = str(ParticipationTier.SKIP_FOR_NOW_WITH_REASON)
+                            _failure_reason = "analysis_failure_after_retries"
+                        _record_terminal_outcome(
+                            state_manager,
+                            market.id,
+                            _failure_reason,
+                        )
+                        logger.info(
+                            "Market %s skipped due to initial analysis failure: %s",
+                            market.id,
+                            analysis_result.get("analysis_error"),
+                            data={
+                                "market_id": market.id,
+                                "final_action": "skip",
+                                "final_reason": _failure_reason,
+                                "participation_tier": _failure_tier,
+                                "error_type": analysis_result.get("analysis_error_type"),
+                            },
+                        )
                     continue
                 markets_analyzed += 1
                 decision = analysis_result["decision"]
                 decisions_made += 1
                 evidence_basis = _decision_evidence_basis(decision)
+                used_extended_research = bool(
+                    analysis_result.get("used_extended_research")
+                )
+                if used_extended_research:
+                    extended_research_market_ids.add(market.id)
                 evidence_basis_breakdown[evidence_basis] = (
                     evidence_basis_breakdown.get(evidence_basis, 0) + 1
                 )
+                candidate_edge_value = decision.edge_external
+                if candidate_edge_value is None:
+                    my_prob_value = getattr(decision, "my_prob", None)
+                    implied_external_value = getattr(decision, "implied_prob_external", None)
+                    if my_prob_value is not None and implied_external_value is not None:
+                        candidate_edge_value = float(my_prob_value) - float(implied_external_value)
+                if candidate_edge_value is not None:
+                    family_edge_samples.setdefault(market_family_name, []).append(
+                        float(candidate_edge_value)
+                    )
                 pre_execution_final_score = float(
                     analysis_result.get("pre_execution_final_score", 0.0) or 0.0
                 )
@@ -4563,13 +6311,36 @@ def main(max_cycles: int | None = None) -> None:
                     day_start_balance=daily_start_balance,
                     current_balance=last_known_portfolio_value,
                 )
+                short_prefix_metrics = (
+                    candidate.get("short_prefix_metrics")
+                    if isinstance(candidate.get("short_prefix_metrics"), dict)
+                    else {}
+                )
+                short_prefix_score_penalty = float(
+                    candidate.get("short_prefix_score_penalty", 0.0) or 0.0
+                )
                 audit_context: dict[str, Any] = {
                     "market_family": market_family_name,
+                    "research_profile": analysis_result.get("analysis_search_profile"),
+                    "ranking_rank": ranking_rank,
+                    "ranking_total_candidates": ranking_total_candidates,
                     "pre_analysis_score": candidate.get("pre_analysis_score"),
                     "pre_analysis_breakdown": candidate.get("pre_analysis_breakdown"),
                     "analysis_count": analysis_count_for_market,
                     "non_actionable_streak": non_actionable_streak_for_market,
                     "traded_before": bool(candidate.get("traded_before", False)),
+                    "historical_gate_allowed": candidate.get("historical_gate_allowed"),
+                    "historical_gate_reason": candidate.get("historical_gate_reason"),
+                    "historical_gate_metrics": candidate.get("historical_gate_metrics"),
+                    "historical_family_pnl_total": candidate.get(
+                        "historical_family_pnl_total"
+                    ),
+                    "historical_family_samples": candidate.get(
+                        "historical_family_sample_size"
+                    ),
+                    "historical_family_win_rate": candidate.get(
+                        "historical_family_win_rate"
+                    ),
                     "pre_execution_final_score": pre_execution_final_score,
                     "score_breakdown": analysis_result.get("pre_execution_score_breakdown"),
                     "evidence_basis_class": evidence_basis,
@@ -4587,6 +6358,18 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     "historical_win_rate_at_bucket": analysis_result.get(
                         "historical_win_rate_at_bucket"
+                    ),
+                    "historical_bucket_sample_size": analysis_result.get(
+                        "historical_bucket_sample_size"
+                    ),
+                    "historical_bucket_family": analysis_result.get(
+                        "historical_bucket_family"
+                    ),
+                    "confidence_history_gap_applied": analysis_result.get(
+                        "confidence_history_gap_applied"
+                    ),
+                    "historical_confidence_shrink_applied": analysis_result.get(
+                        "historical_confidence_shrink_applied"
                     ),
                     "definitive_outcome_for_calibration": analysis_result.get(
                         "definitive_outcome_for_calibration"
@@ -4610,13 +6393,44 @@ def main(max_cycles: int | None = None) -> None:
                     "correlated_position_outcomes": sorted(correlated_position_outcomes),
                     "daily_trade_count": daily_trade_count,
                     "daily_pnl_estimate": daily_pnl_estimate,
+                    "gated_should_trade": bool(decision.should_trade),
+                    "ticker_prefix_short": short_prefix_metrics.get("historical_short_prefix"),
+                    "ticker_prefix_short_pnl": short_prefix_metrics.get(
+                        "historical_short_prefix_pnl_total"
+                    ),
+                    "ticker_prefix_short_sample_size": short_prefix_metrics.get(
+                        "historical_short_prefix_sample_size"
+                    ),
+                    "short_prefix_score_penalty": short_prefix_score_penalty,
+                    "extended_research_used": used_extended_research,
+                    "research_only": bool(candidate.get("research_only", False)),
+                    "primary_source_url_present": bool(
+                        str(getattr(decision, "primary_source_url", "") or "").strip()
+                    ),
                 }
                 audit_context.update(score_receipt_fields)
+                compact_pre_execution_score = _compact_score_breakdown(score_receipt_fields)
+                if compact_pre_execution_score:
+                    audit_context["score_breakdown"] = compact_pre_execution_score
+                if pre_execution_score_result is not None:
+                    audit_context["fallback_high_confidence_penalty_applied"] = bool(
+                        float(
+                            getattr(
+                                pre_execution_score_result,
+                                "fallback_high_confidence_penalty",
+                                0.0,
+                            )
+                            or 0.0
+                        )
+                        > 0.0
+                    )
                 if analysis_result.get("confidence_calibration_applied"):
                     confidence_calibration_applied_count += 1
-                confidence_calibration_delta_sum += float(
+                raw_vs_calibrated_delta = float(
                     analysis_result.get("raw_vs_calibrated_delta", 0.0) or 0.0
                 )
+                confidence_calibration_delta_sum += raw_vs_calibrated_delta
+                confidence_delta_samples.append(raw_vs_calibrated_delta)
                 historical_bucket_rate = analysis_result.get("historical_win_rate_at_bucket")
                 if isinstance(historical_bucket_rate, (float, int)):
                     confidence_calibration_historical_win_rates.append(
@@ -4764,6 +6578,45 @@ def main(max_cycles: int | None = None) -> None:
                         question_short,
                     )
                     continue
+                if (
+                    decision.should_trade
+                    and settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL
+                    and market_family_name != "sports"
+                    and not str(getattr(decision, "primary_source_url", "") or "").strip()
+                ):
+                    trades_skipped_no_trade += 1
+                    _record_should_trade_blocked("non_sports_missing_primary_source")
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "non_sports_missing_primary_source",
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="non_sports_missing_primary_source",
+                            primary_source_url=getattr(decision, "primary_source_url", None),
+                            **audit_context,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "non_sports_missing_primary_source",
+                    )
+                    logger.info(
+                        "SKIP [%s] -> missing primary_source_url for non-sports should_trade decision",
+                        market.id,
+                        data={
+                            "market_id": market.id,
+                            "final_reason": "non_sports_missing_primary_source",
+                            "market_family": market_family_name,
+                        },
+                    )
+                    continue
                 validation_passed += 1
 
                 if _should_skip_for_balance(
@@ -4810,19 +6663,41 @@ def main(max_cycles: int | None = None) -> None:
                     (
                         confidence_override_allowed,
                         override_min_confidence,
+                        override_path,
                     ) = _is_confidence_override_allowed(
                         settings=settings,
                         decision=decision,
                         override_edge=override_edge,
                     )
+                    if not confidence_override_allowed and _is_definitive_outcome_eligible(
+                        decision, settings
+                    ):
+                        confidence_override_allowed = True
+                        override_min_confidence = settings.MIN_CONFIDENCE
+                        override_path = "definitive_outcome"
+                        logger.info(
+                            "Confidence gate override [%s]: definitive_outcome_detected with whitelisted source bypasses MIN_CONFIDENCE (conf=%.2f)",
+                            market.id,
+                            decision.confidence,
+                            data={
+                                "market_id": market.id,
+                                "confidence": decision.confidence,
+                                "min_confidence": settings.MIN_CONFIDENCE,
+                                "definitive_outcome_detected": True,
+                                "primary_source_url": getattr(
+                                    decision, "primary_source_url", None
+                                ),
+                            },
+                        )
                     if confidence_override_allowed:
                         logger.info(
-                            "Confidence gate override [%s]: conf %.2f < min %.2f but edge %.3f and evidence %.2f meet override thresholds",
+                            "Confidence gate override [%s]: conf %.2f < min %.2f but edge %.3f and evidence %.2f meet override thresholds (path=%s)",
                             market.id,
                             decision.confidence,
                             settings.MIN_CONFIDENCE,
                             override_edge,
                             decision.evidence_quality,
+                            override_path,
                             data={
                                 "market_id": market.id,
                                 "confidence": decision.confidence,
@@ -4832,6 +6707,7 @@ def main(max_cycles: int | None = None) -> None:
                                 "model_edge": decision.edge_external,
                                 "evidence_quality": decision.evidence_quality,
                                 "override_min_confidence": override_min_confidence,
+                                "confidence_override_path": override_path,
                             },
                         )
                     else:
@@ -4847,9 +6723,11 @@ def main(max_cycles: int | None = None) -> None:
                                 final_action="skip",
                                 final_reason="confidence_below_min",
                                 confidence_gate_override_allowed=False,
+                                confidence_override_path=override_path,
                                 override_edge=override_edge,
                                 market_edge=market_edge,
                                 override_min_confidence=override_min_confidence,
+                                counterfactual_required_confidence=settings.MIN_CONFIDENCE,
                                 **audit_context,
                             ),
                         )
@@ -5073,18 +6951,77 @@ def main(max_cycles: int | None = None) -> None:
                     if effective_confidence != decision.confidence
                     else decision
                 )
+                decision_for_edge, definitive_floor_was_applied = (
+                    _apply_definitive_outcome_floors(
+                        decision_for_edge, market, settings
+                    )
+                )
+                if definitive_floor_was_applied:
+                    definitive_outcome_floor_applied_count += 1
+                    auto_detected = not bool(
+                        getattr(decision, "definitive_outcome_detected", False)
+                    )
+                    decision = decision_for_edge
+                    analysis_result["pre_execution_score_result"] = None
+                    analysis_result["pre_execution_rejection_reasons"] = []
+                    analysis_result["pre_execution_score_breakdown"] = None
+                    logger.info(
+                        "Definitive outcome floor applied: market=%s eq_after=%.2f conf=%.2f source=%s",
+                        market.id,
+                        decision_for_edge.evidence_quality,
+                        decision_for_edge.confidence,
+                        getattr(decision_for_edge, "primary_source_url", None),
+                        data={
+                            "market_id": market.id,
+                            "evidence_quality_after": decision_for_edge.evidence_quality,
+                            "confidence": decision_for_edge.confidence,
+                            "primary_source_url": getattr(
+                                decision_for_edge, "primary_source_url", None
+                            ),
+                            "definitive_outcome_auto_detected": auto_detected,
+                            "score_cache_invalidated": True,
+                        },
+                    )
                 if (
                     decision_for_edge.evidence_quality
-                    < _min_evidence_quality_for_market(market, settings)
+                    < _min_evidence_quality_for_market(market, settings, decision_for_edge)
                 ):
                     min_evidence_quality = _min_evidence_quality_for_market(
-                        market, settings
+                        market,
+                        settings,
+                        decision_for_edge,
                     )
                     evidence_rejection_reason = (
                         "weather_evidence_quality_below_min"
                         if market_family(market) == "weather"
                         else "evidence_quality_below_min"
                     )
+                    evidence_gap = max(
+                        0.0,
+                        float(min_evidence_quality - float(decision_for_edge.evidence_quality)),
+                    )
+                    queue_for_research = _should_queue_research_for_blocked_trade(
+                        settings=settings,
+                        decision=decision_for_edge,
+                        evidence_basis=evidence_basis,
+                        gate_name="evidence",
+                        threshold_gap=evidence_gap,
+                    )
+                    final_action = "research_queued" if queue_for_research else "skip"
+                    final_outcome_reason = (
+                        "research_queued" if queue_for_research else evidence_rejection_reason
+                    )
+                    research_queue_position: int | None = None
+                    if queue_for_research:
+                        research_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=decision_for_edge,
+                            reason=evidence_rejection_reason,
+                            gate_name="evidence",
+                            threshold_gap=evidence_gap,
+                        )
+                    if evidence_basis == "direct":
+                        blocked_direct_evidence_count += 1
                     trades_skipped_no_trade += 1
                     _record_should_trade_blocked(evidence_rejection_reason)
                     _record_rejection_reason(
@@ -5096,26 +7033,33 @@ def main(max_cycles: int | None = None) -> None:
                         question=market.question,
                         decision=decision_for_edge.model_dump(),
                         execution_audit=_build_execution_audit(
-                            decision_terminal=True,
-                            final_action="skip",
+                            decision_terminal=not queue_for_research,
+                            final_action=final_action,
                             final_reason=evidence_rejection_reason,
                             evidence_quality=decision_for_edge.evidence_quality,
                             min_evidence_quality=min_evidence_quality,
+                            evidence_quality_gap=evidence_gap,
+                            research_queue_position=research_queue_position,
                             **audit_context,
                         ),
                     )
-                    _record_terminal_outcome(
-                        state_manager,
-                        market.id,
-                        evidence_rejection_reason,
-                    )
+                    if not queue_for_research:
+                        _record_terminal_outcome(
+                            state_manager,
+                            market.id,
+                            final_outcome_reason,
+                        )
                     logger.warning(
-                        "SKIP [%s] -> %s after should_trade=True",
+                        "%s [%s] -> %s after should_trade=True",
+                        "RESEARCH" if queue_for_research else "SKIP",
                         market.id,
                         evidence_rejection_reason,
                         data={
                             "market_id": market.id,
+                            "final_action": final_action,
                             "final_reason": evidence_rejection_reason,
+                            "evidence_quality_gap": evidence_gap,
+                            "research_queue_position": research_queue_position,
                             "score_breakdown": score_receipt_fields,
                         },
                     )
@@ -5133,6 +7077,8 @@ def main(max_cycles: int | None = None) -> None:
                     settings,
                     market=market,
                 )
+                audit_context["edge_market"] = edge_value
+                audit_context["edge_external"] = decision_for_edge.edge_external
                 if settings.CALIBRATION_MODE_ENABLED:
                     calibration_payload = {
                         "market_id": market.id,
@@ -5160,29 +7106,81 @@ def main(max_cycles: int | None = None) -> None:
                     trades_skipped_edge += 1
                     _record_should_trade_blocked("edge_gate_blocked")
                     _record_rejection_reason(rejection_breakdown, "edge_gate_blocked")
+                    if edge_reason == "non_sports_needs_direct_evidence":
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "non_sports_needs_direct",
+                        )
+                    elif edge_reason == "edge_above_reasonable_max":
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "edge_above_reasonable_max",
+                        )
+                    elif "below min" in edge_reason:
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "edge_below_min",
+                        )
+                    edge_shortfall = max(
+                        0.0,
+                        float(required_edge_threshold - float(edge_value or 0.0)),
+                    )
+                    queue_for_research = _should_queue_research_for_blocked_trade(
+                        settings=settings,
+                        decision=decision_for_edge,
+                        evidence_basis=evidence_basis,
+                        gate_name="edge",
+                        threshold_gap=edge_shortfall,
+                        edge_reason=edge_reason,
+                    )
+                    research_reason = (
+                        edge_reason
+                        if queue_for_research and str(edge_reason or "") == "edge_above_reasonable_max"
+                        else "edge_gate_blocked"
+                    )
+                    final_action = "research_queued" if queue_for_research else "skip"
+                    final_outcome_reason = (
+                        "research_queued" if queue_for_research else "edge_gate_blocked"
+                    )
+                    research_queue_position: int | None = None
+                    if queue_for_research:
+                        research_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=decision_for_edge,
+                            reason=research_reason,
+                            gate_name="edge",
+                            threshold_gap=edge_shortfall,
+                            edge_market=edge_value,
+                            edge_required=required_edge_threshold,
+                        )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=decision_for_edge.model_dump(),
                         execution_audit=_build_execution_audit(
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="edge_gate_blocked",
+                            decision_terminal=not queue_for_research,
+                            final_action=final_action,
+                            final_reason=research_reason if queue_for_research else "edge_gate_blocked",
                             gate_edge_required=required_edge_threshold,
                             gate_edge_actual=edge_value,
                             gate_edge_reason=edge_reason,
+                            edge_shortfall=edge_shortfall,
+                            research_queue_position=research_queue_position,
                             **audit_context,
                         ),
                     )
-                    _record_terminal_outcome(state_manager, market.id, "edge_gate_blocked")
+                    if not queue_for_research:
+                        _record_terminal_outcome(state_manager, market.id, final_outcome_reason)
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     logger.warning(
-                        "SKIP [%s] '%s' -> edge gate (%s)",
+                        "%s [%s] '%s' -> edge gate (%s)",
+                        "RESEARCH" if queue_for_research else "SKIP",
                         market.id,
                         question_short,
                         edge_reason,
                         data={
                             "market_id": market.id,
+                            "final_action": final_action,
                             "final_reason": "edge_gate_blocked",
                             "implied_prob": implied_prob,
                             "entry_price": entry_price,
@@ -5191,11 +7189,79 @@ def main(max_cycles: int | None = None) -> None:
                             "gate_edge_required": required_edge_threshold,
                             "gate_edge_actual": edge_value,
                             "gate_edge_reason": edge_reason,
+                            "edge_shortfall": edge_shortfall,
+                            "research_queue_position": research_queue_position,
                             "score_breakdown": score_receipt_fields,
                         },
                     )
                     continue
                 edge_gate_passed += 1
+                historical_gate_allowed_exec, historical_gate_reason_exec, historical_gate_metrics_exec = (
+                    _evaluate_historical_gate(
+                        market_id=market.id,
+                        family_name=market_family_name,
+                    )
+                )
+                if not historical_gate_allowed_exec and historical_gate_reason_exec:
+                    trades_skipped_edge += 1
+                    _record_should_trade_blocked(historical_gate_reason_exec)
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        historical_gate_reason_exec,
+                    )
+                    research_queue_position: int | None = None
+                    queue_for_research = bool(settings.RESEARCH_QUEUE_ENABLED)
+                    if queue_for_research:
+                        research_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=decision_for_edge,
+                            reason=historical_gate_reason_exec,
+                            gate_name="historical_performance",
+                            threshold_gap=0.0,
+                            edge_market=edge_value,
+                        )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_terminal=not queue_for_research,
+                            final_action="research_queued" if queue_for_research else "skip",
+                            final_reason=historical_gate_reason_exec,
+                            research_queue_position=research_queue_position,
+                            research_gate_name="historical_performance",
+                            historical_performance_research_only=queue_for_research,
+                            **historical_gate_metrics_exec,
+                            **audit_context,
+                        ),
+                    )
+                    if not queue_for_research:
+                        _record_terminal_outcome(
+                            state_manager,
+                            market.id,
+                            historical_gate_reason_exec,
+                        )
+                    question_short = (
+                        market.question[:40] + "..."
+                        if len(market.question) > 40
+                        else market.question
+                    )
+                    logger.warning(
+                        "%s [%s] '%s' -> historical calibration gate (%s)",
+                        "RESEARCH" if queue_for_research else "SKIP",
+                        market.id,
+                        question_short,
+                        historical_gate_reason_exec,
+                        data={
+                            "market_id": market.id,
+                            "final_action": "research_queued" if queue_for_research else "skip",
+                            "final_reason": historical_gate_reason_exec,
+                            "research_queue_position": research_queue_position,
+                            **historical_gate_metrics_exec,
+                            "score_breakdown": score_receipt_fields,
+                        },
+                    )
+                    continue
 
                 if _is_uniform_implied_probability(implied_prob, market.outcomes):
                     uniform_implied = 1.0 / len(market.outcomes)
@@ -5282,6 +7348,20 @@ def main(max_cycles: int | None = None) -> None:
 
                 score_result = analysis_result.get("pre_execution_score_result")
                 if score_result is None:
+                    short_prefix_score_penalty = float(
+                        candidate.get("short_prefix_score_penalty", 0.0) or 0.0
+                    )
+                    suppress_hallucinated_edge_penalty = (
+                        _should_suppress_hallucinated_edge_penalty(
+                            decision=decision_for_edge,
+                            evidence_basis=evidence_basis,
+                            settings=settings,
+                        )
+                    )
+                    exec_pfx_stats = _get_prefix_pnl(market.id or "")
+                    exec_pfx_n = int(exec_pfx_stats.get("n", 0))
+                    exec_pfx_pnl = float(exec_pfx_stats.get("total_pnl", 0.0))
+                    exec_pfx_shrunk = bayesian_shrunk_pnl(exec_pfx_pnl, exec_pfx_n) if exec_pfx_n > 0 else None
                     score_result = compute_final_score(
                         market=market,
                         decision=decision_for_edge,
@@ -5299,15 +7379,51 @@ def main(max_cycles: int | None = None) -> None:
                             is_weather_market=(market_family(market) == "weather"),
                             evidence_basis_class=evidence_basis,
                             edge_source=decision_for_edge.edge_source or "",
+                            market_family=market_family_name,
+                            short_prefix_penalty=short_prefix_score_penalty,
+                            suppress_hallucinated_edge_penalty=suppress_hallucinated_edge_penalty,
+                            definitive_outcome_eligible=_is_definitive_outcome_eligible(
+                                decision_for_edge, settings
+                            ),
+                            historical_family_pnl_total=float(
+                                candidate.get("historical_family_pnl_total", 0.0) or 0.0
+                            ),
+                            historical_family_sample_size=int(
+                                candidate.get("historical_family_sample_size", 0) or 0
+                            ),
+                            historical_prefix_pnl_per_trade=exec_pfx_shrunk,
+                            historical_prefix_sample_size=exec_pfx_n,
                         ),
                     )
                 score_receipt_fields = _score_receipt_fields(score_result)
+                compact_runtime_score = _compact_score_breakdown(score_receipt_fields)
+                if compact_runtime_score:
+                    audit_context["score_breakdown"] = compact_runtime_score
+                audit_context["fallback_high_confidence_penalty_applied"] = bool(
+                    float(getattr(score_result, "fallback_high_confidence_penalty", 0.0) or 0.0)
+                    > 0.0
+                )
+                audit_context["historical_family_bonus_applied"] = bool(
+                    float(getattr(score_result, "historical_family_bonus", 0.0) or 0.0) > 0.0
+                )
                 score_mode = settings.SCORE_GATE_MODE
                 score_threshold_effective = _effective_score_gate_threshold(
                     settings=settings,
                     market=market,
                     evidence_basis_class=evidence_basis,
                     evidence_quality=decision_for_edge.evidence_quality,
+                )
+                score_gate_critical_reasons = _score_gate_critical_rejection_reasons(
+                    rejection_reasons=score_result.rejection_reasons,
+                    evidence_basis_class=evidence_basis,
+                    edge_source=decision_for_edge.edge_source,
+                    definitive_outcome_eligible=_is_definitive_outcome_eligible(
+                        decision_for_edge, settings
+                    ),
+                )
+                audit_context["score_threshold_effective"] = score_threshold_effective
+                audit_context["score_gate_critical_reasons"] = list(
+                    score_gate_critical_reasons
                 )
                 score_payload: dict[str, Any] | None = None
                 if score_mode != "off":
@@ -5335,11 +7451,27 @@ def main(max_cycles: int | None = None) -> None:
                         "mention_market_penalty": score_result.mention_market_penalty,
                         "confidence_calibration_penalty": score_result.confidence_calibration_penalty,
                         "fallback_edge_penalty": score_result.fallback_edge_penalty,
+                        "fallback_high_confidence_penalty": (
+                            score_result.fallback_high_confidence_penalty
+                        ),
+                        "extreme_market_edge_penalty": (
+                            score_result.extreme_market_edge_penalty
+                        ),
                         "proxy_evidence_penalty": score_result.proxy_evidence_penalty,
                         "liquidity_penalty": score_result.liquidity_penalty,
                         "staleness_penalty": score_result.staleness_penalty,
+                        "extreme_confidence_penalty": score_result.extreme_confidence_penalty,
+                        "hallucinated_edge_penalty": score_result.hallucinated_edge_penalty,
+                        "hallucinated_edge_penalty_suppressed": (
+                            score_result.hallucinated_edge_penalty_suppressed
+                        ),
+                        "late_stage_overconfidence_penalty": score_result.late_stage_overconfidence_penalty,
                         "rejection_reasons": list(score_result.rejection_reasons),
+                        "score_gate_critical_reasons": list(score_gate_critical_reasons),
                         "generic_bin_penalty": score_result.generic_bin_penalty,
+                        "numeric_strike_bin_penalty": score_result.numeric_strike_bin_penalty,
+                        "short_prefix_penalty": score_result.short_prefix_penalty,
+                        "historical_family_bonus": score_result.historical_family_bonus,
                         "ambiguous_resolution_penalty": score_result.ambiguous_resolution_penalty,
                         "bayesian_posterior": bayesian_posterior_applied,
                         "lmsr_price": lmsr_execution_price,
@@ -5381,36 +7513,94 @@ def main(max_cycles: int | None = None) -> None:
                             score_threshold_effective,
                             data=score_payload,
                         )
-                    elif score_result.final_score < score_threshold_effective:
+                    elif (
+                        score_result.final_score < score_threshold_effective
+                        or score_gate_critical_reasons
+                    ):
+                        audit_context["score_gate_passed"] = False
                         score_gate_blocked += 1
                         trades_skipped_edge += 1
+                        score_gap = max(
+                            0.0,
+                            float(score_threshold_effective - score_result.final_score),
+                        )
+                        score_gate_block_reason = (
+                            "score_gate_critical_rejection"
+                            if score_gate_critical_reasons
+                            else "score_gate_blocked"
+                        )
                         score_near_misses.append(
                             {
                                 "market_id": market.id,
                                 "final_score": float(score_result.final_score),
                                 "score_threshold": float(score_threshold_effective),
-                                "score_gap": float(score_threshold_effective - score_result.final_score),
+                                "score_gap": score_gap,
                                 "rejection_reasons": list(score_result.rejection_reasons),
+                                "critical_rejection_reasons": list(score_gate_critical_reasons),
                             }
                         )
-                        _record_should_trade_blocked("score_gate_blocked")
-                        _record_rejection_reason(rejection_breakdown, "score_gate_blocked")
+                        _record_should_trade_blocked(score_gate_block_reason)
+                        _record_rejection_reason(rejection_breakdown, score_gate_block_reason)
+                        for rejection_reason in score_result.rejection_reasons:
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                str(rejection_reason),
+                            )
+                        score_rejection_reasons = {
+                            str(reason) for reason in score_result.rejection_reasons
+                        }
+                        research_gate_name: str | None = None
+                        if "extreme_market_edge_penalty" in score_rejection_reasons:
+                            research_gate_name = "extreme_market_edge"
+                        elif "hallucinated_edge" in score_rejection_reasons:
+                            research_gate_name = "hallucinated_edge"
+                        queue_for_research = False
+                        if research_gate_name is not None:
+                            queue_for_research = _should_queue_research_for_blocked_trade(
+                                settings=settings,
+                                decision=decision_for_edge,
+                                evidence_basis=evidence_basis,
+                                gate_name=research_gate_name,
+                                threshold_gap=score_gap,
+                            )
+                        research_queue_position: int | None = None
+                        if queue_for_research:
+                            research_queue_position = _enqueue_research_candidate(
+                                market=market,
+                                decision=decision_for_edge,
+                                reason=research_gate_name or "score_gate_blocked",
+                                gate_name=research_gate_name or "score_gate",
+                                threshold_gap=score_gap,
+                                edge_market=score_result.edge_market,
+                            )
+                        final_action = "research_queued" if queue_for_research else "skip"
+                        final_reason = (
+                            research_gate_name
+                            if queue_for_research and research_gate_name
+                            else score_gate_block_reason
+                        )
                         log_trade_decision(
                             market_id=market.id,
                             question=market.question,
                             decision=decision_for_edge.model_dump(),
                             execution_audit=_build_execution_audit(
-                                decision_terminal=True,
-                                final_action="skip",
-                                final_reason="score_gate_blocked",
+                                decision_terminal=not queue_for_research,
+                                final_action=final_action,
+                                final_reason=final_reason,
                                 score_threshold=score_threshold_effective,
+                                score_gap=score_gap,
+                                research_queue_position=research_queue_position,
+                                score_gate_research_reason=research_gate_name,
+                                score_gate_block_reason=score_gate_block_reason,
                                 **audit_context,
                             ),
                         )
-                        _record_terminal_outcome(state_manager, market.id, "score_gate_blocked")
+                        if not queue_for_research:
+                            _record_terminal_outcome(state_manager, market.id, "score_gate_blocked")
                         question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                         logger.warning(
-                            "SKIP [%s] '%s' -> score gate (%.4f < %.4f)",
+                            "%s [%s] '%s' -> score gate (%.4f < %.4f)",
+                            "RESEARCH" if queue_for_research else "SKIP",
                             market.id,
                             question_short,
                             score_result.final_score,
@@ -5418,8 +7608,10 @@ def main(max_cycles: int | None = None) -> None:
                             data=score_payload,
                         )
                         continue
+                    audit_context["score_gate_passed"] = True
                     score_gate_passed += 1
                 else:
+                    audit_context["score_gate_passed"] = True
                     score_gate_passed += 1
 
                 edge_scaling_bet_pct = _adjust_bet_size_for_edge(
@@ -5451,10 +7643,42 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 else:
                     adjusted_bet_pct = edge_scaling_bet_pct
+                kelly_posterior_edge_below_min = False
+                if kelly_path_active and adjusted_bet_pct <= 0:
+                    kelly_posterior_edge_below_min = True
+                    (
+                        recovered_bet_amount,
+                        recovered_bet_pct,
+                        _recovered_min_bet_floor_applied,
+                        _recovered_kelly_sub_floor_skipped,
+                        recovered_policy,
+                    ) = _resolve_min_bet_floor(
+                        bet_amount=0.0,
+                        min_bet_usdc=settings.MIN_BET_USDC,
+                        max_bet_usdc=settings.MAX_BET_USDC,
+                        kelly_path_active=True,
+                        min_bet_policy=settings.KELLY_MIN_BET_POLICY,
+                        edge_scaling_bet_pct=edge_scaling_bet_pct,
+                    )
+                    recovered_via_fallback_edge = (
+                        recovered_policy == _KELLY_MIN_BET_POLICY_FALLBACK_EDGE
+                        and recovered_bet_amount >= settings.MIN_BET_USDC
+                        and recovered_bet_pct > 0.0
+                    )
+                    if recovered_via_fallback_edge:
+                        adjusted_bet_pct = recovered_bet_pct
+                        sizing_mode = "kelly_fallback_edge"
+                        audit_context["kelly_posterior_edge_below_min"] = True
                 if adjusted_bet_pct <= 0:
                     trades_skipped_edge += 1
                     _record_should_trade_blocked("zero_bet_after_sizing")
                     _record_rejection_reason(rejection_breakdown, "zero_bet_after_sizing")
+                    if decision_for_edge.bet_size_pct <= 0:
+                        sizing_zero_reason = "model_bet_size_zero"
+                    elif kelly_path_active or kelly_posterior_edge_below_min:
+                        sizing_zero_reason = "kelly_posterior_edge_below_min"
+                    else:
+                        sizing_zero_reason = "edge_scaling_zero"
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     skip_reason = _zero_bet_skip_message(sizing_mode)
                     logger.warning(
@@ -5474,6 +7698,7 @@ def main(max_cycles: int | None = None) -> None:
                             "kelly_fraction_value": kelly_fraction_value,
                             "posterior_for_kelly": posterior_for_kelly,
                             "min_edge_for_kelly": min_edge_for_kelly,
+                            "sizing_zero_reason": sizing_zero_reason,
                             "score_breakdown": score_receipt_fields,
                         },
                     )
@@ -5489,6 +7714,8 @@ def main(max_cycles: int | None = None) -> None:
                             final_action="skip",
                             final_reason="zero_bet_after_sizing",
                             sizing_mode=sizing_mode,
+                            sizing_zero_reason=sizing_zero_reason,
+                            kelly_posterior_edge_below_min=kelly_posterior_edge_below_min,
                             adjusted_bet_pct=adjusted_bet_pct,
                             bet_amount_usdc=0.0,
                             kelly_raw=kelly_raw_value,
@@ -5502,7 +7729,6 @@ def main(max_cycles: int | None = None) -> None:
                             likelihood_ratio=likelihood_ratio,
                             implied_prob_market=implied_prob,
                             min_edge_for_kelly=min_edge_for_kelly,
-                            edge_market=edge_value,
                             lmsr_execution_price=lmsr_execution_price,
                             lmsr_inefficiency_signal=ineff_signal,
                             lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
@@ -5676,7 +7902,6 @@ def main(max_cycles: int | None = None) -> None:
                             likelihood_ratio=likelihood_ratio,
                             implied_prob_market=implied_prob,
                             min_edge_for_kelly=min_edge_for_kelly,
-                            edge_market=edge_value,
                             lmsr_execution_price=lmsr_execution_price,
                             lmsr_inefficiency_signal=ineff_signal,
                             lmsr_liquidity_param_b=settings.LMSR_LIQUIDITY_PARAM_B,
@@ -6053,9 +8278,24 @@ def main(max_cycles: int | None = None) -> None:
                         decision_for_edge,
                         settings,
                     )
+                    audit_context["edge_market"] = refreshed_edge_value
                     if not refreshed_edge_ok:
                         trades_skipped_edge += 1
                         _record_should_trade_blocked("refreshed_edge_gate_blocked")
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "refreshed_edge_gate_blocked",
+                        )
+                        if refreshed_edge_reason == "non_sports_needs_direct_evidence":
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                "non_sports_needs_direct",
+                            )
+                        elif refreshed_edge_reason == "edge_above_reasonable_max":
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                "edge_above_reasonable_max",
+                            )
                         logger.warning(
                             "SKIP [%s] '%s' -> refreshed edge gate (%s)",
                             market.id,
@@ -6082,7 +8322,6 @@ def main(max_cycles: int | None = None) -> None:
                                 final_action="skip",
                                 final_reason="refreshed_edge_gate_blocked",
                                 implied_prob_market=implied_prob,
-                                edge_market=refreshed_edge_value,
                                 **audit_context,
                             ),
                         )
@@ -6327,36 +8566,59 @@ def main(max_cycles: int | None = None) -> None:
                     cycle_event_outcomes=cycle_event_outcomes,
                 )
                 if side_conflict_blocked:
-                    trades_skipped_position += 1
-                    _record_should_trade_blocked("event_side_conflict_blocked")
-                    _record_rejection_reason(
-                        rejection_breakdown,
-                        "event_side_conflict_blocked",
-                    )
-                    log_trade_decision(
-                        market_id=market.id,
-                        question=market.question,
-                        decision=decision_for_edge.model_copy(
-                            update={"bet_size_pct": bet_pct}
-                        ).model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="pre_order_submission_event_side_conflict",
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="event_side_conflict_blocked",
-                            proposed_outcome=_normalize_outcome_key(
-                                decision_for_edge.outcome
-                            ),
-                            existing_event_outcomes=existing_event_outcomes,
-                            **audit_context,
+                    definitive_override = _should_apply_definitive_side_override(
+                        decision=decision_for_edge,
+                        evidence_basis=evidence_basis,
+                        primary_source_whitelisted=_is_definitive_outcome_eligible(
+                            decision_for_edge, settings
                         ),
+                        cycle_overrides_applied=cycle_definitive_overrides_applied,
+                        max_overrides_per_cycle=settings.MAX_DEFINITIVE_OVERRIDES_PER_CYCLE,
                     )
-                    _record_terminal_outcome(
-                        state_manager,
-                        market.id,
-                        "event_side_conflict_blocked",
-                    )
-                    continue
+                    if definitive_override:
+                        cycle_definitive_overrides_applied += 1
+                        logger.info(
+                            "Definitive side-conflict override applied: market=%s proposed=%s existing=%s",
+                            market.id,
+                            decision_for_edge.outcome,
+                            existing_event_outcomes,
+                            data={
+                                "market_id": market.id,
+                                "override_reason": "definitive_outcome_side_override",
+                                "cycle_overrides_applied": cycle_definitive_overrides_applied,
+                            },
+                        )
+                    else:
+                        trades_skipped_position += 1
+                        _record_should_trade_blocked("event_side_conflict_blocked")
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "event_side_conflict_blocked",
+                        )
+                        log_trade_decision(
+                            market_id=market.id,
+                            question=market.question,
+                            decision=decision_for_edge.model_copy(
+                                update={"bet_size_pct": bet_pct}
+                            ).model_dump(),
+                            execution_audit=_build_execution_audit(
+                                decision_phase="pre_order_submission_event_side_conflict",
+                                decision_terminal=True,
+                                final_action="skip",
+                                final_reason="event_side_conflict_blocked",
+                                proposed_outcome=_normalize_outcome_key(
+                                    decision_for_edge.outcome
+                                ),
+                                existing_event_outcomes=existing_event_outcomes,
+                                **audit_context,
+                            ),
+                        )
+                        _record_terminal_outcome(
+                            state_manager,
+                            market.id,
+                            "event_side_conflict_blocked",
+                        )
+                        continue
                 correlated_other_positions_count = len(
                     {
                         market_id
@@ -6799,6 +9061,8 @@ def main(max_cycles: int | None = None) -> None:
                     total_usd_deployed += bet_amount
                     family_stats["orders_filled"] += 1
                     family_stats["usd_deployed"] += bet_amount
+                    if _is_mlb_market_id(market.id):
+                        mlb_family_orders_filled += 1
                     state_manager.reset_fill_failure_count(market.id)
                     if last_known_balance is not None:
                         last_known_balance = max(0.0, float(last_known_balance) - float(bet_amount))
@@ -6809,6 +9073,7 @@ def main(max_cycles: int | None = None) -> None:
                     decision=decision_for_edge.model_copy(
                         update={"bet_size_pct": bet_pct}
                     ).model_dump(),
+                    order=_order_response_receipt(order_response),
                     execution_audit=_build_execution_audit(
                         decision_phase="order_submission",
                         decision_terminal=True,
@@ -6936,6 +9201,88 @@ def main(max_cycles: int | None = None) -> None:
                 if total_usd_deployed > 0
                 else None
             )
+            required_rejection_bucket_keys = (
+                "ticker_prefix_pnl_block",
+                "historical_prefix_pnl_block",
+                "historical_family_pnl_block",
+                "hallucinated_edge",
+                "non_sports_needs_direct",
+                "non_sports_missing_primary_source",
+                "late_stage_overconfidence",
+                "numeric_strike_bin",
+            )
+            normalized_rejection_breakdown: dict[str, int] = {
+                key: int(rejection_breakdown.get(key, 0))
+                for key in required_rejection_bucket_keys
+            }
+            for reason, count in rejection_breakdown.items():
+                normalized_rejection_breakdown[str(reason)] = int(count)
+            per_family_edge_p50: dict[str, float] = {}
+            per_family_edge_p90: dict[str, float] = {}
+            for family_name, edges in sorted(family_edge_samples.items()):
+                edge_p50 = _percentile(edges, 0.50)
+                edge_p90 = _percentile(edges, 0.90)
+                if edge_p50 is not None:
+                    per_family_edge_p50[family_name] = round(edge_p50, 4)
+                if edge_p90 is not None:
+                    per_family_edge_p90[family_name] = round(edge_p90, 4)
+            mean_confidence_delta = (
+                sum(confidence_delta_samples) / len(confidence_delta_samples)
+                if confidence_delta_samples
+                else 0.0
+            )
+            calibration_samples: list[dict[str, Any]] = []
+            try:
+                calibration_samples = state_manager.get_confidence_bucket_calibration(
+                    lookback_days=14
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Calibration sample snapshot lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
+            research_queue_size = len(research_queue)
+
+            _top_candidates_summary: list[dict[str, Any]] = []
+            for _tc_candidate in analysis_candidates[:5]:
+                _tc_market = _tc_candidate.get("market")
+                if not isinstance(_tc_market, Market):
+                    continue
+                _tc_result = analysis_results.get(_tc_market.id, {})
+                _tc_decision = _tc_result.get("decision")
+                _tc_score = _tc_result.get("pre_execution_final_score")
+                _tc_explanation = _tc_result.get("score_breakdown_explanation", "")
+                _tc_final_reason = ""
+                if isinstance(_tc_decision, TradeDecision):
+                    if _tc_decision.should_trade:
+                        _tc_final_reason = "should_trade"
+                    elif _tc_decision.abstain:
+                        _tc_final_reason = "abstain"
+                    else:
+                        _tc_final_reason = "no_trade_recommended"
+                _top_candidates_summary.append({
+                    "market_id": _tc_market.id,
+                    "family": market_family(_tc_market),
+                    "final_score": round(float(_tc_score or 0.0), 4),
+                    "score_breakdown": str(_tc_explanation or "")[:200],
+                    "final_reason": _tc_final_reason,
+                })
+
+            _confidence_bucket_decision_counts: dict[str, int] = {}
+            for _cbd_mid, _cbd_result in analysis_results.items():
+                if not isinstance(_cbd_result, dict):
+                    continue
+                _cbd_decision = _cbd_result.get("decision")
+                if not isinstance(_cbd_decision, TradeDecision):
+                    continue
+                _cbd_conf = _cbd_decision.confidence
+                _cbd_left = int(_cbd_conf * 10) / 10
+                _cbd_bucket = f"{_cbd_left:.1f}-{_cbd_left + 0.1:.1f}"
+                _confidence_bucket_decision_counts[_cbd_bucket] = (
+                    _confidence_bucket_decision_counts.get(_cbd_bucket, 0) + 1
+                )
+
             cycle_receipt = {
                 "cycle": cycle_count,
                 "cycle_id": cycle_id,
@@ -6949,6 +9296,9 @@ def main(max_cycles: int | None = None) -> None:
                 "validation_passed": validation_passed,
                 "refined_markets": markets_refined,
                 "execution_candidates": execution_candidates,
+                "research_queue_size": research_queue_size,
+                "research_queue_emissions": research_queue_size,
+                "research_only_emissions": research_only_emissions,
                 "edge_gate_passed": edge_gate_passed,
                 "score_gate_passed": score_gate_passed,
                 "order_attempted": trades_attempted,
@@ -6970,9 +9320,22 @@ def main(max_cycles: int | None = None) -> None:
                     "kelly_sub_floor": trades_skipped_kelly_sub_floor,
                     "pre_analysis": pre_analysis_blocked,
                 },
-                "rejection_breakdown": rejection_breakdown,
+                "rejection_breakdown": dict(
+                    sorted(normalized_rejection_breakdown.items())
+                ),
                 "pre_analysis_rejection_breakdown": pre_analysis_rejection_breakdown,
                 "score_rejection_reason_breakdown": score_rejection_reason_breakdown,
+                "blocked_direct_evidence_count": blocked_direct_evidence_count,
+                "hallucinated_edge_blocks": int(
+                    normalized_rejection_breakdown.get("hallucinated_edge", 0)
+                ),
+                "fallback_high_conf_blocks": int(
+                    normalized_rejection_breakdown.get("fallback_high_confidence_trade", 0)
+                ),
+                "mlb_family_orders_attempted": mlb_family_orders_attempted,
+                "mlb_family_orders_filled": mlb_family_orders_filled,
+                "per_family_edge_p50": per_family_edge_p50,
+                "per_family_edge_p90": per_family_edge_p90,
                 "api_tokens_consumed": api_tokens_consumed,
                 "api_prompt_tokens": cycle_prompt_tokens,
                 "api_completion_tokens": cycle_completion_tokens,
@@ -6992,10 +9355,12 @@ def main(max_cycles: int | None = None) -> None:
                 "best_candidate_score": best_candidate_score,
                 "evidence_basis_breakdown": dict(sorted(evidence_basis_breakdown.items())),
                 "confidence_calibration_applied": confidence_calibration_applied_count,
+                "calibration_samples": calibration_samples,
                 "raw_vs_calibrated_delta": round(
                     confidence_calibration_delta_sum / max(1, markets_analyzed),
                     4,
                 ),
+                "mean_raw_vs_calibrated_confidence_delta": round(mean_confidence_delta, 4),
                 "historical_win_rate_at_bucket": round(
                     (
                         sum(confidence_calibration_historical_win_rates)
@@ -7012,6 +9377,27 @@ def main(max_cycles: int | None = None) -> None:
                 "cumulative_cycle_pnl_estimate": round(cumulative_cycle_pnl_estimate, 2),
                 "exchange_realized_pnl_total": round(exchange_realized_pnl_total, 2),
                 "rejection_funnel_summary": rejection_funnel_summary[:50],
+                "funnel_stage_counts": {
+                    "fetched": fetched_count,
+                    "filtered": len(markets),
+                    "deduped": len(markets),
+                    "pre_scored": original_analysis_candidates_count,
+                    "hard_rejected": pre_analysis_blocked,
+                    "analyzed": markets_analyzed,
+                    "decided": decisions_made,
+                    "research_queued": research_queue_size,
+                    "order_submitted": trades_attempted,
+                    "orders_filled": trades_filled,
+                },
+                "family_trade_counts": {
+                    family_name: int(stats.get("order_attempts", 0))
+                    for family_name, stats in sorted(execution_family_stats.items())
+                },
+                "top_candidates_summary": _top_candidates_summary,
+                "confidence_bucket_decision_counts": dict(
+                    sorted(_confidence_bucket_decision_counts.items())
+                ),
+                "pre_analysis_research_routed_count": pre_analysis_research_routed_count,
             }
             logger.info(
                 "Cycle receipt",
@@ -7098,6 +9484,29 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     data={"score_near_misses": ranked_near_misses},
                 )
+            if research_queue:
+                logger.info(
+                    "Research queue captured %d blocked opportunities",
+                    len(research_queue),
+                    data={"research_queue": list(research_queue)},
+                )
+            if execution_candidates == 0 and len(research_queue) > 50:
+                top_tiers = sorted(
+                    participation_tier_breakdown.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )[:3]
+                logger.warning(
+                    "Cycle yield alert: 0 execution candidates with %d research-queued; "
+                    "top tiers: %s — investigate gate calibration",
+                    len(research_queue),
+                    ", ".join(f"{t}={c}" for t, c in top_tiers),
+                    data={
+                        "cycle_yield_alert": True,
+                        "research_queue_size": len(research_queue),
+                        "participation_tier_breakdown": participation_tier_breakdown,
+                    },
+                )
             if settings.CALIBRATION_MODE_ENABLED and calibration_samples:
                 recommendation = compute_adaptive_thresholds(
                     samples=calibration_samples,
@@ -7118,7 +9527,7 @@ def main(max_cycles: int | None = None) -> None:
                 "Cycle funnel: fetched=%d filtered=%d skipped_resolved=%d skipped_likely_resolved_by_ticker=%d scheduler_skips=%d "
                 "(closed=%d recently=%d other=%d) "
                 "analyzed=%d refined=%d flip_precheck_skipped=%d flip_guard_triggered=%d "
-                "flip_guard_blocked=%d execution_candidates=%d should_trade_blocked=%d order_attempts=%d "
+                "flip_guard_blocked=%d execution_candidates=%d research_queue_size=%d should_trade_blocked=%d order_attempts=%d "
                 "skipped_kelly_sub_floor=%d",
                 fetched_count,
                 len(markets),
@@ -7134,6 +9543,7 @@ def main(max_cycles: int | None = None) -> None:
                 flip_guard_triggered,
                 flip_guard_blocked,
                 execution_candidates,
+                research_queue_size,
                 should_trade_but_blocked,
                 trades_attempted,
                 trades_skipped_kelly_sub_floor,
@@ -7160,8 +9570,10 @@ def main(max_cycles: int | None = None) -> None:
                     "flip_guard_blocked": flip_guard_blocked,
                     "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "execution_candidates": execution_candidates,
+                    "research_queue_size": research_queue_size,
                     "should_trade_but_blocked": should_trade_but_blocked,
                     "should_trade_blocked_breakdown": should_trade_blocked_breakdown,
+                    "blocked_direct_evidence_count": blocked_direct_evidence_count,
                     "order_attempts": trades_attempted,
                     "orders_filled": trades_filled,
                     "orders_canceled_unfilled": trades_canceled_unfilled,
@@ -7170,11 +9582,21 @@ def main(max_cycles: int | None = None) -> None:
                     "skipped_kelly_sub_floor": trades_skipped_kelly_sub_floor,
                     "pre_analysis_blocked": pre_analysis_blocked,
                     "pre_analysis_rejection_breakdown": pre_analysis_rejection_breakdown,
+                    "participation_tier_breakdown": dict(sorted(participation_tier_breakdown.items())),
+                    "definitive_outcome_floor_applied_count": definitive_outcome_floor_applied_count,
+                    "timeout_routed_to_monitor_only_count": timeout_routed_to_monitor_only_count,
+                    "negative_best_score_skipped_count": negative_best_score_skipped_count,
                     "api_tokens_consumed": api_tokens_consumed,
                     "api_cost_estimate_usd": round(api_cost_estimate_usd, 6),
                     "best_candidate_market_id": best_candidate_market_id,
                     "best_candidate_score": best_candidate_score,
                     "evidence_basis_breakdown": dict(sorted(evidence_basis_breakdown.items())),
+                    "per_family_edge_p50": per_family_edge_p50,
+                    "per_family_edge_p90": per_family_edge_p90,
+                    "mean_raw_vs_calibrated_confidence_delta": round(
+                        mean_confidence_delta,
+                        4,
+                    ),
                 },
             )
             logger.info(
@@ -7208,6 +9630,7 @@ def main(max_cycles: int | None = None) -> None:
                     "flip_guard_blocked": flip_guard_blocked,
                     "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "execution_candidates": execution_candidates,
+                    "research_queue_size": research_queue_size,
                     "score_gate_blocked": score_gate_blocked,
                     "decisions_made": decisions_made,
                     "order_attempts": trades_attempted,
@@ -7228,6 +9651,13 @@ def main(max_cycles: int | None = None) -> None:
                     "best_candidate_market_id": best_candidate_market_id,
                     "best_candidate_score": best_candidate_score,
                     "evidence_basis_breakdown": dict(sorted(evidence_basis_breakdown.items())),
+                    "per_family_edge_p50": per_family_edge_p50,
+                    "per_family_edge_p90": per_family_edge_p90,
+                    "blocked_direct_evidence_count": blocked_direct_evidence_count,
+                    "mean_raw_vs_calibrated_confidence_delta": round(
+                        mean_confidence_delta,
+                        4,
+                    ),
                 },
             )
             if trades_attempted > 0:
@@ -7237,6 +9667,7 @@ def main(max_cycles: int | None = None) -> None:
             dry_streak_sleep_seconds = _dry_streak_sleep_seconds(
                 base_poll_interval_sec=settings.POLL_INTERVAL_SEC,
                 consecutive_zero_order_cycles=consecutive_zero_order_cycles,
+                enabled=settings.DRY_STREAK_SLEEP_ENABLED,
             )
             if dry_streak_sleep_seconds is not None:
                 if dry_streak_sleep_seconds > sleep_seconds:
@@ -7269,6 +9700,28 @@ def main(max_cycles: int | None = None) -> None:
                     )
 
         except Exception as exc:
+            error_text = str(exc)
+            if "Could not find a suitable TLS CA certificate bundle" in error_text:
+                certifi_path = None
+                if certifi is not None:
+                    try:
+                        certifi_path = certifi.where()
+                    except Exception:
+                        certifi_path = None
+                logger.error(
+                    "Bot cycle #%d TLS CA bundle error: %s",
+                    cycle_count,
+                    error_text,
+                    data={
+                        "cycle": cycle_count,
+                        "error": error_text,
+                        "error_type": type(exc).__name__,
+                        "python_executable": sys.executable,
+                        "certifi_where": certifi_path,
+                    },
+                )
+                sleep_seconds = max(60, int(sleep_seconds))
+                continue
             logger.exception(
                 "Bot cycle #%d failed: %s",
                 cycle_count,

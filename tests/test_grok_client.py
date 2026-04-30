@@ -93,6 +93,58 @@ class TestGrokClient(unittest.TestCase):
         self.assertFalse(_is_timeout_class_error(err))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
 
+    def test_grpc_rst_stream_is_retriable_even_when_slow(self) -> None:
+        err = RuntimeError(
+            '_MultiThreadedRendezvous ... status = StatusCode.INTERNAL '
+            'details = "Received RST_STREAM with error code 2"'
+        )
+        self.assertFalse(_is_timeout_class_error(err))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=19_000.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_grpc_unavailable_is_retriable_even_when_slow(self) -> None:
+        err = RuntimeError(
+            'StatusCode.UNAVAILABLE details = "connection reset by peer"'
+        )
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=30_000.0))
+
+    def test_stream_deadline_clamps_to_remaining_budget(self) -> None:
+        client = GrokClient(api_key="x")
+        client.stream_timeout_seconds = 90
+        full = client._resolve_stream_deadline_seconds(None)
+        clamped = client._resolve_stream_deadline_seconds(20_000.0)
+        uncapped = client._resolve_stream_deadline_seconds(200_000.0)
+        self.assertEqual(full, 90.0)
+        self.assertLess(clamped, 20.0)
+        self.assertGreater(clamped, 18.0)
+        self.assertEqual(uncapped, 90.0)
+
+    def test_deep_analysis_does_not_retry_on_failure(self) -> None:
+        market = Market(
+            id="m-deep-noretry",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        client = GrokClient(api_key="x")
+        failing = FailingClient(TimeoutError("Grok stream exceeded 90.0s for market m-deep-noretry"))
+        client.client = failing
+        with self.assertRaises(TimeoutError):
+            client.analyze_market_deep(market)
+        self.assertEqual(failing.chat.create_calls, 1)
+
+    def test_initial_analysis_still_retries_on_retriable_error(self) -> None:
+        market = Market(
+            id="m-initial-retry",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        client = GrokClient(api_key="x")
+        failing = FailingClient(TimeoutError("Grok stream exceeded 90.0s for market m-initial-retry"))
+        client.client = failing
+        with self.assertRaises(TimeoutError):
+            client.analyze_market(market)
+        self.assertGreaterEqual(failing.chat.create_calls, 2)
+
     def test_analyze_market_stops_when_budget_exhausted(self) -> None:
         market = Market(
             id="m-budget",
@@ -349,6 +401,56 @@ class TestGrokClient(unittest.TestCase):
         decision = client.analyze_market_deep(market)
         self.assertAlmostEqual(decision.confidence, 0.74, places=6)
         self.assertAlmostEqual(decision.edge_external or 0.0, 0.0, places=6)
+
+    def test_normalize_preserves_probability_boundary_one_point_zero(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"confidence": 1.0, "my_prob": 1.0}
+        with patch("grok_client.logger.warning") as warning_mock:
+            normalized = client._normalize_numeric_fields(payload, market_id="m-boundary-prob")
+        self.assertEqual(normalized["confidence"], 1.0)
+        self.assertEqual(normalized["my_prob"], 1.0)
+        warning_mock.assert_not_called()
+
+    def test_normalize_preserves_edge_boundary_negative_one_point_zero(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"edge_external": -1.0}
+        normalized = client._normalize_numeric_fields(payload, market_id="m-boundary-edge")
+        self.assertEqual(normalized["edge_external"], -1.0)
+
+    def test_normalize_still_converts_percentages_above_one(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"my_prob": 50, "edge_external": -1.07}
+        normalized = client._normalize_numeric_fields(payload, market_id="m-percent-convert")
+        self.assertAlmostEqual(float(normalized["my_prob"]), 0.5, places=6)
+        self.assertAlmostEqual(float(normalized["edge_external"]), -0.0107, places=6)
+
+    def test_normalize_edge_near_boundary_logs_debug(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"edge_external": -1.02}
+        with patch("grok_client.logger.debug") as debug_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            normalized = client._normalize_numeric_fields(
+                payload,
+                market_id="m-edge-debug-boundary",
+            )
+        self.assertAlmostEqual(float(normalized["edge_external"]), -0.0102, places=6)
+        debug_mock.assert_called_once()
+        warning_mock.assert_not_called()
+
+    def test_normalize_edge_above_one_point_five_still_warns(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"edge_external": -1.8}
+        with patch("grok_client.logger.debug") as debug_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            normalized = client._normalize_numeric_fields(
+                payload,
+                market_id="m-edge-warning",
+            )
+        self.assertAlmostEqual(float(normalized["edge_external"]), -0.018, places=6)
+        warning_mock.assert_called_once()
+        debug_mock.assert_not_called()
 
     def test_analyze_market_deep_normalizes_edge_at_negative_one_boundary(self) -> None:
         market = Market(

@@ -1,0 +1,408 @@
+from __future__ import annotations
+
+from calibration_gates import (
+    GateTier,
+    PerformanceStats,
+    evaluate_market,
+    evaluate_market_tiered,
+    evaluate_short_prefix_penalty,
+)
+from participation import wilson_lower_bound
+
+
+def test_evaluate_market_blocks_losing_prefix_with_sufficient_samples() -> None:
+    """n=5 is below the new hard_block_min_samples=10 default so the reason
+    changes to ``historical_prefix_small_sample_negative`` (soft demote).
+    ``allowed`` is still ``False``."""
+    allowed, reason, metrics = evaluate_market(
+        market_id="ABCDEF123456-TEST",
+        family="generic",
+        prefix_stats={
+            "ABCDEF123456": PerformanceStats(
+                sample_size=5,
+                wins=1,
+                win_rate=0.20,
+                pnl_total=-8.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert allowed is False
+    assert reason == "historical_prefix_small_sample_negative"
+    assert metrics["historical_gate_market_prefix"] == "ABCDEF123456"
+    assert metrics["historical_gate_tier"] == GateTier.SOFT_DEMOTE
+
+
+def test_evaluate_market_respects_min_sample_guard() -> None:
+    allowed, reason, _ = evaluate_market(
+        market_id="ABCDEF123456-TEST",
+        family="generic",
+        prefix_stats={
+            "ABCDEF123456": PerformanceStats(
+                sample_size=2,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-20.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_evaluate_market_blocks_losing_family_when_enabled() -> None:
+    allowed, reason, metrics = evaluate_market(
+        market_id="ZZZZZZ999999-TEST",
+        family="crypto",
+        prefix_stats={},
+        family_stats={
+            "crypto": PerformanceStats(
+                sample_size=30,
+                wins=10,
+                win_rate=0.3333,
+                pnl_total=-40.0,
+            )
+        },
+        prefix_gate_enabled=False,
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+    )
+    assert allowed is False
+    assert reason == "historical_family_pnl_block"
+    assert metrics["historical_gate_market_family"] == "crypto"
+    assert metrics["historical_family_samples"] == 30
+    assert metrics["historical_family_pnl_total"] == -40.0
+
+
+def test_evaluate_market_does_not_block_zero_win_prefix_without_pnl_cutoff() -> None:
+    allowed, reason, metrics = evaluate_market(
+        market_id="ZEROWIN12345-TEST",
+        family="generic",
+        prefix_stats={
+            "ZEROWIN12345": PerformanceStats(
+                sample_size=8,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=1.5,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert allowed is True
+    assert reason is None
+    assert metrics["historical_gate_prefix_sample_size"] == 8
+
+
+def test_evaluate_short_prefix_penalty_returns_zero_without_snapshot() -> None:
+    penalty, metrics = evaluate_short_prefix_penalty(
+        market_id="KXETH-26APR20-T123",
+        short_prefix_stats=None,
+        prefix_len=5,
+        min_samples=3,
+        pnl_cutoff=-5.0,
+        score_penalty=0.10,
+    )
+    assert penalty == 0.0
+    assert metrics["historical_short_prefix"] == "KXETH"
+
+
+def test_evaluate_short_prefix_penalty_applies_for_losing_prefix() -> None:
+    penalty, metrics = evaluate_short_prefix_penalty(
+        market_id="KXETH-26APR20-T123",
+        short_prefix_stats={
+            "KXETH": PerformanceStats(
+                sample_size=4,
+                wins=1,
+                win_rate=0.25,
+                pnl_total=-9.0,
+            )
+        },
+        prefix_len=5,
+        min_samples=3,
+        pnl_cutoff=-5.0,
+        score_penalty=0.10,
+    )
+    assert penalty == 0.10
+    assert metrics["historical_short_prefix_sample_size"] == 4
+    assert metrics["historical_short_prefix_pnl_total"] == -9.0
+
+
+def test_evaluate_short_prefix_penalty_respects_sample_floor() -> None:
+    penalty, _ = evaluate_short_prefix_penalty(
+        market_id="KXETH-26APR20-T123",
+        short_prefix_stats={
+            "KXETH": PerformanceStats(
+                sample_size=2,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-20.0,
+            )
+        },
+        prefix_len=5,
+        min_samples=3,
+        pnl_cutoff=-5.0,
+        score_penalty=0.10,
+    )
+    assert penalty == 0.0
+
+
+def test_wilson_lower_bound_3_wins_of_3() -> None:
+    wlb = wilson_lower_bound(3, 3)
+    assert 0.29 < wlb < 1.0
+
+
+def test_wilson_lower_bound_0_wins_of_5() -> None:
+    wlb = wilson_lower_bound(0, 5)
+    assert wlb < 0.05
+
+
+def test_wilson_lower_bound_1_win_of_3() -> None:
+    wlb = wilson_lower_bound(1, 3)
+    assert 0.01 < wlb < 0.50
+
+
+def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
+    """With n=3 and negative PnL, the tiered evaluator should produce
+    SOFT_DEMOTE, not HARD_DENY (which requires n>=10 by default)."""
+    result = evaluate_market_tiered(
+        market_id="KXMLBHIT-26A-TEST",
+        family="generic",
+        prefix_stats={
+            "KXMLBHIT-26A": PerformanceStats(
+                sample_size=3,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-14.44,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.reason == "historical_prefix_small_sample_negative"
+    assert result.sample_size == 3
+    assert result.wilson_win_rate_lower_bound is not None
+    assert result.what_to_learn_next is not None
+
+
+def test_tiered_n12_low_wilson_is_hard_deny() -> None:
+    """With n=12 >= hard_block_min_samples and low Wilson LB, the tiered
+    evaluator should produce HARD_DENY."""
+    result = evaluate_market_tiered(
+        market_id="KXMLBHIT-26A-TEST",
+        family="generic",
+        prefix_stats={
+            "KXMLBHIT-26A": PerformanceStats(
+                sample_size=12,
+                wins=1,
+                win_rate=0.083,
+                pnl_total=-30.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.HARD_DENY
+    assert result.reason == "historical_prefix_pnl_block"
+    assert result.allowed is False
+
+
+def test_legacy_wrapper_returns_same_allowed_for_soft_demote() -> None:
+    """The legacy wrapper should still return allowed=False for soft-demoted
+    markets so existing callers get the same gating behavior."""
+    allowed, reason, metrics = evaluate_market(
+        market_id="KXMLBHIT-26A-TEST",
+        family="generic",
+        prefix_stats={
+            "KXMLBHIT-26A": PerformanceStats(
+                sample_size=4,
+                wins=1,
+                win_rate=0.25,
+                pnl_total=-14.44,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert allowed is False
+    assert reason == "historical_prefix_small_sample_negative"
+    assert "historical_gate_wilson_lb" in metrics
+    assert "what_to_learn_next" in metrics
+
+
+def test_tiered_neutral_when_pnl_above_cutoff() -> None:
+    result = evaluate_market_tiered(
+        market_id="KXWINNING-26-TEST",
+        family="generic",
+        prefix_stats={
+            "KXWINNING-26": PerformanceStats(
+                sample_size=8,
+                wins=5,
+                win_rate=0.625,
+                pnl_total=10.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.NEUTRAL
+    assert result.allowed is True
+
+
+def test_soft_demote_n4_mild_negative_does_not_block() -> None:
+    """n=4, wins=2, pnl=-3.5 -> shrunk_pnl/trade ~ -0.25 which is above
+    the default -0.50 cutoff, so the market should NOT be soft-demoted."""
+    result = evaluate_market_tiered(
+        market_id="KXMILD-26APR-TEST",
+        family="generic",
+        prefix_stats={
+            "KXMILD-26APR": PerformanceStats(
+                sample_size=4,
+                wins=2,
+                win_rate=0.50,
+                pnl_total=-3.5,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.NEUTRAL
+    assert result.allowed is True
+
+
+def test_soft_demote_n4_strong_negative_still_blocks() -> None:
+    """n=4, wins=0, pnl=-16 -> shrunk_pnl/trade ~ -1.14 which is well
+    below -0.50, and Wilson LB for 0/4 ~ 0.0 <= 0.40, so soft-demote fires."""
+    result = evaluate_market_tiered(
+        market_id="KXBAD-26APR2-TEST",
+        family="generic",
+        prefix_stats={
+            "KXBAD-26APR2": PerformanceStats(
+                sample_size=4,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-16.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.allowed is False
+    assert result.reason == "historical_prefix_small_sample_negative"
+
+
+def test_soft_demote_requires_wilson_lb_below_cutoff() -> None:
+    """n=8, wins=5, pnl=-4 -> Wilson LB ~ 0.34 which is below 0.40 cutoff,
+    but the shrunk PnL/trade is only about -0.11 (above -0.50), so NEUTRAL."""
+    result = evaluate_market_tiered(
+        market_id="KXMIXED-26AP-TEST",
+        family="generic",
+        prefix_stats={
+            "KXMIXED-26AP": PerformanceStats(
+                sample_size=8,
+                wins=5,
+                win_rate=0.625,
+                pnl_total=-4.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.NEUTRAL
+    assert result.allowed is True
+
+
+def test_soft_demote_blocked_by_high_wilson_lb() -> None:
+    """n=6, wins=4, pnl=-5 -> Wilson LB ~ 0.33 which is below cutoff,
+    but check: actually wins=4/6 gives WLB ~ 0.30, and
+    shrunk_pnl = (6/16)*(-5/6) = 0.375*-0.833 = -0.3125 which is above -0.50.
+    So NEUTRAL because shrunk PnL is not low enough."""
+    result = evaluate_market_tiered(
+        market_id="KXWINNY-26AP-TEST",
+        family="generic",
+        prefix_stats={
+            "KXWINNY-26AP": PerformanceStats(
+                sample_size=6,
+                wins=4,
+                win_rate=0.667,
+                pnl_total=-5.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.NEUTRAL
+    assert result.allowed is True

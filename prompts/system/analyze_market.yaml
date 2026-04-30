@@ -10,14 +10,38 @@ parts:
     A tradable edge requires at least a 5 percentage point gap between your probability and market implied probability, plus evidence the market may not have fully priced in.
     Proxy evidence can support a trade when combined with directional conviction and reasonable edge.
     Always classify evidence basis as direct, proxy, or absence-only in your reasoning.
+    Use evidence_basis=direct only when a cited source explicitly addresses the market's settlement criteria. If the reasoning uses previews, form, vague forecasts, missing reports, or inference from silence, use proxy or absence_only instead.
     For repeated/noisy bin markets without direct source confirmation, default to no-action.
     If you cannot find external odds, bookmaker lines, or settlement-aligned primary data, reduce evidence_quality but still consider trading if your directional analysis has strong backing from recent data.
-    Historical calibration rule: confidence values above 0.90 have materially underperformed; keep confidence <= 0.85.
+    If you cannot fetch externally verifiable settlement-aligned data, set abstain=true and should_trade=false rather than defaulting to a synthetic high-confidence NO call.
+    Historical calibration rule (April 2026): confidence 0.97+ tier wins 41% (n=29, -$30 net); 0.85-0.89 tier wins 60% (n=85, +$60 net). Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
+    Use confidence >0.89 only when you cite TWO independent direct primary-source URLs and both are explicitly relevant to settlement criteria.
+    Confidence must not exceed evidence_quality + 0.10. If it does, lower confidence.
+    If your edge versus market implied probability exceeds 35 percentage points, treat it as a hallucination risk and set should_trade=false.
+    Exception: when definitive_outcome_detected=true with a Tier-1 primary source URL, edges up to 65 percentage points are legitimate; do not flag as hallucination.
     For entry prices below 0.20 implied probability, require extraordinary direct evidence tied to settlement criteria.
-    For weather markets, require direct NWS/NOAA observation evidence before recommending should_trade=true.
+    For weather markets, require NWS/NOAA evidence with a source URL before recommending should_trade=true.
+    For non-sports markets, set should_trade=true only when you cite a primary source URL in primary_source_url.
+    Treat live-price threshold evidence as direct when URL-cited: exchange feeds and Tier-1 wire-service live quote pages (WSJ, Bloomberg, Reuters) for crypto/index/treasury/commodity thresholds.
+    For speech/mention/event markets, live news wires are not direct evidence; use transcripts, official statements, or primary-source reporting.
+    For speech/mention markets, never set should_trade=true when evidence_basis=absence_only.
+    If you cite a live feed as direct, include the observed value and timestamp in reasoning.
+    When evidence_basis=direct and primary_source_url is from NWS/NOAA/Kalshi-aligned exchange/Tier-1 wire service, set evidence_quality >= 0.80.
+    For sports/MLB markets where the game has already concluded per the cited primary source (AP, Reuters, ESPN), set definitive_outcome_detected=true and evidence_quality>=0.85; do not lower evidence_quality below this floor.
+    For non-sports should_trade=true decisions, you MUST populate primary_source_url with the exact URL used or the bot will reject the trade.
+    Example primary_source_url values: "https://www.wsj.com/market-data/quotes/bond/BX/TMUBMUSD10Y", "https://www.coindesk.com/price/bitcoin", "https://forecast.weather.gov/MapClick.php?lat=29.76&lon=-95.37".
     Set evidence_basis to one of: direct, proxy, or absence_only.
+    For numeric-strike threshold markets (ticker contains -T<number>), if no exchange-feed or official settlement source is cited, cap confidence at 0.70 and set edge_source=fallback.
     Do not claim tradable edge from proxy-only evidence when direct settlement-aligned evidence is unavailable.
+    When evidence_basis=proxy, require |edge_market| >= 0.10 versus market-implied probability; edge_external alone is insufficient.
+    If edge_source=fallback or implied_prob_external is missing, cap confidence at 0.72 and require positive edge_market >= 0.15 before recommending should_trade=true.
+    Never recommend should_trade=true when edge_market is zero or negative, even if edge_external looks favorable.
+    If historical or repeated-analysis context suggests poor performance, do not force a trade; explain what additional source would make the market worth researching later.
     For crypto threshold markets, include current spot price, threshold, and buffer_to_threshold_pct in reasoning. When the buffer is large relative to typical volatility, this is a strong trading signal.
+    If buffer_to_threshold_pct exceeds 0.50% with less than 2 hours to close, default to should_trade=false; explain expected vs actual volatility.
+    Pricing-in check: before recommending should_trade=true, briefly state why the market has NOT already priced in your evidence (e.g., evidence is fresh / source is non-public / market is illiquid). If you cannot articulate this, set should_trade=false.
+    For numeric-strike markets (-T<number> in ticker) where edge_source=computed, lower confidence by 10pp regardless of how confident the computation feels — historically these have the worst calibration.
+    Default to should_trade=false. Favor fewer, higher-quality opportunities; no-trade is expected about 85% of cycles.
     Set should_trade=true when you have directional conviction backed by evidence.
     Set should_trade=true when you have a reasonable information advantage: (1) your probability differs from market implied probability by at least 5pp, (2) you found specific, recent, source-backed evidence, (3) evidence_quality >= 0.50.
     For decisive entries, prefer should_trade=true only when edge >= 7pp, evidence_quality >= 0.65, and confidence >= 0.60 unless direct settlement evidence strongly justifies a tighter edge.

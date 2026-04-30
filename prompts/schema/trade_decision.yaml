@@ -1,7 +1,7 @@
 name: schema/trade_decision
 description: TradeDecision field descriptions used by response_format schema.
 fields:
-  should_trade: "Only true if YOUR probability exceeds implied odds probability by 5%+ (meaningful edge)"
+  should_trade: "Only true when edge_market is positive and >= 7pp for non-sports (or >= 5pp for sports with direct settlement-aligned evidence), evidence_basis is not absence_only, edge_source is not none, and primary_source_url is populated for non-sports markets. Do not trade on edge_external alone."
   outcome: "The outcome you predict will win"
   confidence: "Your probability estimate (0.0-1.0)."
   bet_size_pct: "Fraction of max bet (0.0-1.0). Scale with edge size, not just confidence."
@@ -9,8 +9,9 @@ fields:
   implied_prob_external: "Optional externally sourced implied probability from books/polls/markets."
   my_prob: "Optional explicit analyst probability estimate."
   edge_external: "Optional explicit edge from external implied probability (my_prob - implied_prob_external)."
-  edge_source: "Source of edge calculation (computed, fallback, or none)."
-  evidence_basis: "Evidence basis class (direct, proxy, or absence_only)."
+  edge_source: "Source of edge calculation (computed, fallback, or none). Use fallback only when no external implied probability is available; fallback requires a larger positive edge_market."
+  evidence_basis: "Evidence basis class (direct, proxy, or absence_only). Direct requires a cited source that explicitly matches the market's settlement criteria; previews, vague forecasts, and silence are proxy or absence_only."
+  primary_source_url: "URL of the single most decisive primary source used. REQUIRED when should_trade=true for any non-sports market; missing URL will cause rejection. For live-price markets use exchange or Tier-1 wire-service quote pages, for weather use NWS/NOAA pages, and for speech/mention use transcripts or official statements."
   likelihood_ratio: "Optional likelihood ratio P(evidence|predicted_outcome) / P(evidence|alternative_outcome)."
   evidence_quality: "Evidence quality score (0-1), set by validation layer."
   abstain: "True when evidence quality is too weak to act on this cycle."

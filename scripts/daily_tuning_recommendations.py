@@ -102,7 +102,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rows = _parse_json_lines(Path(args.log_file))
+    log_base = Path(args.log_file)
+    log_files = sorted(log_base.parent.glob(log_base.name + "*"))
+    rows: list[dict[str, Any]] = []
+    for log_path in log_files:
+        rows.extend(_parse_json_lines(log_path))
     samples = _extract_calibration_samples(rows)
     recommendation = compute_adaptive_thresholds(
         samples=samples,
@@ -115,7 +119,8 @@ def main() -> None:
 
     print("Daily Tuning Recommendations")
     print("============================")
-    print(f"log_file: {args.log_file}")
+    scanned = [str(f.name) for f in log_files]
+    print(f"log_files_scanned: {scanned}")
     print(f"calibration_samples: {recommendation['sample_count']}")
     print(
         "recommended_min_market_edge_for_trade: "

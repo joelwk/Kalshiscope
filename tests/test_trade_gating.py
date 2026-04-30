@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from config import Settings
 from main import (
     _adjust_bet_size_for_edge,
+    _build_execution_audit,
     _effective_score_gate_threshold,
     _extract_winning_outcome,
     _filter_markets,
@@ -63,6 +66,52 @@ def test_edge_gate_allows_when_edge_clears_threshold() -> None:
     assert reason == ""
 
 
+def test_edge_gate_blocks_non_sports_without_direct_evidence() -> None:
+    settings = Settings(
+        MIN_EDGE=0.10,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        MAX_REASONABLE_EDGE=0.45,
+    )
+    market = Market(
+        id="KXBTCD-TEST",
+        question="Bitcoin threshold",
+        category="crypto",
+    )
+    decision = _decision(0.70).model_copy(update={"evidence_basis": "proxy"})
+    ok, edge, reason = _passes_edge_threshold(
+        0.50,
+        decision,
+        settings,
+        market=market,
+    )
+    assert ok is False
+    assert edge == pytest.approx(0.20)
+    assert reason == "non_sports_needs_direct_evidence"
+
+
+def test_edge_gate_keeps_sports_path_with_direct_evidence() -> None:
+    settings = Settings(
+        MIN_EDGE=0.10,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        MAX_REASONABLE_EDGE=0.45,
+    )
+    market = Market(
+        id="KXMLBGAME-TEST",
+        question="MLB: Team A vs Team B winner",
+        category="sports",
+    )
+    decision = _decision(0.78).model_copy(update={"evidence_basis": "direct"})
+    ok, edge, reason = _passes_edge_threshold(
+        0.58,
+        decision,
+        settings,
+        market=market,
+    )
+    assert ok is True
+    assert round(edge or 0.0, 2) == 0.20
+    assert reason == ""
+
+
 def test_edge_gate_allows_low_price_with_sufficient_edge() -> None:
     """Verifies that underdog outcomes pass when edge exceeds LOW_PRICE_MIN_EDGE."""
     settings = Settings(
@@ -111,6 +160,7 @@ def test_edge_based_sizing_caps_fallback_edge_to_min_bet() -> None:
         MIN_BET_USDC=2.0,
         MAX_BET_USDC=8.0,
         MIN_EDGE=0.05,
+        FALLBACK_EDGE_MIN_EDGE=0.15,
         EDGE_SCALING_RANGE=0.05,
     )
     decision = _decision(0.78, bet_size_pct=1.0).model_copy(update={"edge_source": "fallback"})
@@ -231,7 +281,7 @@ def test_edge_gate_blocks_below_tightened_global_min_edge() -> None:
 def test_edge_gate_blocks_fallback_edge_below_tightened_threshold() -> None:
     settings = Settings(
         MIN_EDGE=0.07,
-        FALLBACK_EDGE_MIN_EDGE=0.15,
+        FALLBACK_EDGE_MIN_EDGE=0.22,
         LOW_PRICE_THRESHOLD=0.50,
         LOW_PRICE_MIN_EDGE=0.10,
     )
@@ -258,13 +308,14 @@ def test_confidence_override_requires_floor_even_with_edge_and_evidence() -> Non
         reasoning="test",
         evidence_quality=0.9,
     )
-    allowed, min_confidence = _is_confidence_override_allowed(
+    allowed, min_confidence, override_path = _is_confidence_override_allowed(
         settings=settings,
         decision=decision,
         override_edge=0.20,
     )
     assert min_confidence == 0.50
     assert allowed is False
+    assert override_path == "none"
 
 
 def test_confidence_override_allows_when_floor_and_thresholds_met() -> None:
@@ -282,12 +333,13 @@ def test_confidence_override_allows_when_floor_and_thresholds_met() -> None:
         reasoning="test",
         evidence_quality=0.9,
     )
-    allowed, _ = _is_confidence_override_allowed(
+    allowed, _, override_path = _is_confidence_override_allowed(
         settings=settings,
         decision=decision,
         override_edge=0.20,
     )
     assert allowed is True
+    assert override_path == "edge_default"
 
 
 def test_effective_score_gate_threshold_uses_weather_direct_threshold() -> None:
@@ -356,3 +408,299 @@ def test_effective_score_gate_threshold_uses_direct_high_quality_override() -> N
         evidence_quality=0.85,
     )
     assert threshold == 0.25
+
+
+def test_research_queue_receipt_emitted_on_soft_block() -> None:
+    payload = _build_execution_audit(
+        decision_terminal=False,
+        final_action="research_queued",
+        final_reason="edge_gate_blocked",
+        gate_edge_required=0.14,
+        gate_edge_actual=0.11,
+        edge_shortfall=0.03,
+    )
+    assert payload["final_action"] == "research_queued"
+    assert payload["final_reason"] == "edge_gate_blocked"
+    assert payload["skip_reasons"] == ["edge_gate_blocked"]
+    assert payload["rejection_reason"] == "edge_gate_blocked"
+
+
+def test_research_queue_receipt_emitted_for_edge_above_reasonable_max() -> None:
+    payload = _build_execution_audit(
+        decision_terminal=False,
+        final_action="research_queued",
+        final_reason="edge_above_reasonable_max",
+        gate_edge_required=0.14,
+        gate_edge_actual=0.36,
+        edge_shortfall=0.0,
+        gate_edge_reason="edge_above_reasonable_max",
+    )
+    assert payload["final_action"] == "research_queued"
+    assert payload["final_reason"] == "edge_above_reasonable_max"
+    assert payload["skip_reasons"] == ["edge_above_reasonable_max"]
+    assert payload["gate_edge_reason"] == "edge_above_reasonable_max"
+
+
+def test_research_queue_receipt_emitted_for_hallucinated_edge() -> None:
+    payload = _build_execution_audit(
+        decision_terminal=False,
+        final_action="research_queued",
+        final_reason="hallucinated_edge",
+        score_threshold=0.48,
+        score_gap=0.07,
+    )
+    assert payload["final_action"] == "research_queued"
+    assert payload["final_reason"] == "hallucinated_edge"
+    assert payload["skip_reasons"] == ["hallucinated_edge"]
+
+
+def test_research_queue_receipt_emitted_for_extreme_market_edge() -> None:
+    payload = _build_execution_audit(
+        decision_terminal=False,
+        final_action="research_queued",
+        final_reason="extreme_market_edge",
+        score_threshold=0.48,
+        score_gap=0.11,
+    )
+    assert payload["final_action"] == "research_queued"
+    assert payload["final_reason"] == "extreme_market_edge"
+    assert payload["skip_reasons"] == ["extreme_market_edge"]
+
+
+def test_execution_audit_preserves_gated_should_trade_field() -> None:
+    payload = _build_execution_audit(
+        decision_terminal=True,
+        final_action="skip",
+        final_reason="score_gate_blocked",
+        should_trade=False,
+        gated_should_trade=True,
+        ticker_prefix_short="KXETH",
+        ticker_prefix_short_pnl=-9.1,
+    )
+    assert payload["should_trade"] is False
+    assert payload["gated_should_trade"] is True
+    assert payload["ticker_prefix_short"] == "KXETH"
+    assert payload["ticker_prefix_short_pnl"] == -9.1
+
+
+def test_execution_audit_includes_ranking_and_research_only_fields() -> None:
+    payload = _build_execution_audit(
+        decision_terminal=False,
+        final_action="research_queued",
+        final_reason="repeated_non_actionable_research_only",
+        ranking_rank=2,
+        ranking_total_candidates=8,
+        historical_family_pnl_total=14.5,
+        historical_family_samples=12,
+        primary_source_url_present=False,
+        fallback_high_confidence_penalty_applied=True,
+        research_only=True,
+    )
+    assert payload["final_action"] == "research_queued"
+    assert payload["ranking_rank"] == 2
+    assert payload["ranking_total_candidates"] == 8
+    assert payload["historical_family_pnl_total"] == 14.5
+    assert payload["historical_family_samples"] == 12
+    assert payload["fallback_high_confidence_penalty_applied"] is True
+    assert payload["research_only"] is True
+
+
+_WHITELIST_WITH_AP = (
+    "weather.gov", "noaa.gov", "wsj.com", "bloomberg.com",
+    "reuters.com", "coindesk.com", "kalshi.com", "apnews.com",
+)
+
+
+def test_definitive_outcome_bypasses_evidence_quality_gate() -> None:
+    """When definitive_outcome_detected is True with a whitelisted URL and
+    direct basis, _min_evidence_quality_for_market should return the lower
+    definitive floor instead of the normal threshold."""
+    market = Market(
+        id="KXMLBGAME-26APR251915DETCIN-CIN",
+        question="Will CIN win?",
+        category="sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.45),
+            MarketOutcome(name="NO", price=0.55),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.95,
+        bet_size_pct=0.5,
+        reasoning="Game over per Reuters source",
+        evidence_basis="direct",
+        evidence_quality=0.60,
+        primary_source_url="https://reuters.com/article/test",
+        definitive_outcome_detected=True,
+    )
+    settings = Settings(
+        DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR=0.78,
+        MIN_EVIDENCE_QUALITY_FOR_TRADE=0.75,
+    )
+    threshold = _min_evidence_quality_for_market(market, settings, decision)
+    assert threshold <= 0.78
+
+
+def test_definitive_outcome_edge_cap_raised() -> None:
+    """Edge cap should be 0.65 for definitive outcomes instead of 0.35."""
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.95,
+        bet_size_pct=0.5,
+        reasoning="Game resolved",
+        evidence_basis="direct",
+        evidence_quality=0.85,
+        primary_source_url="https://reuters.com/article/test",
+        definitive_outcome_detected=True,
+    )
+    market = Market(
+        id="KXMLBF5-26APR251415SEASTL-SEA",
+        question="Will SEA win F5?",
+        category="sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.45),
+            MarketOutcome(name="NO", price=0.55),
+        ],
+    )
+    settings = Settings(
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.65,
+        MAX_REASONABLE_EDGE=0.35,
+    )
+    passed, edge_val, reason = _passes_edge_threshold(
+        0.45, decision, settings, market=market
+    )
+    assert passed is True
+    assert edge_val is not None
+    assert abs(edge_val - 0.50) < 0.01
+
+
+def test_non_definitive_edge_049_still_blocked() -> None:
+    """Without definitive_outcome_detected, edge=0.49 is still blocked."""
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.94,
+        bet_size_pct=0.5,
+        reasoning="Test",
+        evidence_basis="direct",
+        evidence_quality=0.85,
+    )
+    market = Market(
+        id="KXTEST-001",
+        question="Test?",
+        category="generic",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.45),
+            MarketOutcome(name="NO", price=0.55),
+        ],
+    )
+    settings = Settings(
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.65,
+        MAX_REASONABLE_EDGE=0.35,
+    )
+    passed, edge_val, reason = _passes_edge_threshold(
+        0.45, decision, settings, market=market
+    )
+    assert passed is False
+    assert reason == "edge_above_reasonable_max"
+
+
+def test_strong_direct_evidence_override_unlocks_high_eq_low_conf_trade() -> None:
+    """KXHIGHMIA-style: whitelisted source, basis=direct, eq=1.0, edge=0.15,
+    conf=0.58 -> override_path=strong_direct_evidence, allowed=True."""
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.62,
+        STRONG_EVIDENCE_CONFIDENCE_FLOOR=0.55,
+        STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY=0.85,
+        DIRECT_SOURCE_WHITELIST=("weather.gov", "espn.com"),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.58,
+        bet_size_pct=0.2,
+        reasoning="NWS forecast evidence",
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        edge_source="computed",
+        edge_external=0.15,
+        primary_source_url="https://forecast.weather.gov/product.php?site=MFL",
+    )
+    allowed, floor, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.15,
+    )
+    assert allowed is True
+    assert override_path == "strong_direct_evidence"
+    assert floor == 0.55
+
+
+def test_strong_direct_evidence_override_rejects_low_eq() -> None:
+    """Same as above but evidence_quality=0.70 < 0.85 threshold -> blocked."""
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.62,
+        STRONG_EVIDENCE_CONFIDENCE_FLOOR=0.55,
+        STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY=0.85,
+        DIRECT_SOURCE_WHITELIST=("weather.gov",),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.58,
+        bet_size_pct=0.2,
+        reasoning="Weather forecast",
+        evidence_basis="direct",
+        evidence_quality=0.70,
+        edge_source="computed",
+        edge_external=0.15,
+        primary_source_url="https://forecast.weather.gov/product.php?site=MFL",
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.15,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def test_strong_direct_evidence_override_rejects_non_whitelisted_source() -> None:
+    """Non-whitelisted source URL -> strong override path doesn't trigger."""
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.62,
+        STRONG_EVIDENCE_CONFIDENCE_FLOOR=0.55,
+        STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY=0.85,
+        DIRECT_SOURCE_WHITELIST=("weather.gov",),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.58,
+        bet_size_pct=0.2,
+        reasoning="Blog source",
+        evidence_basis="direct",
+        evidence_quality=0.95,
+        edge_source="computed",
+        edge_external=0.15,
+        primary_source_url="https://randomblog.example.com/forecast",
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.15,
+    )
+    assert allowed is False
+    assert override_path == "none"

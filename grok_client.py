@@ -76,9 +76,20 @@ _VERIFIABLE_EVIDENCE_KEYWORDS = (
 )
 _MAX_MODEL_RESPONSE_LOG_CHARS = 500
 _ANALYSIS_MAX_ATTEMPTS = 3
+# Deep refinement always has `previous_analysis` as a safe fallback in the
+# caller, so a single failed attempt should short-circuit rather than burn
+# budget that other candidates could use. Initial analyses (no fallback)
+# still use the full attempt count.
+_DEEP_ANALYSIS_MAX_ATTEMPTS = 1
 _ANALYSIS_RETRY_WAIT_SECONDS = 2
-_DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 180
+_DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 240
 _SLOW_FAILURE_THRESHOLD_MS = 15_000
+# Reserve a small cushion inside the per-attempt deadline so post-stream work
+# (JSON parse, validation, logging) still fits within the overall budget.
+_STREAM_DEADLINE_SAFETY_MARGIN_SECONDS = 1.0
+# Do not start a new stream attempt unless this much budget remains; avoids
+# spinning up an xAI request that is virtually guaranteed to time out.
+_MIN_STREAM_ATTEMPT_SECONDS = 8.0
 _SYSTEM_PROMPT_SHARED = load_prompt("system/shared_output_rules")
 _SYSTEM_PROMPT_ANALYZE = load_prompt("system/analyze_market")
 _SYSTEM_PROMPT_DEEP = load_prompt("system/analyze_market_deep")
@@ -130,6 +141,24 @@ def _response_preview(text: str, max_chars: int = _MAX_MODEL_RESPONSE_LOG_CHARS)
     return preview[:max_chars] + "..."
 
 
+_TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
+    "rst_stream",
+    "statuscode.unavailable",
+    "unavailable",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "broken pipe",
+    "eof occurred",
+)
+
+
+def _is_transport_reset_error(exc: Exception) -> bool:
+    """Transport-layer gRPC/HTTP resets that are safely retriable."""
+    error_text = str(exc).lower()
+    return any(marker in error_text for marker in _TRANSPORT_RESET_MARKERS)
+
+
 def _is_timeout_class_error(exc: Exception) -> bool:
     """Server-side gRPC deadline or our own stream timeout — both transient."""
     error_text = str(exc).lower()
@@ -144,10 +173,11 @@ def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
     """Classify transient failures that should be retried.
 
     Timeout-class errors (gRPC DEADLINE_EXCEEDED and our own stream timeout)
-    are always retriable regardless of duration, since they indicate the
-    model ran out of time — not a content failure.
+    and transport-layer resets (RST_STREAM / UNAVAILABLE) are always retriable
+    regardless of duration, since they indicate an interrupted stream rather
+    than a content failure.
     """
-    if _is_timeout_class_error(exc):
+    if _is_timeout_class_error(exc) or _is_transport_reset_error(exc):
         return True
     if duration_ms >= _SLOW_FAILURE_THRESHOLD_MS:
         return False
@@ -884,9 +914,17 @@ class GrokClient:
 
             reasons: list[str] = []
             normalized_value = numeric_value
-            if abs(normalized_value) >= 1.0:
-                normalized_value = normalized_value / 100.0
-                reasons.append("percent_to_decimal")
+            used_percent_to_decimal = False
+            if field_name in probability_fields:
+                if normalized_value > 1.0:
+                    normalized_value = normalized_value / 100.0
+                    reasons.append("percent_to_decimal")
+                    used_percent_to_decimal = True
+            elif field_name in edge_fields:
+                if abs(normalized_value) > 1.0:
+                    normalized_value = normalized_value / 100.0
+                    reasons.append("percent_to_decimal")
+                    used_percent_to_decimal = True
 
             bounded_value = max(lower_bound, min(upper_bound, normalized_value))
             if bounded_value != normalized_value:
@@ -896,21 +934,49 @@ class GrokClient:
                 return
 
             normalized_payload[field_name] = bounded_value
-            logger.warning(
-                "Normalized model numeric field: market=%s field=%s raw=%s normalized=%s reason=%s",
-                market_id,
-                field_name,
-                raw_value,
-                bounded_value,
-                ",".join(reasons) if reasons else "normalized",
-                data={
-                    "market_id": market_id,
-                    "field": field_name,
-                    "raw_value": raw_value,
-                    "normalized_value": bounded_value,
-                    "reason": reasons,
-                },
+            log_data = {
+                "market_id": market_id,
+                "field": field_name,
+                "raw_value": raw_value,
+                "normalized_value": bounded_value,
+                "reason": reasons,
+            }
+            reason_text = ",".join(reasons) if reasons else "normalized"
+            near_boundary_probability_conversion = (
+                field_name in probability_fields
+                and used_percent_to_decimal
+                and 1.0 < numeric_value <= 1.5
+                and "clamped" not in reasons
             )
+            near_boundary_edge_conversion = (
+                field_name in edge_fields
+                and used_percent_to_decimal
+                and 1.0 < abs(numeric_value) <= 1.5
+                and "clamped" not in reasons
+            )
+            if (
+                near_boundary_probability_conversion
+                or near_boundary_edge_conversion
+            ):
+                logger.debug(
+                    "Normalized model numeric field: market=%s field=%s raw=%s normalized=%s reason=%s",
+                    market_id,
+                    field_name,
+                    raw_value,
+                    bounded_value,
+                    reason_text,
+                    data=log_data,
+                )
+            else:
+                logger.warning(
+                    "Normalized model numeric field: market=%s field=%s raw=%s normalized=%s reason=%s",
+                    market_id,
+                    field_name,
+                    raw_value,
+                    bounded_value,
+                    reason_text,
+                    data=log_data,
+                )
 
         for field_name in probability_fields:
             _normalize_field(field_name, 0.0, 1.0)
@@ -1018,10 +1084,43 @@ class GrokClient:
             )
             return _extract_json(repaired_content)
 
+    def _resolve_stream_deadline_seconds(
+        self,
+        budget_remaining_ms: float | None,
+        search_profile: str | None = None,
+    ) -> float:
+        """Per-attempt stream deadline, clamped to the remaining analysis budget.
+
+        When *search_profile* is ``"crypto"`` the per-profile timeout from
+        settings (``GROK_STREAM_TIMEOUT_SECONDS_CRYPTO``) is preferred over
+        the generic default, giving crypto markets a longer window to avoid
+        frequent timeouts.
+        """
+        base_timeout = float(self.stream_timeout_seconds)
+        if (
+            search_profile == "crypto"
+            and hasattr(self, "settings")
+            and self.settings is not None
+        ):
+            crypto_timeout = getattr(
+                self.settings, "GROK_STREAM_TIMEOUT_SECONDS_CRYPTO", None
+            )
+            if crypto_timeout is not None and int(crypto_timeout) > 0:
+                base_timeout = float(crypto_timeout)
+        if budget_remaining_ms is None or budget_remaining_ms <= 0:
+            return base_timeout
+        budget_seconds = max(
+            0.0, (budget_remaining_ms / 1000.0) - _STREAM_DEADLINE_SAFETY_MARGIN_SECONDS
+        )
+        return min(base_timeout, budget_seconds)
+
     def _stream_chat_content(
         self,
         chat,
         market_id: str,
+        *,
+        budget_remaining_ms: float | None = None,
+        search_profile: str | None = None,
     ) -> tuple[str, int, dict[str, int | None]]:
         content = ""
         chunk_count = 0
@@ -1031,11 +1130,14 @@ class GrokClient:
             "reasoning_tokens": None,
             "cached_tokens": None,
         }
-        deadline = time.monotonic() + self.stream_timeout_seconds
+        deadline_seconds = self._resolve_stream_deadline_seconds(
+            budget_remaining_ms, search_profile=search_profile
+        )
+        deadline = time.monotonic() + deadline_seconds
         for response, chunk in chat.stream():
             if time.monotonic() > deadline:
                 raise TimeoutError(
-                    f"Grok stream exceeded {self.stream_timeout_seconds}s for market {market_id}"
+                    f"Grok stream exceeded {deadline_seconds:.1f}s for market {market_id}"
                 )
             usage_metrics = _extract_usage_metrics(response)
             if chunk.content:
@@ -1055,9 +1157,27 @@ class GrokClient:
     ) -> TradeDecision:
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
         last_error: Exception | None = None
-        for attempt in range(1, _ANALYSIS_MAX_ATTEMPTS + 1):
+        max_attempts = _DEEP_ANALYSIS_MAX_ATTEMPTS if deep else _ANALYSIS_MAX_ATTEMPTS
+        for attempt in range(1, max_attempts + 1):
             budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
             if budget_remaining_ms <= 0:
+                break
+            if (
+                attempt > 1
+                and budget_remaining_ms < _MIN_STREAM_ATTEMPT_SECONDS * 1000.0
+            ):
+                logger.debug(
+                    "Skipping retry with insufficient budget: market=%s attempt=%d remaining_ms=%.0f",
+                    market.id,
+                    attempt,
+                    budget_remaining_ms,
+                    data={
+                        "market_id": market.id,
+                        "retry_attempt": attempt,
+                        "budget_remaining_ms": round(budget_remaining_ms, 2),
+                        "min_attempt_seconds": _MIN_STREAM_ATTEMPT_SECONDS,
+                    },
+                )
                 break
             try:
                 return self._run_analysis_once(
@@ -1075,7 +1195,7 @@ class GrokClient:
                 budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
                 if (
                     not retriable
-                    or attempt >= _ANALYSIS_MAX_ATTEMPTS
+                    or attempt >= max_attempts
                     or budget_remaining_ms <= 0
                 ):
                     raise
@@ -1088,12 +1208,12 @@ class GrokClient:
                     "deep market analysis" if deep else "market analysis",
                     market.id,
                     attempt + 1,
-                    _ANALYSIS_MAX_ATTEMPTS,
+                    max_attempts,
                     data={
                         "market_id": market.id,
                         "deep": deep,
                         "retry_attempt": attempt + 1,
-                        "max_attempts": _ANALYSIS_MAX_ATTEMPTS,
+                        "max_attempts": max_attempts,
                         "budget_remaining_ms": round(budget_remaining_ms, 2),
                         "retriable": retriable,
                     },
@@ -1162,7 +1282,12 @@ class GrokClient:
                     )
                 )
             )
-            content, chunk_count, usage_metrics = self._stream_chat_content(chat, market.id)
+            content, chunk_count, usage_metrics = self._stream_chat_content(
+                chat,
+                market.id,
+                budget_remaining_ms=budget_remaining_ms,
+                search_profile=getattr(active_config, "profile_name", None),
+            )
             data = self._parse_response_payload(market.id, content, deep=deep)
             raw_payload = dict(data)
 

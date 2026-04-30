@@ -10,10 +10,15 @@ _WEATHER_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
 _NARROW_WEATHER_BIN_PENALTY = 0.03
 _MENTION_MARKET_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
 _GENERIC_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
+_NUMERIC_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+$", re.IGNORECASE)
 _CONFIDENCE_SHRINKAGE_FLOOR = 0.50
 _CONFIDENCE_SHRINKAGE_FACTOR = 0.50
-_OVERCONFIDENCE_GAP_FREE_BAND = 0.12
-_OVERCONFIDENCE_GAP_MAX = 0.20
+_OVERCONFIDENCE_PENALTY_SCALE_BASE = 0.08
+_OVERCONFIDENCE_STEP_LOW_GAP = 0.15
+_OVERCONFIDENCE_STEP_HIGH_GAP = 0.25
+_OVERCONFIDENCE_STEP_LOW_PENALTY = 0.06
+_OVERCONFIDENCE_STEP_HIGH_PENALTY = 0.12
+_LATE_STAGE_OVERCONFIDENCE_THRESHOLD = 0.85
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,20 @@ class ScoreResult:
     fallback_edge_penalty: float = 0.0
     proxy_evidence_penalty: float = 0.0
     overconfidence_penalty: float = 0.0
+    extreme_confidence_penalty: float = 0.0
+    numeric_strike_bin_penalty: float = 0.0
+    fallback_high_confidence_penalty: float = 0.0
+    extreme_market_edge_penalty: float = 0.0
+    hallucinated_edge_penalty: float = 0.0
+    hallucinated_edge_penalty_suppressed: bool = False
+    coinflip_sports_penalty: float = 0.0
+    late_stage_overconfidence_penalty: float = 0.0
+    short_prefix_penalty: float = 0.0
+    historical_family_bonus: float = 0.0
+    historical_prefix_bonus: float = 0.0
+    historical_prefix_penalty: float = 0.0
+    extreme_confidence_band_penalty: float = 0.0
+    numeric_strike_computed_overconfidence_penalty: float = 0.0
     rejection_reasons: tuple[str, ...] = ()
     bayesian_posterior: float | None = None
     lmsr_price: float | None = None
@@ -77,9 +96,28 @@ def compute_final_score(
     overconfidence_penalty_base: float = 0.08,
     generic_bin_penalty_base: float = 0.03,
     ambiguous_resolution_penalty_base: float = 0.06,
+    max_reasonable_edge: float = 0.45,
+    hallucinated_edge_penalty_base: float = 0.15,
+    extreme_market_edge_penalty_base: float = 0.08,
+    late_stage_overconfidence_penalty_base: float = 0.08,
+    extreme_confidence_threshold: float = 0.90,
+    extreme_confidence_penalty_base: float = 0.0,
+    short_prefix_penalty: float = 0.0,
+    suppress_hallucinated_edge_penalty: bool = False,
+    definitive_outcome_eligible: bool = False,
+    historical_family_pnl_total: float | None = None,
+    historical_family_sample_size: int = 0,
+    historical_family_bonus_base: float = 0.04,
+    historical_family_min_samples: int = 8,
+    historical_family_positive_pnl_threshold: float = 10.0,
     now: datetime | None = None,
     evidence_basis_class: str = "",
     edge_source: str = "",
+    market_family: str = "",
+    coinflip_price_lower: float = 0.45,
+    coinflip_price_upper: float = 0.55,
+    historical_prefix_pnl_per_trade: float | None = None,
+    historical_prefix_sample_size: int = 0,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -148,6 +186,12 @@ def compute_final_score(
         and likelihood_ratio >= 10.0
     ):
         definitive_outcome_bonus = 0.06
+    elif definitive_outcome_eligible:
+        # Auto-detected via whitelisted primary source + my_prob near 0/1 +
+        # direct basis. This is a stronger signal than likelihood_ratio
+        # inference since it requires a settlement-aligned source and a
+        # near-binary read of the outcome.
+        definitive_outcome_bonus = 0.10
     computed_edge_bonus = 0.0
     if normalized_edge_source == "computed":
         computed_edge_bonus = max(0.0, computed_edge_bonus_base) * (
@@ -157,8 +201,14 @@ def compute_final_score(
         low_info_shortfall = low_info_threshold - evidence_quality
         low_information_penalty = low_info_base + (low_info_base * low_info_shortfall)
     no_external_odds_penalty = 0.0
-    if normalized_edge_source in {"fallback", "none"} and decision.implied_prob_external is None:
+    if (
+        normalized_edge_source in {"fallback", "none"}
+        and decision.implied_prob_external is None
+        and not definitive_outcome_eligible
+    ):
         no_external_odds_penalty = 0.04
+    if normalized_edge_source == "none" and not definitive_outcome_eligible:
+        no_external_odds_penalty += 0.06
     repeated_analysis_penalty = 0.0
     repeated_penalty_start = max(0, int(repeated_analysis_penalty_start_count))
     if repeated_analysis_count > repeated_penalty_start:
@@ -184,13 +234,55 @@ def compute_final_score(
             confidence_shortfall * max(0.0, confidence_calibration_penalty_scale)
         )
     overconfidence_penalty = 0.0
-    overconfidence_gap = max(
-        0.0,
-        decision.confidence - evidence_quality - _OVERCONFIDENCE_GAP_FREE_BAND,
+    overconfidence_gap = max(0.0, decision.confidence - evidence_quality)
+    penalty_scale = 0.0
+    if overconfidence_penalty_base > 0:
+        penalty_scale = overconfidence_penalty_base / _OVERCONFIDENCE_PENALTY_SCALE_BASE
+    if overconfidence_gap > _OVERCONFIDENCE_STEP_HIGH_GAP:
+        overconfidence_penalty = _OVERCONFIDENCE_STEP_HIGH_PENALTY * penalty_scale
+    elif overconfidence_gap > _OVERCONFIDENCE_STEP_LOW_GAP:
+        overconfidence_penalty = _OVERCONFIDENCE_STEP_LOW_PENALTY * penalty_scale
+
+    late_stage_overconfidence_penalty = 0.0
+    if (
+        decision.confidence >= _LATE_STAGE_OVERCONFIDENCE_THRESHOLD
+        and normalized_evidence_basis != "direct"
+    ):
+        late_stage_overconfidence_penalty = max(
+            0.0, late_stage_overconfidence_penalty_base
+        )
+    extreme_confidence_penalty = 0.0
+    normalized_extreme_confidence_threshold = max(
+        0.0, min(1.0, extreme_confidence_threshold)
     )
-    if overconfidence_gap > 0:
-        normalized_gap = min(1.0, overconfidence_gap / _OVERCONFIDENCE_GAP_MAX)
-        overconfidence_penalty = max(0.0, overconfidence_penalty_base) * normalized_gap
+    if decision.confidence >= normalized_extreme_confidence_threshold:
+        extreme_confidence_penalty = max(0.0, extreme_confidence_penalty_base)
+        if normalized_evidence_basis != "direct":
+            extreme_confidence_penalty += 0.04
+
+    normalized_max_reasonable_edge = max(0.0, min(1.0, max_reasonable_edge))
+    fallback_high_confidence_penalty = 0.0
+    if normalized_edge_source in {"fallback", "none"} and decision.confidence >= 0.85:
+        fallback_high_confidence_penalty = 0.10 + (
+            max(0.0, decision.confidence - 0.85) * 2.0
+        )
+        confidence_evidence_gap = max(0.0, decision.confidence - evidence_quality - 0.15)
+        fallback_high_confidence_penalty += confidence_evidence_gap * 0.5
+
+    extreme_market_edge_penalty = 0.0
+    if (
+        edge_market >= normalized_max_reasonable_edge
+        and normalized_evidence_basis != "direct"
+        and normalized_edge_source != "computed"
+    ):
+        extreme_market_edge_penalty = max(0.0, extreme_market_edge_penalty_base)
+
+    hallucinated_edge_penalty = 0.0
+    if not suppress_hallucinated_edge_penalty and (
+        abs(edge_market) >= normalized_max_reasonable_edge
+        or abs(edge_external) >= normalized_max_reasonable_edge
+    ):
+        hallucinated_edge_penalty = max(0.0, hallucinated_edge_penalty_base)
 
     weather_uncertainty_penalty = 0.0
     weather_bin_penalty = 0.0
@@ -214,8 +306,9 @@ def compute_final_score(
     fallback_edge_penalty = 0.0
     proxy_evidence_penalty = 0.0
     generic_bin_penalty = 0.0
+    numeric_strike_bin_penalty = 0.0
     ambiguous_resolution_penalty = 0.0
-    if normalized_edge_source in {"fallback", "none"}:
+    if normalized_edge_source in {"fallback", "none"} and not definitive_outcome_eligible:
         fallback_edge_penalty = max(0.0, fallback_edge_penalty_base)
         evidence_shortfall = max(0.0, 0.70 - evidence_quality)
         proxy_evidence_penalty = max(0.0, proxy_evidence_penalty_base) * (
@@ -227,8 +320,8 @@ def compute_final_score(
             proxy_evidence_penalty += 0.04
         if normalized_evidence_basis == "direct":
             if evidence_quality >= 0.75:
-                fallback_edge_penalty *= 0.10
-                proxy_evidence_penalty *= 0.10
+                fallback_edge_penalty *= 0.20
+                proxy_evidence_penalty *= 0.20
             elif evidence_quality >= 0.55:
                 fallback_edge_penalty *= 0.25
                 proxy_evidence_penalty *= 0.25
@@ -237,6 +330,76 @@ def compute_final_score(
                 proxy_evidence_penalty *= 0.40
     if _GENERIC_BIN_TICKER_PATTERN.search((market.id or "").strip()) and not _is_weather_market(market):
         generic_bin_penalty = max(0.0, generic_bin_penalty_base) * (1.0 + max(0.0, 0.65 - evidence_quality))
+    if (
+        _NUMERIC_STRIKE_TICKER_PATTERN.search((market.id or "").strip())
+        and not _is_weather_market(market)
+        and (
+            normalized_evidence_basis != "direct"
+            or normalized_edge_source != "computed"
+        )
+    ):
+        numeric_strike_bin_penalty = max(0.0, generic_bin_penalty_base) * (
+            1.0 + max(0.0, 0.65 - evidence_quality)
+        )
+    short_prefix_penalty = max(0.0, float(short_prefix_penalty))
+    historical_family_bonus = 0.0
+    if (
+        historical_family_pnl_total is not None
+        and historical_family_sample_size >= max(1, int(historical_family_min_samples))
+        and float(historical_family_pnl_total)
+        > float(historical_family_positive_pnl_threshold)
+    ):
+        historical_family_bonus = max(0.0, float(historical_family_bonus_base))
+    _HISTORICAL_PREFIX_MIN_SAMPLES = 8
+    _HISTORICAL_PREFIX_BONUS_THRESHOLD = 1.0
+    _HISTORICAL_PREFIX_PENALTY_THRESHOLD = -0.5
+    _HISTORICAL_PREFIX_SCALE = 0.08
+    _HISTORICAL_PREFIX_NORM = 3.0
+    historical_prefix_bonus = 0.0
+    historical_prefix_penalty = 0.0
+    if (
+        historical_prefix_pnl_per_trade is not None
+        and historical_prefix_sample_size >= _HISTORICAL_PREFIX_MIN_SAMPLES
+    ):
+        if historical_prefix_pnl_per_trade > _HISTORICAL_PREFIX_BONUS_THRESHOLD:
+            historical_prefix_bonus = _HISTORICAL_PREFIX_SCALE * min(
+                1.0, historical_prefix_pnl_per_trade / _HISTORICAL_PREFIX_NORM
+            )
+        elif historical_prefix_pnl_per_trade < _HISTORICAL_PREFIX_PENALTY_THRESHOLD:
+            historical_prefix_penalty = _HISTORICAL_PREFIX_SCALE * min(
+                1.0, abs(historical_prefix_pnl_per_trade) / _HISTORICAL_PREFIX_NORM
+            )
+
+    extreme_confidence_band_penalty = 0.0
+    if (
+        decision.confidence >= 0.95
+        and not (
+            normalized_evidence_basis == "direct" and definitive_outcome_eligible
+        )
+    ):
+        extreme_confidence_band_penalty = 0.10 * (decision.confidence - 0.94) / 0.05
+
+    numeric_strike_computed_overconfidence_penalty = 0.0
+    if (
+        _NUMERIC_STRIKE_TICKER_PATTERN.search((market.id or "").strip())
+        and normalized_edge_source == "computed"
+        and decision.confidence >= 0.85
+    ):
+        numeric_strike_computed_overconfidence_penalty = min(
+            0.06, 0.05 * (decision.confidence - 0.85) * 4
+        )
+
+    normalized_market_family = str(market_family or "").strip().lower()
+    coinflip_sports_penalty = 0.0
+    if (
+        normalized_market_family == "sports"
+        and implied_prob_market is not None
+        and coinflip_price_lower <= implied_prob_market <= coinflip_price_upper
+        and decision.confidence >= 0.80
+        and normalized_evidence_basis != "direct"
+    ):
+        coinflip_sports_penalty = 0.10
+
     if not (getattr(market, "resolution_criteria", "") or "").strip():
         ambiguous_resolution_penalty = max(0.0, ambiguous_resolution_penalty_base)
 
@@ -251,12 +414,22 @@ def compute_final_score(
         + definitive_outcome_bonus
         + evidence_basis_bonus
         + observed_data_bonus
+        + historical_family_bonus
+        + historical_prefix_bonus
+        - historical_prefix_penalty
+        - extreme_confidence_band_penalty
+        - numeric_strike_computed_overconfidence_penalty
         - low_information_penalty
         - no_external_odds_penalty
         - repeated_analysis_penalty
         - mention_market_penalty
         - confidence_calibration_penalty
         - overconfidence_penalty
+        - extreme_confidence_penalty
+        - late_stage_overconfidence_penalty
+        - fallback_high_confidence_penalty
+        - extreme_market_edge_penalty
+        - hallucinated_edge_penalty
         - fallback_edge_penalty
         - proxy_evidence_penalty
         - liquidity_penalty
@@ -264,7 +437,10 @@ def compute_final_score(
         - weather_uncertainty_penalty
         - weather_bin_penalty
         - generic_bin_penalty
+        - numeric_strike_bin_penalty
+        - short_prefix_penalty
         - ambiguous_resolution_penalty
+        - coinflip_sports_penalty
     )
 
     rejection_reasons: list[str] = []
@@ -276,6 +452,8 @@ def compute_final_score(
         rejection_reasons.append("low_information_penalty")
     if no_external_odds_penalty > 0:
         rejection_reasons.append("no_external_odds_penalty")
+        if normalized_edge_source in {"fallback", "none"}:
+            rejection_reasons.append("fallback_without_external_odds")
     if repeated_analysis_penalty > 0:
         rejection_reasons.append("repeated_analysis_penalty")
     if mention_market_penalty > 0:
@@ -284,6 +462,16 @@ def compute_final_score(
         rejection_reasons.append("confidence_calibration_penalty")
     if overconfidence_penalty > 0:
         rejection_reasons.append("overconfidence_penalty")
+    if extreme_confidence_penalty > 0:
+        rejection_reasons.append("extreme_confidence_penalty")
+    if late_stage_overconfidence_penalty > 0:
+        rejection_reasons.append("late_stage_overconfidence")
+    if fallback_high_confidence_penalty > 0:
+        rejection_reasons.append("fallback_high_confidence_trade")
+    if extreme_market_edge_penalty > 0:
+        rejection_reasons.append("extreme_market_edge_penalty")
+    if hallucinated_edge_penalty > 0:
+        rejection_reasons.append("hallucinated_edge")
     if fallback_edge_penalty > 0:
         rejection_reasons.append("fallback_edge_penalty")
     if proxy_evidence_penalty > 0:
@@ -298,8 +486,20 @@ def compute_final_score(
         rejection_reasons.append("weather_bin_penalty")
     if generic_bin_penalty > 0:
         rejection_reasons.append("generic_bin_penalty")
+    if numeric_strike_bin_penalty > 0:
+        rejection_reasons.append("numeric_strike_bin")
+    if short_prefix_penalty > 0:
+        rejection_reasons.append("historical_short_prefix_pnl")
     if ambiguous_resolution_penalty > 0:
         rejection_reasons.append("ambiguous_resolution_penalty")
+    if historical_prefix_penalty > 0:
+        rejection_reasons.append("historical_prefix_unprofitable")
+    if extreme_confidence_band_penalty > 0:
+        rejection_reasons.append("extreme_confidence_band")
+    if numeric_strike_computed_overconfidence_penalty > 0:
+        rejection_reasons.append("numeric_strike_computed_overconfidence")
+    if coinflip_sports_penalty > 0:
+        rejection_reasons.append("coinflip_sports_penalty")
 
     return ScoreResult(
         final_score=final_score,
@@ -323,6 +523,20 @@ def compute_final_score(
         mention_market_penalty=mention_market_penalty,
         confidence_calibration_penalty=confidence_calibration_penalty,
         overconfidence_penalty=overconfidence_penalty,
+        extreme_confidence_penalty=extreme_confidence_penalty,
+        numeric_strike_bin_penalty=numeric_strike_bin_penalty,
+        fallback_high_confidence_penalty=fallback_high_confidence_penalty,
+        extreme_market_edge_penalty=extreme_market_edge_penalty,
+        hallucinated_edge_penalty=hallucinated_edge_penalty,
+        hallucinated_edge_penalty_suppressed=bool(suppress_hallucinated_edge_penalty),
+        coinflip_sports_penalty=coinflip_sports_penalty,
+        late_stage_overconfidence_penalty=late_stage_overconfidence_penalty,
+        short_prefix_penalty=short_prefix_penalty,
+        historical_family_bonus=historical_family_bonus,
+        historical_prefix_bonus=historical_prefix_bonus,
+        historical_prefix_penalty=historical_prefix_penalty,
+        extreme_confidence_band_penalty=extreme_confidence_band_penalty,
+        numeric_strike_computed_overconfidence_penalty=numeric_strike_computed_overconfidence_penalty,
         weather_uncertainty_penalty=weather_uncertainty_penalty,
         weather_bin_penalty=weather_bin_penalty,
         generic_bin_penalty=generic_bin_penalty,
@@ -345,6 +559,8 @@ def calibrate_confidence(
     family_shrinkage_override: float | None = None,
     evidence_basis_class: str = "",
     definitive_outcome: bool = False,
+    has_primary_source_url: bool = False,
+    direct_shrinkage_boost_factor: float = 1.5,
 ) -> float:
     """Shrink high confidence values toward a neutral baseline."""
     bounded_confidence = max(0.0, min(1.0, raw_confidence))
@@ -353,6 +569,11 @@ def calibrate_confidence(
     if str(evidence_basis_class or "").strip().lower() == "direct":
         bounded_floor = max(bounded_floor, 0.55)
         bounded_factor = min(1.0, bounded_factor * 1.5)
+        if has_primary_source_url:
+            bounded_factor = min(
+                0.80,
+                bounded_factor * max(1.0, float(direct_shrinkage_boost_factor)),
+            )
     if definitive_outcome:
         bounded_floor = max(bounded_floor, 0.60)
         bounded_factor = min(1.0, bounded_factor * 2.5)
@@ -365,6 +586,64 @@ def calibrate_confidence(
         return bounded_confidence
     calibrated = bounded_floor + ((bounded_confidence - bounded_floor) * bounded_factor)
     return max(0.0, min(1.0, calibrated))
+
+
+def score_breakdown_explanation(result: ScoreResult) -> str:
+    """One-line human-readable summary of the top 3 bonuses and top 3 penalties."""
+    bonus_fields = [
+        ("evidence", result.evidence_component),
+        ("bayesian", result.bayesian_component),
+        ("inefficiency", result.inefficiency_component),
+        ("kelly", result.kelly_component),
+        ("alignment", result.confidence_alignment_bonus),
+        ("computed_edge", result.computed_edge_bonus),
+        ("definitive", result.definitive_outcome_bonus),
+        ("evidence_basis", result.evidence_basis_bonus),
+        ("observed_data", result.observed_data_bonus),
+        ("hist_family", result.historical_family_bonus),
+        ("hist_prefix", result.historical_prefix_bonus),
+    ]
+    penalty_fields = [
+        ("low_info", result.low_information_penalty),
+        ("no_ext_odds", result.no_external_odds_penalty),
+        ("repeated", result.repeated_analysis_penalty),
+        ("mention", result.mention_market_penalty),
+        ("conf_cal", result.confidence_calibration_penalty),
+        ("overconf", result.overconfidence_penalty),
+        ("extreme_conf", result.extreme_confidence_penalty),
+        ("late_overconf", result.late_stage_overconfidence_penalty),
+        ("fb_high_conf", result.fallback_high_confidence_penalty),
+        ("extreme_edge", result.extreme_market_edge_penalty),
+        ("halluc_edge", result.hallucinated_edge_penalty),
+        ("fb_edge", result.fallback_edge_penalty),
+        ("proxy_ev", result.proxy_evidence_penalty),
+        ("liquidity", result.liquidity_penalty),
+        ("staleness", result.staleness_penalty),
+        ("weather_unc", result.weather_uncertainty_penalty),
+        ("weather_bin", result.weather_bin_penalty),
+        ("generic_bin", result.generic_bin_penalty),
+        ("num_strike", result.numeric_strike_bin_penalty),
+        ("short_pfx", result.short_prefix_penalty),
+        ("ambig_res", result.ambiguous_resolution_penalty),
+        ("hist_pfx_pen", result.historical_prefix_penalty),
+        ("ext_conf_band", result.extreme_confidence_band_penalty),
+        ("num_strike_oc", result.numeric_strike_computed_overconfidence_penalty),
+        ("coinflip_sp", result.coinflip_sports_penalty),
+    ]
+    top_bonus = sorted(
+        ((n, v) for n, v in bonus_fields if v > 0),
+        key=lambda x: -x[1],
+    )[:3]
+    top_penalty = sorted(
+        ((n, v) for n, v in penalty_fields if v > 0),
+        key=lambda x: -x[1],
+    )[:3]
+    parts: list[str] = [f"score={result.final_score:.4f}"]
+    if top_bonus:
+        parts.append("+" + "+".join(f"{n}:{v:.3f}" for n, v in top_bonus))
+    if top_penalty:
+        parts.append("-" + "-".join(f"{n}:{v:.3f}" for n, v in top_penalty))
+    return " | ".join(parts)
 
 
 def _weather_bin_penalty(market: Market) -> float:

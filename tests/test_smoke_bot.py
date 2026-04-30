@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 import main
+from bootstrap_checks import BootstrapError, run_bootstrap_checks
 from models import OrderResponse
 
 
@@ -94,3 +95,63 @@ def test_bot_smoke_parallel_analysis_dry_run(
         main.main()
 
     assert dummy_kalshi.submitted is False
+
+
+def test_bootstrap_check_fails_fast_on_missing_certifi_bundle(monkeypatch) -> None:
+    import certifi
+    monkeypatch.setattr(certifi, "where", lambda: "/nonexistent/path/cacert.pem")
+    with pytest.raises(BootstrapError, match="TLS CA certificate bundle not found"):
+        run_bootstrap_checks()
+
+
+def test_bootstrap_check_passes_when_cert_exists(monkeypatch, tmp_path) -> None:
+    import certifi
+    cert_file = tmp_path / "cacert.pem"
+    cert_file.write_text("dummy")
+    monkeypatch.setattr(certifi, "where", lambda: str(cert_file))
+    run_bootstrap_checks(skip_api_checks=True)
+
+
+def test_cycle_receipt_contains_forensic_keys(
+    monkeypatch, sample_market, sample_decision, dummy_settings
+) -> None:
+    """Verify the new forensic cycle-receipt keys are emitted during a smoke cycle."""
+    import json
+    from dataclasses import replace
+
+    captured_receipts: list[dict] = []
+    original_info = main.logger.info
+
+    def _capture_info(msg, *args, **kwargs):
+        data = kwargs.get("data") or {}
+        if isinstance(data, dict) and "cycle_receipt" in data:
+            captured_receipts.append(data["cycle_receipt"])
+        return original_info(msg, *args, **kwargs)
+
+    monkeypatch.setattr(main.logger, "info", _capture_info)
+
+    dummy_kalshi = DummyKalshi([sample_market])
+    tuned = replace(
+        dummy_settings,
+        PRE_ANALYSIS_OPPORTUNITY_ENABLED=False,
+    )
+    monkeypatch.setattr(main, "load_settings", lambda: tuned)
+    monkeypatch.setattr(main, "GrokClient", lambda *a, **kw: DummyGrok(sample_decision))
+    monkeypatch.setattr(main, "KalshiClient", lambda *a, **kw: dummy_kalshi)
+
+    def _stop_sleep(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main.time, "sleep", _stop_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    assert len(captured_receipts) >= 1, "Should capture at least one cycle receipt"
+    receipt = captured_receipts[0]
+    assert "top_candidates_summary" in receipt
+    assert "confidence_bucket_decision_counts" in receipt
+    assert "pre_analysis_research_routed_count" in receipt
+    assert isinstance(receipt["top_candidates_summary"], list)
+    assert isinstance(receipt["confidence_bucket_decision_counts"], dict)
+    assert isinstance(receipt["pre_analysis_research_routed_count"], int)

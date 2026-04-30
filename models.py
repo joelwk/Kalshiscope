@@ -97,6 +97,10 @@ class TradeDecision(BaseModel):
         default=None,
         description=_TRADE_DECISION_DESCRIPTIONS["evidence_basis"],
     )
+    primary_source_url: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["primary_source_url"],
+    )
     likelihood_ratio: float | None = Field(
         default=None,
         gt=0.0,
@@ -219,6 +223,7 @@ class MarketState(BaseModel):
     last_terminal_outcome: str | None = None
     non_actionable_streak: int = 0
     fill_failure_count: int = 0
+    next_eligible_cycle: int = 0
 
 
 class Position(BaseModel):

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from calibration import build_counterfactual_flags, compute_adaptive_thresholds
+from calibration import (
+    build_counterfactual_flags,
+    compute_adaptive_thresholds,
+    historical_confidence_shrink,
+)
 
 
 def test_build_counterfactual_flags_with_edge() -> None:
@@ -54,3 +58,111 @@ def test_compute_adaptive_thresholds_with_insufficient_samples() -> None:
     assert recommendation["recommended_min_market_edge_for_trade"] == 0.05
     assert recommendation["recommended_orderbook_spread_cutoff"] == 0.08
     assert recommendation["recommended_analysis_max_workers"] == 3
+
+
+def test_historical_confidence_shrink_respects_min_samples() -> None:
+    buckets = {
+        "all": {
+            0.8: {
+                "sample_size": 10,
+                "win_rate": 0.40,
+            }
+        }
+    }
+    result = historical_confidence_shrink(
+        0.84,
+        family="generic",
+        calibration_buckets=buckets,
+        min_samples=15,
+    )
+    assert result.applied is False
+    assert result.sample_size == 0
+    assert result.calibrated_confidence == 0.84
+
+
+def test_historical_confidence_shrink_is_monotonic_down_only() -> None:
+    buckets = {
+        "all": {
+            0.8: {
+                "sample_size": 30,
+                "win_rate": 0.50,
+            }
+        }
+    }
+    shrunk = historical_confidence_shrink(
+        0.84,
+        family="generic",
+        calibration_buckets=buckets,
+        min_samples=15,
+    )
+    not_raised = historical_confidence_shrink(
+        0.84,
+        family="generic",
+        calibration_buckets={
+            "all": {
+                0.8: {
+                    "sample_size": 30,
+                    "win_rate": 0.95,
+                }
+            }
+        },
+        min_samples=15,
+    )
+    assert shrunk.applied is True
+    assert shrunk.calibrated_confidence < 0.84
+    assert not_raised.applied is False
+    assert not_raised.calibrated_confidence == 0.84
+
+
+def test_historical_confidence_shrink_family_scoped() -> None:
+    buckets = {
+        "all": {
+            0.8: {
+                "sample_size": 40,
+                "win_rate": 0.65,
+            }
+        },
+        "weather": {
+            0.8: {
+                "sample_size": 40,
+                "win_rate": 0.35,
+            }
+        },
+    }
+    weather_result = historical_confidence_shrink(
+        0.84,
+        family="weather",
+        calibration_buckets=buckets,
+        min_samples=15,
+    )
+    generic_result = historical_confidence_shrink(
+        0.84,
+        family="generic",
+        calibration_buckets=buckets,
+        min_samples=15,
+    )
+    assert weather_result.family_used == "weather"
+    assert weather_result.calibrated_confidence < generic_result.calibrated_confidence
+
+
+def test_historical_shrink_with_backfilled_buckets() -> None:
+    """When buckets are populated (as after backfill), low-confidence trades shrink."""
+    buckets = {
+        "all": {
+            0.6: {"sample_size": 30, "win_rate": 0.45},
+            0.7: {"sample_size": 50, "win_rate": 0.55},
+            0.8: {"sample_size": 40, "win_rate": 0.60},
+        },
+    }
+    low_conf = historical_confidence_shrink(
+        0.65, family="generic", calibration_buckets=buckets, min_samples=15,
+    )
+    assert low_conf.applied is True
+    assert low_conf.calibrated_confidence < 0.65
+    assert low_conf.observed_win_rate == 0.45
+
+    high_conf = historical_confidence_shrink(
+        0.82, family="generic", calibration_buckets=buckets, min_samples=15,
+    )
+    assert high_conf.applied is True
+    assert high_conf.calibrated_confidence < 0.82
