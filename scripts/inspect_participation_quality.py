@@ -403,7 +403,7 @@ def section_decision_field_distribution(
 
     rows = conn.execute(
         """
-        SELECT decision_json
+        SELECT decision_json, audit_json, final_action, final_reason
         FROM decision_receipts
         WHERE timestamp >= ?
         """,
@@ -423,9 +423,49 @@ def section_decision_field_distribution(
     abstain_count = 0
     should_trade_true = 0
     should_trade_false = 0
+    synthetic_placeholder_count = 0
+    model_judgment_count = 0
+    real_eq_exact_zero = 0
+    real_confidence_exact_half = 0
 
     for row in rows:
         decision = _safe_json_loads(row["decision_json"]) or {}
+        audit = _safe_json_loads(row["audit_json"]) or {}
+        decision_origin = str(
+            decision.get("decision_origin") or audit.get("decision_origin") or ""
+        ).strip().lower()
+        final_action = str(row["final_action"] or "").strip().lower()
+        final_reason = str(row["final_reason"] or "").strip().lower()
+        market_judgment_available = decision.get(
+            "market_judgment_available",
+            audit.get("market_judgment_available"),
+        )
+        is_synthetic_placeholder = (
+            decision_origin.startswith("synthetic")
+            or market_judgment_available is False
+        )
+        if not is_synthetic_placeholder:
+            try:
+                eq_for_placeholder = float(decision.get("evidence_quality", 0.0) or 0.0)
+                conf_for_placeholder = float(decision.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                eq_for_placeholder = 0.0
+                conf_for_placeholder = 0.0
+            is_synthetic_placeholder = (
+                final_action == "research_queued"
+                and final_reason.startswith("pre_analysis_")
+                and decision.get("should_trade") is False
+                and decision.get("abstain") is True
+                and abs(eq_for_placeholder) < 1e-9
+                and abs(conf_for_placeholder - 0.50) < 1e-9
+                and str(decision.get("edge_source") or "").strip().lower() == "none"
+                and str(decision.get("evidence_basis") or "").strip().lower()
+                == "absence_only"
+            )
+        if is_synthetic_placeholder:
+            synthetic_placeholder_count += 1
+        else:
+            model_judgment_count += 1
         eq_raw = decision.get("evidence_quality")
         if eq_raw is None:
             eq_missing += 1
@@ -439,6 +479,8 @@ def section_decision_field_distribution(
             else:
                 if abs(eq) < 1e-9:
                     eq_exact_zero += 1
+                    if not is_synthetic_placeholder:
+                        real_eq_exact_zero += 1
                 left = max(0.0, min(1.0, eq))
                 bucket_lo = int(left * 10) / 10
                 eq_buckets[f"{bucket_lo:.1f}-{bucket_lo + 0.1:.1f}"] += 1
@@ -464,6 +506,8 @@ def section_decision_field_distribution(
             else:
                 if abs(conf - 0.5) < 1e-9:
                     confidence_exact_half += 1
+                    if not is_synthetic_placeholder:
+                        real_confidence_exact_half += 1
                 left = max(0.0, min(1.0, conf))
                 bucket_lo = int(left * 10) / 10
                 confidence_buckets[f"{bucket_lo:.1f}-{bucket_lo + 0.1:.1f}"] += 1
@@ -478,6 +522,10 @@ def section_decision_field_distribution(
 
     _print_subheader("evidence_quality distribution")
     print(f"  exact 0.0:   {eq_exact_zero:>6}  ({_fmt_pct(eq_exact_zero, total)})")
+    print(
+        f"  exact 0.0 excluding synthetic placeholders: "
+        f"{real_eq_exact_zero:>6}  ({_fmt_pct(real_eq_exact_zero, model_judgment_count)})"
+    )
     print(f"  missing:     {eq_missing:>6}  ({_fmt_pct(eq_missing, total)})")
     for bucket in sorted(eq_buckets):
         n = eq_buckets[bucket]
@@ -493,12 +541,24 @@ def section_decision_field_distribution(
 
     _print_subheader("confidence distribution")
     print(f"  exact 0.50: {confidence_exact_half:>6} ({_fmt_pct(confidence_exact_half, total)})")
+    print(
+        f"  exact 0.50 excluding synthetic placeholders: "
+        f"{real_confidence_exact_half:>6} ({_fmt_pct(real_confidence_exact_half, model_judgment_count)})"
+    )
     print(f"  missing:    {confidence_missing:>6} ({_fmt_pct(confidence_missing, total)})")
     for bucket in sorted(confidence_buckets):
         n = confidence_buckets[bucket]
         print(f"  {bucket}:   {n:>6}  ({_fmt_pct(n, total)})")
 
     _print_subheader("should_trade / abstain summary")
+    print(
+        f"  synthetic placeholders: {synthetic_placeholder_count:>6} "
+        f"({_fmt_pct(synthetic_placeholder_count, total)})"
+    )
+    print(
+        f"  model judgments:        {model_judgment_count:>6} "
+        f"({_fmt_pct(model_judgment_count, total)})"
+    )
     print(f"  should_trade=true:  {should_trade_true:>6} ({_fmt_pct(should_trade_true, total)})")
     print(f"  should_trade=false: {should_trade_false:>6} ({_fmt_pct(should_trade_false, total)})")
     print(f"  abstain=true:       {abstain_count:>6} ({_fmt_pct(abstain_count, total)})")
@@ -659,7 +719,7 @@ def section_per_family_prefix(
         wr = (wins / n) if n > 0 else 0.0
         wlb = _wilson_lower_bound(wins, n)
         shrunk = _bayesian_shrunk_pnl(pnl_total, n)
-        block = _historical_prefix_gate_predicate(n, wlb, pnl_total, shrunk)
+        block = _historical_prefix_gate_predicate(n, wr, pnl_total, shrunk)
         print(
             f"{str(row['prefix']):<14} {n:>5} {wins:>5} {wr:>9.2%} "
             f"{pnl_total:>+10.2f} {wlb:>10.4f} "
@@ -694,19 +754,27 @@ def _bayesian_shrunk_pnl(
 
 def _historical_prefix_gate_predicate(
     n: int,
-    wlb: float,
+    win_rate: float,
     pnl_total: float,
     shrunk_pnl_per_trade: float = 0.0,
     *,
     pnl_cutoff: float = -3.0,
     win_rate_cutoff: float = 0.40,
-    hard_block_min_samples: int = 10,
+    hard_block_min_samples: int = 20,
     soft_min_samples: int = 3,
     shrunk_pnl_cutoff: float = -0.50,
 ) -> str:
-    if n >= hard_block_min_samples and wlb <= win_rate_cutoff and pnl_total <= pnl_cutoff:
+    if (
+        n >= hard_block_min_samples
+        and win_rate <= win_rate_cutoff
+        and shrunk_pnl_per_trade <= shrunk_pnl_cutoff
+        and pnl_total <= pnl_cutoff
+    ):
         return "HARD"
-    if n >= soft_min_samples and wlb <= win_rate_cutoff and shrunk_pnl_per_trade <= shrunk_pnl_cutoff:
+    if n >= soft_min_samples and (
+        shrunk_pnl_per_trade <= shrunk_pnl_cutoff
+        or (win_rate <= win_rate_cutoff and pnl_total <= pnl_cutoff)
+    ):
         return "SOFT"
     return "-"
 

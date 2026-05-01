@@ -188,13 +188,14 @@ def evaluate_market_tiered(
     prefix_len: int = 12,
     prefix_gate_enabled: bool = True,
     prefix_min_samples: int = 3,
-    prefix_hard_block_min_samples: int = 10,
+    prefix_hard_block_min_samples: int = 20,
     prefix_pnl_cutoff: float = -3.0,
     prefix_win_rate_cutoff: float = 0.40,
     prefix_shrinkage_enabled: bool = True,
     prefix_prior_win_rate: float = 0.50,
     prefix_prior_strength: float = 10.0,
     prefix_shrunk_pnl_cutoff: float = -0.50,
+    prefix_soft_demote_score_penalty: float = 0.08,
     family_gate_enabled: bool = True,
     family_min_samples: int = 12,
     family_pnl_cutoff: float = -12.0,
@@ -233,12 +234,21 @@ def evaluate_market_tiered(
                 }
             )
 
-            hard_block_min = max(1, int(prefix_hard_block_min_samples))
             soft_min = max(1, int(prefix_min_samples))
+            hard_block_min = max(soft_min, int(prefix_hard_block_min_samples))
+            sample_weight = min(1.0, n / hard_block_min) if hard_block_min > 0 else 1.0
+            score_penalty = max(0.0, float(prefix_soft_demote_score_penalty)) * sample_weight
+            metrics.update(
+                {
+                    "historical_gate_sample_weight": round(sample_weight, 4),
+                    "historical_gate_score_penalty": round(score_penalty, 4),
+                }
+            )
 
             if (
                 n >= hard_block_min
-                and wlb <= float(prefix_win_rate_cutoff)
+                and prefix_snapshot.win_rate <= float(prefix_win_rate_cutoff)
+                and shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
                 and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
             ):
                 return EvaluateMarketResult(
@@ -251,29 +261,35 @@ def evaluate_market_tiered(
                     sample_size=n,
                     what_to_learn_next=(
                         f"Prefix '{market_prefix}' has {n} samples, "
+                        f"observed win_rate={prefix_snapshot.win_rate:.2f}, "
                         f"Wilson LB={wlb:.2f}, shrunk PnL/trade={shrunk_pnl:.2f}; "
-                        f"track outcomes for recovery."
+                        "execution needs current direct evidence and recovery in outcomes."
                     ),
                 )
 
             if (
                 n >= soft_min
-                and wlb <= float(prefix_win_rate_cutoff)
-                and shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
+                and (
+                    shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
+                    or (
+                        prefix_snapshot.win_rate <= float(prefix_win_rate_cutoff)
+                        and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
+                    )
+                )
             ):
                 return EvaluateMarketResult(
                     tier=GateTier.SOFT_DEMOTE,
-                    allowed=False,
+                    allowed=True,
                     reason="historical_prefix_small_sample_negative",
                     metrics=metrics,
                     wilson_win_rate_lower_bound=wlb,
                     shrunk_pnl_per_trade=shrunk_pnl,
                     sample_size=n,
                     what_to_learn_next=(
-                        f"Small-sample ({n}<{hard_block_min}) negative shrunk PnL/trade on "
-                        f"prefix '{market_prefix}'; Wilson LB={wlb:.2f}, "
-                        f"shrunk PnL/trade={shrunk_pnl:.2f}. "
-                        f"Need {hard_block_min - n} more outcomes to confirm."
+                        f"Historical soft-demotion on prefix '{market_prefix}': "
+                        f"sample_size={n}, observed win_rate={prefix_snapshot.win_rate:.2f}, "
+                        f"Wilson LB={wlb:.2f}, shrunk PnL/trade={shrunk_pnl:.2f}. "
+                        "Treat as a score penalty and learning signal, not a terminal judgment."
                     ),
                 )
 
@@ -304,7 +320,8 @@ def evaluate_market_tiered(
             if (
                 n_fam >= max(1, int(family_min_samples))
                 and family_snapshot.pnl_total <= float(family_pnl_cutoff)
-                and wlb_fam <= float(family_win_rate_cutoff)
+                and family_snapshot.win_rate <= float(family_win_rate_cutoff)
+                and shrunk_pnl_fam <= float(prefix_shrunk_pnl_cutoff)
             ):
                 return EvaluateMarketResult(
                     tier=GateTier.HARD_DENY,
@@ -337,13 +354,14 @@ def evaluate_market(
     prefix_len: int = 12,
     prefix_gate_enabled: bool = True,
     prefix_min_samples: int = 3,
-    prefix_hard_block_min_samples: int = 10,
+    prefix_hard_block_min_samples: int = 20,
     prefix_pnl_cutoff: float = -3.0,
     prefix_win_rate_cutoff: float = 0.40,
     prefix_shrinkage_enabled: bool = True,
     prefix_prior_win_rate: float = 0.50,
     prefix_prior_strength: float = 10.0,
     prefix_shrunk_pnl_cutoff: float = -0.50,
+    prefix_soft_demote_score_penalty: float = 0.08,
     family_gate_enabled: bool = True,
     family_min_samples: int = 12,
     family_pnl_cutoff: float = -12.0,
@@ -369,6 +387,7 @@ def evaluate_market(
         prefix_prior_win_rate=prefix_prior_win_rate,
         prefix_prior_strength=prefix_prior_strength,
         prefix_shrunk_pnl_cutoff=prefix_shrunk_pnl_cutoff,
+        prefix_soft_demote_score_penalty=prefix_soft_demote_score_penalty,
         family_gate_enabled=family_gate_enabled,
         family_min_samples=family_min_samples,
         family_pnl_cutoff=family_pnl_cutoff,

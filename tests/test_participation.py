@@ -78,7 +78,7 @@ def test_classify_large_sample_neg_pnl_returns_research_only() -> None:
     assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
 
 
-def test_classify_timeout_returns_monitor_only() -> None:
+def test_classify_first_timeout_returns_operational_retry() -> None:
     decision = classify_participation(
         timeout_state=TimeoutState(
             timed_out=True,
@@ -87,8 +87,20 @@ def test_classify_timeout_returns_monitor_only() -> None:
             search_profile="crypto",
         ),
     )
-    assert decision.tier == ParticipationTier.MONITOR_ONLY
+    assert decision.tier == ParticipationTier.OPERATIONAL_ERROR_RETRY
     assert "crypto" in (decision.what_to_learn_next or "")
+
+
+def test_classify_repeated_timeout_returns_monitor_only() -> None:
+    decision = classify_participation(
+        timeout_state=TimeoutState(
+            timed_out=True,
+            retriable=True,
+            timeout_streak=2,
+            search_profile="generic",
+        ),
+    )
+    assert decision.tier == ParticipationTier.MONITOR_ONLY
 
 
 def test_classify_analysis_failure_retriable_returns_operational_error() -> None:
@@ -120,6 +132,15 @@ def test_classify_zero_action_family_returns_research_only() -> None:
     assert "probe" in (decision.what_to_learn_next or "").lower()
 
 
+def test_classify_score_soft_research_returns_research_only() -> None:
+    decision = classify_participation(
+        pre_analysis_rejection_reason="pre_analysis_score_soft_research",
+        pre_analysis_metadata={"pre_analysis_score": 0.55},
+    )
+    assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+    assert "source" in (decision.what_to_learn_next or "").lower()
+
+
 def test_classify_should_trade_true_all_gates_pass() -> None:
     decision = classify_participation(
         decision_should_trade=True,
@@ -139,6 +160,19 @@ def test_classify_should_trade_true_evidence_quality_below_min() -> None:
     )
     assert decision.tier == ParticipationTier.SKIP_FOR_NOW_WITH_REASON
     assert "evidence_quality" in decision.primary_reason
+
+
+def test_classify_should_trade_true_absence_only_is_research_gap() -> None:
+    decision = classify_participation(
+        decision_should_trade=True,
+        decision_evidence_basis="absence_only",
+        decision_edge_source="none",
+        decision_evidence_quality=0.0,
+        evidence_quality_threshold=0.75,
+    )
+    assert decision.tier == ParticipationTier.DEEP_RESEARCH_REQUIRED
+    assert decision.primary_reason == "research_gap_not_market_judgment"
+    assert decision.legacy_metadata["blocked_conviction"] is True
 
 
 def test_classify_definitive_outcome_bypasses_evidence_quality() -> None:

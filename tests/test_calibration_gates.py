@@ -11,9 +11,9 @@ from participation import wilson_lower_bound
 
 
 def test_evaluate_market_blocks_losing_prefix_with_sufficient_samples() -> None:
-    """n=5 is below the new hard_block_min_samples=10 default so the reason
+    """n=5 is below the hard-block sample floor so the reason
     changes to ``historical_prefix_small_sample_negative`` (soft demote).
-    ``allowed`` is still ``False``."""
+    Soft demotion remains execution-eligible for deeper scoring."""
     allowed, reason, metrics = evaluate_market(
         market_id="ABCDEF123456-TEST",
         family="generic",
@@ -33,10 +33,11 @@ def test_evaluate_market_blocks_losing_prefix_with_sufficient_samples() -> None:
         prefix_win_rate_cutoff=0.40,
         family_gate_enabled=False,
     )
-    assert allowed is False
+    assert allowed is True
     assert reason == "historical_prefix_small_sample_negative"
     assert metrics["historical_gate_market_prefix"] == "ABCDEF123456"
     assert metrics["historical_gate_tier"] == GateTier.SOFT_DEMOTE
+    assert metrics["historical_gate_score_penalty"] > 0.0
 
 
 def test_evaluate_market_respects_min_sample_guard() -> None:
@@ -184,7 +185,7 @@ def test_wilson_lower_bound_1_win_of_3() -> None:
 
 def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
     """With n=3 and negative PnL, the tiered evaluator should produce
-    SOFT_DEMOTE, not HARD_DENY (which requires n>=10 by default)."""
+    SOFT_DEMOTE, not HARD_DENY."""
     result = evaluate_market_tiered(
         market_id="KXMLBHIT-26A-TEST",
         family="generic",
@@ -206,6 +207,7 @@ def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
         family_gate_enabled=False,
     )
     assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.allowed is True
     assert result.reason == "historical_prefix_small_sample_negative"
     assert result.sample_size == 3
     assert result.wilson_win_rate_lower_bound is not None
@@ -240,9 +242,8 @@ def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     assert result.allowed is False
 
 
-def test_legacy_wrapper_returns_same_allowed_for_soft_demote() -> None:
-    """The legacy wrapper should still return allowed=False for soft-demoted
-    markets so existing callers get the same gating behavior."""
+def test_legacy_wrapper_returns_allowed_true_for_soft_demote() -> None:
+    """Soft-demoted markets remain eligible for scoring/research prioritization."""
     allowed, reason, metrics = evaluate_market(
         market_id="KXMLBHIT-26A-TEST",
         family="generic",
@@ -262,10 +263,11 @@ def test_legacy_wrapper_returns_same_allowed_for_soft_demote() -> None:
         prefix_win_rate_cutoff=0.40,
         family_gate_enabled=False,
     )
-    assert allowed is False
+    assert allowed is True
     assert reason == "historical_prefix_small_sample_negative"
     assert "historical_gate_wilson_lb" in metrics
     assert "what_to_learn_next" in metrics
+    assert metrics["historical_gate_score_penalty"] > 0.0
 
 
 def test_tiered_neutral_when_pnl_above_cutoff() -> None:
@@ -321,7 +323,7 @@ def test_soft_demote_n4_mild_negative_does_not_block() -> None:
     assert result.allowed is True
 
 
-def test_soft_demote_n4_strong_negative_still_blocks() -> None:
+def test_soft_demote_n4_strong_negative_applies_penalty_not_block() -> None:
     """n=4, wins=0, pnl=-16 -> shrunk_pnl/trade ~ -1.14 which is well
     below -0.50, and Wilson LB for 0/4 ~ 0.0 <= 0.40, so soft-demote fires."""
     result = evaluate_market_tiered(
@@ -346,7 +348,7 @@ def test_soft_demote_n4_strong_negative_still_blocks() -> None:
         family_gate_enabled=False,
     )
     assert result.tier == GateTier.SOFT_DEMOTE
-    assert result.allowed is False
+    assert result.allowed is True
     assert result.reason == "historical_prefix_small_sample_negative"
 
 

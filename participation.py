@@ -88,6 +88,7 @@ _TIER_FOR_REJECTION_REASON: dict[str, ParticipationTier] = {
     "historical_prefix_pnl_block": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "historical_prefix_small_sample_negative": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "historical_family_pnl_block": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
+    "score_soft_research": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "fallback_edge_high_churn": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "zero_action_family": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "crypto_historically_unprofitable": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
@@ -108,6 +109,10 @@ _LEARN_NEXT_FOR_REASON: dict[str, str] = {
     "historical_family_pnl_block": (
         "Family-level PnL is negative; monitor for recovery across the family "
         "before re-enabling execution."
+    ),
+    "score_soft_research": (
+        "Pre-analysis score is near the execution threshold; learn whether better "
+        "sources, fresher prices, or settlement context would make this actionable."
     ),
     "zero_action_family": (
         "This family has never been deep-analyzed to execution; needs a probe "
@@ -132,6 +137,7 @@ def classify_participation(
     decision_abstain: bool | None = None,
     decision_definitive_outcome: bool = False,
     decision_evidence_basis: str | None = None,
+    decision_edge_source: str | None = None,
     decision_primary_source_whitelisted: bool = False,
     decision_evidence_quality: float | None = None,
     evidence_quality_threshold: float | None = None,
@@ -151,8 +157,13 @@ def classify_participation(
     metadata = dict(pre_analysis_metadata or {})
 
     if timeout_state and timeout_state.timed_out:
+        timeout_tier = (
+            ParticipationTier.OPERATIONAL_ERROR_RETRY
+            if timeout_state.retriable and timeout_state.timeout_streak <= 1
+            else ParticipationTier.MONITOR_ONLY
+        )
         return ParticipationDecision(
-            tier=ParticipationTier.MONITOR_ONLY,
+            tier=timeout_tier,
             primary_reason="grok_stream_timeout",
             why_not_execution_eligible="Analysis timed out before completion",
             what_to_learn_next=(
@@ -259,6 +270,36 @@ def classify_participation(
         )
 
     if decision_should_trade is True:
+        normalized_evidence_basis = str(decision_evidence_basis or "").strip().lower()
+        normalized_edge_source = str(decision_edge_source or "").strip().lower()
+        if (
+            not is_definitive
+            and (
+                normalized_evidence_basis == "absence_only"
+                or normalized_edge_source == "none"
+                or (
+                    decision_evidence_quality is not None
+                    and decision_evidence_quality <= 0.0
+                )
+            )
+        ):
+            return ParticipationDecision(
+                tier=ParticipationTier.DEEP_RESEARCH_REQUIRED,
+                primary_reason="research_gap_not_market_judgment",
+                why_not_execution_eligible=(
+                    "Trade conviction exists but evidence/edge source is missing"
+                ),
+                what_to_learn_next=(
+                    "Find direct settlement-aligned evidence, a current orderbook, "
+                    "and a computed edge before treating this as executable."
+                ),
+                legacy_metadata={
+                    **metadata,
+                    "blocked_conviction": True,
+                    "skip_due_to": "lack_of_evidence",
+                },
+            )
+
         if (
             decision_evidence_quality is not None
             and evidence_quality_threshold is not None
@@ -273,7 +314,11 @@ def classify_participation(
                     f"< threshold={evidence_quality_threshold:.2f}"
                 ),
                 what_to_learn_next="Need higher evidence quality from primary sources",
-                legacy_metadata=metadata,
+                legacy_metadata={
+                    **metadata,
+                    "blocked_conviction": True,
+                    "skip_due_to": "lack_of_evidence",
+                },
             )
 
         effective_edge_max = (
@@ -288,7 +333,11 @@ def classify_participation(
                         f"Edge {edge_value:.4f} exceeds max {effective_edge_max:.2f}"
                     ),
                     what_to_learn_next="Verify edge is not hallucinated",
-                    legacy_metadata=metadata,
+                    legacy_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "weak_edge",
+                    },
                 )
 
         if score_gate_blocked:
@@ -297,7 +346,11 @@ def classify_participation(
                 primary_reason=score_gate_reason or "score_gate_blocked",
                 why_not_execution_eligible="Score gate rejected this candidate",
                 what_to_learn_next="Improve score components",
-                legacy_metadata=metadata,
+                legacy_metadata={
+                    **metadata,
+                    "blocked_conviction": True,
+                    "skip_due_to": score_gate_reason or "score_gate",
+                },
             )
 
         return ParticipationDecision(

@@ -85,6 +85,7 @@ def main() -> None:
             decision_abstain=decision.get("abstain"),
             decision_definitive_outcome=bool(decision.get("definitive_outcome_detected")),
             decision_evidence_basis=decision.get("evidence_basis"),
+            decision_edge_source=decision.get("edge_source"),
             decision_evidence_quality=decision.get("evidence_quality"),
             evidence_quality_threshold=0.75,
         )
