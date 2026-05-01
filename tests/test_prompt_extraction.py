@@ -6,8 +6,8 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    "analyze": "0491777973d061bdef701bd2979d51f674d77cbbd3fd0e772b3a0214f64d1bf7",
-    "deep": "ea93885d617ad6ed5500a18c9cfd17fc97b1a22977348751c8bcf472e2487135",
+    "analyze": "f7b233c508a07d33667d560ab9ae786da81576213d25b907790de41112fcc701",
+    "deep": "d0550226ab14dcc2ec52fff8733f51df5daa8c207e329b685a4b0e07c532dfc6",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
@@ -36,11 +36,12 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "bet_size_pct": "641a0cd6d5347f4b1e64447cfe665638765238c6505b67697d4b2e2750d80dc4",
     "cached_tokens": "17c3feb94f70c94185ca5932f3717f8808124cb104f6a59ca433d72b6970a180",
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
-    "confidence": "2e0ae289279f3f159b702a396d633e4310b0a4b10107a6f620d601803cdf8815",
+    "confidence": "3993782437221b5549e1c1d527d246a5a9899919641c5bceb63a90a89d4ea137",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
     "edge_external": "c85f0f881724bd6cb9c2626a4b3497e6540511c9dbbaef1b125b79c484ad16ad",
-    "edge_source": "18f4468809adc797a59afb38ec5798cc44248cb09af95e3a8a106b56f072cbea",
+    "edge_source": "75cb7566f0a7e79d0a2263653ec3ab6adf74f4db3307e38eeeff924a1cda5260",
     "evidence_basis": "c5c8ed42edf1f9118ad56b3dd4c8ce1e8c95bf5c66356fde2854e1163307b983",
+    "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
     "evidence_quality": "16da4528a2879172de8b4370c697655df6fe0dfff3fd99bb339cb1585137bc2d",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",
     "implied_prob_external": "db0b9497d1f31ef2601d3130975e4b4ea115c49758eedb266f4986410ef69765",
@@ -55,9 +56,10 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "raw_outcome": "907648115ca3f1fb58fa62d08cbce43ea30930d19ce410f3c1e39031aebd0c53",
     "raw_reasoning": "a26f9a108c792b0d03e1ba7626b7a8d5f68f9c1a48fd1875818ae23d4d1eecc3",
     "raw_should_trade": "4e06a691859874c81a7e47e8eb005df24c905457147959d13b924f507df9027e",
-    "reasoning": "61f5445ef509335cc97c1a4f03d2705e94482c04acd9a536558a32fb4762c6da",
+    "reasoning": "c07771931c2070d60b09b1b1e7701ceb33017c7da58cd8a8deaf48ad7fbc1bcf",
     "reasoning_tokens": "6b47f605e7844debc22ecbf3b199a6f581dd2a72a1ebdaaca8c06f282f7122b9",
-    "should_trade": "c95ae17cfac6bed1dbc46abb585af56286c3f5b1ba3fc1ffcf699fdd5d426d5f",
+    "should_trade": "997fe2b7115c9a5af68197e3bb41b5e2d0e653d5b8ba8533b0e28a1233488e53",
+    "source_match_class": "8bca00a6b3b1f3d3edc79c9a23303957f8c3971dc39208283368c5b6c1f07efc",
 }
 
 
@@ -176,7 +178,8 @@ def test_trade_decision_schema_includes_primary_source_url() -> None:
 
 
 def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> None:
-    assert "Confidence must not exceed evidence_quality + 0.10." in _SYSTEM_PROMPT_ANALYZE
-    assert "edge versus market implied probability exceeds 35 percentage points" in _SYSTEM_PROMPT_ANALYZE
+    assert "Confidence must not exceed evidence_quality + 0.05." in _SYSTEM_PROMPT_ANALYZE
+    assert "edge versus market implied probability exceeds 32 percentage points" in _SYSTEM_PROMPT_ANALYZE
     assert "Treat live-price threshold evidence as direct when URL-cited" in _SYSTEM_PROMPT_ANALYZE
     assert "you MUST populate primary_source_url with the exact URL used" in _SYSTEM_PROMPT_ANALYZE
+    assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE

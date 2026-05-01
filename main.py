@@ -178,6 +178,7 @@ _SCORE_GATE_ALWAYS_BLOCK_REASONS = frozenset(
         "low_evidence_quality",
         "low_information_penalty",
         "hallucinated_edge",
+        "extreme_edge_learning_queue",
         "extreme_market_edge_penalty",
         "ambiguous_resolution_penalty",
     }
@@ -2713,8 +2714,8 @@ def _analysis_result_rank(
     evidence_rank = max(0.0, min(1.0, decision.evidence_quality))
     confidence_rank = max(0.0, min(1.0, decision.confidence))
     return (
-        score_rank,
         critical_rejection_rank,
+        score_rank,
         profitable_family_rank,
         historical_family_win_rate_rank,
         overconfidence_gap_penalty_rank,
@@ -3007,6 +3008,12 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         "score_hallucinated_edge_penalty_suppressed": bool(
             getattr(score_result, "hallucinated_edge_penalty_suppressed", False)
         ),
+        "score_high_edge_calibration_penalty": float(
+            getattr(score_result, "high_edge_calibration_penalty", 0.0) or 0.0
+        ),
+        "score_extreme_edge_learning_queue": bool(
+            getattr(score_result, "extreme_edge_learning_queue", False)
+        ),
         "score_proxy_evidence_penalty": float(
             getattr(score_result, "proxy_evidence_penalty", 0.0) or 0.0
         ),
@@ -3100,6 +3107,41 @@ def _compact_score_breakdown(score_fields: dict[str, Any] | None) -> dict[str, A
         if value is not None:
             compact[key] = value
     return compact
+
+
+def _apply_runtime_score_receipt(
+    audit_context: dict[str, Any],
+    *,
+    score_result: Any,
+    score_threshold_effective: float,
+    pre_execution_final_score: float | None,
+    score_gate_score_source: str,
+    score_gate_critical_reasons: tuple[str, ...] | list[str] | set[str] = (),
+) -> dict[str, Any]:
+    """Persist the score actually used by the execution gate into audit fields."""
+    score_fields = _score_receipt_fields(score_result)
+    if score_fields:
+        audit_context.update(score_fields)
+        compact_score = _compact_score_breakdown(score_fields)
+        if compact_score:
+            audit_context["score_breakdown"] = compact_score
+
+    runtime_final_score = score_fields.get("score_final")
+    audit_context["execution_score_final"] = runtime_final_score
+    audit_context["execution_score_threshold"] = float(score_threshold_effective)
+    audit_context["execution_score_rejection_reasons"] = list(
+        score_fields.get("score_rejection_reasons", []) or []
+    )
+    audit_context["score_threshold_effective"] = float(score_threshold_effective)
+    audit_context["score_gate_score_source"] = str(score_gate_score_source or "")
+    audit_context["score_gate_critical_reasons"] = [
+        str(reason) for reason in score_gate_critical_reasons if str(reason).strip()
+    ]
+    if runtime_final_score is not None and pre_execution_final_score is not None:
+        audit_context["pre_vs_runtime_score_delta"] = (
+            float(runtime_final_score) - float(pre_execution_final_score)
+        )
+    return score_fields
 
 
 def _resolved_pnl_estimate_total(state_manager: MarketStateManager) -> float:
@@ -3887,39 +3929,76 @@ def _cap_analysis_candidates(
     max_music_candidates_per_cycle: int | None = None,
     pre_scores: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply a hard cap to per-cycle candidates with family stratification."""
+    """Apply a hard cap using global risk-adjusted rank, then family caps."""
     if max_markets_per_cycle <= 0:
         return []
     if len(analysis_candidates) <= max_markets_per_cycle:
         return analysis_candidates
 
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    family_order: list[str] = []
-    for candidate in analysis_candidates:
+    ranked_candidates: list[tuple[tuple[float, int, int, str], dict[str, Any]]] = []
+    invalid_candidates: list[dict[str, Any]] = []
+    for input_index, candidate in enumerate(analysis_candidates):
         market = candidate.get("market")
         if not isinstance(market, Market):
+            invalid_candidates.append(candidate)
             continue
         family = market_family(market)
-        if family not in grouped:
-            grouped[family] = []
-            family_order.append(family)
-        grouped[family].append(candidate)
-
-    for family, family_candidates in grouped.items():
-        family_candidates.sort(
-            key=lambda candidate: (
-                -float(
-                    (pre_scores or {}).get(
-                        str(getattr(candidate.get("market"), "id", "")),
-                        candidate.get("pre_analysis_score") or 0.0,
-                    )
+        market_id = str(getattr(market, "id", ""))
+        base_score = float(
+            (pre_scores or {}).get(
+                market_id,
+                candidate.get("pre_analysis_score") or 0.0,
+            )
+        )
+        non_actionable_streak = max(0, int(candidate.get("non_actionable_streak", 0) or 0))
+        historical_pnl = float(candidate.get("historical_family_pnl_total", 0.0) or 0.0)
+        historical_samples = max(0, int(candidate.get("historical_family_sample_size", 0) or 0))
+        historical_win_rate = float(candidate.get("historical_family_win_rate", 0.0) or 0.0)
+        historical_gate_allowed = candidate.get("historical_gate_allowed")
+        short_prefix_penalty = float(candidate.get("short_prefix_score_penalty", 0.0) or 0.0)
+        historical_loss_penalty = 0.0
+        if historical_samples >= 8 and historical_pnl < 0.0:
+            historical_loss_penalty = min(0.20, abs(historical_pnl) / 250.0)
+            if historical_win_rate and historical_win_rate < 0.50:
+                historical_loss_penalty += min(0.06, (0.50 - historical_win_rate) * 0.20)
+        historical_gate_penalty = 0.12 if historical_gate_allowed is False else 0.0
+        repeated_penalty = min(0.12, non_actionable_streak * 0.02)
+        source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(
+            family,
+            0.0,
+        ) * 0.5
+        risk_adjusted_score = (
+            base_score
+            - repeated_penalty
+            - historical_loss_penalty
+            - historical_gate_penalty
+            - short_prefix_penalty
+            - source_difficulty_penalty
+        )
+        selection_components = {
+            "base_pre_analysis_score": round(base_score, 4),
+            "risk_adjusted_score": round(risk_adjusted_score, 4),
+            "repeated_penalty": round(repeated_penalty, 4),
+            "historical_loss_penalty": round(historical_loss_penalty, 4),
+            "historical_gate_penalty": round(historical_gate_penalty, 4),
+            "short_prefix_penalty": round(short_prefix_penalty, 4),
+            "source_difficulty_penalty": round(source_difficulty_penalty, 4),
+        }
+        candidate["selection_rank_score"] = round(risk_adjusted_score, 4)
+        candidate["selection_rank_components"] = selection_components
+        ranked_candidates.append(
+            (
+                (
+                    -risk_adjusted_score,
+                    non_actionable_streak,
+                    input_index,
+                    market_id,
                 ),
-                int(candidate.get("non_actionable_streak", 0)),
-                str(getattr(candidate.get("market"), "id", "")),
+                candidate,
             )
         )
 
-    if not grouped:
+    if not ranked_candidates:
         return analysis_candidates[:max_markets_per_cycle]
 
     selected: list[dict[str, Any]] = []
@@ -3927,50 +4006,48 @@ def _cap_analysis_candidates(
     selected_crypto_count = 0
     selected_speech_count = 0
     selected_music_count = 0
-    while len(selected) < max_markets_per_cycle:
-        progressed = False
-        for family in family_order:
-            family_candidates = grouped.get(family)
-            if not family_candidates:
-                continue
-            if (
-                family == "weather"
-                and max_weather_candidates_per_cycle is not None
-                and selected_weather_count >= max_weather_candidates_per_cycle
-            ):
-                continue
-            if (
-                family == "crypto"
-                and max_crypto_candidates_per_cycle is not None
-                and selected_crypto_count >= max_crypto_candidates_per_cycle
-            ):
-                continue
-            if (
-                family == "speech"
-                and max_speech_candidates_per_cycle is not None
-                and selected_speech_count >= max_speech_candidates_per_cycle
-            ):
-                continue
-            if (
-                family == "music"
-                and max_music_candidates_per_cycle is not None
-                and selected_music_count >= max_music_candidates_per_cycle
-            ):
-                continue
-            selected.append(family_candidates.pop(0))
-            if family == "weather":
-                selected_weather_count += 1
-            elif family == "crypto":
-                selected_crypto_count += 1
-            elif family == "speech":
-                selected_speech_count += 1
-            elif family == "music":
-                selected_music_count += 1
-            progressed = True
-            if len(selected) >= max_markets_per_cycle:
-                break
-        if not progressed:
+    for _, candidate in sorted(ranked_candidates, key=lambda item: item[0]):
+        if len(selected) >= max_markets_per_cycle:
             break
+        market = candidate.get("market")
+        if not isinstance(market, Market):
+            continue
+        family = market_family(market)
+        if (
+            family == "weather"
+            and max_weather_candidates_per_cycle is not None
+            and selected_weather_count >= max_weather_candidates_per_cycle
+        ):
+            continue
+        if (
+            family == "crypto"
+            and max_crypto_candidates_per_cycle is not None
+            and selected_crypto_count >= max_crypto_candidates_per_cycle
+        ):
+            continue
+        if (
+            family == "speech"
+            and max_speech_candidates_per_cycle is not None
+            and selected_speech_count >= max_speech_candidates_per_cycle
+        ):
+            continue
+        if (
+            family == "music"
+            and max_music_candidates_per_cycle is not None
+            and selected_music_count >= max_music_candidates_per_cycle
+        ):
+            continue
+        selected.append(candidate)
+        if family == "weather":
+            selected_weather_count += 1
+        elif family == "crypto":
+            selected_crypto_count += 1
+        elif family == "speech":
+            selected_speech_count += 1
+        elif family == "music":
+            selected_music_count += 1
+    if len(selected) < max_markets_per_cycle and invalid_candidates:
+        selected.extend(invalid_candidates[: max_markets_per_cycle - len(selected)])
     return selected
 
 
@@ -4595,6 +4672,10 @@ def main(max_cycles: int | None = None) -> None:
             rejection_breakdown: dict[str, int] = {}
             score_rejection_reason_breakdown: dict[str, int] = {}
             score_near_misses: list[dict[str, Any]] = []
+            pre_vs_runtime_score_deltas: list[float] = []
+            runtime_score_below_threshold_order_count = 0
+            runtime_score_evaluation_count = 0
+            score_gate_score_source_counts: dict[str, int] = {}
             rejection_funnel_summary: list[dict[str, Any]] = []
             pre_analysis_rejection_breakdown: dict[str, int] = {}
             execution_family_stats: dict[str, dict[str, float]] = {}
@@ -4607,6 +4688,7 @@ def main(max_cycles: int | None = None) -> None:
             blocked_direct_evidence_count = 0
             participation_tier_breakdown: dict[str, int] = {}
             definitive_outcome_floor_applied_count = 0
+            evidence_floor_suppressed_count = 0
             timeout_routed_to_monitor_only_count = 0
             negative_best_score_skipped_count = 0
             should_trade_blocked_breakdown: dict[str, int] = {}
@@ -4687,9 +4769,30 @@ def main(max_cycles: int | None = None) -> None:
                         "primary_source_url_present": has_primary_source,
                         "requires_primary_source": normalized_family not in {"sports", "generic"},
                     }
+                for _source_audit_key in (
+                    "source_match_class",
+                    "evidence_floor_suppressed_reason",
+                    "evidence_quality_floor_applied",
+                ):
+                    if (
+                        _source_audit_key not in audit_payload
+                        and normalized_decision.get(_source_audit_key) is not None
+                    ):
+                        audit_payload[_source_audit_key] = normalized_decision.get(
+                            _source_audit_key
+                        )
                 if market_id in extended_research_market_ids:
                     audit_payload["extended_research_used"] = True
                 normalized_final_action = str(audit_payload.get("final_action") or "").strip().lower()
+                if "calibration_outcome_key" not in normalized_decision:
+                    normalized_decision["calibration_outcome_key"] = (
+                        f"{market_id}:{str(normalized_decision.get('outcome') or '').strip()}"
+                    )
+                if normalized_final_action in {"skip", "research_queued"}:
+                    normalized_decision.setdefault(
+                        "no_action_reason",
+                        str(audit_payload.get("final_reason") or normalized_final_action),
+                    )
                 inferred_edge_market = audit_payload.get("edge_market")
                 if inferred_edge_market is None:
                     inferred_edge_market = audit_payload.get("score_edge_market")
@@ -4762,7 +4865,10 @@ def main(max_cycles: int | None = None) -> None:
                             "market_id": market_id,
                             "market_family": audit.get("market_family"),
                             "evidence_basis": audit.get("evidence_basis_class"),
-                            "score": audit.get("pre_execution_final_score"),
+                            "score": audit.get(
+                                "execution_score_final",
+                                audit.get("pre_execution_final_score"),
+                            ),
                             "final_action": normalized_final_action,
                             "rejection_stage": audit.get("rejection_stage"),
                             "rejection_reason": audit.get("final_reason"),
@@ -4776,6 +4882,51 @@ def main(max_cycles: int | None = None) -> None:
                     should_trade_blocked_breakdown.get(reason, 0) + 1
                 )
 
+            def _research_learning_target(
+                *,
+                gate_name: str,
+                reason: str,
+                market: Market,
+                decision: TradeDecision,
+            ) -> str:
+                normalized_gate = str(gate_name or "").strip().lower()
+                normalized_reason = str(reason or "").strip().lower()
+                if "historical" in normalized_gate or "historical" in normalized_reason:
+                    return (
+                        "Review settled prefix outcomes, compare direct evidence quality, "
+                        "and require a current primary source plus refreshed market edge before execution."
+                    )
+                if (
+                    "extreme_market_edge" in normalized_gate
+                    or "extreme_edge_learning_queue" in normalized_gate
+                    or "high_edge" in normalized_gate
+                    or "edge_above_reasonable_max" in normalized_reason
+                ):
+                    return (
+                        "Verify the edge against a current orderbook and an independent primary source; "
+                        "learn whether the apparent edge was stale, ambiguous, or already priced in."
+                    )
+                if "hallucinated" in normalized_gate or "hallucinated" in normalized_reason:
+                    return (
+                        "Find direct primary-source evidence for the exact resolution criteria; "
+                        "do not reuse proxy or inferred evidence without a market-specific source."
+                    )
+                if "research_only" in normalized_gate or "analysis_cap" in normalized_gate:
+                    return (
+                        "Wait for outcome/settlement data and compare it with the repeated analyses "
+                        "before spending more model tokens."
+                    )
+                source_hint = str(getattr(decision, "primary_source_url", "") or "").strip()
+                if source_hint:
+                    return (
+                        "Recheck the primary source, current orderbook, and exact resolution text "
+                        "to decide whether the held edge is now execution-quality."
+                    )
+                return (
+                    "Find a direct primary source, current market price, and explicit pricing-in explanation "
+                    "before reconsidering execution."
+                )
+
             def _enqueue_research_candidate(
                 *,
                 market: Market,
@@ -4786,12 +4937,20 @@ def main(max_cycles: int | None = None) -> None:
                 edge_market: float | None = None,
                 edge_required: float | None = None,
             ) -> int:
+                what_to_learn_next = _research_learning_target(
+                    gate_name=gate_name,
+                    reason=reason,
+                    market=market,
+                    decision=decision,
+                )
                 research_queue.append(
                     {
                         "market_id": market.id,
                         "market_family": market_family(market),
                         "gate_name": gate_name,
                         "reason": reason,
+                        "learning_hold_reason": reason,
+                        "what_to_learn_next": what_to_learn_next,
                         "threshold_gap": round(max(0.0, threshold_gap), 4),
                         "edge_market": edge_market,
                         "edge_required": edge_required,
@@ -4802,6 +4961,20 @@ def main(max_cycles: int | None = None) -> None:
                     }
                 )
                 return len(research_queue)
+
+            def _record_runtime_score_order_attempt_if_below(
+                audit_context: dict[str, Any],
+            ) -> None:
+                nonlocal runtime_score_below_threshold_order_count
+                try:
+                    runtime_score = float(audit_context.get("execution_score_final"))
+                    runtime_threshold = float(
+                        audit_context.get("execution_score_threshold")
+                    )
+                except (TypeError, ValueError):
+                    return
+                if runtime_score < runtime_threshold:
+                    runtime_score_below_threshold_order_count += 1
 
             def _register_order_attempt(
                 event_key: str,
@@ -5196,6 +5369,7 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 if pre_analysis_hard_reject:
                     pre_analysis_blocked += 1
+                    pre_analysis_research_routed_count += 1
                     if pre_analysis_hard_reject_reason:
                         _record_rejection_reason(
                             pre_analysis_rejection_breakdown,
@@ -6257,6 +6431,8 @@ def main(max_cycles: int | None = None) -> None:
                 evidence_basis_breakdown[evidence_basis] = (
                     evidence_basis_breakdown.get(evidence_basis, 0) + 1
                 )
+                if getattr(decision, "evidence_floor_suppressed_reason", None):
+                    evidence_floor_suppressed_count += 1
                 candidate_edge_value = decision.edge_external
                 if candidate_edge_value is None:
                     my_prob_value = getattr(decision, "my_prob", None)
@@ -6386,6 +6562,12 @@ def main(max_cycles: int | None = None) -> None:
                     "evidence_quality_floor_applied": getattr(
                         decision,
                         "evidence_quality_floor_applied",
+                        None,
+                    ),
+                    "source_match_class": getattr(decision, "source_match_class", None),
+                    "evidence_floor_suppressed_reason": getattr(
+                        decision,
+                        "evidence_floor_suppressed_reason",
                         None,
                     ),
                     "event_ticker_prefix": event_ticker_prefix,
@@ -7079,29 +7261,28 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
-                if settings.CALIBRATION_MODE_ENABLED:
-                    calibration_payload = {
-                        "market_id": market.id,
-                        "cycle": cycle_count,
-                        "edge_market": edge_value,
-                        "implied_prob_market": implied_prob,
-                        "confidence": decision_for_edge.confidence,
-                        "evidence_quality": decision.evidence_quality,
-                        "liquidity_usdc": market.liquidity_usdc,
-                        "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
-                        "edge_gate_pass": edge_ok,
-                        "gate_edge_required": required_edge_threshold,
-                        "gate_edge_actual": edge_value,
-                    }
-                    calibration_payload.update(build_counterfactual_flags(edge_value))
-                    calibration_samples.append(calibration_payload)
-                    logger.info(
-                        "Calibration sample: market=%s edge=%s edge_gate_pass=%s",
-                        market.id,
-                        f"{edge_value:.4f}" if edge_value is not None else "n/a",
-                        edge_ok,
-                        data=calibration_payload,
-                    )
+                calibration_payload = {
+                    "market_id": market.id,
+                    "cycle": cycle_count,
+                    "edge_market": edge_value,
+                    "implied_prob_market": implied_prob,
+                    "confidence": decision_for_edge.confidence,
+                    "evidence_quality": decision_for_edge.evidence_quality,
+                    "liquidity_usdc": market.liquidity_usdc,
+                    "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
+                    "edge_gate_pass": edge_ok,
+                    "gate_edge_required": required_edge_threshold,
+                    "gate_edge_actual": edge_value,
+                }
+                calibration_payload.update(build_counterfactual_flags(edge_value))
+                calibration_samples.append(calibration_payload)
+                logger.info(
+                    "Calibration sample: market=%s edge=%s edge_gate_pass=%s",
+                    market.id,
+                    f"{edge_value:.4f}" if edge_value is not None else "n/a",
+                    edge_ok,
+                    data=calibration_payload,
+                )
                 if not edge_ok:
                     trades_skipped_edge += 1
                     _record_should_trade_blocked("edge_gate_blocked")
@@ -7220,6 +7401,16 @@ def main(max_cycles: int | None = None) -> None:
                             threshold_gap=0.0,
                             edge_market=edge_value,
                         )
+                    historical_learning_target = (
+                        historical_gate_metrics_exec.get("what_to_learn_next")
+                        if isinstance(historical_gate_metrics_exec, dict)
+                        else None
+                    ) or _research_learning_target(
+                        gate_name="historical_performance",
+                        reason=historical_gate_reason_exec,
+                        market=market,
+                        decision=decision_for_edge,
+                    )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -7231,6 +7422,11 @@ def main(max_cycles: int | None = None) -> None:
                             research_queue_position=research_queue_position,
                             research_gate_name="historical_performance",
                             historical_performance_research_only=queue_for_research,
+                            historical_prefix_action=(
+                                "research_queued" if queue_for_research else "skip"
+                            ),
+                            learning_hold_reason=historical_gate_reason_exec,
+                            what_to_learn_next=historical_learning_target,
                             **historical_gate_metrics_exec,
                             **audit_context,
                         ),
@@ -7346,59 +7542,62 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
 
-                score_result = analysis_result.get("pre_execution_score_result")
-                if score_result is None:
-                    short_prefix_score_penalty = float(
-                        candidate.get("short_prefix_score_penalty", 0.0) or 0.0
-                    )
-                    suppress_hallucinated_edge_penalty = (
-                        _should_suppress_hallucinated_edge_penalty(
-                            decision=decision_for_edge,
-                            evidence_basis=evidence_basis,
-                            settings=settings,
-                        )
-                    )
-                    exec_pfx_stats = _get_prefix_pnl(market.id or "")
-                    exec_pfx_n = int(exec_pfx_stats.get("n", 0))
-                    exec_pfx_pnl = float(exec_pfx_stats.get("total_pnl", 0.0))
-                    exec_pfx_shrunk = bayesian_shrunk_pnl(exec_pfx_pnl, exec_pfx_n) if exec_pfx_n > 0 else None
-                    score_result = compute_final_score(
-                        market=market,
+                score_gate_score_source = "runtime_recomputed"
+                short_prefix_score_penalty = float(
+                    candidate.get("short_prefix_score_penalty", 0.0) or 0.0
+                )
+                suppress_hallucinated_edge_penalty = (
+                    _should_suppress_hallucinated_edge_penalty(
                         decision=decision_for_edge,
-                        implied_prob_market=implied_prob,
-                        bayesian_posterior=bayesian_posterior_applied,
-                        lmsr_price=lmsr_execution_price,
-                        inefficiency_signal=ineff_signal,
-                        kelly_raw=kelly_raw_value,
-                        **_score_kwargs(
-                            settings=settings,
-                            repeated_analysis_count=(state.analysis_count if state is not None else 0),
-                            non_actionable_streak=(
-                                state.non_actionable_streak if state is not None else 0
-                            ),
-                            is_weather_market=(market_family(market) == "weather"),
-                            evidence_basis_class=evidence_basis,
-                            edge_source=decision_for_edge.edge_source or "",
-                            market_family=market_family_name,
-                            short_prefix_penalty=short_prefix_score_penalty,
-                            suppress_hallucinated_edge_penalty=suppress_hallucinated_edge_penalty,
-                            definitive_outcome_eligible=_is_definitive_outcome_eligible(
-                                decision_for_edge, settings
-                            ),
-                            historical_family_pnl_total=float(
-                                candidate.get("historical_family_pnl_total", 0.0) or 0.0
-                            ),
-                            historical_family_sample_size=int(
-                                candidate.get("historical_family_sample_size", 0) or 0
-                            ),
-                            historical_prefix_pnl_per_trade=exec_pfx_shrunk,
-                            historical_prefix_sample_size=exec_pfx_n,
-                        ),
+                        evidence_basis=evidence_basis,
+                        settings=settings,
                     )
-                score_receipt_fields = _score_receipt_fields(score_result)
-                compact_runtime_score = _compact_score_breakdown(score_receipt_fields)
-                if compact_runtime_score:
-                    audit_context["score_breakdown"] = compact_runtime_score
+                )
+                exec_pfx_stats = _get_prefix_pnl(market.id or "")
+                exec_pfx_n = int(exec_pfx_stats.get("n", 0))
+                exec_pfx_pnl = float(exec_pfx_stats.get("total_pnl", 0.0))
+                exec_pfx_shrunk = (
+                    bayesian_shrunk_pnl(exec_pfx_pnl, exec_pfx_n)
+                    if exec_pfx_n > 0
+                    else None
+                )
+                score_result = compute_final_score(
+                    market=market,
+                    decision=decision_for_edge,
+                    implied_prob_market=implied_prob,
+                    bayesian_posterior=bayesian_posterior_applied,
+                    lmsr_price=lmsr_execution_price,
+                    inefficiency_signal=ineff_signal,
+                    kelly_raw=kelly_raw_value,
+                    **_score_kwargs(
+                        settings=settings,
+                        repeated_analysis_count=(state.analysis_count if state is not None else 0),
+                        non_actionable_streak=(
+                            state.non_actionable_streak if state is not None else 0
+                        ),
+                        is_weather_market=(market_family(market) == "weather"),
+                        evidence_basis_class=evidence_basis,
+                        edge_source=decision_for_edge.edge_source or "",
+                        market_family=market_family_name,
+                        short_prefix_penalty=short_prefix_score_penalty,
+                        suppress_hallucinated_edge_penalty=suppress_hallucinated_edge_penalty,
+                        definitive_outcome_eligible=_is_definitive_outcome_eligible(
+                            decision_for_edge, settings
+                        ),
+                        historical_family_pnl_total=float(
+                            candidate.get("historical_family_pnl_total", 0.0) or 0.0
+                        ),
+                        historical_family_sample_size=int(
+                            candidate.get("historical_family_sample_size", 0) or 0
+                        ),
+                        historical_prefix_pnl_per_trade=exec_pfx_shrunk,
+                        historical_prefix_sample_size=exec_pfx_n,
+                    ),
+                )
+                runtime_score_evaluation_count += 1
+                score_gate_score_source_counts[score_gate_score_source] = (
+                    score_gate_score_source_counts.get(score_gate_score_source, 0) + 1
+                )
                 audit_context["fallback_high_confidence_penalty_applied"] = bool(
                     float(getattr(score_result, "fallback_high_confidence_penalty", 0.0) or 0.0)
                     > 0.0
@@ -7421,10 +7620,23 @@ def main(max_cycles: int | None = None) -> None:
                         decision_for_edge, settings
                     ),
                 )
-                audit_context["score_threshold_effective"] = score_threshold_effective
-                audit_context["score_gate_critical_reasons"] = list(
-                    score_gate_critical_reasons
+                score_receipt_fields = _apply_runtime_score_receipt(
+                    audit_context,
+                    score_result=score_result,
+                    score_threshold_effective=score_threshold_effective,
+                    pre_execution_final_score=pre_execution_final_score,
+                    score_gate_score_source=score_gate_score_source,
+                    score_gate_critical_reasons=score_gate_critical_reasons,
                 )
+                analysis_result["execution_final_score"] = score_result.final_score
+                analysis_result["execution_rejection_reasons"] = list(
+                    score_result.rejection_reasons
+                )
+                analysis_result["execution_score_result"] = score_result
+                analysis_result["score_gate_score_source"] = score_gate_score_source
+                runtime_delta = audit_context.get("pre_vs_runtime_score_delta")
+                if runtime_delta is not None:
+                    pre_vs_runtime_score_deltas.append(float(runtime_delta))
                 score_payload: dict[str, Any] | None = None
                 if score_mode != "off":
                     score_payload = {
@@ -7465,6 +7677,10 @@ def main(max_cycles: int | None = None) -> None:
                         "hallucinated_edge_penalty_suppressed": (
                             score_result.hallucinated_edge_penalty_suppressed
                         ),
+                        "high_edge_calibration_penalty": (
+                            score_result.high_edge_calibration_penalty
+                        ),
+                        "extreme_edge_learning_queue": score_result.extreme_edge_learning_queue,
                         "late_stage_overconfidence_penalty": score_result.late_stage_overconfidence_penalty,
                         "rejection_reasons": list(score_result.rejection_reasons),
                         "score_gate_critical_reasons": list(score_gate_critical_reasons),
@@ -7486,6 +7702,11 @@ def main(max_cycles: int | None = None) -> None:
                         "market_family": market_family_name,
                         "evidence_basis_class": evidence_basis,
                         "pre_execution_final_score": pre_execution_final_score,
+                        "execution_score_final": score_result.final_score,
+                        "pre_vs_runtime_score_delta": audit_context.get(
+                            "pre_vs_runtime_score_delta"
+                        ),
+                        "score_gate_score_source": score_gate_score_source,
                     }
                     pre_analysis_score_value = candidate.get("pre_analysis_score")
                     if pre_analysis_score_value is not None:
@@ -7537,6 +7758,7 @@ def main(max_cycles: int | None = None) -> None:
                                 "score_gap": score_gap,
                                 "rejection_reasons": list(score_result.rejection_reasons),
                                 "critical_rejection_reasons": list(score_gate_critical_reasons),
+                                "score_gate_score_source": score_gate_score_source,
                             }
                         )
                         _record_should_trade_blocked(score_gate_block_reason)
@@ -7550,7 +7772,9 @@ def main(max_cycles: int | None = None) -> None:
                             str(reason) for reason in score_result.rejection_reasons
                         }
                         research_gate_name: str | None = None
-                        if "extreme_market_edge_penalty" in score_rejection_reasons:
+                        if "extreme_edge_learning_queue" in score_rejection_reasons:
+                            research_gate_name = "extreme_edge_learning_queue"
+                        elif "extreme_market_edge_penalty" in score_rejection_reasons:
                             research_gate_name = "extreme_market_edge"
                         elif "hallucinated_edge" in score_rejection_reasons:
                             research_gate_name = "hallucinated_edge"
@@ -7565,6 +7789,12 @@ def main(max_cycles: int | None = None) -> None:
                             )
                         research_queue_position: int | None = None
                         if queue_for_research:
+                            score_gate_learning_target = _research_learning_target(
+                                gate_name=research_gate_name or "score_gate",
+                                reason=research_gate_name or score_gate_block_reason,
+                                market=market,
+                                decision=decision_for_edge,
+                            )
                             research_queue_position = _enqueue_research_candidate(
                                 market=market,
                                 decision=decision_for_edge,
@@ -7573,6 +7803,8 @@ def main(max_cycles: int | None = None) -> None:
                                 threshold_gap=score_gap,
                                 edge_market=score_result.edge_market,
                             )
+                        else:
+                            score_gate_learning_target = None
                         final_action = "research_queued" if queue_for_research else "skip"
                         final_reason = (
                             research_gate_name
@@ -7592,6 +7824,13 @@ def main(max_cycles: int | None = None) -> None:
                                 research_queue_position=research_queue_position,
                                 score_gate_research_reason=research_gate_name,
                                 score_gate_block_reason=score_gate_block_reason,
+                                historical_prefix_action=(
+                                    "research_queued" if queue_for_research else "not_applicable"
+                                ),
+                                learning_hold_reason=(
+                                    final_reason if queue_for_research else None
+                                ),
+                                what_to_learn_next=score_gate_learning_target,
                                 **audit_context,
                             ),
                         )
@@ -8120,6 +8359,7 @@ def main(max_cycles: int | None = None) -> None:
                             "kelly_sub_floor_skipped": kelly_sub_floor_skipped,
                         },
                     )
+                    _record_runtime_score_order_attempt_if_below(audit_context)
                     trades_attempted += 1
                     _register_order_attempt(
                         event_ticker_prefix,
@@ -8858,6 +9098,7 @@ def main(max_cycles: int | None = None) -> None:
                         closed_exc,
                         data={"market_id": market.id, "error": str(closed_exc)},
                     )
+                    _record_runtime_score_order_attempt_if_below(audit_context)
                     trades_attempted += 1
                     _register_order_attempt(
                         event_ticker_prefix,
@@ -8909,6 +9150,7 @@ def main(max_cycles: int | None = None) -> None:
                         order_exc,
                         data={"market_id": market.id, "error": error_msg},
                     )
+                    _record_runtime_score_order_attempt_if_below(audit_context)
                     trades_attempted += 1
                     _register_order_attempt(
                         event_ticker_prefix,
@@ -8951,6 +9193,7 @@ def main(max_cycles: int | None = None) -> None:
                     _record_terminal_outcome(state_manager, market.id, order_failure_reason)
                     continue  # Continue to next market for other errors
 
+                _record_runtime_score_order_attempt_if_below(audit_context)
                 trades_attempted += 1
                 _register_order_attempt(
                     event_ticker_prefix,
@@ -9251,7 +9494,10 @@ def main(max_cycles: int | None = None) -> None:
                     continue
                 _tc_result = analysis_results.get(_tc_market.id, {})
                 _tc_decision = _tc_result.get("decision")
-                _tc_score = _tc_result.get("pre_execution_final_score")
+                _tc_score = _tc_result.get(
+                    "execution_final_score",
+                    _tc_result.get("pre_execution_final_score"),
+                )
                 _tc_explanation = _tc_result.get("score_breakdown_explanation", "")
                 _tc_final_reason = ""
                 if isinstance(_tc_decision, TradeDecision):
@@ -9267,6 +9513,17 @@ def main(max_cycles: int | None = None) -> None:
                     "final_score": round(float(_tc_score or 0.0), 4),
                     "score_breakdown": str(_tc_explanation or "")[:200],
                     "final_reason": _tc_final_reason,
+                    "selection_rank_score": _tc_candidate.get("selection_rank_score"),
+                    "selection_rank_components": _tc_candidate.get(
+                        "selection_rank_components"
+                    ),
+                    "source_match_class": getattr(
+                        _tc_decision,
+                        "source_match_class",
+                        None,
+                    )
+                    if isinstance(_tc_decision, TradeDecision)
+                    else None,
                 })
 
             _confidence_bucket_decision_counts: dict[str, int] = {}
@@ -9282,6 +9539,52 @@ def main(max_cycles: int | None = None) -> None:
                 _confidence_bucket_decision_counts[_cbd_bucket] = (
                     _confidence_bucket_decision_counts.get(_cbd_bucket, 0) + 1
                 )
+
+            _near_miss_reason_counts: dict[str, int] = {}
+            for _near_miss in score_near_misses:
+                _near_miss_reasons = (
+                    _near_miss.get("critical_rejection_reasons")
+                    or _near_miss.get("rejection_reasons")
+                    or ["score_below_threshold"]
+                )
+                for _near_miss_reason in _near_miss_reasons:
+                    _reason_key = str(_near_miss_reason or "").strip()
+                    if not _reason_key:
+                        continue
+                    _near_miss_reason_counts[_reason_key] = (
+                        _near_miss_reason_counts.get(_reason_key, 0) + 1
+                    )
+            top_near_miss_research_reasons = [
+                {"reason": reason, "count": count}
+                for reason, count in sorted(
+                    _near_miss_reason_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:8]
+            ]
+            pre_vs_runtime_score_delta = (
+                round(
+                    sum(pre_vs_runtime_score_deltas)
+                    / len(pre_vs_runtime_score_deltas),
+                    4,
+                )
+                if pre_vs_runtime_score_deltas
+                else None
+            )
+            pre_vs_runtime_score_delta_abs_max = (
+                round(max(abs(delta) for delta in pre_vs_runtime_score_deltas), 4)
+                if pre_vs_runtime_score_deltas
+                else None
+            )
+            cost_per_analyzed_market = (
+                round(api_cost_estimate_usd / markets_analyzed, 6)
+                if markets_analyzed > 0
+                else None
+            )
+            cost_per_order_attempt = (
+                round(api_cost_estimate_usd / trades_attempted, 6)
+                if trades_attempted > 0
+                else None
+            )
 
             cycle_receipt = {
                 "cycle": cycle_count,
@@ -9299,6 +9602,10 @@ def main(max_cycles: int | None = None) -> None:
                 "research_queue_size": research_queue_size,
                 "research_queue_emissions": research_queue_size,
                 "research_only_emissions": research_only_emissions,
+                "no_grok_research_routed": (
+                    pre_analysis_research_routed_count + research_only_emissions
+                ),
+                "research_queue_deduped": 0,
                 "edge_gate_passed": edge_gate_passed,
                 "score_gate_passed": score_gate_passed,
                 "order_attempted": trades_attempted,
@@ -9329,6 +9636,22 @@ def main(max_cycles: int | None = None) -> None:
                 "hallucinated_edge_blocks": int(
                     normalized_rejection_breakdown.get("hallucinated_edge", 0)
                 ),
+                "high_edge_hallucination_blocks": int(
+                    normalized_rejection_breakdown.get("hallucinated_edge", 0)
+                    + normalized_rejection_breakdown.get("extreme_edge_learning_queue", 0)
+                    + normalized_rejection_breakdown.get("edge_above_reasonable_max", 0)
+                ),
+                "source_floor_suppressed": evidence_floor_suppressed_count,
+                "estimated_cost_saved_usd": round(
+                    (
+                        pre_analysis_research_routed_count
+                        + research_only_emissions
+                    )
+                    * cost_per_analyzed_market,
+                    6,
+                )
+                if cost_per_analyzed_market is not None
+                else None,
                 "fallback_high_conf_blocks": int(
                     normalized_rejection_breakdown.get("fallback_high_confidence_trade", 0)
                 ),
@@ -9342,6 +9665,8 @@ def main(max_cycles: int | None = None) -> None:
                 "api_reasoning_tokens": cycle_reasoning_tokens,
                 "api_cached_tokens": cycle_cached_tokens,
                 "api_cost_estimate_usd": round(api_cost_estimate_usd, 6),
+                "cost_per_analyzed_market": cost_per_analyzed_market,
+                "cost_per_order_attempt": cost_per_order_attempt,
                 "api_cost_per_fill": api_cost_per_fill,
                 "api_cost_per_usd_deployed": api_cost_per_usd_deployed,
                 "cumulative_api_cost_estimate_usd": round(cumulative_api_cost_estimate_usd, 6),
@@ -9356,6 +9681,16 @@ def main(max_cycles: int | None = None) -> None:
                 "evidence_basis_breakdown": dict(sorted(evidence_basis_breakdown.items())),
                 "confidence_calibration_applied": confidence_calibration_applied_count,
                 "calibration_samples": calibration_samples,
+                "runtime_score_evaluation_count": runtime_score_evaluation_count,
+                "score_gate_score_source_counts": dict(
+                    sorted(score_gate_score_source_counts.items())
+                ),
+                "pre_vs_runtime_score_delta": pre_vs_runtime_score_delta,
+                "pre_vs_runtime_score_delta_abs_max": pre_vs_runtime_score_delta_abs_max,
+                "runtime_score_below_threshold_order_count": (
+                    runtime_score_below_threshold_order_count
+                ),
+                "top_near_miss_research_reasons": top_near_miss_research_reasons,
                 "raw_vs_calibrated_delta": round(
                     confidence_calibration_delta_sum / max(1, markets_analyzed),
                     4,

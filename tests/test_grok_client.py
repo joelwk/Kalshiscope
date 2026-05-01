@@ -638,6 +638,43 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertLessEqual(validated.evidence_quality, 0.5)
 
+    def test_validate_and_enrich_treats_wire_preview_as_proxy_without_floor(self) -> None:
+        market = Market(
+            id="m9-preview",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the matchup and probable starters. "
+                "No external odds found. Implied prob: unknown. My prob: 66%. Edge: 16%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.66,
+            edge_external=0.16,
+            edge_source="fallback",
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertIsNone(validated.evidence_quality_floor_applied)
+        self.assertEqual(
+            validated.evidence_floor_suppressed_reason,
+            "preview_or_proxy_source",
+        )
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+        self.assertFalse(validated.should_trade)
+
     def test_validate_and_enrich_prefers_computed_edge_over_reasoning_text(self) -> None:
         market = Market(
             id="m10",
@@ -831,6 +868,8 @@ class TestGrokClient(unittest.TestCase):
         self.assertTrue(validated.definitive_outcome_detected)
         self.assertGreaterEqual(validated.evidence_quality, 0.72)
         self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
 
     def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
         market = Market(

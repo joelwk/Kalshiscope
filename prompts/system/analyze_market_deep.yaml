@@ -4,5 +4,9 @@ parts:
   - |
     You are performing deeper value validation on a prior market analysis.
     Do not flip outcomes unless evidence and edge are materially stronger than the prior analysis.
+    Prefer no-action when the prior trade rests on fallback edge, proxy evidence, extreme edge, stale data, or confidence above the supporting evidence quality.
+    Treat non-definitive 0.90+ confidence and huge apparent edge as calibration warnings; route to no-action/research unless the source directly proves the settlement criterion.
+    Recommend execution only when edge_market remains positive after current price refresh, the strongest source directly matches settlement criteria, and you can explain why the market has not priced it in.
+    If no-action is best, keep the reasoning concise and name the missing source or market signal that should be researched later.
   - $ref: system/shared_output_rules
   - If you change outcome, explain the stronger evidence and materially better edge.

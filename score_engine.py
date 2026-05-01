@@ -56,6 +56,8 @@ class ScoreResult:
     extreme_market_edge_penalty: float = 0.0
     hallucinated_edge_penalty: float = 0.0
     hallucinated_edge_penalty_suppressed: bool = False
+    high_edge_calibration_penalty: float = 0.0
+    extreme_edge_learning_queue: bool = False
     coinflip_sports_penalty: float = 0.0
     late_stage_overconfidence_penalty: float = 0.0
     short_prefix_penalty: float = 0.0
@@ -284,6 +286,26 @@ def compute_final_score(
     ):
         hallucinated_edge_penalty = max(0.0, hallucinated_edge_penalty_base)
 
+    high_edge_calibration_penalty = 0.0
+    extreme_edge_learning_queue = False
+    edge_abs_max = max(abs(edge_market), abs(edge_external))
+    high_edge_threshold = min(normalized_max_reasonable_edge, 0.32)
+    if (
+        not suppress_hallucinated_edge_penalty
+        and edge_abs_max > high_edge_threshold
+        and not (
+            normalized_evidence_basis == "direct"
+            and definitive_outcome_eligible
+        )
+    ):
+        high_edge_calibration_penalty = min(
+            0.18,
+            max(0.0, edge_abs_max - high_edge_threshold) * 0.50,
+        )
+        if edge_abs_max > max(0.45, high_edge_threshold):
+            high_edge_calibration_penalty = max(high_edge_calibration_penalty, 0.12)
+            extreme_edge_learning_queue = True
+
     weather_uncertainty_penalty = 0.0
     weather_bin_penalty = 0.0
     if is_weather_market:
@@ -430,6 +452,7 @@ def compute_final_score(
         - fallback_high_confidence_penalty
         - extreme_market_edge_penalty
         - hallucinated_edge_penalty
+        - high_edge_calibration_penalty
         - fallback_edge_penalty
         - proxy_evidence_penalty
         - liquidity_penalty
@@ -472,6 +495,10 @@ def compute_final_score(
         rejection_reasons.append("extreme_market_edge_penalty")
     if hallucinated_edge_penalty > 0:
         rejection_reasons.append("hallucinated_edge")
+    if high_edge_calibration_penalty > 0:
+        rejection_reasons.append("high_edge_calibration_penalty")
+    if extreme_edge_learning_queue:
+        rejection_reasons.append("extreme_edge_learning_queue")
     if fallback_edge_penalty > 0:
         rejection_reasons.append("fallback_edge_penalty")
     if proxy_evidence_penalty > 0:
@@ -529,6 +556,8 @@ def compute_final_score(
         extreme_market_edge_penalty=extreme_market_edge_penalty,
         hallucinated_edge_penalty=hallucinated_edge_penalty,
         hallucinated_edge_penalty_suppressed=bool(suppress_hallucinated_edge_penalty),
+        high_edge_calibration_penalty=high_edge_calibration_penalty,
+        extreme_edge_learning_queue=extreme_edge_learning_queue,
         coinflip_sports_penalty=coinflip_sports_penalty,
         late_stage_overconfidence_penalty=late_stage_overconfidence_penalty,
         short_prefix_penalty=short_prefix_penalty,
@@ -615,6 +644,7 @@ def score_breakdown_explanation(result: ScoreResult) -> str:
         ("fb_high_conf", result.fallback_high_confidence_penalty),
         ("extreme_edge", result.extreme_market_edge_penalty),
         ("halluc_edge", result.hallucinated_edge_penalty),
+        ("high_edge_cal", result.high_edge_calibration_penalty),
         ("fb_edge", result.fallback_edge_penalty),
         ("proxy_ev", result.proxy_evidence_penalty),
         ("liquidity", result.liquidity_penalty),

@@ -10,6 +10,7 @@ from main import (
     _available_orderbook_sell_quantity,
     _analysis_result_rank,
     _analyze_market_candidate,
+    _apply_runtime_score_receipt,
     _best_orderbook_sell_price,
     _build_order_request_from_market,
     _build_kalshi_market_fetch_window,
@@ -63,6 +64,7 @@ from main import (
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
 from research_profiles import build_market_search_config
+from score_engine import compute_final_score
 
 
 class DummyStateManager:
@@ -180,10 +182,89 @@ class TestMainUtils(unittest.TestCase):
         }
         critical = {
             "decision": decision,
-            "pre_execution_final_score": 0.30,
+            "pre_execution_final_score": 0.90,
             "pre_execution_rejection_reasons": ("non_positive_market_edge",),
         }
         self.assertGreater(_analysis_result_rank(clean), _analysis_result_rank(critical))
+
+    def test_runtime_score_receipt_overwrites_pre_execution_score_fields(self) -> None:
+        market = Market(
+            id="KXMLBGAME-26APR121610TEXLAD-LAD",
+            question="Will the Dodgers beat the Rangers?",
+            liquidity_usdc=1000.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.78,
+            bet_size_pct=0.2,
+            reasoning="Direct source says final score is settled.",
+            evidence_quality=0.86,
+            edge_source="computed",
+            evidence_basis="direct",
+            primary_source_url="https://www.espn.com/mlb/game/_/gameId/test",
+        )
+        runtime_score = compute_final_score(
+            market,
+            decision,
+            implied_prob_market=0.55,
+            evidence_basis_class="direct",
+            edge_source="computed",
+        )
+        audit_context = {
+            "score_final": -0.10,
+            "score_breakdown": {"score_final": -0.10},
+        }
+
+        score_fields = _apply_runtime_score_receipt(
+            audit_context,
+            score_result=runtime_score,
+            score_threshold_effective=0.30,
+            pre_execution_final_score=-0.10,
+            score_gate_score_source="runtime_recomputed",
+            score_gate_critical_reasons=(),
+        )
+
+        self.assertEqual(score_fields["score_final"], runtime_score.final_score)
+        self.assertEqual(audit_context["score_final"], runtime_score.final_score)
+        self.assertEqual(
+            audit_context["score_breakdown"]["score_final"],
+            runtime_score.final_score,
+        )
+        self.assertEqual(audit_context["execution_score_final"], runtime_score.final_score)
+        self.assertEqual(audit_context["execution_score_threshold"], 0.30)
+        self.assertEqual(audit_context["score_gate_score_source"], "runtime_recomputed")
+        self.assertAlmostEqual(
+            audit_context["pre_vs_runtime_score_delta"],
+            runtime_score.final_score - (-0.10),
+        )
+
+    def test_research_queued_audit_preserves_learning_fields(self) -> None:
+        audit = _build_execution_audit(
+            decision_terminal=False,
+            final_action="research_queued",
+            final_reason="historical_prefix_small_sample_negative",
+            historical_prefix_action="research_queued",
+            learning_hold_reason="historical_prefix_small_sample_negative",
+            what_to_learn_next="Review settled prefix outcomes before execution.",
+            score_gate_score_source="runtime_recomputed",
+        )
+
+        self.assertEqual(audit["final_action"], "research_queued")
+        self.assertEqual(
+            audit["learning_hold_reason"],
+            "historical_prefix_small_sample_negative",
+        )
+        self.assertEqual(audit["historical_prefix_action"], "research_queued")
+        self.assertEqual(
+            audit["what_to_learn_next"],
+            "Review settled prefix outcomes before execution.",
+        )
+        self.assertEqual(audit["score_gate_score_source"], "runtime_recomputed")
 
     def test_score_gate_critical_rejection_blocks_fallback_source_failures(self) -> None:
         reasons = _score_gate_critical_rejection_reasons(
@@ -1650,53 +1731,60 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(capped[0]["market"], "m0")
         self.assertEqual(capped[-1]["market"], "m2")
 
-    def test_cap_analysis_candidates_uses_family_round_robin(self) -> None:
+    def test_cap_analysis_candidates_uses_global_risk_adjusted_rank(self) -> None:
         candidates = [
             {
                 "market": Market(
                     id="c1",
                     question="Will Bitcoin close above $70k?",
                     category="crypto",
-                )
+                ),
+                "pre_analysis_score": 0.90,
             },
             {
                 "market": Market(
                     id="c2",
                     question="Will Ethereum close above $4k?",
                     category="crypto",
-                )
+                ),
+                "pre_analysis_score": 0.95,
             },
             {
                 "market": Market(
                     id="c3",
                     question="Will Solana close above $200?",
                     category="crypto",
-                )
+                ),
+                "pre_analysis_score": 0.10,
             },
             {
                 "market": Market(
                     id="s1",
                     question="Will the Lakers win tonight?",
                     category="sports",
-                )
+                ),
+                "pre_analysis_score": 0.80,
             },
             {
                 "market": Market(
                     id="s2",
                     question="Will the Celtics win tonight?",
                     category="sports",
-                )
+                ),
+                "pre_analysis_score": 0.20,
             },
             {
                 "market": Market(
                     id="p1",
                     question="Will candidate X win the election?",
                     category="politics",
-                )
+                ),
+                "pre_analysis_score": 0.70,
             },
         ]
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=4)
-        self.assertEqual([item["market"].id for item in capped], ["c1", "s1", "p1", "c2"])
+        self.assertEqual([item["market"].id for item in capped], ["c2", "c1", "s1", "p1"])
+        self.assertIn("selection_rank_components", capped[0])
 
     def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
         candidates = [
@@ -1712,7 +1800,12 @@ class TestMainUtils(unittest.TestCase):
             max_markets_per_cycle=5,
             max_weather_candidates_per_cycle=1,
         )
-        self.assertEqual([item["market"].id for item in capped], ["w1", "c1", "p1", "s1"])
+        capped_ids = [item["market"].id for item in capped]
+        self.assertEqual(len([market_id for market_id in capped_ids if market_id.startswith("w")]), 1)
+        self.assertIn("w1", capped_ids)
+        self.assertIn("c1", capped_ids)
+        self.assertIn("s1", capped_ids)
+        self.assertIn("p1", capped_ids)
 
     def test_cap_analysis_candidates_limits_crypto_candidates(self) -> None:
         candidates = [
@@ -1762,14 +1855,17 @@ class TestMainUtils(unittest.TestCase):
             {
                 "market": Market(id="w-high-streak", question="Weather A", category="weather"),
                 "non_actionable_streak": 5,
+                "pre_analysis_score": 0.90,
             },
             {
                 "market": Market(id="w-low-streak", question="Weather B", category="weather"),
                 "non_actionable_streak": 1,
+                "pre_analysis_score": 0.90,
             },
             {
                 "market": Market(id="c1", question="Crypto", category="crypto"),
                 "non_actionable_streak": 0,
+                "pre_analysis_score": 0.80,
             },
         ]
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)

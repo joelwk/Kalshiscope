@@ -150,6 +150,14 @@ class TradeDecision(BaseModel):
         default=None,
         description=_TRADE_DECISION_DESCRIPTIONS["evidence_quality_floor_applied"],
     )
+    source_match_class: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["source_match_class"],
+    )
+    evidence_floor_suppressed_reason: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["evidence_floor_suppressed_reason"],
+    )
     prompt_tokens: int | None = Field(
         default=None,
         ge=0,

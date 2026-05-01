@@ -30,6 +30,11 @@ _RE_LOW_INFORMATION = re.compile(
     r"(?:evidence|information|data))",
     re.IGNORECASE,
 )
+_RE_PREVIEW_OR_PROXY_SOURCE = re.compile(
+    r"\b(preview|probable|probables|projected|projection|expected|matchup|form|"
+    r"pre-game|pregame|lineup preview|odds preview|scheduled)\b",
+    re.IGNORECASE,
+)
 _RE_WEATHER_OBS_LOCKED = re.compile(
     r"(observ(?:ed|ation)[^\.]{0,80}(?:already|exceed|surpass|hit|locked)|already (?:above|below|over|under|exceeded)|"
     r"physically impossible|threshold (?:already )?(?:met|exceeded)|high already reached)",
@@ -37,6 +42,14 @@ _RE_WEATHER_OBS_LOCKED = re.compile(
 )
 _RE_DEFINITIVE_OUTCOME_SIGNAL = re.compile(
     r"(final score|game (?:completed|concluded|final)|confirmed|official recap|box score)",
+    re.IGNORECASE,
+)
+_RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL = re.compile(
+    r"(settlement|resolution criter(?:ia|ion)|official recap|box score|final score|"
+    r"game (?:completed|concluded|final)|weather\.gov|nws|noaa|asos|metar|"
+    r"observation|observed|official station|exchange bulletin|confirmed outcome|"
+    r"threshold (?:already )?(?:met|exceeded)|live quote|quote page|spot price|"
+    r"current spot|current price|observed value|timestamp)",
     re.IGNORECASE,
 )
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
@@ -486,11 +499,34 @@ class GrokClient:
         return any(keyword in normalized_reasoning for keyword in _VERIFIABLE_EVIDENCE_KEYWORDS)
 
     @staticmethod
+    def _source_match_class(
+        reasoning: str,
+        *,
+        has_verifiable_signal: bool,
+        has_definitive_outcome_signal: bool,
+        no_external_odds: bool,
+        low_information: bool,
+    ) -> str:
+        normalized_reasoning = (reasoning or "").lower()
+        if low_information or (no_external_odds and not has_verifiable_signal):
+            return "missing_or_absence_only"
+        if _RE_PREVIEW_OR_PROXY_SOURCE.search(normalized_reasoning):
+            return "preview_or_proxy"
+        if has_definitive_outcome_signal or _RE_WEATHER_OBS_LOCKED.search(normalized_reasoning):
+            return "settlement_aligned"
+        if _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL.search(normalized_reasoning):
+            return "settlement_aligned"
+        if has_verifiable_signal:
+            return "verifiable_unmatched"
+        return "unverified"
+
+    @staticmethod
     def _evidence_basis_class(
         reasoning: str,
         edge_source: str,
         has_verifiable_signal: bool,
         low_information: bool,
+        source_match_class: str = "",
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
         has_absence_signal = any(
@@ -504,9 +540,17 @@ class GrokClient:
                 "no external odds",
             )
         )
-        if has_absence_signal and edge_source in {"fallback", "none"}:
+        if (
+            has_absence_signal
+            and source_match_class != "preview_or_proxy"
+            and edge_source in {"fallback", "none"}
+        ):
             return "absence_only"
-        if has_verifiable_signal and not low_information:
+        if (
+            has_verifiable_signal
+            and not low_information
+            and source_match_class == "settlement_aligned"
+        ):
             return "direct"
         return "proxy"
 
@@ -566,6 +610,13 @@ class GrokClient:
         has_definitive_outcome_signal = bool(
             _RE_DEFINITIVE_OUTCOME_SIGNAL.search(decision.reasoning or "")
         )
+        source_match_class = self._source_match_class(
+            decision.reasoning or "",
+            has_verifiable_signal=has_verifiable_signal,
+            has_definitive_outcome_signal=has_definitive_outcome_signal,
+            no_external_odds=no_external_odds,
+            low_information=low_information,
+        )
         prob_component = 0.0
         if implied is not None and my_prob is not None:
             prob_component = 0.55
@@ -600,6 +651,10 @@ class GrokClient:
                 data={"market_id": market.id, "profile_name": profile_name},
             )
         evidence_quality = max(0.0, min(1.0, evidence_quality))
+        if no_external_odds and source_match_class != "settlement_aligned":
+            evidence_quality = min(evidence_quality, 0.50)
+        if source_match_class == "preview_or_proxy":
+            evidence_quality = min(evidence_quality, 0.60)
         market_implied = self._market_implied_probability(market, canonical_outcome)
         if edge_source == "fallback":
             if market_implied is not None and my_prob is not None:
@@ -611,6 +666,7 @@ class GrokClient:
             edge_source=edge_source,
             has_verifiable_signal=has_verifiable_signal,
             low_information=low_information,
+            source_match_class=source_match_class,
         )
         active_settings = self.settings or Settings()
         proxy_confidence_cap = max(0.0, min(1.0, active_settings.GROK_PROXY_CONFIDENCE_CAP))
@@ -647,7 +703,22 @@ class GrokClient:
             else None
         )
         evidence_quality_floor_applied: str | None = None
-        if has_verifiable_signal and not low_information:
+        evidence_floor_suppressed_reason: str | None = None
+        verifiable_floor_allowed = (
+            has_verifiable_signal
+            and not low_information
+            and source_match_class == "settlement_aligned"
+        )
+        if has_verifiable_signal and not verifiable_floor_allowed:
+            if low_information:
+                evidence_floor_suppressed_reason = "low_information"
+            elif source_match_class == "preview_or_proxy":
+                evidence_floor_suppressed_reason = "preview_or_proxy_source"
+            elif no_external_odds and source_match_class == "missing_or_absence_only":
+                evidence_floor_suppressed_reason = "no_external_odds"
+            else:
+                evidence_floor_suppressed_reason = "source_not_settlement_aligned"
+        if verifiable_floor_allowed:
             evidence_floor = 0.60
             if (
                 has_definitive_outcome_signal
@@ -668,7 +739,7 @@ class GrokClient:
             and market_edge is not None
             and decision.confidence >= _EVIDENCE_OVERRIDE_MIN_CONFIDENCE
             and market_edge >= _EVIDENCE_OVERRIDE_MIN_MARKET_EDGE
-            and self._has_verifiable_source_signal(decision.reasoning)
+            and verifiable_floor_allowed
         ):
             if evidence_quality < _EVIDENCE_OVERRIDE_MIN_QUALITY:
                 evidence_quality = _EVIDENCE_OVERRIDE_MIN_QUALITY
@@ -682,7 +753,7 @@ class GrokClient:
                 evidence_quality = _WEATHER_OBS_EVIDENCE_FLOOR
                 evidence_quality_floor_applied = "weather_observed_floor"
         definitive_outcome_detected = (
-            has_verifiable_signal
+            source_match_class == "settlement_aligned"
             and has_definitive_outcome_signal
             and decision.likelihood_ratio is not None
             and decision.likelihood_ratio >= 10.0
@@ -696,7 +767,7 @@ class GrokClient:
             evidence_quality_floor_applied = "definitive_outcome_floor"
         direct_fallback_gate_override = (
             evidence_basis_class == "direct"
-            and has_verifiable_signal
+            and source_match_class == "settlement_aligned"
             and evidence_quality >= _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE
         )
 
@@ -730,6 +801,12 @@ class GrokClient:
             if evidence_basis_class == "absence_only":
                 should_trade = False
                 gate_reasons.append("absence_only_evidence")
+            if (
+                source_match_class == "preview_or_proxy"
+                and edge_source in {"fallback", "none"}
+            ):
+                should_trade = False
+                gate_reasons.append("preview_proxy_without_direct_source")
             if (
                 edge_source in {"fallback", "none"}
                 and evidence_quality < fallback_min_evidence_quality
@@ -780,6 +857,8 @@ class GrokClient:
                     "evidence_quality": evidence_quality,
                     "edge_source": edge_source,
                     "evidence_basis_class": evidence_basis_class,
+                    "source_match_class": source_match_class,
+                    "evidence_floor_suppressed_reason": evidence_floor_suppressed_reason,
                 },
             )
         bet_size_pct = decision.bet_size_pct if should_trade else 0.0
@@ -800,9 +879,13 @@ class GrokClient:
                 "raw_evidence_quality": raw_evidence_quality,
                 "definitive_outcome_detected": definitive_outcome_detected,
                 "evidence_quality_floor_applied": evidence_quality_floor_applied,
+                "source_match_class": source_match_class,
+                "evidence_floor_suppressed_reason": evidence_floor_suppressed_reason,
                 "reasoning": (
                     f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
                     f"basis={evidence_basis_class} "
+                    f"source_match={source_match_class} "
+                    f"floor_suppressed={evidence_floor_suppressed_reason or 'none'} "
                     f"edge_market={market_edge if market_edge is not None else 'n/a'} "
                     f"gate_edge_required={gate_edge_required:.4f} "
                     f"gate_edge_actual={gate_edge_actual if gate_edge_actual is not None else 'n/a'} "

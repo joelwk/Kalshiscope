@@ -1105,6 +1105,108 @@ def section_research_queued_settlement_review(
             )
 
 
+def section_calibration_guard_receipts(
+    conn: sqlite3.Connection,
+    *,
+    window_days: int,
+) -> None:
+    if not _table_exists(conn, "decision_receipts"):
+        return
+    cutoff = _cutoff_iso(window_days)
+    _print_header(f"CALIBRATION GUARD RECEIPTS (last {window_days}d)")
+
+    rows = conn.execute(
+        """
+        SELECT
+          COALESCE(json_extract(audit_json,'$.source_match_class'), 'unknown') AS source_match_class,
+          COUNT(*) AS n,
+          SUM(CASE WHEN COALESCE(final_action,'') IN ('order_attempt','order_submitted','dry_run') THEN 1 ELSE 0 END) AS attempted,
+          SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.evidence_floor_suppressed_reason'), '') <> '' THEN 1 ELSE 0 END) AS floor_suppressed
+        FROM decision_receipts
+        WHERE timestamp >= ?
+        GROUP BY source_match_class
+        ORDER BY n DESC
+        LIMIT 12
+        """,
+        (cutoff,),
+    ).fetchall()
+    if rows:
+        _print_subheader("Source match class")
+        print(f"{'source_match_class':<28} {'n':>8} {'attempted':>10} {'floor_supp':>10}")
+        for row in rows:
+            print(
+                f"{str(row['source_match_class'] or ''):<28} "
+                f"{int(row['n'] or 0):>8} "
+                f"{int(row['attempted'] or 0):>10} "
+                f"{int(row['floor_suppressed'] or 0):>10}"
+            )
+
+    rows = conn.execute(
+        """
+        SELECT
+          COALESCE(CAST(json_extract(audit_json,'$.ranking_rank') AS INTEGER), 0) AS ranking_rank,
+          COUNT(*) AS n,
+          SUM(CASE WHEN COALESCE(final_action,'') IN ('order_attempt','order_submitted','dry_run') THEN 1 ELSE 0 END) AS attempted,
+          AVG(COALESCE(CAST(json_extract(audit_json,'$.pre_execution_final_score') AS REAL), 0.0)) AS avg_score
+        FROM decision_receipts
+        WHERE timestamp >= ?
+          AND json_extract(audit_json,'$.ranking_rank') IS NOT NULL
+        GROUP BY ranking_rank
+        ORDER BY ranking_rank ASC
+        LIMIT 10
+        """,
+        (cutoff,),
+    ).fetchall()
+    if rows:
+        _print_subheader("Rank yield")
+        print(f"{'rank':>4} {'n':>8} {'attempted':>10} {'attempt_rate':>12} {'avg_score':>10}")
+        for row in rows:
+            n = int(row["n"] or 0)
+            attempted = int(row["attempted"] or 0)
+            print(
+                f"{int(row['ranking_rank'] or 0):>4} {n:>8} {attempted:>10} "
+                f"{_fmt_pct(attempted, n):>12} {float(row['avg_score'] or 0.0):>10.4f}"
+            )
+
+    rows = conn.execute(
+        """
+        SELECT
+          CASE
+            WHEN MAX(
+              ABS(COALESCE(CAST(json_extract(audit_json,'$.score_edge_market') AS REAL), 0.0)),
+              ABS(COALESCE(CAST(json_extract(audit_json,'$.score_edge_external') AS REAL), 0.0))
+            ) >= 0.45 THEN 'extreme_45_plus'
+            WHEN MAX(
+              ABS(COALESCE(CAST(json_extract(audit_json,'$.score_edge_market') AS REAL), 0.0)),
+              ABS(COALESCE(CAST(json_extract(audit_json,'$.score_edge_external') AS REAL), 0.0))
+            ) >= 0.32 THEN 'high_32_to_45'
+            ELSE 'normal'
+          END AS edge_band,
+          COUNT(*) AS n,
+          SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.score_rejection_reasons'), '') LIKE '%high_edge_calibration_penalty%' THEN 1 ELSE 0 END) AS high_edge_penalty,
+          SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.score_rejection_reasons'), '') LIKE '%extreme_edge_learning_queue%' THEN 1 ELSE 0 END) AS learning_queue
+        FROM decision_receipts
+        WHERE timestamp >= ?
+          AND (
+            json_extract(audit_json,'$.score_edge_market') IS NOT NULL
+            OR json_extract(audit_json,'$.score_edge_external') IS NOT NULL
+          )
+        GROUP BY edge_band
+        ORDER BY n DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+    if rows:
+        _print_subheader("High-edge guard bands")
+        print(f"{'edge_band':<18} {'n':>8} {'high_edge_pen':>14} {'learning_q':>12}")
+        for row in rows:
+            print(
+                f"{str(row['edge_band'] or ''):<18} {int(row['n'] or 0):>8} "
+                f"{int(row['high_edge_penalty'] or 0):>14} "
+                f"{int(row['learning_queue'] or 0):>12}"
+            )
+
+
 def section_account_snapshot(conn: sqlite3.Connection) -> None:
     _print_header("ACCOUNT SNAPSHOT (DB-only — for live API run pnl_report.py --sync)")
 
@@ -1197,6 +1299,7 @@ def main() -> None:
         section_per_family_prefix(conn, window_days=args.window_days)
         section_cycle_funnel(conn, window_days=args.window_days)
         section_research_queued_settlement_review(conn, window_days=args.window_days)
+        section_calibration_guard_receipts(conn, window_days=args.window_days)
         section_grok_failures(args.logs)
     finally:
         conn.close()

@@ -284,6 +284,68 @@ def test_compute_final_score_applies_hallucinated_edge_penalty_when_not_definiti
     assert "hallucinated_edge" in score.rejection_reasons
 
 
+def test_compute_final_score_adds_high_edge_calibration_penalty() -> None:
+    market = Market(
+        id="m-high-edge-cal",
+        question="High edge calibration guard",
+        outcomes=[MarketOutcome(name="YES", price=0.35), MarketOutcome(name="NO", price=0.65)],
+        liquidity_usdc=1500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+        resolution_criteria="Official settlement source",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.78,
+        bet_size_pct=0.3,
+        reasoning="Large non-definitive edge.",
+        edge_external=0.40,
+        edge_source="computed",
+        evidence_quality=0.70,
+    )
+    score = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.35,
+        max_reasonable_edge=0.45,
+        evidence_basis_class="proxy",
+    )
+    assert score.high_edge_calibration_penalty > 0
+    assert "high_edge_calibration_penalty" in score.rejection_reasons
+    assert "extreme_edge_learning_queue" not in score.rejection_reasons
+
+
+def test_compute_final_score_routes_extreme_edge_to_learning_queue() -> None:
+    market = Market(
+        id="m-extreme-edge-learning",
+        question="Extreme edge learning queue guard",
+        outcomes=[MarketOutcome(name="YES", price=0.20), MarketOutcome(name="NO", price=0.80)],
+        liquidity_usdc=1500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+        resolution_criteria="Official settlement source",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.82,
+        bet_size_pct=0.3,
+        reasoning="Huge non-definitive edge.",
+        edge_external=0.52,
+        edge_source="computed",
+        evidence_quality=0.75,
+    )
+    score = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.20,
+        max_reasonable_edge=0.45,
+        evidence_basis_class="proxy",
+    )
+    assert score.extreme_edge_learning_queue is True
+    assert score.high_edge_calibration_penalty >= 0.12
+    assert "extreme_edge_learning_queue" in score.rejection_reasons
+
+
 def test_compute_final_score_adds_late_stage_overconfidence_penalty_for_non_direct() -> None:
     market = Market(
         id="m-late-overconfidence",

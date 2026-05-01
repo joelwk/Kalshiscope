@@ -11,3 +11,4 @@ data/market_state.json
 *.pem
 kalshi-scope.txt
 .cursor/
+AGENTS.md

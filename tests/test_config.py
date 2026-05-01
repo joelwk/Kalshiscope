@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import config
@@ -150,11 +151,28 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
     def test_profit_tuning_defaults_are_loaded(self) -> None:
-        self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.18)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_THRESHOLD, 0.25)
-        self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.25)
+        self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.28)
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
-        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.48)
+        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
+
+    def test_env_example_profit_thresholds_match_conservative_defaults(self) -> None:
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        expected_lines = {
+            "MIN_EDGE=0.12",
+            "LOW_PRICE_MIN_EDGE=0.18",
+            "VERY_LOW_PRICE_MIN_EDGE=0.28",
+            "FALLBACK_EDGE_MIN_EDGE=0.30",
+            "MAX_REASONABLE_EDGE=0.32",
+            "SCORE_GATE_THRESHOLD=0.52",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.30",
+            "MAX_MARKETS_PER_CYCLE=3",
+            "MAX_TRADES_PER_CYCLE=2",
+            "MAX_TRADES_PER_DAY=6",
+        }
+        for expected_line in expected_lines:
+            self.assertIn(expected_line, env_example)
 
     def test_historical_family_penalty_settings_overrides(self) -> None:
         env = {
@@ -320,17 +338,17 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.68)
         self.assertIn("weather.gov", settings.DIRECT_SOURCE_WHITELIST)
         self.assertEqual(settings.SCORE_GATE_MODE, "active")
-        self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.48)
+        self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.60)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.08)
         self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.60)
-        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 6)
+        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 3)
         self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 1)
         self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 0)
         self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 0)
-        self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 5)
+        self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
-        self.assertEqual(settings.MAX_TRADES_PER_DAY, 15)
+        self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
         self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
         self.assertTrue(settings.POSITION_SYNC_ENABLED)
         self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
@@ -366,7 +384,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
         self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.72)
         self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.65)
-        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.35)
+        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.32)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
         self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)

@@ -1,15 +1,15 @@
 name: schema/trade_decision
 description: TradeDecision field descriptions used by response_format schema.
 fields:
-  should_trade: "Only true when edge_market is positive and >= 7pp for non-sports (or >= 5pp for sports with direct settlement-aligned evidence), evidence_basis is not absence_only, edge_source is not none, and primary_source_url is populated for non-sports markets. Do not trade on edge_external alone."
+  should_trade: "Only true when edge_market is positive, source-backed, pricing-in explanation is credible, evidence_basis is not absence_only, edge_source is not none, and primary_source_url is populated for non-sports markets. Fallback/no-external-odds trades require the configured fallback edge threshold. Do not trade on edge_external alone."
   outcome: "The outcome you predict will win"
-  confidence: "Your probability estimate (0.0-1.0)."
+  confidence: "Your probability estimate (0.0-1.0). Cap non-definitive confidence at 0.89 and keep confidence <= evidence_quality + 0.05; confidence >0.89 requires direct definitive evidence with primary_source_url."
   bet_size_pct: "Fraction of max bet (0.0-1.0). Scale with edge size, not just confidence."
-  reasoning: "MUST include: 1) Implied prob from odds, 2) Your prob estimate, 3) Calculated edge (your prob - implied prob), 4) Why edge exists"
+  reasoning: "MUST include: 1) Implied prob from odds, 2) Your prob estimate, 3) Calculated edge_market (your prob - market implied prob), 4) Why the edge exists and has not been priced in. For no-action, keep it concise and name the missing evidence to research later."
   implied_prob_external: "Optional externally sourced implied probability from books/polls/markets."
   my_prob: "Optional explicit analyst probability estimate."
   edge_external: "Optional explicit edge from external implied probability (my_prob - implied_prob_external)."
-  edge_source: "Source of edge calculation (computed, fallback, or none). Use fallback only when no external implied probability is available; fallback requires a larger positive edge_market."
+  edge_source: "Source of edge calculation (computed, fallback, or none). Use fallback only when no external implied probability is available; fallback requires the configured fallback edge threshold and cannot justify should_trade=true from edge_external alone."
   evidence_basis: "Evidence basis class (direct, proxy, or absence_only). Direct requires a cited source that explicitly matches the market's settlement criteria; previews, vague forecasts, and silence are proxy or absence_only."
   primary_source_url: "URL of the single most decisive primary source used. REQUIRED when should_trade=true for any non-sports market; missing URL will cause rejection. For live-price markets use exchange or Tier-1 wire-service quote pages, for weather use NWS/NOAA pages, and for speech/mention use transcripts or official statements."
   likelihood_ratio: "Optional likelihood ratio P(evidence|predicted_outcome) / P(evidence|alternative_outcome)."
@@ -23,6 +23,8 @@ fields:
   raw_evidence_quality: "Raw model evidence quality before validation recalibration."
   definitive_outcome_detected: "True when definitive settlement-aligned evidence is detected."
   evidence_quality_floor_applied: "Name of the evidence-quality floor rule applied during validation."
+  source_match_class: "Validator-assigned class for the strongest evidence source: settlement_aligned, preview_or_proxy, verifiable_unmatched, missing_or_absence_only, or unverified."
+  evidence_floor_suppressed_reason: "Validator-assigned reason an evidence-quality floor was not applied despite a verifiable-looking source signal."
   prompt_tokens: "Prompt token usage captured from provider response."
   completion_tokens: "Completion token usage captured from provider response."
   reasoning_tokens: "Reasoning token usage captured from provider response."
