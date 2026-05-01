@@ -551,6 +551,19 @@ def run(db_path: str) -> None:
                     for basis in sorted(evidence_basis_counts):
                         print(f"    {basis}: n={evidence_basis_counts[basis]}")
 
+            quota_paused_cycles = sum(
+                1
+                for row in cycle_rows
+                if row["payload_json"]
+                and isinstance(
+                    (lambda r: json.loads(r) if r else {})(row["payload_json"]),
+                    dict,
+                )
+                and json.loads(row["payload_json"]).get("xai_quota_paused")
+            )
+            if quota_paused_cycles > 0:
+                print(f"  xai_quota_paused_cycles={quota_paused_cycles}")
+
         profitable_row = conn.execute(
             """
             SELECT COUNT(*) AS profitable_count

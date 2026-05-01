@@ -1735,3 +1735,99 @@ def test_non_definitive_confidence_ceiling_allows_definitive() -> None:
     ceiling = _non_definitive_confidence_ceiling(decision, settings)
     assert ceiling > 0.89
 
+
+def test_high_edge_calibration_penalty_fires_on_extreme_edge() -> None:
+    """Edges >= 0.45 must receive a positive high_edge_calibration_penalty
+    even when suppress_hallucinated_edge_penalty=True (the fix for the
+    biggest realized PnL leak: 22 trades at 22.7% WR, -$90.12)."""
+    market = Market(
+        id="KXMLBGAME-test",
+        question="Test MLB game",
+        outcomes=[MarketOutcome(name="YES", price=0.30)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=2),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.80,
+        bet_size_pct=0.5,
+        reasoning="test",
+        evidence_quality=0.75,
+        edge_external=0.0,
+        evidence_basis="proxy",
+        edge_source="fallback",
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.30,
+        suppress_hallucinated_edge_penalty=True,
+    )
+    assert result.high_edge_calibration_penalty >= 0.12, (
+        f"Expected penalty >= 0.12 for edge_market=0.50, "
+        f"got {result.high_edge_calibration_penalty}"
+    )
+    assert result.extreme_edge_learning_queue is True
+
+
+def test_high_edge_calibration_penalty_escalates_at_055() -> None:
+    """Edge >= 0.55 forces the maximum penalty of 0.18."""
+    market = Market(
+        id="KXMLBSPREAD-test",
+        question="Test spread",
+        outcomes=[MarketOutcome(name="YES", price=0.20)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.85,
+        bet_size_pct=0.5,
+        reasoning="test",
+        evidence_quality=0.60,
+        evidence_basis="proxy",
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.20,
+    )
+    assert result.high_edge_calibration_penalty >= 0.18, (
+        f"Expected penalty >= 0.18 for edge_market=0.65, "
+        f"got {result.high_edge_calibration_penalty}"
+    )
+    assert result.extreme_edge_learning_queue is True
+
+
+def test_high_edge_calibration_penalty_exempts_direct_definitive() -> None:
+    """Direct evidence + definitive_outcome_eligible should exempt from
+    the high-edge calibration penalty."""
+    market = Market(
+        id="KXMLBGAME-exempt",
+        question="Test settled game",
+        outcomes=[MarketOutcome(name="NO", price=0.40)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.95,
+        bet_size_pct=1.0,
+        reasoning="Game settled per AP recap",
+        evidence_quality=0.90,
+        evidence_basis="direct",
+        primary_source_url="https://apnews.com/article/game-result",
+        definitive_outcome_detected=True,
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.40,
+        definitive_outcome_eligible=True,
+        evidence_basis_class="direct",
+    )
+    assert result.high_edge_calibration_penalty == 0.0
+

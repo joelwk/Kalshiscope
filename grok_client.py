@@ -204,6 +204,20 @@ def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
     return any(marker in error_text for marker in retriable_markers)
 
 
+_QUOTA_EXHAUSTED_MARKERS: tuple[str, ...] = (
+    "resource_exhausted",
+    "available credits",
+    "monthly spending limit",
+    "reached its monthly spending limit",
+)
+
+
+def _is_quota_exhausted_grok_error(exc: Exception) -> bool:
+    """Detect xAI account quota/credit exhaustion (non-retriable, non-transient)."""
+    error_text = str(exc).lower()
+    return any(marker in error_text for marker in _QUOTA_EXHAUSTED_MARKERS)
+
+
 def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, dict):
@@ -1501,6 +1515,7 @@ class GrokClient:
                     "error_type": type(exc).__name__,
                     "duration_ms": round(duration, 2),
                     "retriable": _is_retriable_grok_error(exc, duration),
+                    "quota_exhausted": _is_quota_exhausted_grok_error(exc),
                     "retry_attempt": retry_attempt,
                     "budget_remaining_ms": round(max(0.0, budget_remaining_ms - duration), 2),
                     "previous_analysis": previous_summary if deep else None,

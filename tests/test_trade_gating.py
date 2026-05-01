@@ -544,7 +544,7 @@ def test_definitive_outcome_bypasses_evidence_quality_gate() -> None:
 
 
 def test_definitive_outcome_edge_cap_raised() -> None:
-    """Edge cap should be 0.65 for definitive outcomes instead of 0.35."""
+    """Edge cap should be raised for validated-definitive outcomes."""
     decision = TradeDecision(
         should_trade=True,
         outcome="YES",
@@ -555,6 +555,7 @@ def test_definitive_outcome_edge_cap_raised() -> None:
         evidence_quality=0.85,
         primary_source_url="https://reuters.com/article/test",
         definitive_outcome_detected=True,
+        source_match_class="settlement_aligned",
     )
     market = Market(
         id="KXMLBF5-26APR251415SEASTL-SEA",

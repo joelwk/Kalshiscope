@@ -1042,5 +1042,37 @@ class TestGrokClient(unittest.TestCase):
         self.assertIn("[Outcome mismatch]", validated.reasoning)
 
 
+class TestQuotaExhaustedClassification(unittest.TestCase):
+    """Verify _is_quota_exhausted_grok_error detects xAI spending-limit errors."""
+
+    def test_resource_exhausted_detected(self) -> None:
+        from grok_client import _is_quota_exhausted_grok_error
+
+        exc = RuntimeError(
+            "RESOURCE_EXHAUSTED: Your team has either used all available credits "
+            "or reached its monthly spending limit."
+        )
+        self.assertTrue(_is_quota_exhausted_grok_error(exc))
+
+    def test_monthly_spending_limit_detected(self) -> None:
+        from grok_client import _is_quota_exhausted_grok_error
+
+        exc = RuntimeError("reached its monthly spending limit")
+        self.assertTrue(_is_quota_exhausted_grok_error(exc))
+
+    def test_transient_internal_not_quota(self) -> None:
+        from grok_client import _is_quota_exhausted_grok_error
+
+        exc = RuntimeError("StatusCode.INTERNAL: internal server error")
+        self.assertFalse(_is_quota_exhausted_grok_error(exc))
+
+    def test_retriable_excludes_quota(self) -> None:
+        exc = RuntimeError(
+            "RESOURCE_EXHAUSTED: monthly spending limit"
+        )
+        result = _is_retriable_grok_error(exc, 100.0)
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()

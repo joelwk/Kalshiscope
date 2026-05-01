@@ -1263,12 +1263,12 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertAlmostEqual(
             breakdown["pre_score_historical_family_pnl_penalty"],
-            0.21,
+            0.15,
             places=6,
         )
         self.assertAlmostEqual(
             breakdown["pre_score_historical_family_pnl_ratio"],
-            2.1,
+            0.525,
             places=6,
         )
 
@@ -2903,7 +2903,7 @@ class TestPreAnalysisOpportunityResearchBand(unittest.TestCase):
 class TestLifetimeAnalysisCap(unittest.TestCase):
     def test_config_defaults(self) -> None:
         settings = Settings()
-        self.assertEqual(settings.MAX_LIFETIME_ANALYSES_PER_MARKET, 12)
+        self.assertEqual(settings.MAX_LIFETIME_ANALYSES_PER_MARKET, 8)
 
     def test_cap_zero_disables_check(self) -> None:
         settings = Settings(MAX_LIFETIME_ANALYSES_PER_MARKET=0)

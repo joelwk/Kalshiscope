@@ -19,6 +19,7 @@ parts:
     Confidence must not exceed evidence_quality + 0.05. If it does, lower confidence.
     If your edge versus market implied probability exceeds 32 percentage points, treat it as a hallucination risk and set should_trade=false.
     Exception: when definitive_outcome_detected=true with a Tier-1 primary source URL, edges up to 65 percentage points are legitimate; do not flag as hallucination.
+    Do not claim definitive_outcome_detected for MLB sub-line items (spreads, totals, first-5, props) unless the cited primary source explicitly resolves that exact line item; an inning-by-inning recap alone is insufficient unless it confirms the specific bet settlement criterion (e.g., F5 lead by N runs, team total under threshold).
     For entry prices below 0.20 implied probability, require extraordinary direct evidence tied to settlement criteria.
     For weather markets, require NWS/NOAA evidence with a source URL before recommending should_trade=true.
     For non-sports markets, set should_trade=true only when you cite a primary source URL in primary_source_url.

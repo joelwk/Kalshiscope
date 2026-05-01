@@ -146,6 +146,12 @@ _XAI_RETRIABLE_ERROR_MARKERS = (
     "service temporarily unavailable",
     "temporarily unavailable",
 )
+_XAI_QUOTA_EXHAUSTED_MARKERS = (
+    "resource_exhausted",
+    "available credits",
+    "monthly spending limit",
+    "reached its monthly spending limit",
+)
 _WEATHER_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
 _PRE_ANALYSIS_HARD_REJECTION_TERMINAL_OUTCOMES = {
     "no_trade_recommended",
@@ -169,6 +175,7 @@ _MLB_SUBFAMILY_PREFIXES = (
     "KXMLBF5-",
     "KXMLBTOTAL-",
 )
+_MLB_NO_EDGE_CONFIDENCE_CAP = 0.70
 _RESEARCH_QUEUE_MAXLEN = 200
 _RESEARCH_QUEUE_EVIDENCE_GAP_MAX = 0.08
 _RESEARCH_QUEUE_EDGE_GAP_MAX = 0.08
@@ -222,6 +229,13 @@ def _is_retriable_xai_error(error_text: str | None) -> bool:
     if not normalized:
         return False
     return any(marker in normalized for marker in _XAI_RETRIABLE_ERROR_MARKERS)
+
+
+def _is_quota_exhausted_xai_error(error_text: str | None) -> bool:
+    normalized = (error_text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _XAI_QUOTA_EXHAUSTED_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -1001,17 +1015,22 @@ def _passes_edge_threshold(
     )
     edge = effective_confidence - implied_prob
     is_definitive = _is_definitive_outcome_eligible(decision, settings)
+    is_definitive_validated = (
+        is_definitive
+        and bool(getattr(decision, "definitive_outcome_detected", False))
+        and float(getattr(decision, "evidence_quality", 0.0) or 0.0) >= 0.80
+        and _decision_evidence_basis(decision) == "direct"
+        and (getattr(decision, "source_match_class", "") or "").strip().lower()
+        == "settlement_aligned"
+    )
     max_reasonable_edge = (
         max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX)))
-        if is_definitive
+        if is_definitive_validated
         else max(0.0, min(1.0, float(settings.MAX_REASONABLE_EDGE)))
     )
-    if abs(edge) > max_reasonable_edge + 1e-9 and not is_definitive:
+    if abs(edge) > max_reasonable_edge + 1e-9 and not is_definitive_validated:
         return False, edge, "edge_above_reasonable_max"
-    if abs(edge) > max_reasonable_edge + 1e-9 and is_definitive:
-        # Definitive outcomes can have legitimate huge edges (game over,
-        # market hasn't caught up). Allow up to the definitive cap; only
-        # block on truly absurd values (>0.95).
+    if abs(edge) > max_reasonable_edge + 1e-9 and is_definitive_validated:
         if abs(edge) > 0.95:
             return False, edge, "edge_above_reasonable_max"
     if (
@@ -3625,19 +3644,26 @@ def _pre_analysis_opportunity_score(
             historical_family_sample_size >= historical_pnl_min_samples
             and historical_family_pnl <= historical_pnl_threshold
         ):
+            pnl_per_trade = historical_family_pnl / max(
+                historical_family_sample_size,
+                historical_pnl_min_samples,
+            )
             historical_pnl_penalty_base = max(
                 0.0,
                 settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY,
             )
-            pnl_threshold_abs = max(0.01, abs(historical_pnl_threshold))
-            historical_family_pnl_ratio = max(
-                1.0,
-                abs(historical_family_pnl) / pnl_threshold_abs,
-            )
-            historical_family_pnl_penalty = min(
-                0.25,
-                historical_pnl_penalty_base * historical_family_pnl_ratio,
-            )
+            if pnl_per_trade <= -1.0:
+                historical_family_pnl_penalty = min(
+                    0.25,
+                    max(0.0, settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY),
+                )
+            elif pnl_per_trade <= -0.30:
+                historical_family_pnl_penalty = min(0.25, historical_pnl_penalty_base)
+            elif pnl_per_trade <= -0.05:
+                historical_family_pnl_penalty = min(0.25, historical_pnl_penalty_base * 0.25)
+            else:
+                historical_family_pnl_penalty = 0.0
+            historical_family_pnl_ratio = abs(pnl_per_trade)
             severe_pnl_threshold = float(
                 settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD
             )
@@ -4171,6 +4197,7 @@ def _analyze_market_candidate(
             "analysis_error": error_text,
             "analysis_error_type": type(exc).__name__,
             "analysis_error_retriable_xai": _is_retriable_xai_error(error_text),
+            "analysis_error_quota_exhausted": _is_quota_exhausted_xai_error(error_text),
             "analysis_is_timeout": is_timeout,
             "analysis_search_profile": getattr(search_config, "profile_name", None),
             "was_refined": False,
@@ -4464,6 +4491,7 @@ def main(max_cycles: int | None = None) -> None:
     daily_start_balance: float | None = None
     cumulative_api_cost_estimate_usd = 0.0
     consecutive_zero_order_cycles = 0
+    xai_quota_paused_until: datetime | None = None
 
     while True:
         cycle_count += 1
@@ -5945,6 +5973,29 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 analysis_candidates = analyzable_candidates
 
+            # -- xAI quota-exhaustion cross-cycle breaker --
+            xai_quota_paused_this_cycle = False
+            if (
+                settings.XAI_QUOTA_BREAKER_ENABLED
+                and xai_quota_paused_until is not None
+            ):
+                if datetime.now(timezone.utc) < xai_quota_paused_until:
+                    logger.info(
+                        "xAI quota pause active; skipping analysis phase (resumes %s)",
+                        xai_quota_paused_until.isoformat(),
+                        data={
+                            "xai_quota_paused": True,
+                            "paused_until_utc": xai_quota_paused_until.isoformat(),
+                        },
+                    )
+                    xai_quota_paused_this_cycle = True
+                else:
+                    logger.info(
+                        "xAI quota pause expired; resuming analysis",
+                        data={"xai_quota_paused": False},
+                    )
+                    xai_quota_paused_until = None
+
             analysis_results: dict[str, dict[str, Any]] = {}
             analysis_phase_start = time.monotonic()
             analysis_candidates_count = len(analysis_candidates)
@@ -5955,6 +6006,12 @@ def main(max_cycles: int | None = None) -> None:
             parallel_analysis_used = False
             analysis_worker_count = 1
             xai_circuit_breaker_triggered = False
+
+            if xai_quota_paused_this_cycle:
+                analysis_candidates = []
+                analysis_candidates_count = 0
+                parallel_analysis_requested = False
+                analysis_phase_duration_ms = 0.0
 
             if parallel_analysis_requested:
                 configured_workers = max(1, settings.ANALYSIS_MAX_WORKERS)
@@ -6003,6 +6060,22 @@ def main(max_cycles: int | None = None) -> None:
                                     exc,
                                     data={"market_id": market.id, "error": str(exc)},
                                 )
+                                if _is_quota_exhausted_xai_error(str(exc)):
+                                    if settings.XAI_QUOTA_BREAKER_ENABLED:
+                                        pause_until = datetime.now(timezone.utc) + timedelta(
+                                            minutes=max(1, settings.XAI_QUOTA_PAUSE_MINUTES)
+                                        )
+                                        xai_quota_paused_until = pause_until
+                                        logger.error(
+                                            "xAI quota exhausted; pausing analysis for %d minutes until %s",
+                                            settings.XAI_QUOTA_PAUSE_MINUTES,
+                                            pause_until.isoformat(),
+                                            data={
+                                                "xai_quota_exhausted": True,
+                                                "pause_minutes": settings.XAI_QUOTA_PAUSE_MINUTES,
+                                                "paused_until_utc": pause_until.isoformat(),
+                                            },
+                                        )
                                 logger.info(
                                     "Market %s skipped for this cycle due to analysis failure after retries",
                                     market.id,
@@ -6031,6 +6104,26 @@ def main(max_cycles: int | None = None) -> None:
                                     "xai_circuit_breaker_max_failures": settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
                                     "xai_retriable_failures": xai_failure_count,
                                     "total_results": len(analysis_results),
+                                },
+                            )
+                    if parallel_analysis_used and settings.XAI_QUOTA_BREAKER_ENABLED:
+                        quota_hit = any(
+                            r.get("analysis_failed") and r.get("analysis_error_quota_exhausted")
+                            for r in analysis_results.values()
+                        )
+                        if quota_hit:
+                            pause_until = datetime.now(timezone.utc) + timedelta(
+                                minutes=max(1, settings.XAI_QUOTA_PAUSE_MINUTES)
+                            )
+                            xai_quota_paused_until = pause_until
+                            logger.error(
+                                "xAI quota exhausted (parallel batch); pausing analysis for %d minutes until %s",
+                                settings.XAI_QUOTA_PAUSE_MINUTES,
+                                pause_until.isoformat(),
+                                data={
+                                    "xai_quota_exhausted": True,
+                                    "pause_minutes": settings.XAI_QUOTA_PAUSE_MINUTES,
+                                    "paused_until_utc": pause_until.isoformat(),
                                 },
                             )
                 except Exception as exc:
@@ -6071,6 +6164,23 @@ def main(max_cycles: int | None = None) -> None:
                                 consecutive_xai_failures += 1
                             else:
                                 consecutive_xai_failures = 0
+                            if result.get("analysis_error_quota_exhausted"):
+                                if settings.XAI_QUOTA_BREAKER_ENABLED:
+                                    pause_until = datetime.now(timezone.utc) + timedelta(
+                                        minutes=max(1, settings.XAI_QUOTA_PAUSE_MINUTES)
+                                    )
+                                    xai_quota_paused_until = pause_until
+                                    logger.error(
+                                        "xAI quota exhausted (from result); pausing analysis for %d minutes until %s",
+                                        settings.XAI_QUOTA_PAUSE_MINUTES,
+                                        pause_until.isoformat(),
+                                        data={
+                                            "xai_quota_exhausted": True,
+                                            "pause_minutes": settings.XAI_QUOTA_PAUSE_MINUTES,
+                                            "paused_until_utc": pause_until.isoformat(),
+                                        },
+                                    )
+                                    break
                         else:
                             consecutive_xai_failures = 0
                             successful_analysis_count += 1
@@ -6126,6 +6236,23 @@ def main(max_cycles: int | None = None) -> None:
                             consecutive_xai_failures += 1
                         else:
                             consecutive_xai_failures = 0
+                        if _is_quota_exhausted_xai_error(error_text):
+                            if settings.XAI_QUOTA_BREAKER_ENABLED:
+                                pause_until = datetime.now(timezone.utc) + timedelta(
+                                    minutes=max(1, settings.XAI_QUOTA_PAUSE_MINUTES)
+                                )
+                                xai_quota_paused_until = pause_until
+                                logger.error(
+                                    "xAI quota exhausted; pausing analysis for %d minutes until %s",
+                                    settings.XAI_QUOTA_PAUSE_MINUTES,
+                                    pause_until.isoformat(),
+                                    data={
+                                        "xai_quota_exhausted": True,
+                                        "pause_minutes": settings.XAI_QUOTA_PAUSE_MINUTES,
+                                        "paused_until_utc": pause_until.isoformat(),
+                                    },
+                                )
+                                break
                         if (
                             not xai_circuit_breaker_triggered
                             and settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES > 0
@@ -6929,6 +7056,42 @@ def main(max_cycles: int | None = None) -> None:
                         )
                         continue
 
+                # MLB no-edge confidence cap
+                if (
+                    not decision.abstain
+                    and decision.should_trade
+                    and any(
+                        (market.id or "").upper().startswith(p)
+                        for p in _MLB_PRIORITY_PREFIXES + _MLB_SUBFAMILY_PREFIXES
+                    )
+                ):
+                    _mlb_implied = _get_implied_probability(market, decision.outcome)
+                    _mlb_edge = (
+                        decision.confidence - _mlb_implied
+                        if _mlb_implied is not None
+                        else (decision.edge_external or 0.0)
+                    )
+                    if _mlb_edge is None or _mlb_edge <= 0:
+                        if decision.confidence > _MLB_NO_EDGE_CONFIDENCE_CAP:
+                            _original_mlb_conf = decision.confidence
+                            decision.confidence = _MLB_NO_EDGE_CONFIDENCE_CAP
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                "mlb_no_edge_confidence_cap_applied",
+                            )
+                            logger.info(
+                                "MLB no-edge confidence cap applied: %s conf %.4f -> %.4f",
+                                market.id,
+                                _original_mlb_conf,
+                                decision.confidence,
+                                data={
+                                    "market_id": market.id,
+                                    "original_confidence": _original_mlb_conf,
+                                    "capped_confidence": decision.confidence,
+                                    "reason": "mlb_no_edge_confidence_cap",
+                                },
+                            )
+
                 entry_price = _get_outcome_entry_price(market, decision.outcome)
                 implied_prob = _get_implied_probability(market, decision.outcome)
                 audit_context["audit_entry_price"] = entry_price
@@ -7261,6 +7424,16 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
+                _def_validated = (
+                    _is_definitive_outcome_eligible(decision_for_edge, settings)
+                    and bool(getattr(decision_for_edge, "definitive_outcome_detected", False))
+                    and float(getattr(decision_for_edge, "evidence_quality", 0.0) or 0.0) >= 0.80
+                    and _decision_evidence_basis(decision_for_edge) == "direct"
+                    and (getattr(decision_for_edge, "source_match_class", "") or "").strip().lower()
+                    == "settlement_aligned"
+                )
+                if _def_validated:
+                    audit_context["definitive_edge_bypass_validated"] = True
                 calibration_payload = {
                     "market_id": market.id,
                     "cycle": cycle_count,
@@ -9733,6 +9906,8 @@ def main(max_cycles: int | None = None) -> None:
                     sorted(_confidence_bucket_decision_counts.items())
                 ),
                 "pre_analysis_research_routed_count": pre_analysis_research_routed_count,
+                "markets_considered": len(markets),
+                "markets_filtered": len(markets),
             }
             logger.info(
                 "Cycle receipt",
@@ -9932,6 +10107,8 @@ def main(max_cycles: int | None = None) -> None:
                         mean_confidence_delta,
                         4,
                     ),
+                    "markets_considered": len(markets),
+                    "markets_filtered": len(markets),
                 },
             )
             logger.info(

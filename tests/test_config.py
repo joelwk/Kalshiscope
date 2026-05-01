@@ -335,7 +335,7 @@ class TestConfig(unittest.TestCase):
         settings = config.Settings()
         self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.75)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER, 0.72)
-        self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.68)
+        self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
         self.assertIn("weather.gov", settings.DIRECT_SOURCE_WHITELIST)
         self.assertEqual(settings.SCORE_GATE_MODE, "active")
         self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.52)
@@ -361,7 +361,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 10)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
-        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 90)
+        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 240)
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
@@ -390,7 +390,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)
         self.assertTrue(settings.HISTORICAL_TICKER_PREFIX_GATE_ENABLED)
         self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES, 3)
-        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF, -3.0)
+        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF, -2.0)
         self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_WIN_RATE_CUTOFF, 0.40)
         self.assertTrue(settings.HISTORICAL_FAMILY_GATE_ENABLED)
         self.assertEqual(settings.HISTORICAL_FAMILY_MIN_SAMPLES, 12)
@@ -434,6 +434,29 @@ class TestConfig(unittest.TestCase):
         self.assertIn("flashscore.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
         self.assertIn("atptour", config.Settings.SPORTS_ALLOWED_X_HANDLES)
         self.assertIn("WTA", config.Settings.SPORTS_ALLOWED_X_HANDLES)
+
+    def test_profit_leak_fix_defaults(self) -> None:
+        """Verify the profit-leak-fix defaults match .env.example values."""
+        defaults = config.Settings
+        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.40)
+        self.assertEqual(defaults.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
+        self.assertEqual(defaults.MAX_REANALYSES_PER_MARKET_PER_DAY, 2)
+        self.assertEqual(defaults.MAX_LIFETIME_ANALYSES_PER_MARKET, 8)
+        self.assertEqual(defaults.GROK_STREAM_TIMEOUT_SECONDS, 75)
+        self.assertEqual(defaults.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF, -2.0)
+        self.assertTrue(defaults.XAI_QUOTA_BREAKER_ENABLED)
+        self.assertEqual(defaults.XAI_QUOTA_PAUSE_MINUTES, 30)
+
+    def test_quota_breaker_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "XAI_QUOTA_BREAKER_ENABLED": "false",
+            "XAI_QUOTA_PAUSE_MINUTES": "60",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.XAI_QUOTA_BREAKER_ENABLED)
+        self.assertEqual(settings.XAI_QUOTA_PAUSE_MINUTES, 60)
 
 
 if __name__ == "__main__":

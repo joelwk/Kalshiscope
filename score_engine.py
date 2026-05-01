@@ -291,8 +291,7 @@ def compute_final_score(
     edge_abs_max = max(abs(edge_market), abs(edge_external))
     high_edge_threshold = min(normalized_max_reasonable_edge, 0.32)
     if (
-        not suppress_hallucinated_edge_penalty
-        and edge_abs_max > high_edge_threshold
+        edge_abs_max > high_edge_threshold
         and not (
             normalized_evidence_basis == "direct"
             and definitive_outcome_eligible
@@ -304,6 +303,9 @@ def compute_final_score(
         )
         if edge_abs_max > max(0.45, high_edge_threshold):
             high_edge_calibration_penalty = max(high_edge_calibration_penalty, 0.12)
+            extreme_edge_learning_queue = True
+        if edge_abs_max >= 0.55:
+            high_edge_calibration_penalty = max(high_edge_calibration_penalty, 0.18)
             extreme_edge_learning_queue = True
 
     weather_uncertainty_penalty = 0.0

@@ -6,7 +6,7 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    "analyze": "f7b233c508a07d33667d560ab9ae786da81576213d25b907790de41112fcc701",
+    "analyze": "965a8140f6296556298c0d8cd9ce8cb55c37471fdee544166522153c58bb8887",
     "deep": "d0550226ab14dcc2ec52fff8733f51df5daa8c207e329b685a4b0e07c532dfc6",
 }
 
