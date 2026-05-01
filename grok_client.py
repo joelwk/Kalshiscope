@@ -1185,15 +1185,28 @@ class GrokClient:
         self,
         budget_remaining_ms: float | None,
         search_profile: str | None = None,
+        deep: bool = False,
     ) -> float:
         """Per-attempt stream deadline, clamped to the remaining analysis budget.
 
         When *search_profile* is ``"crypto"`` the per-profile timeout from
         settings (``GROK_STREAM_TIMEOUT_SECONDS_CRYPTO``) is preferred over
         the generic default, giving crypto markets a longer window to avoid
-        frequent timeouts.
+        frequent timeouts. When *deep* is True we use
+        ``GROK_STREAM_TIMEOUT_SECONDS_DEEP`` (defaults to a higher value than
+        the initial-pass timeout) since deep refinement runs richer prompts.
         """
         base_timeout = float(self.stream_timeout_seconds)
+        if (
+            deep
+            and hasattr(self, "settings")
+            and self.settings is not None
+        ):
+            deep_timeout = getattr(
+                self.settings, "GROK_STREAM_TIMEOUT_SECONDS_DEEP", None
+            )
+            if deep_timeout is not None and int(deep_timeout) > 0:
+                base_timeout = max(base_timeout, float(deep_timeout))
         if (
             search_profile == "crypto"
             and hasattr(self, "settings")
@@ -1203,7 +1216,7 @@ class GrokClient:
                 self.settings, "GROK_STREAM_TIMEOUT_SECONDS_CRYPTO", None
             )
             if crypto_timeout is not None and int(crypto_timeout) > 0:
-                base_timeout = float(crypto_timeout)
+                base_timeout = max(base_timeout, float(crypto_timeout))
         if budget_remaining_ms is None or budget_remaining_ms <= 0:
             return base_timeout
         budget_seconds = max(
@@ -1218,6 +1231,7 @@ class GrokClient:
         *,
         budget_remaining_ms: float | None = None,
         search_profile: str | None = None,
+        deep: bool = False,
     ) -> tuple[str, int, dict[str, int | None]]:
         content = ""
         chunk_count = 0
@@ -1228,7 +1242,9 @@ class GrokClient:
             "cached_tokens": None,
         }
         deadline_seconds = self._resolve_stream_deadline_seconds(
-            budget_remaining_ms, search_profile=search_profile
+            budget_remaining_ms,
+            search_profile=search_profile,
+            deep=deep,
         )
         deadline = time.monotonic() + deadline_seconds
         for response, chunk in chat.stream():
@@ -1384,6 +1400,7 @@ class GrokClient:
                 market.id,
                 budget_remaining_ms=budget_remaining_ms,
                 search_profile=getattr(active_config, "profile_name", None),
+                deep=deep,
             )
             data = self._parse_response_payload(market.id, content, deep=deep)
             raw_payload = dict(data)

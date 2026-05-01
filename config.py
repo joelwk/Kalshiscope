@@ -351,6 +351,10 @@ class Settings:
     XAI_QUOTA_PAUSE_MINUTES: int = 30
     XAI_CLIENT_TIMEOUT_SECONDS: int = 120
     GROK_STREAM_TIMEOUT_SECONDS: int = 75
+    # Deep refinement runs richer prompts and tends to take longer than the
+    # initial pass; keep its per-attempt deadline at the pre-fix value of 90s
+    # so legitimate refinements (e.g. KXINXU at ~75s) don't timeout.
+    GROK_STREAM_TIMEOUT_SECONDS_DEEP: int = 90
     GROK_ANALYSIS_MAX_BUDGET_SECONDS: int = 240
 
     # Resolution tracking
@@ -1058,6 +1062,10 @@ def load_settings() -> Settings:
         GROK_STREAM_TIMEOUT_SECONDS=_read_env_int(
             "GROK_STREAM_TIMEOUT_SECONDS",
             Settings.GROK_STREAM_TIMEOUT_SECONDS,
+        ),
+        GROK_STREAM_TIMEOUT_SECONDS_DEEP=_read_env_int(
+            "GROK_STREAM_TIMEOUT_SECONDS_DEEP",
+            Settings.GROK_STREAM_TIMEOUT_SECONDS_DEEP,
         ),
         GROK_ANALYSIS_MAX_BUDGET_SECONDS=_read_env_int(
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS",
