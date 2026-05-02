@@ -3031,6 +3031,95 @@ class TestCounterfactualAuditFields(unittest.TestCase):
         )
         self.assertEqual(fields["counterfactual_prefix_samples_short_by"], 13)
 
+    def test_helper_emits_drawdown_counterfactual_for_drawdown_reason(self) -> None:
+        settings = Settings(MAX_DAILY_DRAWDOWN_USDC=25.0)
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_daily_drawdown_blocked",
+            settings=settings,
+        )
+        self.assertEqual(
+            fields["counterfactual_required_for_drawdown_block"],
+            "drawdown_reset_or_position_close",
+        )
+        self.assertEqual(fields["counterfactual_max_daily_drawdown_usdc"], 25.0)
+
+
+class TestSkipDueToForReason(unittest.TestCase):
+    """Regression tests for the skip-reason categorizer used by audit/receipts."""
+
+    def setUp(self) -> None:
+        from main import _skip_due_to_for_reason
+        self._fn = _skip_due_to_for_reason
+
+    def test_pre_analysis_score_soft_research_returns_weak_pre_analysis_score(self) -> None:
+        """Score-band soft-research must be tagged as a pre-analysis-score
+        weakness, not as 'weak_edge'. Distinguishing these in receipts lets
+        analytics tell apart 'low pre-analysis opportunity score' from 'low
+        runtime edge'."""
+        self.assertEqual(
+            self._fn("pre_analysis_score_soft_research"),
+            "weak_pre_analysis_score",
+        )
+        self.assertEqual(
+            self._fn("pre_analysis_score_below_min"),
+            "weak_pre_analysis_score",
+        )
+        self.assertEqual(
+            self._fn("pre_analysis_score_far_below_min"),
+            "weak_pre_analysis_score",
+        )
+
+    def test_daily_drawdown_blocked_returns_risk_cap(self) -> None:
+        self.assertEqual(
+            self._fn("pre_analysis_daily_drawdown_blocked"),
+            "risk_cap",
+        )
+        self.assertEqual(self._fn("daily_drawdown_limit"), "risk_cap")
+
+    def test_fallback_edge_high_churn_returns_repeated_churn(self) -> None:
+        """High-churn fallback-edge reasons describe repeated non-actionable
+        cycles, not weak-edge market-judgment failures."""
+        self.assertEqual(
+            self._fn("pre_analysis_fallback_edge_high_churn"),
+            "repeated_churn",
+        )
+
+    def test_evidence_reason_returns_lack_of_evidence(self) -> None:
+        self.assertEqual(self._fn("evidence_quality_below_min"), "lack_of_evidence")
+
+    def test_timeout_reason_returns_timeout(self) -> None:
+        self.assertEqual(self._fn("grok_stream_timeout"), "timeout")
+
+
+class TestSyntheticDecisionAuditFields(unittest.TestCase):
+    """Receipts for markets that were never actually analyzed by Grok must
+    explicitly mark themselves so analytics can partition real findings from
+    placeholder triples (eq=0.0/edge_source=none/basis=absence_only)."""
+
+    def test_constant_carries_expected_flags(self) -> None:
+        from main import _SYNTHETIC_DECISION_AUDIT_FIELDS as fields
+        self.assertTrue(fields["analysis_skipped"])
+        self.assertTrue(fields["evidence_quality_unevaluated"])
+        self.assertTrue(fields["edge_source_unevaluated"])
+        self.assertFalse(fields["pre_analysis_hard_reject"])
+
+    def test_synthetic_audit_resolves_hard_reject_naming(self) -> None:
+        """final_action=research_queued must NOT be conflated with hard reject;
+        the explicit pre_analysis_hard_reject=False resolves the legacy
+        naming confusion in receipts."""
+        from main import _SYNTHETIC_DECISION_AUDIT_FIELDS, _build_execution_audit
+        audit = _build_execution_audit(
+            decision_terminal=False,
+            final_action="research_queued",
+            final_reason="pre_analysis_score_soft_research",
+            decision_origin="synthetic_research_queue",
+            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+        )
+        self.assertEqual(audit["final_action"], "research_queued")
+        self.assertFalse(audit["pre_analysis_hard_reject"])
+        self.assertTrue(audit["analysis_skipped"])
+        self.assertTrue(audit["synthetic_decision"])
+
 
 class TestPreviousAnalysisAnchorEvidence(unittest.TestCase):
     def test_anchor_evidence_fields_preserved(self) -> None:

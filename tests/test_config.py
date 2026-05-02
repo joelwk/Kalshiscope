@@ -462,6 +462,96 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.XAI_QUOTA_BREAKER_ENABLED)
         self.assertEqual(settings.XAI_QUOTA_PAUSE_MINUTES, 60)
 
+    def test_pre_analysis_participation_alias_overrides_legacy(self) -> None:
+        """The new PRE_ANALYSIS_PARTICIPATION_* names take precedence over the
+        legacy PRE_ANALYSIS_HARD_REJECTION_* names so the rename is real but
+        non-breaking."""
+        env = {
+            **self._required_env(),
+            "PRE_ANALYSIS_HARD_REJECTION_ENABLED": "false",
+            "PRE_ANALYSIS_PARTICIPATION_GATING_ENABLED": "true",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK": "3",
+            "PRE_ANALYSIS_PARTICIPATION_MIN_STREAK": "7",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES": "5",
+            "PRE_ANALYSIS_PARTICIPATION_MIN_ANALYSES": "9",
+            "PRE_ANALYSIS_HARD_REJECTION_FAMILIES": "speech,music",
+            "PRE_ANALYSIS_PARTICIPATION_FAMILIES": "weather,crypto",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertTrue(settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK, 7)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES, 9)
+        self.assertEqual(
+            settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
+            ("weather", "crypto"),
+        )
+
+    def test_pre_analysis_legacy_name_still_works_when_alias_unset(self) -> None:
+        """When the new alias is unset, the legacy PRE_ANALYSIS_HARD_REJECTION_*
+        env vars are still honored. Operators don't need to migrate today."""
+        env = {
+            **self._required_env(),
+            "PRE_ANALYSIS_HARD_REJECTION_ENABLED": "false",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK": "11",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES": "13",
+            "PRE_ANALYSIS_HARD_REJECTION_FAMILIES": "sports",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK, 11)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES, 13)
+        self.assertEqual(
+            settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
+            ("sports",),
+        )
+
+    def test_research_queue_drain_settings_load_with_defaults(self) -> None:
+        env = self._required_env()
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 1)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+
+    def test_research_queue_drain_settings_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "RESEARCH_QUEUE_DRAIN_ENABLED": "false",
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE": "3",
+            "RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS": "0.25",
+            "RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS": "24.0",
+            "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY": "0.65",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 3)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 0.25)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 24.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.65)
+
+    def test_daily_drawdown_preflight_setting_loads(self) -> None:
+        env = {**self._required_env(), "DAILY_DRAWDOWN_PREFLIGHT_ENABLED": "false"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.DAILY_DRAWDOWN_PREFLIGHT_ENABLED)
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertTrue(defaults.DAILY_DRAWDOWN_PREFLIGHT_ENABLED)
+
+    def test_cycle_yield_alert_escalation_setting_loads(self) -> None:
+        env = {**self._required_env(), "CYCLE_YIELD_ALERT_ESCALATE_AFTER": "5"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER, 5)
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.CYCLE_YIELD_ALERT_ESCALATE_AFTER, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

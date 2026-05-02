@@ -214,6 +214,66 @@ def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
     assert result.what_to_learn_next is not None
 
 
+def test_tiered_tiny_sample_never_hard_blocks_regardless_of_pnl() -> None:
+    """Regression guard: tiny samples (n < hard_block_min_samples) must never
+    produce HARD_DENY no matter how bad the win-rate, total PnL, or shrunk
+    PnL/trade are. The user explicitly flagged "tiny-sample historical-gate
+    hard blocking" as a concern; this test prevents that regression."""
+    worst_case_metrics = PerformanceStats(
+        sample_size=4,
+        wins=0,
+        win_rate=0.0,
+        pnl_total=-100.0,
+    )
+    result = evaluate_market_tiered(
+        market_id="KXTINY-12345678-TEST",
+        family="generic",
+        prefix_stats={"KXTINY-12345": worst_case_metrics},
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier != GateTier.HARD_DENY
+    assert result.allowed is True
+    assert result.reason == "historical_prefix_small_sample_negative"
+
+
+def test_tiered_sample_just_below_hard_block_floor_stays_soft() -> None:
+    """Sample size = hard_block_min_samples - 1 must still be SOFT_DEMOTE,
+    even with terrible metrics. The hard-block path is only reached when
+    sample_size >= hard_block_min_samples."""
+    result = evaluate_market_tiered(
+        market_id="KXBORDER-12345678-TEST",
+        family="generic",
+        prefix_stats={
+            # 12-char ticker prefix extracted from market_id above.
+            "KXBORDER-123": PerformanceStats(
+                sample_size=19,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-50.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.allowed is True
+
+
 def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     """With n=12 >= hard_block_min_samples and low Wilson LB, the tiered
     evaluator should produce HARD_DENY."""

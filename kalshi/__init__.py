@@ -1,2 +1,2 @@
-"""Predi package."""
+"""Kalshi package."""
 

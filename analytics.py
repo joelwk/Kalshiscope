@@ -442,6 +442,8 @@ def run(db_path: str) -> None:
                         COALESCE(CAST(json_extract(decision_json, '$.confidence') AS REAL), 0.0) AS confidence
                     FROM decision_receipts
                     WHERE COALESCE(final_action, '') IN ('order_submitted', 'dry_run')
+                      AND COALESCE(json_extract(audit_json, '$.analysis_skipped'), 0) = 0
+                      AND COALESCE(json_extract(audit_json, '$.synthetic_decision'), 0) = 0
                     """
                 ).fetchall()
                 if retrospective_rows:

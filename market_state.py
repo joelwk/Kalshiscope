@@ -1381,6 +1381,76 @@ class MarketStateManager:
         self._conn.commit()
         return cursor.rowcount
 
+    def get_drainable_research_entries(
+        self,
+        *,
+        min_age_hours: float = 1.0,
+        max_age_hours: float = 12.0,
+        limit: int = 5,
+        excluded_market_ids: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return research-queue entries eligible for forced re-analysis.
+
+        Eligibility window is ``min_age_hours <= age_since_queued <= max_age_hours``.
+        Caller passes ``excluded_market_ids`` (e.g. tickers already on this cycle's
+        candidate list, already-traded markets, or recently-resolved markets) so
+        we don't double-promote. Results are ordered oldest-first to give the
+        longest-waiting entries a turn before fresher ones.
+        """
+        now = datetime.now(timezone.utc)
+        max_cutoff_iso = (
+            now - timedelta(hours=max(0.0, float(max_age_hours)))
+        ).isoformat()
+        min_cutoff_iso = (
+            now - timedelta(hours=max(0.0, float(min_age_hours)))
+        ).isoformat()
+        excluded = tuple(
+            str(mid).strip()
+            for mid in (excluded_market_ids or ())
+            if str(mid or "").strip()
+        )
+        if excluded:
+            placeholders = ",".join("?" * len(excluded))
+            sql = f"""
+                SELECT market_id, cycle_id, queued_at, gate_name, reason,
+                       threshold_gap, what_to_learn_next, last_seen, expires_at,
+                       last_decision_json
+                FROM research_queue_entries
+                WHERE queued_at >= ?
+                  AND queued_at <= ?
+                  AND (expires_at IS NULL OR expires_at >= ?)
+                  AND market_id NOT IN ({placeholders})
+                ORDER BY queued_at ASC
+                LIMIT ?
+            """
+            params: tuple[Any, ...] = (
+                max_cutoff_iso,
+                min_cutoff_iso,
+                now.isoformat(),
+                *excluded,
+                max(0, int(limit)),
+            )
+        else:
+            sql = """
+                SELECT market_id, cycle_id, queued_at, gate_name, reason,
+                       threshold_gap, what_to_learn_next, last_seen, expires_at,
+                       last_decision_json
+                FROM research_queue_entries
+                WHERE queued_at >= ?
+                  AND queued_at <= ?
+                  AND (expires_at IS NULL OR expires_at >= ?)
+                ORDER BY queued_at ASC
+                LIMIT ?
+            """
+            params = (
+                max_cutoff_iso,
+                min_cutoff_iso,
+                now.isoformat(),
+                max(0, int(limit)),
+            )
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:
         text = f"{market_id} {question} {category}".upper()

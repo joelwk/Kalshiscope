@@ -346,6 +346,11 @@ class Settings:
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
     MAX_DAILY_DRAWDOWN_USDC: float = 30.0
+    # When the daily drawdown cap is already exceeded, skip Grok analysis for
+    # the remainder of the day and route candidates to research_queue with
+    # tier=MONITOR_ONLY so we capture the conviction signal without spending
+    # API tokens on trades that will be blocked downstream by the same cap.
+    DAILY_DRAWDOWN_PREFLIGHT_ENABLED: bool = True
     XAI_CIRCUIT_BREAKER_MAX_FAILURES: int = 3
     XAI_QUOTA_BREAKER_ENABLED: bool = True
     XAI_QUOTA_PAUSE_MINUTES: int = 30
@@ -500,6 +505,14 @@ class Settings:
     RESEARCH_QUEUE_PERSIST_TO_DB: bool = True
     RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS: int = 6
     RESEARCH_QUEUE_PRIORITY_ENABLED: bool = True
+    # Periodically promote stale research-queued markets back to deep analysis so
+    # the queue is not a write-only black hole. Conservative defaults: at most one
+    # forced probe per cycle, only after the entry has aged at least an hour.
+    RESEARCH_QUEUE_DRAIN_ENABLED: bool = True
+    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 1
+    RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
+    RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
+    RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.55
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
     EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
     PRE_ANALYSIS_ZERO_ACTION_FAMILY_USE_DEEP_ANALYZED_DENOMINATOR: bool = True
@@ -508,6 +521,10 @@ class Settings:
     DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX: float = 0.40
     PARTICIPATION_TIER_AUDIT_ENABLED: bool = True
     PARTICIPATION_TIER_GATING_ENABLED: bool = True
+    # Escalate the per-cycle "zero execution candidates with research_queue >50"
+    # warning to ERROR after this many consecutive cycles so predictbot_errors.log
+    # captures sustained selection failure. 0 disables escalation.
+    CYCLE_YIELD_ALERT_ESCALATE_AFTER: int = 2
     NEGATIVE_BEST_SCORE_DEEP_ANALYSIS_FLOOR: float = 0.05
     CRYPTO_PREFLIGHT_ENABLED: bool = False
     CRYPTO_THRESHOLD_BUFFER_AUTO_NO_TRADE_PCT: float = 0.50
@@ -1047,6 +1064,10 @@ def load_settings() -> Settings:
             "MAX_DAILY_DRAWDOWN_USDC",
             Settings.MAX_DAILY_DRAWDOWN_USDC,
         ),
+        DAILY_DRAWDOWN_PREFLIGHT_ENABLED=_read_env_bool(
+            "DAILY_DRAWDOWN_PREFLIGHT_ENABLED",
+            Settings.DAILY_DRAWDOWN_PREFLIGHT_ENABLED,
+        ),
         XAI_CIRCUIT_BREAKER_MAX_FAILURES=_read_env_int(
             "XAI_CIRCUIT_BREAKER_MAX_FAILURES",
             Settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
@@ -1351,17 +1372,31 @@ def load_settings() -> Settings:
             "MAX_LIFETIME_ANALYSES_PER_MARKET",
             Settings.MAX_LIFETIME_ANALYSES_PER_MARKET,
         ),
+        # The PRE_ANALYSIS_HARD_REJECTION_* settings are misnamed: they actually
+        # control soft research-routing (final_action="research_queued"), not
+        # terminal rejection. Accept the clearer PRE_ANALYSIS_PARTICIPATION_*
+        # aliases first; fall back to the legacy names so existing .env files
+        # keep working without any operator action.
         PRE_ANALYSIS_HARD_REJECTION_ENABLED=_read_env_bool(
-            "PRE_ANALYSIS_HARD_REJECTION_ENABLED",
-            Settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED,
+            "PRE_ANALYSIS_PARTICIPATION_GATING_ENABLED",
+            _read_env_bool(
+                "PRE_ANALYSIS_HARD_REJECTION_ENABLED",
+                Settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED,
+            ),
         ),
         PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK=_read_env_int(
-            "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK",
-            Settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK,
+            "PRE_ANALYSIS_PARTICIPATION_MIN_STREAK",
+            _read_env_int(
+                "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK",
+                Settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK,
+            ),
         ),
         PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES=_read_env_int(
-            "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES",
-            Settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES,
+            "PRE_ANALYSIS_PARTICIPATION_MIN_ANALYSES",
+            _read_env_int(
+                "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES",
+                Settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES,
+            ),
         ),
         PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED=_read_env_bool(
             "PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED",
@@ -1372,8 +1407,11 @@ def load_settings() -> Settings:
             Settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES,
         ),
         PRE_ANALYSIS_HARD_REJECTION_FAMILIES=_read_env_csv(
-            "PRE_ANALYSIS_HARD_REJECTION_FAMILIES",
-            Settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
+            "PRE_ANALYSIS_PARTICIPATION_FAMILIES",
+            _read_env_csv(
+                "PRE_ANALYSIS_HARD_REJECTION_FAMILIES",
+                Settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
+            ),
         ),
         HISTORICAL_TICKER_PREFIX_GATE_ENABLED=_read_env_bool(
             "HISTORICAL_TICKER_PREFIX_GATE_ENABLED",
@@ -1533,6 +1571,26 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_PRIORITY_ENABLED",
             Settings.RESEARCH_QUEUE_PRIORITY_ENABLED,
         ),
+        RESEARCH_QUEUE_DRAIN_ENABLED=_read_env_bool(
+            "RESEARCH_QUEUE_DRAIN_ENABLED",
+            Settings.RESEARCH_QUEUE_DRAIN_ENABLED,
+        ),
+        RESEARCH_QUEUE_DRAIN_PER_CYCLE=_read_env_int(
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE",
+            Settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE,
+        ),
+        RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS",
+            Settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS,
+        ),
+        RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS",
+            Settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
+        ),
+        RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=_read_env_float(
+            "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY",
+            Settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY,
+        ),
         EXTENDED_RESEARCH_AFTER_STREAK=_read_env_int(
             "EXTENDED_RESEARCH_AFTER_STREAK",
             Settings.EXTENDED_RESEARCH_AFTER_STREAK,
@@ -1564,6 +1622,10 @@ def load_settings() -> Settings:
         PARTICIPATION_TIER_GATING_ENABLED=_read_env_bool(
             "PARTICIPATION_TIER_GATING_ENABLED",
             Settings.PARTICIPATION_TIER_GATING_ENABLED,
+        ),
+        CYCLE_YIELD_ALERT_ESCALATE_AFTER=_read_env_int(
+            "CYCLE_YIELD_ALERT_ESCALATE_AFTER",
+            Settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER,
         ),
         NEGATIVE_BEST_SCORE_DEEP_ANALYSIS_FLOOR=_read_env_float(
             "NEGATIVE_BEST_SCORE_DEEP_ANALYSIS_FLOOR",

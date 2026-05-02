@@ -355,6 +355,27 @@ def test_terminal_reject_sets_terminal_reject_flag_true():
     assert metadata["participation_tier"] == str(ParticipationTier.TERMINAL_REJECT)
 
 
+def test_classify_daily_drawdown_blocked_returns_monitor_only():
+    """daily_drawdown_blocked is a transient risk-cap signal, not a market
+    judgment, so the participation tier should be MONITOR_ONLY (not
+    RESEARCH_ONLY or TERMINAL_REJECT). The decision must surface a non-empty
+    what_to_learn_next so receipts capture how to recover."""
+    decision = classify_participation(
+        pre_analysis_rejection_reason="pre_analysis_daily_drawdown_blocked",
+        pre_analysis_metadata={
+            "daily_drawdown_usdc": 25.5,
+            "max_daily_drawdown_usdc": 20.0,
+        },
+    )
+    assert decision.tier == ParticipationTier.MONITOR_ONLY
+    assert decision.what_to_learn_next is not None
+    assert "drawdown" in decision.what_to_learn_next.lower()
+    demoted, reason, metadata = decision.to_metadata_tuple()
+    assert demoted is True
+    assert metadata["participation_terminal_reject"] is False
+    assert metadata["participation_tier"] == str(ParticipationTier.MONITOR_ONLY)
+
+
 def test_non_terminal_tiers_have_terminal_reject_false():
     """Spec: only TERMINAL_REJECT sets participation_terminal_reject=True.
     All other tiers must surface False."""

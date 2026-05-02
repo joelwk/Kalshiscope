@@ -103,6 +103,7 @@ _TIER_FOR_REJECTION_REASON: dict[str, ParticipationTier] = {
     "repeated_non_actionable_market": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "repeated_non_actionable_bin_market": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "repeated_churn_market": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
+    "daily_drawdown_blocked": ParticipationTier.MONITOR_ONLY,
 }
 
 _LEARN_NEXT_FOR_REASON: dict[str, str] = {
@@ -129,6 +130,10 @@ _LEARN_NEXT_FOR_REASON: dict[str, str] = {
     "crypto_historically_unprofitable": (
         "Crypto family historically unprofitable; monitor for improved "
         "conditions or better edge signal."
+    ),
+    "daily_drawdown_blocked": (
+        "Daily drawdown cap already exceeded; monitor for drawdown reset "
+        "(new trading day or position close) before re-evaluating."
     ),
 }
 

@@ -3024,6 +3024,18 @@ def _build_execution_audit(
     return payload
 
 
+# Audit/decision fields stamped on synthetic research-queue / cap / non-actionable
+# decisions where Grok was never invoked. They make it explicit downstream that
+# the placeholder (eq=0.0/edge_source=none/basis=absence_only) is a research gap,
+# not a Grok finding, and that final_action="research_queued" is NOT a hard reject.
+_SYNTHETIC_DECISION_AUDIT_FIELDS: dict[str, Any] = {
+    "analysis_skipped": True,
+    "evidence_quality_unevaluated": True,
+    "edge_source_unevaluated": True,
+    "pre_analysis_hard_reject": False,
+}
+
+
 def _skip_due_to_for_reason(reason: str | None, audit: dict[str, Any] | None = None) -> str:
     normalized = str(reason or "").strip().lower()
     audit_payload = audit or {}
@@ -3035,10 +3047,16 @@ def _skip_due_to_for_reason(reason: str | None, audit: dict[str, Any] | None = N
         return "lack_of_evidence"
     if "stale" in normalized:
         return "stale_evidence"
+    if "daily_drawdown" in normalized:
+        return "risk_cap"
     if "historical" in normalized or "prefix" in normalized or "family_pnl" in normalized:
         return "poor_historical_prefix"
     if "resolution" in normalized or "ambiguous" in normalized or "outcome_mismatch" in normalized:
         return "ambiguous_resolution"
+    if "pre_analysis_score" in normalized:
+        return "weak_pre_analysis_score"
+    if "fallback_edge_high_churn" in normalized or "churn" in normalized:
+        return "repeated_churn"
     if "edge" in normalized or "score" in normalized or "confidence" in normalized:
         return "weak_edge"
     if "daily" in normalized or "position" in normalized or "balance" in normalized or "risk" in normalized:
@@ -3112,6 +3130,13 @@ def _build_counterfactual_audit_fields(
     if "family" in normalized_reason and "historical" in normalized_reason:
         fields["counterfactual_required_family_sample_size"] = (
             settings.HISTORICAL_FAMILY_MIN_SAMPLES
+        )
+    if "daily_drawdown" in normalized_reason:
+        fields["counterfactual_required_for_drawdown_block"] = (
+            "drawdown_reset_or_position_close"
+        )
+        fields["counterfactual_max_daily_drawdown_usdc"] = (
+            settings.MAX_DAILY_DRAWDOWN_USDC
         )
     if historical_metrics:
         prefix_n = historical_metrics.get("historical_gate_prefix_sample_size")
@@ -4278,9 +4303,13 @@ def _cap_analysis_candidates(
         }
         candidate["selection_rank_score"] = round(risk_adjusted_score, 4)
         candidate["selection_rank_components"] = selection_components
+        # Research-queue drain probes always rank ahead of normal candidates so
+        # the cap doesn't silently drop the longest-waiting research entries.
+        drain_probe_priority = 0 if candidate.get("is_research_queue_drain_probe") else 1
         ranked_candidates.append(
             (
                 (
+                    drain_probe_priority,
                     -risk_adjusted_score,
                     non_actionable_streak,
                     input_index,
@@ -4757,6 +4786,7 @@ def main(max_cycles: int | None = None) -> None:
     daily_start_balance: float | None = None
     cumulative_api_cost_estimate_usd = 0.0
     consecutive_zero_order_cycles = 0
+    consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
 
     while True:
@@ -5478,6 +5508,52 @@ def main(max_cycles: int | None = None) -> None:
                         data={"research_queue_consumer_loaded": len(recent_research_entries)},
                     )
 
+            drainable_research_entries: dict[str, dict[str, Any]] = {}
+            research_queue_drained_count = 0
+            if (
+                settings.RESEARCH_QUEUE_ENABLED
+                and settings.RESEARCH_QUEUE_PERSIST_TO_DB
+                and settings.RESEARCH_QUEUE_DRAIN_ENABLED
+                and settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE > 0
+            ):
+                try:
+                    excluded_ids = tuple(traded_market_ids)
+                except Exception:
+                    excluded_ids = ()
+                try:
+                    drain_rows = state_manager.get_drainable_research_entries(
+                        min_age_hours=settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS,
+                        max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
+                        limit=max(1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE),
+                        excluded_market_ids=excluded_ids,
+                    )
+                    for entry in drain_rows:
+                        mid = str(entry.get("market_id") or "").strip()
+                        if mid:
+                            drainable_research_entries[mid] = entry
+                except Exception as exc:
+                    logger.debug(
+                        "Research queue drain lookup failed: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+                if drainable_research_entries:
+                    logger.info(
+                        "Research queue drain selected %d candidate(s) for forced re-analysis",
+                        len(drainable_research_entries),
+                        data={
+                            "research_queue_drain_candidates": [
+                                {
+                                    "market_id": mid,
+                                    "queued_at": entry.get("queued_at"),
+                                    "reason": entry.get("reason"),
+                                    "what_to_learn_next": entry.get("what_to_learn_next"),
+                                }
+                                for mid, entry in drainable_research_entries.items()
+                            ],
+                        },
+                    )
+
             _RESEARCH_QUEUE_SCORE_BUMP = 0.05
 
             def _get_fallback_family_stats(family_name: str) -> tuple[float, int]:
@@ -5887,6 +5963,7 @@ def main(max_cycles: int | None = None) -> None:
                             pre_analysis_demotion_reason,
                             historical_gate_metrics,
                         ),
+                        **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                         **_demotion_counterfactuals,
                         **_demotion_audit_extra,
                     )
@@ -6025,6 +6102,7 @@ def main(max_cycles: int | None = None) -> None:
                                 f"Reached {_analysis_count_for_cap} analyses; wait for outcome learning."
                             ),
                             skip_due_to="not_execution_quality_now",
+                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                             **_cap_counterfactuals,
                         ),
                     )
@@ -6064,7 +6142,26 @@ def main(max_cycles: int | None = None) -> None:
                         pre_analysis_breakdown["previous_research_reason"] = str(
                             research_entry.get("reason") or ""
                         )
-                    if pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:
+                    drain_entry = drainable_research_entries.get(market.id)
+                    is_drain_probe = drain_entry is not None
+                    if is_drain_probe:
+                        # Forced probe from research-queue drain: bypass the
+                        # pre-analysis score gate entirely so the longest-waiting
+                        # research-queued markets get a fresh look at deep analysis.
+                        # Do NOT mutate pre_analysis_score itself; record the bypass
+                        # in the breakdown so receipts show why this market was
+                        # admitted despite a low score.
+                        if pre_analysis_breakdown is None:
+                            pre_analysis_breakdown = {}
+                        pre_analysis_breakdown["research_queue_drain_probe"] = True
+                        pre_analysis_breakdown["research_queue_drain_queued_at"] = str(
+                            drain_entry.get("queued_at") or ""
+                        )
+                        pre_analysis_breakdown["research_queue_drain_reason"] = str(
+                            drain_entry.get("reason") or ""
+                        )
+                        research_queue_drained_count += 1
+                    if not is_drain_probe and pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:
                         _research_floor = (
                             settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
                             - max(0.0, settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND)
@@ -6209,7 +6306,8 @@ def main(max_cycles: int | None = None) -> None:
                                     ),
                                     decision_origin="synthetic_research_queue",
                                     market_judgment_available=False,
-                                    skip_due_to="weak_edge",
+                                    skip_due_to="weak_pre_analysis_score",
+                                    **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                                     **_soft_counterfactuals,
                                 ),
                             )
@@ -6294,6 +6392,10 @@ def main(max_cycles: int | None = None) -> None:
                             str(_research_context.get("what_to_learn_next") or "")
                             if _research_context else None
                         ),
+                        "is_research_queue_drain_probe": is_drain_probe,
+                        "research_queue_drain_entry": (
+                            drain_entry if is_drain_probe else None
+                        ),
                     }
                 )
                 pre_analysis_passed += 1
@@ -6372,6 +6474,153 @@ def main(max_cycles: int | None = None) -> None:
                     "reduced_candidate_cap_applied": reduced_candidate_cap_applied,
                 },
             )
+
+            daily_drawdown_preflight_blocked_count = 0
+            if (
+                settings.DAILY_DRAWDOWN_PREFLIGHT_ENABLED
+                and analysis_candidates
+                and settings.MAX_DAILY_DRAWDOWN_USDC > 0
+            ):
+                preflight_balance_delta = _daily_balance_delta_usdc(
+                    day_start_balance=daily_start_balance,
+                    current_balance=last_known_portfolio_value,
+                )
+                preflight_drawdown = max(
+                    0.0,
+                    -(preflight_balance_delta if preflight_balance_delta is not None else 0.0),
+                )
+                if _daily_drawdown_cap_reached(
+                    daily_balance_delta=preflight_balance_delta,
+                    max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                ):
+                    _drawdown_reason = "pre_analysis_daily_drawdown_blocked"
+                    monitor_tier_str = str(ParticipationTier.MONITOR_ONLY)
+                    drawdown_what_to_learn = (
+                        "Re-evaluate after drawdown reset (new trading day or "
+                        "position close); would-be conviction held for next session."
+                    )
+                    drawdown_why_not = (
+                        f"Daily drawdown cap reached (drawdown=${preflight_drawdown:.2f}, "
+                        f"cap=${settings.MAX_DAILY_DRAWDOWN_USDC:.2f}); analysis skipped"
+                        " to avoid wasted Grok cost on trades that would be blocked."
+                    )
+                    for candidate in analysis_candidates:
+                        market_for_drawdown = candidate.get("market")
+                        if not isinstance(market_for_drawdown, Market):
+                            continue
+                        family_name_drawdown = str(
+                            candidate.get("market_family")
+                            or market_family(market_for_drawdown)
+                        )
+                        default_outcome_drawdown = (
+                            market_for_drawdown.outcomes[0].name
+                            if market_for_drawdown.outcomes
+                            else "YES"
+                        )
+                        drawdown_decision = TradeDecision(
+                            should_trade=False,
+                            outcome=default_outcome_drawdown,
+                            confidence=0.50,
+                            bet_size_pct=0.0,
+                            reasoning=(
+                                f"[MonitorOnly reason={_drawdown_reason}] "
+                                f"{drawdown_why_not}"
+                            ),
+                            edge_source="none",
+                            evidence_basis="absence_only",
+                            evidence_quality=0.0,
+                            abstain=True,
+                        )
+                        drawdown_rq_pos: int | None = None
+                        if settings.RESEARCH_QUEUE_ENABLED:
+                            drawdown_rq_pos = _enqueue_research_candidate(
+                                market=market_for_drawdown,
+                                decision=drawdown_decision,
+                                reason=_drawdown_reason,
+                                gate_name="daily_drawdown_preflight",
+                                threshold_gap=0.0,
+                                participation_tier=monitor_tier_str,
+                                why_not_execution_eligible=drawdown_why_not,
+                                what_to_learn_next=drawdown_what_to_learn,
+                                decision_origin="synthetic_research_queue",
+                            )
+                        if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                            try:
+                                state_manager.record_research_queue_entry(
+                                    market_id=market_for_drawdown.id,
+                                    cycle_id=cycle_id,
+                                    gate_name="daily_drawdown_preflight",
+                                    reason=_drawdown_reason,
+                                    threshold_gap=0.0,
+                                    what_to_learn_next=drawdown_what_to_learn,
+                                    last_decision_json=_safe_json_dumps(
+                                        {
+                                            **drawdown_decision.model_dump(),
+                                            "decision_origin": "synthetic_research_queue",
+                                            "market_judgment_available": False,
+                                            "participation_tier": monitor_tier_str,
+                                            "participation_decision": _drawdown_reason,
+                                        }
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            _drawdown_reason,
+                        )
+                        _record_rejection_reason(
+                            participation_tier_breakdown,
+                            monitor_tier_str,
+                        )
+                        drawdown_counterfactuals = _build_counterfactual_audit_fields(
+                            reason=_drawdown_reason,
+                            settings=settings,
+                            pre_analysis_score=candidate.get("pre_analysis_score"),
+                            historical_metrics=candidate.get("historical_gate_metrics"),
+                        )
+                        log_trade_decision(
+                            market_id=market_for_drawdown.id,
+                            question=market_for_drawdown.question,
+                            decision=drawdown_decision.model_dump(),
+                            execution_audit=_build_execution_audit(
+                                decision_terminal=False,
+                                final_action="research_queued",
+                                final_reason=_drawdown_reason,
+                                market_family=family_name_drawdown,
+                                pre_analysis_score=candidate.get("pre_analysis_score"),
+                                pre_analysis_breakdown=candidate.get("pre_analysis_breakdown"),
+                                research_queue_position=drawdown_rq_pos,
+                                participation_tier=monitor_tier_str,
+                                participation_decision=_drawdown_reason,
+                                why_not_execution_eligible=drawdown_why_not,
+                                what_to_learn_next=drawdown_what_to_learn,
+                                decision_origin="synthetic_research_queue",
+                                market_judgment_available=False,
+                                skip_due_to=_skip_due_to_for_reason(_drawdown_reason),
+                                daily_drawdown_usdc=round(preflight_drawdown, 2),
+                                max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                                **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+                                **drawdown_counterfactuals,
+                            ),
+                        )
+                        daily_drawdown_preflight_blocked_count += 1
+                    logger.warning(
+                        "Daily drawdown preflight engaged: drawdown=$%.2f cap=$%.2f; "
+                        "routed %d candidate(s) to research_queue (MONITOR_ONLY) and skipped Grok",
+                        preflight_drawdown,
+                        settings.MAX_DAILY_DRAWDOWN_USDC,
+                        daily_drawdown_preflight_blocked_count,
+                        data={
+                            "daily_drawdown_preflight_engaged": True,
+                            "daily_drawdown_usdc": round(preflight_drawdown, 2),
+                            "max_daily_drawdown_usdc": settings.MAX_DAILY_DRAWDOWN_USDC,
+                            "daily_drawdown_preflight_blocked_count": (
+                                daily_drawdown_preflight_blocked_count
+                            ),
+                        },
+                    )
+                    analysis_candidates = []
 
             research_only_emissions = 0
             if settings.RESEARCH_QUEUE_ENABLED and analysis_candidates:
@@ -6465,6 +6714,7 @@ def main(max_cycles: int | None = None) -> None:
                             decision_origin="synthetic_research_queue",
                             market_judgment_available=False,
                             skip_due_to="not_execution_quality_now",
+                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                             **_research_only_counterfactuals,
                         ),
                     )
@@ -7135,6 +7385,7 @@ def main(max_cycles: int | None = None) -> None:
                             search_profile=analysis_result.get("analysis_search_profile"),
                             error_type=analysis_result.get("analysis_error_type"),
                             error_message=analysis_result.get("analysis_error"),
+                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                             **_failure_counterfactuals,
                         ),
                     )
@@ -7319,10 +7570,21 @@ def main(max_cycles: int | None = None) -> None:
                     "short_prefix_score_penalty": short_prefix_score_penalty,
                     "extended_research_used": used_extended_research,
                     "research_only": bool(candidate.get("research_only", False)),
+                    "research_queue_drain_probe": bool(
+                        candidate.get("is_research_queue_drain_probe", False)
+                    ),
                     "primary_source_url_present": bool(
                         str(getattr(decision, "primary_source_url", "") or "").strip()
                     ),
                 }
+                if candidate.get("is_research_queue_drain_probe"):
+                    drain_meta = candidate.get("research_queue_drain_entry") or {}
+                    audit_context["research_queue_drain_queued_at"] = (
+                        drain_meta.get("queued_at")
+                    )
+                    audit_context["research_queue_drain_reason"] = (
+                        drain_meta.get("reason")
+                    )
                 audit_context.update(score_receipt_fields)
                 compact_pre_execution_score = _compact_score_breakdown(score_receipt_fields)
                 if compact_pre_execution_score:
@@ -10606,23 +10868,52 @@ def main(max_cycles: int | None = None) -> None:
                     len(research_queue),
                     data={"research_queue": list(research_queue)},
                 )
+            if execution_candidates == 0:
+                consecutive_zero_execution_yield_cycles += 1
+            else:
+                consecutive_zero_execution_yield_cycles = 0
             if execution_candidates == 0 and len(research_queue) > 50:
                 top_tiers = sorted(
                     participation_tier_breakdown.items(),
                     key=lambda x: x[1],
                     reverse=True,
                 )[:3]
-                logger.warning(
-                    "Cycle yield alert: 0 execution candidates with %d research-queued; "
-                    "top tiers: %s — investigate gate calibration",
-                    len(research_queue),
-                    ", ".join(f"{t}={c}" for t, c in top_tiers),
-                    data={
-                        "cycle_yield_alert": True,
-                        "research_queue_size": len(research_queue),
-                        "participation_tier_breakdown": participation_tier_breakdown,
-                    },
+                yield_alert_payload = {
+                    "cycle_yield_alert": True,
+                    "research_queue_size": len(research_queue),
+                    "consecutive_zero_execution_yield_cycles": (
+                        consecutive_zero_execution_yield_cycles
+                    ),
+                    "consecutive_zero_execution_yield_threshold": (
+                        settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                    ),
+                    "participation_tier_breakdown": participation_tier_breakdown,
+                }
+                # Escalate to ERROR once sustained selection failure exceeds the
+                # configured threshold so predictbot_errors.log captures it.
+                # First-time alerts stay at WARN to avoid noise.
+                escalate_to_error = (
+                    settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+                    and consecutive_zero_execution_yield_cycles
+                    >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
                 )
+                if escalate_to_error:
+                    logger.error(
+                        "Cycle yield alert (sustained, %d cycles): 0 execution candidates "
+                        "with %d research-queued; top tiers: %s — investigate gate calibration",
+                        consecutive_zero_execution_yield_cycles,
+                        len(research_queue),
+                        ", ".join(f"{t}={c}" for t, c in top_tiers),
+                        data=yield_alert_payload,
+                    )
+                else:
+                    logger.warning(
+                        "Cycle yield alert: 0 execution candidates with %d research-queued; "
+                        "top tiers: %s — investigate gate calibration",
+                        len(research_queue),
+                        ", ".join(f"{t}={c}" for t, c in top_tiers),
+                        data=yield_alert_payload,
+                    )
             if settings.CALIBRATION_MODE_ENABLED and calibration_samples:
                 recommendation = compute_adaptive_thresholds(
                     samples=calibration_samples,
@@ -10688,6 +10979,8 @@ def main(max_cycles: int | None = None) -> None:
                     "outcome_mismatch_blocked": outcome_mismatch_blocked,
                     "execution_candidates": execution_candidates,
                     "research_queue_size": research_queue_size,
+                    "research_queue_drained_count": research_queue_drained_count,
+                    "daily_drawdown_preflight_blocked_count": daily_drawdown_preflight_blocked_count,
                     "should_trade_but_blocked": should_trade_but_blocked,
                     "should_trade_blocked_breakdown": should_trade_blocked_breakdown,
                     "blocked_direct_evidence_count": blocked_direct_evidence_count,
