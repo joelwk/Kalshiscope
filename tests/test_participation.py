@@ -123,9 +123,9 @@ def test_classify_zero_action_family_returns_research_only() -> None:
     decision = classify_participation(
         pre_analysis_rejection_reason="pre_analysis_zero_action_family",
         pre_analysis_metadata={
-            "pre_analysis_hard_reject_family": "crypto",
-            "pre_analysis_hard_reject_family_sample_size": 50,
-            "pre_analysis_hard_reject_family_action_rate": 0.0,
+            "participation_demotion_family": "crypto",
+            "participation_demotion_family_sample_size": 50,
+            "participation_demotion_family_action_rate": 0.0,
         },
     )
     assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
@@ -172,7 +172,7 @@ def test_classify_should_trade_true_absence_only_is_research_gap() -> None:
     )
     assert decision.tier == ParticipationTier.DEEP_RESEARCH_REQUIRED
     assert decision.primary_reason == "research_gap_not_market_judgment"
-    assert decision.legacy_metadata["blocked_conviction"] is True
+    assert decision.tier_metadata["blocked_conviction"] is True
 
 
 def test_classify_definitive_outcome_bypasses_evidence_quality() -> None:
@@ -245,29 +245,32 @@ def test_classify_awaiting_analysis() -> None:
     assert decision.tier == ParticipationTier.DEEP_RESEARCH_REQUIRED
 
 
-def test_legacy_tuple_roundtrip_for_rejection() -> None:
+def test_to_metadata_tuple_for_demotion() -> None:
     decision = classify_participation(
         pre_analysis_rejection_reason="pre_analysis_repeated_churn_market",
         pre_analysis_metadata={"some_key": "some_val"},
     )
-    reject, reason, metadata = decision.to_legacy_tuple()
-    assert reject is True
+    demoted, reason, metadata = decision.to_metadata_tuple()
+    assert demoted is True
     assert reason == "pre_analysis_repeated_churn_market"
-    assert metadata["legacy_pre_analysis_hard_reject"] is True
+    assert metadata["participation_demotion_reason"] == "pre_analysis_repeated_churn_market"
     assert metadata["participation_tier"] == str(ParticipationTier.SKIP_FOR_NOW_WITH_REASON)
+    assert metadata["participation_terminal_reject"] is False
 
 
-def test_legacy_tuple_roundtrip_for_execution() -> None:
+def test_to_metadata_tuple_for_execution() -> None:
     decision = classify_participation(
         decision_should_trade=True,
         decision_evidence_quality=0.90,
         evidence_quality_threshold=0.75,
         edge_value=0.10,
     )
-    reject, reason, metadata = decision.to_legacy_tuple()
-    assert reject is False
+    demoted, reason, metadata = decision.to_metadata_tuple()
+    assert demoted is False
     assert reason is None
     assert metadata["participation_tier"] == str(ParticipationTier.EXECUTION_ELIGIBLE)
+    assert metadata["participation_terminal_reject"] is False
+    assert "participation_demotion_reason" not in metadata
 
 
 def test_probe_trade_enabled_routes_winning_family_small_sample_to_execution_eligible():
@@ -280,12 +283,12 @@ def test_probe_trade_enabled_routes_winning_family_small_sample_to_execution_eli
     decision = classify_participation(
         historical_gate=gate,
         pre_analysis_rejection_reason="pre_analysis_historical_prefix_small_sample_negative",
-        pre_analysis_metadata={"pre_analysis_hard_reject_family": "sports"},
+        pre_analysis_metadata={"participation_demotion_family": "sports"},
         probe_trade_enabled=True,
         proven_winning_families=frozenset({"sports"}),
     )
     assert decision.tier == ParticipationTier.EXECUTION_ELIGIBLE
-    assert decision.legacy_metadata.get("probe_trade") is True
+    assert decision.tier_metadata.get("probe_trade") is True
     assert "probe_trade_small_sample_winning_family" in decision.primary_reason
 
 
@@ -299,7 +302,7 @@ def test_probe_trade_disabled_preserves_research_only_default():
     decision = classify_participation(
         historical_gate=gate,
         pre_analysis_rejection_reason="pre_analysis_historical_prefix_small_sample_negative",
-        pre_analysis_metadata={"pre_analysis_hard_reject_family": "sports"},
+        pre_analysis_metadata={"participation_demotion_family": "sports"},
         probe_trade_enabled=False,
         proven_winning_families=frozenset({"sports"}),
     )
@@ -316,23 +319,59 @@ def test_probe_trade_non_winning_family_stays_research_only():
     decision = classify_participation(
         historical_gate=gate,
         pre_analysis_rejection_reason="pre_analysis_historical_prefix_small_sample_negative",
-        pre_analysis_metadata={"pre_analysis_hard_reject_family": "crypto"},
+        pre_analysis_metadata={"participation_demotion_family": "crypto"},
         probe_trade_enabled=True,
         proven_winning_families=frozenset({"sports"}),
     )
     assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
 
 
-def test_research_queued_receipt_uses_legacy_pre_analysis_hard_reject():
-    """When the rejection is research-queued, to_legacy_tuple should set
-    legacy_pre_analysis_hard_reject=True (not pre_analysis_hard_reject)."""
+def test_research_queued_does_not_set_terminal_reject_flag():
+    """Research-queued tier is NOT a terminal rejection. The
+    participation_terminal_reject flag must stay False so analytics can
+    distinguish true terminal rejects from soft demotions."""
     decision = classify_participation(
         pre_analysis_rejection_reason="pre_analysis_historical_prefix_pnl_block",
         pre_analysis_metadata={"some_key": 42},
     )
-    reject, reason, metadata = decision.to_legacy_tuple()
-    assert reject is True
-    assert "legacy_pre_analysis_hard_reject" in metadata
-    assert metadata["legacy_pre_analysis_hard_reject"] is True
-    assert "pre_analysis_hard_reject" not in metadata
+    demoted, reason, metadata = decision.to_metadata_tuple()
+    assert demoted is True
+    assert metadata["participation_terminal_reject"] is False
+    assert metadata["participation_demotion_reason"] == "pre_analysis_historical_prefix_pnl_block"
     assert metadata["participation_tier"] == str(ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE)
+
+
+def test_terminal_reject_sets_terminal_reject_flag_true():
+    """Only ParticipationTier.TERMINAL_REJECT should set
+    participation_terminal_reject=True."""
+    decision = ParticipationDecision(
+        tier=ParticipationTier.TERMINAL_REJECT,
+        primary_reason="market_untradable",
+        why_not_execution_eligible="Market is permanently invalid",
+    )
+    _, _, metadata = decision.to_metadata_tuple()
+    assert metadata["participation_terminal_reject"] is True
+    assert metadata["participation_demotion_reason"] == "market_untradable"
+    assert metadata["participation_tier"] == str(ParticipationTier.TERMINAL_REJECT)
+
+
+def test_non_terminal_tiers_have_terminal_reject_false():
+    """Spec: only TERMINAL_REJECT sets participation_terminal_reject=True.
+    All other tiers must surface False."""
+    non_terminal = [
+        ParticipationTier.EXECUTION_ELIGIBLE,
+        ParticipationTier.DEEP_RESEARCH_REQUIRED,
+        ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
+        ParticipationTier.MONITOR_ONLY,
+        ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
+        ParticipationTier.OPERATIONAL_ERROR_RETRY,
+    ]
+    for tier in non_terminal:
+        decision = ParticipationDecision(
+            tier=tier,
+            primary_reason="some_reason",
+        )
+        _, _, metadata = decision.to_metadata_tuple()
+        assert metadata["participation_terminal_reject"] is False, (
+            f"Tier {tier} should NOT set participation_terminal_reject=True"
+        )

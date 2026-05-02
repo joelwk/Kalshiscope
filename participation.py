@@ -39,29 +39,37 @@ class ParticipationDecision:
     what_to_learn_next: str | None = None
     confidence_in_classification: float = 1.0
     sample_size_signal: int | None = None
-    legacy_hard_reject: bool = False
-    legacy_metadata: dict[str, Any] = field(default_factory=dict)
+    tier_metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_legacy_tuple(self) -> tuple[bool, str | None, dict[str, Any]]:
-        """Backward-compatible mapping to the old (reject, reason, metadata) shape."""
-        reject = self.tier not in {
+    def to_metadata_tuple(self) -> tuple[bool, str | None, dict[str, Any]]:
+        """Convert decision to the (demoted, reason, metadata) shape used by callers.
+
+        ``demoted`` is True for any tier other than EXECUTION_ELIGIBLE and
+        DEEP_RESEARCH_REQUIRED (the two tiers that allow continuation through
+        analysis or execution). For demoted tiers, callers consume
+        ``participation_demotion_reason`` plus the structured tier on
+        ``participation_tier`` to decide downstream routing.
+        """
+        demoted = self.tier not in {
             ParticipationTier.EXECUTION_ELIGIBLE,
             ParticipationTier.DEEP_RESEARCH_REQUIRED,
         }
-        reason = self.primary_reason if reject else None
-        metadata = dict(self.legacy_metadata)
+        reason = self.primary_reason if demoted else None
+        metadata = dict(self.tier_metadata)
         metadata["participation_tier"] = str(self.tier)
         metadata["participation_decision"] = str(self.primary_reason)
+        metadata["participation_terminal_reject"] = (
+            self.tier == ParticipationTier.TERMINAL_REJECT
+        )
         if self.why_not_execution_eligible:
             metadata["why_not_execution_eligible"] = self.why_not_execution_eligible
         if self.what_to_learn_next:
             metadata["what_to_learn_next"] = self.what_to_learn_next
         if self.sample_size_signal is not None:
             metadata["sample_size_signal"] = self.sample_size_signal
-        if reject:
-            metadata["legacy_pre_analysis_hard_reject"] = True
-            metadata["pre_analysis_hard_reject_reason"] = self.primary_reason
-        return reject, reason, metadata
+        if demoted:
+            metadata["participation_demotion_reason"] = self.primary_reason
+        return demoted, reason, metadata
 
 
 @dataclass(frozen=True)
@@ -172,7 +180,7 @@ def classify_participation(
                 f"streak={timeout_state.timeout_streak}"
             ),
             sample_size_signal=None,
-            legacy_metadata=metadata,
+            tier_metadata=metadata,
         )
 
     if analysis_failed:
@@ -186,7 +194,7 @@ def classify_participation(
             primary_reason="analysis_failure",
             why_not_execution_eligible="Analysis failed; no decision produced",
             what_to_learn_next="Retry on next cycle if retriable; otherwise monitor",
-            legacy_metadata=metadata,
+            tier_metadata=metadata,
         )
 
     if pre_analysis_rejection_reason:
@@ -218,7 +226,7 @@ def classify_participation(
         ):
             gate_family = (
                 (historical_gate.metrics.get("family", "") if historical_gate else "")
-                or metadata.get("pre_analysis_hard_reject_family", "")
+                or metadata.get("participation_demotion_family", "")
             ).strip().lower()
             if gate_family in proven_winning_families:
                 probe_metadata = dict(metadata)
@@ -232,7 +240,7 @@ def classify_participation(
                         "is a proven winner; capped at PROBE_TRADE_MAX_USDC."
                     ),
                     sample_size_signal=sample_size,
-                    legacy_metadata=probe_metadata,
+                    tier_metadata=probe_metadata,
                 )
 
         return ParticipationDecision(
@@ -241,8 +249,7 @@ def classify_participation(
             why_not_execution_eligible=why_not,
             what_to_learn_next=what_to_learn,
             sample_size_signal=sample_size,
-            legacy_hard_reject=True,
-            legacy_metadata=metadata,
+            tier_metadata=metadata,
         )
 
     is_definitive = (
@@ -257,7 +264,7 @@ def classify_participation(
             primary_reason="abstain_low_evidence",
             why_not_execution_eligible="Model abstained due to low evidence",
             what_to_learn_next="Gather better evidence sources for this market",
-            legacy_metadata=metadata,
+            tier_metadata=metadata,
         )
 
     if decision_should_trade is False:
@@ -266,7 +273,7 @@ def classify_participation(
             primary_reason="no_trade_recommended",
             why_not_execution_eligible="Model did not recommend trading",
             what_to_learn_next="Monitor for condition changes",
-            legacy_metadata=metadata,
+            tier_metadata=metadata,
         )
 
     if decision_should_trade is True:
@@ -293,7 +300,7 @@ def classify_participation(
                     "Find direct settlement-aligned evidence, a current orderbook, "
                     "and a computed edge before treating this as executable."
                 ),
-                legacy_metadata={
+                tier_metadata={
                     **metadata,
                     "blocked_conviction": True,
                     "skip_due_to": "lack_of_evidence",
@@ -314,7 +321,7 @@ def classify_participation(
                     f"< threshold={evidence_quality_threshold:.2f}"
                 ),
                 what_to_learn_next="Need higher evidence quality from primary sources",
-                legacy_metadata={
+                tier_metadata={
                     **metadata,
                     "blocked_conviction": True,
                     "skip_due_to": "lack_of_evidence",
@@ -333,7 +340,7 @@ def classify_participation(
                         f"Edge {edge_value:.4f} exceeds max {effective_edge_max:.2f}"
                     ),
                     what_to_learn_next="Verify edge is not hallucinated",
-                    legacy_metadata={
+                    tier_metadata={
                         **metadata,
                         "blocked_conviction": True,
                         "skip_due_to": "weak_edge",
@@ -346,7 +353,7 @@ def classify_participation(
                 primary_reason=score_gate_reason or "score_gate_blocked",
                 why_not_execution_eligible="Score gate rejected this candidate",
                 what_to_learn_next="Improve score components",
-                legacy_metadata={
+                tier_metadata={
                     **metadata,
                     "blocked_conviction": True,
                     "skip_due_to": score_gate_reason or "score_gate",
@@ -356,7 +363,7 @@ def classify_participation(
         return ParticipationDecision(
             tier=ParticipationTier.EXECUTION_ELIGIBLE,
             primary_reason="all_gates_passed",
-            legacy_metadata=metadata,
+            tier_metadata=metadata,
         )
 
     return ParticipationDecision(
@@ -364,7 +371,7 @@ def classify_participation(
         primary_reason="awaiting_analysis",
         why_not_execution_eligible="No analysis performed yet",
         what_to_learn_next="Run deep analysis to determine tradability",
-        legacy_metadata=metadata,
+        tier_metadata=metadata,
     )
 
 
@@ -378,9 +385,9 @@ def _why_not_for_reason(reason: str, metadata: dict[str, Any]) -> str:
             f"win_rate={wr}, pnl_total={pnl}"
         )
     if "zero_action" in reason:
-        fam = metadata.get("pre_analysis_hard_reject_family", "?")
-        sz = metadata.get("pre_analysis_hard_reject_family_sample_size", "?")
-        rate = metadata.get("pre_analysis_hard_reject_family_action_rate", "?")
+        fam = metadata.get("participation_demotion_family", "?")
+        sz = metadata.get("participation_demotion_family_sample_size", "?")
+        rate = metadata.get("participation_demotion_family_action_rate", "?")
         return (
             f"Family '{fam}' has zero action rate: "
             f"sample_size={sz}, action_rate={rate}"
@@ -388,8 +395,8 @@ def _why_not_for_reason(reason: str, metadata: dict[str, Any]) -> str:
     if "crypto" in reason:
         return "Crypto family historically unprofitable"
     if "churn" in reason:
-        streak = metadata.get("pre_analysis_hard_reject_non_actionable_streak", "?")
-        count = metadata.get("pre_analysis_hard_reject_analysis_count", "?")
+        streak = metadata.get("participation_demotion_non_actionable_streak", "?")
+        count = metadata.get("participation_demotion_analysis_count", "?")
         return f"Repeated churn: streak={streak}, analyses={count}"
     if "fallback" in reason:
         return "High fallback-edge churn with non-actionable streak"

@@ -14,8 +14,11 @@ from main import (
     _best_orderbook_sell_price,
     _build_order_request_from_market,
     _build_kalshi_market_fetch_window,
+    _build_counterfactual_audit_fields,
     _build_execution_audit,
+    _build_previous_analysis,
     _build_reasoning_hash,
+    _format_tier_breakdown_for_log,
     _can_use_lenient_stale_refresh_fallback,
     _cap_analysis_candidates,
     _cap_effective_confidence_for_market,
@@ -42,7 +45,7 @@ from main import (
     _max_confidence_for_market,
     _min_evidence_quality_for_market,
     _non_definitive_confidence_ceiling,
-    _pre_analysis_hard_rejection,
+    _pre_analysis_participation_hold,
     _pre_analysis_opportunity_score,
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
@@ -759,7 +762,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertGreater(breakdown["pre_score_ambiguous_market_penalty"], 0.0)
         self.assertGreater(breakdown["pre_score_ambiguous_resolution_penalty"], 0.0)
 
-    def test_pre_analysis_hard_rejection_blocks_repeated_non_actionable_family(self) -> None:
+    def test_pre_analysis_demotion_for_repeated_non_actionable_family(self) -> None:
         market = Market(
             id="KXPERSONMENTION-26APR09-TERM",
             question="Will candidate mention term?",
@@ -773,7 +776,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=7,
             last_terminal_outcome="evidence_quality_below_min",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -781,9 +784,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_repeated_non_actionable_market")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "speech")
+        self.assertEqual(metadata["participation_demotion_family"], "speech")
 
-    def test_pre_analysis_hard_rejection_blocks_repeated_non_actionable_generic_bin(self) -> None:
+    def test_pre_analysis_demotion_for_repeated_non_actionable_generic_bin(self) -> None:
         market = Market(
             id="KXNASDAQ100-26APR10H1600-B25250",
             question="Will the Nasdaq-100 be between 25200 and 25299.99?",
@@ -797,7 +800,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=7,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -805,9 +808,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_repeated_non_actionable_bin_market")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "generic")
+        self.assertEqual(metadata["participation_demotion_family"], "generic")
 
-    def test_pre_analysis_hard_rejection_blocks_zero_action_family(self) -> None:
+    def test_pre_analysis_demotion_for_zero_action_family(self) -> None:
         market = Market(
             id="KXPERSONMENTION-26APR09-TERM",
             question="Will candidate mention term?",
@@ -828,7 +831,7 @@ class TestMainUtils(unittest.TestCase):
             PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES=20,
             PRE_ANALYSIS_HARD_REJECTION_FAMILIES=("speech", "mention"),
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=settings,
@@ -837,9 +840,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_zero_action_family")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "speech")
+        self.assertEqual(metadata["participation_demotion_family"], "speech")
 
-    def test_pre_analysis_hard_rejection_blocks_fallback_edge_high_churn(self) -> None:
+    def test_pre_analysis_demotion_for_fallback_edge_high_churn(self) -> None:
         market = Market(
             id="KXBTCD-26APR0917-T70499.99",
             question="Bitcoin threshold",
@@ -853,7 +856,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=3,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -862,9 +865,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_fallback_edge_high_churn")
-        self.assertTrue(metadata["pre_analysis_hard_reject_had_recent_fallback_edge"])
+        self.assertTrue(metadata["participation_demotion_had_recent_fallback_edge"])
 
-    def test_pre_analysis_hard_rejection_blocks_repeated_churn_market(self) -> None:
+    def test_pre_analysis_demotion_for_repeated_churn_market(self) -> None:
         market = Market(
             id="KXWTI-26APR14-T96.99",
             question="WTI settlement threshold",
@@ -878,7 +881,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=3,
             last_terminal_outcome="manual_skip",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -886,9 +889,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_repeated_churn_market")
-        self.assertEqual(metadata["pre_analysis_hard_reject_analysis_count"], 5)
+        self.assertEqual(metadata["participation_demotion_analysis_count"], 5)
 
-    def test_pre_analysis_hard_rejection_blocks_unprofitable_crypto_fallback_family(self) -> None:
+    def test_pre_analysis_demotion_for_unprofitable_crypto_fallback_family(self) -> None:
         market = Market(
             id="KXBTCD-26APR1217-T70999.99",
             question="Bitcoin threshold",
@@ -902,7 +905,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=1,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(
@@ -921,7 +924,7 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_crypto_historically_unprofitable")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "crypto")
+        self.assertEqual(metadata["participation_demotion_family"], "crypto")
 
     def test_pre_analysis_opportunity_score_penalizes_generic_bin_churn(self) -> None:
         market = Market(
@@ -1129,7 +1132,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(unpenalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.0)
         self.assertLess(penalized_score, unpenalized_score)
 
-    def test_pre_analysis_hard_rejection_blocks_historical_prefix_loss_gate(self) -> None:
+    def test_pre_analysis_demotion_for_historical_prefix_loss_gate(self) -> None:
         market = Market(
             id="KXTESTMARKET-26APR20-T50",
             question="Test market",
@@ -1142,7 +1145,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=1,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -2908,6 +2911,219 @@ class TestLifetimeAnalysisCap(unittest.TestCase):
     def test_cap_zero_disables_check(self) -> None:
         settings = Settings(MAX_LIFETIME_ANALYSES_PER_MARKET=0)
         self.assertEqual(settings.MAX_LIFETIME_ANALYSES_PER_MARKET, 0)
+
+
+class TestSyntheticDecisionMarker(unittest.TestCase):
+    def test_synthetic_research_queue_origin_marks_audit(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            final_reason="pre_analysis_score_soft_research",
+            decision_origin="synthetic_research_queue",
+        )
+        self.assertTrue(audit.get("synthetic_decision"))
+
+    def test_synthetic_operational_hold_origin_marks_audit(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            final_reason="grok_stream_timeout",
+            decision_origin="synthetic_operational_hold",
+        )
+        self.assertTrue(audit.get("synthetic_decision"))
+
+    def test_real_decision_origin_is_not_synthetic(self) -> None:
+        audit = _build_execution_audit(
+            final_action="skip",
+            final_reason="confidence_below_min",
+            decision_origin="grok_initial",
+        )
+        self.assertFalse(audit.get("synthetic_decision"))
+
+    def test_missing_decision_origin_defaults_to_not_synthetic(self) -> None:
+        audit = _build_execution_audit(
+            final_action="order_submitted",
+        )
+        self.assertFalse(audit.get("synthetic_decision"))
+
+
+class TestHistoricalFamilyFlattening(unittest.TestCase):
+    def test_breakdown_fields_lift_to_top_level(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            pre_analysis_breakdown={
+                "pre_score_historical_family_samples": 138.0,
+                "pre_score_historical_family_pnl_total": -16.64,
+                "pre_score_historical_family_win_rate": 0.536,
+                "pre_score_historical_family_pnl_ratio": -0.121,
+            },
+        )
+        self.assertEqual(audit.get("historical_family_samples"), 138.0)
+        self.assertAlmostEqual(audit.get("historical_family_pnl_total"), -16.64)
+        self.assertAlmostEqual(audit.get("historical_family_win_rate"), 0.536)
+        self.assertAlmostEqual(audit.get("historical_family_pnl_ratio"), -0.121)
+
+    def test_top_level_value_wins_over_breakdown(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            historical_family_samples=99,
+            pre_analysis_breakdown={
+                "pre_score_historical_family_samples": 138.0,
+            },
+        )
+        self.assertEqual(audit.get("historical_family_samples"), 99)
+
+
+class TestCounterfactualAuditFields(unittest.TestCase):
+    def test_helper_emits_all_universal_thresholds(self) -> None:
+        settings = Settings()
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_score_soft_research",
+            settings=settings,
+            pre_analysis_score=0.55,
+        )
+        self.assertEqual(fields["counterfactual_required_confidence"], settings.MIN_CONFIDENCE)
+        self.assertEqual(
+            fields["counterfactual_required_evidence_quality"],
+            settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+        )
+        self.assertEqual(fields["counterfactual_required_edge_min"], settings.MIN_EDGE)
+        self.assertAlmostEqual(
+            fields["counterfactual_required_pre_analysis_score"],
+            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+        )
+
+    def test_helper_emits_threshold_gap_when_score_provided(self) -> None:
+        settings = Settings(PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.60)
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_score_soft_research",
+            settings=settings,
+            pre_analysis_score=0.45,
+        )
+        self.assertAlmostEqual(fields["pre_analysis_threshold_gap"], 0.15)
+
+    def test_helper_emits_prefix_sample_size_for_historical_prefix_reason(self) -> None:
+        settings = Settings()
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_historical_prefix_pnl_block",
+            settings=settings,
+        )
+        self.assertEqual(
+            fields["counterfactual_required_prefix_sample_size"],
+            settings.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES,
+        )
+
+    def test_helper_emits_family_sample_size_for_family_reason(self) -> None:
+        settings = Settings()
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_historical_family_pnl_block",
+            settings=settings,
+        )
+        self.assertEqual(
+            fields["counterfactual_required_family_sample_size"],
+            settings.HISTORICAL_FAMILY_MIN_SAMPLES,
+        )
+
+    def test_helper_quantifies_prefix_sample_shortfall(self) -> None:
+        settings = Settings(HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES=20)
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_historical_prefix_pnl_block",
+            settings=settings,
+            historical_metrics={"historical_gate_prefix_sample_size": 7},
+        )
+        self.assertEqual(fields["counterfactual_prefix_samples_short_by"], 13)
+
+
+class TestPreviousAnalysisAnchorEvidence(unittest.TestCase):
+    def test_anchor_evidence_fields_preserved(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.74,
+            "reasoning": "Found settlement-aligned source.",
+            "evidence_quality": 0.82,
+            "edge_source": "computed",
+            "evidence_basis": "direct",
+            "implied_prob_external": 0.55,
+            "edge_external": 0.12,
+            "my_prob": 0.67,
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertAlmostEqual(prev.evidence_quality, 0.82)
+        self.assertEqual(prev.edge_source, "computed")
+        self.assertEqual(prev.evidence_basis, "direct")
+        self.assertAlmostEqual(prev.implied_prob_external, 0.55)
+        self.assertAlmostEqual(prev.edge_external, 0.12)
+        self.assertAlmostEqual(prev.my_prob, 0.67)
+
+    def test_direct_evidence_anchor_appends_material_change_hint(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.74,
+            "reasoning": "Found settlement-aligned source.",
+            "evidence_quality": 0.82,
+            "edge_source": "computed",
+            "evidence_basis": "direct",
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertIn("material change", prev.reasoning.lower())
+
+    def test_proxy_evidence_anchor_does_not_append_hint(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.50,
+            "reasoning": "Looked at proxy data only.",
+            "evidence_quality": 0.40,
+            "edge_source": "fallback",
+            "evidence_basis": "proxy",
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertNotIn("material change", prev.reasoning.lower())
+
+    def test_missing_evidence_fields_default_safely(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.50,
+            "reasoning": "Minimal anchor.",
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertEqual(prev.evidence_quality, 0.0)
+        self.assertIsNone(prev.edge_source)
+        self.assertIsNone(prev.evidence_basis)
+
+
+class TestTierBreakdownFormat(unittest.TestCase):
+    def test_empty_breakdown_renders_empty_braces(self) -> None:
+        self.assertEqual(_format_tier_breakdown_for_log(None), "{}")
+        self.assertEqual(_format_tier_breakdown_for_log({}), "{}")
+
+    def test_single_tier_renders_label(self) -> None:
+        result = _format_tier_breakdown_for_log({"research_only_learning_queue": 142})
+        self.assertEqual(result, "{research:142}")
+
+    def test_multiple_tiers_render_alphabetically_by_key(self) -> None:
+        result = _format_tier_breakdown_for_log(
+            {
+                "research_only_learning_queue": 100,
+                "skip_for_now_with_reason": 5,
+                "monitor_only": 2,
+            }
+        )
+        self.assertIn("research:100", result)
+        self.assertIn("skip:5", result)
+        self.assertIn("monitor:2", result)
+
+    def test_zero_count_tiers_omitted(self) -> None:
+        result = _format_tier_breakdown_for_log(
+            {"research_only_learning_queue": 0, "monitor_only": 3}
+        )
+        self.assertNotIn("research:0", result)
+        self.assertIn("monitor:3", result)
+
+    def test_unknown_tier_falls_back_to_raw_label(self) -> None:
+        result = _format_tier_breakdown_for_log({"some_future_tier": 1})
+        self.assertIn("some_future_tier:1", result)
 
 
 if __name__ == "__main__":

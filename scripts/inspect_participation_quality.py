@@ -288,7 +288,7 @@ def section_blocked_conviction(
             )
 
 
-def section_naming_mismatch(
+def section_participation_demotions(
     conn: sqlite3.Connection,
     *,
     window_days: int,
@@ -297,17 +297,11 @@ def section_naming_mismatch(
         return
     cutoff = _cutoff_iso(window_days)
 
-    _print_header("PRE-ANALYSIS HARD-REJECT NAMING MISMATCH")
+    _print_header("PARTICIPATION DEMOTION DISTRIBUTION")
 
     queries = [
-        (
-            f"recent (last {window_days}d): pre_analysis_hard_reject=true with final_action=research_queued",
-            cutoff,
-        ),
-        (
-            "all-time: pre_analysis_hard_reject=true with final_action=research_queued",
-            None,
-        ),
+        (f"recent (last {window_days}d)", cutoff),
+        ("all-time", None),
     ]
     for label, cutoff_value in queries:
         if cutoff_value is not None:
@@ -315,17 +309,16 @@ def section_naming_mismatch(
                 """
                 SELECT
                   COUNT(*) AS n,
-                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                                         json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
                             AND COALESCE(final_action,'') = 'research_queued'
-                           THEN 1 ELSE 0 END) AS mismatch,
-                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                                         json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
+                           THEN 1 ELSE 0 END) AS demoted_to_research,
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
                             AND COALESCE(final_action,'') = 'skip'
-                           THEN 1 ELSE 0 END) AS skip_aligned,
-                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                                         json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
-                           THEN 1 ELSE 0 END) AS hard_reject_total
+                           THEN 1 ELSE 0 END) AS demoted_to_skip,
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
+                           THEN 1 ELSE 0 END) AS demoted_total,
+                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.participation_terminal_reject'),0)=1
+                           THEN 1 ELSE 0 END) AS terminal_rejects
                 FROM decision_receipts
                 WHERE timestamp >= ?
                 """,
@@ -336,45 +329,45 @@ def section_naming_mismatch(
                 """
                 SELECT
                   COUNT(*) AS n,
-                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                                         json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
                             AND COALESCE(final_action,'') = 'research_queued'
-                           THEN 1 ELSE 0 END) AS mismatch,
-                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                                         json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
+                           THEN 1 ELSE 0 END) AS demoted_to_research,
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
                             AND COALESCE(final_action,'') = 'skip'
-                           THEN 1 ELSE 0 END) AS skip_aligned,
-                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                                         json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
-                           THEN 1 ELSE 0 END) AS hard_reject_total
+                           THEN 1 ELSE 0 END) AS demoted_to_skip,
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
+                           THEN 1 ELSE 0 END) AS demoted_total,
+                  SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.participation_terminal_reject'),0)=1
+                           THEN 1 ELSE 0 END) AS terminal_rejects
                 FROM decision_receipts
                 """,
             ).fetchone()
         total = int(row["n"] or 0)
-        mismatch = int(row["mismatch"] or 0)
-        skip_aligned = int(row["skip_aligned"] or 0)
-        hard_reject_total = int(row["hard_reject_total"] or 0)
+        demoted_total = int(row["demoted_total"] or 0)
+        demoted_to_research = int(row["demoted_to_research"] or 0)
+        demoted_to_skip = int(row["demoted_to_skip"] or 0)
+        terminal_rejects = int(row["terminal_rejects"] or 0)
         print(f"{label}")
         print(f"  decisions seen:                         {total}")
-        print(f"  pre_analysis_hard_reject=true:          {hard_reject_total}")
+        print(f"  participation_demotion_reason set:      {demoted_total}")
         print(
-            f"    -> with final_action=research_queued: {mismatch} "
-            f"({_fmt_pct(mismatch, hard_reject_total)})"
+            f"    -> routed to research_queued:         {demoted_to_research} "
+            f"({_fmt_pct(demoted_to_research, demoted_total)})"
         )
         print(
-            f"    -> with final_action=skip:            {skip_aligned} "
-            f"({_fmt_pct(skip_aligned, hard_reject_total)})"
+            f"    -> routed to skip:                    {demoted_to_skip} "
+            f"({_fmt_pct(demoted_to_skip, demoted_total)})"
         )
+        print(f"  participation_terminal_reject=true:     {terminal_rejects}")
         print()
 
     rows = conn.execute(
         """
         SELECT
-          COALESCE(json_extract(audit_json,'$.pre_analysis_hard_reject_reason'),'unknown') AS reason,
+          COALESCE(json_extract(audit_json,'$.participation_demotion_reason'),'unknown') AS reason,
           COUNT(*) AS n
         FROM decision_receipts
-        WHERE COALESCE(json_extract(audit_json,'$.legacy_pre_analysis_hard_reject'),
-                       json_extract(audit_json,'$.pre_analysis_hard_reject'),0)=1
+        WHERE json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
           AND COALESCE(final_action,'') = 'research_queued'
         GROUP BY reason
         ORDER BY n DESC
@@ -382,7 +375,7 @@ def section_naming_mismatch(
         """,
     ).fetchall()
     if rows:
-        _print_subheader("Top reasons among hard-reject -> research_queued (all-time)")
+        _print_subheader("Top reasons among participation demotions -> research_queued (all-time)")
         print(f"{'reason':<48} {'n':>8}")
         for row in rows:
             print(f"{str(row['reason']):<48} {int(row['n']):>8}")
@@ -1362,7 +1355,7 @@ def main() -> None:
         section_account_snapshot(conn)
         section_decision_outcome_mix(conn, window_days=args.window_days)
         section_blocked_conviction(conn, window_days=args.window_days)
-        section_naming_mismatch(conn, window_days=args.window_days)
+        section_participation_demotions(conn, window_days=args.window_days)
         section_decision_field_distribution(conn, window_days=args.window_days)
         section_per_family_prefix(conn, window_days=args.window_days)
         section_cycle_funnel(conn, window_days=args.window_days)

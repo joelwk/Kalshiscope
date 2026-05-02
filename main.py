@@ -2037,14 +2037,50 @@ def _build_previous_analysis(anchor: dict[str, Any] | None) -> TradeDecision | N
     reasoning = str(anchor.get("reasoning") or "").strip()
     if not outcome or confidence is None:
         return None
+    # Preserve anchor evidence fields so the next Grok turn sees the real
+    # quality/source/basis instead of always-zero defaults. Without this,
+    # previous_analysis biases the model toward "research gap" framing on
+    # every retry, which collapses repeat-analysis quality.
+    evidence_quality = _coerce_float(anchor.get("evidence_quality"))
+    if evidence_quality is None:
+        evidence_quality = 0.0
+    edge_source_raw = anchor.get("edge_source")
+    edge_source = (
+        str(edge_source_raw).strip()
+        if isinstance(edge_source_raw, str) and edge_source_raw.strip()
+        else None
+    )
+    evidence_basis_raw = anchor.get("evidence_basis")
+    evidence_basis = (
+        str(evidence_basis_raw).strip()
+        if isinstance(evidence_basis_raw, str) and evidence_basis_raw.strip()
+        else None
+    )
+    implied_prob_external = _coerce_float(anchor.get("implied_prob_external"))
+    edge_external = _coerce_float(anchor.get("edge_external"))
+    my_prob = _coerce_float(anchor.get("my_prob"))
     if not reasoning:
         reasoning = "Previous cycle analysis."
+    # Soft hint: when prior cycle found direct evidence, the next pass should
+    # check for material change before defaulting to abstain. Stays advisory.
+    if evidence_basis == "direct" and "material change" not in reasoning.lower():
+        reasoning = (
+            f"{reasoning}\n\n"
+            "Note: prior cycle reached direct evidence; check for material "
+            "change before defaulting to abstain."
+        )
     return TradeDecision(
         should_trade=False,
         outcome=outcome,
         confidence=max(0.0, min(1.0, confidence)),
         bet_size_pct=0.0,
         reasoning=reasoning,
+        edge_source=edge_source,
+        evidence_basis=evidence_basis,
+        evidence_quality=max(0.0, min(1.0, evidence_quality)),
+        implied_prob_external=implied_prob_external,
+        edge_external=edge_external,
+        my_prob=my_prob,
     )
 
 
@@ -2412,6 +2448,20 @@ def _is_confidence_override_allowed(
     )
     if strong_evidence_allowed:
         return True, strong_floor, "strong_direct_evidence"
+
+    proxy_eq_min = max(0.0, settings.STRONG_EVIDENCE_PROXY_MIN_EVIDENCE_QUALITY)
+    proxy_edge_min = max(0.0, settings.STRONG_EVIDENCE_PROXY_MIN_EDGE)
+    strong_proxy_allowed = (
+        evidence_basis == "proxy"
+        and decision.evidence_quality >= proxy_eq_min
+        and source_whitelisted
+        and edge_source == "computed"
+        and override_edge is not None
+        and abs(override_edge) >= proxy_edge_min
+        and decision.confidence >= strong_floor
+    )
+    if strong_proxy_allowed:
+        return True, strong_floor, "strong_proxy_evidence"
 
     return False, override_min_confidence, "none"
 
@@ -2921,6 +2971,27 @@ def _build_execution_audit(
                     data={"key": key, "old_value": payload[key], "new_value": value},
                 )
             payload[key] = value
+    # Mark synthetic placeholder decisions so analytics scripts can partition
+    # "real Grok output" from queue/timeout/cap routing without string-matching.
+    decision_origin_value = payload.get("decision_origin")
+    if isinstance(decision_origin_value, str) and decision_origin_value.startswith("synthetic_"):
+        payload.setdefault("synthetic_decision", True)
+    elif "synthetic_decision" not in payload:
+        payload["synthetic_decision"] = False
+    # Flatten historical family fields from the pre_analysis_breakdown blob to
+    # top-level audit keys so SQL analytics can read them without JSON-path
+    # navigation. Top-level fields win if both are set.
+    breakdown = payload.get("pre_analysis_breakdown")
+    if isinstance(breakdown, dict):
+        for breakdown_key, audit_key in (
+            ("pre_score_historical_family_samples", "historical_family_samples"),
+            ("pre_score_historical_family_pnl_total", "historical_family_pnl_total"),
+            ("pre_score_historical_family_win_rate", "historical_family_win_rate"),
+            ("pre_score_historical_family_pnl_ratio", "historical_family_pnl_ratio"),
+        ):
+            value = breakdown.get(breakdown_key)
+            if value is not None:
+                payload.setdefault(audit_key, value)
     if final_reason and "rejection_stage" not in payload:
         if str(final_reason).startswith("pre_analysis_"):
             payload["rejection_stage"] = "pre_analysis"
@@ -2979,6 +3050,85 @@ def _skip_due_to_for_reason(reason: str | None, audit: dict[str, Any] | None = N
         if basis == "absence_only" or edge_source == "none":
             return "lack_of_evidence"
     return "not_execution_quality_now"
+
+
+_TIER_LABEL_FOR_LOG: dict[str, str] = {
+    "execution_eligible": "exec",
+    "deep_research_required": "deep",
+    "research_only_learning_queue": "research",
+    "monitor_only": "monitor",
+    "skip_for_now_with_reason": "skip",
+    "operational_error_retry": "retry",
+    "terminal_reject": "terminal",
+}
+
+
+def _format_tier_breakdown_for_log(breakdown: dict[str, int] | None) -> str:
+    """Render participation tier counts for the Cycle funnel: log line."""
+    if not breakdown:
+        return "{}"
+    parts: list[str] = []
+    for tier_key in sorted(breakdown.keys()):
+        count = int(breakdown.get(tier_key) or 0)
+        if count <= 0:
+            continue
+        label = _TIER_LABEL_FOR_LOG.get(str(tier_key), str(tier_key))
+        parts.append(f"{label}:{count}")
+    if not parts:
+        return "{}"
+    return "{" + ",".join(parts) + "}"
+
+
+def _build_counterfactual_audit_fields(
+    *,
+    reason: str | None,
+    settings: Settings,
+    pre_analysis_score: float | None = None,
+    historical_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build counterfactual audit fields explaining what would have unblocked a market.
+
+    Returns a dict of "what would the system need to see to participate?" answers
+    so analytics can quantify the gap between the current state and execution
+    eligibility. Always-applicable trade thresholds (confidence, evidence quality,
+    edge minimum) are emitted everywhere; gate-specific fields (sample size for
+    historical gates, threshold gap for score gates) are only added when relevant.
+    """
+    fields: dict[str, Any] = {
+        "counterfactual_required_confidence": settings.MIN_CONFIDENCE,
+        "counterfactual_required_evidence_quality": settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+        "counterfactual_required_edge_min": settings.MIN_EDGE,
+        "counterfactual_required_pre_analysis_score": settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+    }
+    normalized_reason = str(reason or "").strip().lower()
+    if pre_analysis_score is not None:
+        fields["pre_analysis_threshold_gap"] = float(
+            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE - pre_analysis_score
+        )
+    if "prefix" in normalized_reason or "historical_prefix" in normalized_reason:
+        fields["counterfactual_required_prefix_sample_size"] = (
+            settings.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES
+        )
+    if "family" in normalized_reason and "historical" in normalized_reason:
+        fields["counterfactual_required_family_sample_size"] = (
+            settings.HISTORICAL_FAMILY_MIN_SAMPLES
+        )
+    if historical_metrics:
+        prefix_n = historical_metrics.get("historical_gate_prefix_sample_size")
+        if isinstance(prefix_n, (int, float)):
+            shortfall = max(
+                0,
+                int(settings.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES) - int(prefix_n),
+            )
+            fields["counterfactual_prefix_samples_short_by"] = shortfall
+        family_n = historical_metrics.get("historical_gate_family_sample_size")
+        if isinstance(family_n, (int, float)):
+            shortfall = max(
+                0,
+                int(settings.HISTORICAL_FAMILY_MIN_SAMPLES) - int(family_n),
+            )
+            fields["counterfactual_family_samples_short_by"] = shortfall
+    return fields
 
 
 def _research_priority_for_reason(
@@ -3912,7 +4062,7 @@ def _pre_analysis_opportunity_score(
     }
 
 
-def _pre_analysis_hard_rejection(
+def _pre_analysis_participation_hold(
     *,
     market: Market,
     state: MarketState | None,
@@ -3927,6 +4077,14 @@ def _pre_analysis_hard_rejection(
     historical_gate_reason: str | None = None,
     historical_gate_metrics: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None, dict[str, Any]]:
+    """Evaluate pre-analysis participation gates.
+
+    Returns ``(demoted, reason, metadata)`` where ``demoted`` indicates the
+    market should be routed away from deep analysis (to research queue or
+    skip), and ``metadata`` describes which gate fired with structured fields.
+    Note: most "demoted" outcomes route to research/monitor tiers, not true
+    terminal rejection.
+    """
     if not settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED:
         return False, None, {}
     analysis_count = int(state.analysis_count or 0) if state is not None else 0
@@ -3937,10 +4095,9 @@ def _pre_analysis_hard_rejection(
         and not traded_before
     ):
         metadata = {
-            "legacy_pre_analysis_hard_reject": True,
-            "pre_analysis_hard_reject_reason": historical_gate_reason,
-            "pre_analysis_hard_reject_analysis_count": analysis_count,
-            "pre_analysis_hard_reject_traded_before": traded_before,
+            "participation_demotion_reason": historical_gate_reason,
+            "participation_demotion_analysis_count": analysis_count,
+            "participation_demotion_traded_before": traded_before,
             **(historical_gate_metrics or {}),
         }
         return True, f"pre_analysis_{historical_gate_reason}", metadata
@@ -3952,12 +4109,11 @@ def _pre_analysis_hard_rejection(
         and not traded_before
     ):
         metadata = {
-            "legacy_pre_analysis_hard_reject": True,
-            "pre_analysis_hard_reject_reason": "fallback_edge_high_churn",
-            "pre_analysis_hard_reject_non_actionable_streak": non_actionable_streak,
-            "pre_analysis_hard_reject_analysis_count": analysis_count,
-            "pre_analysis_hard_reject_traded_before": traded_before,
-            "pre_analysis_hard_reject_had_recent_fallback_edge": had_recent_fallback_edge,
+            "participation_demotion_reason": "fallback_edge_high_churn",
+            "participation_demotion_non_actionable_streak": non_actionable_streak,
+            "participation_demotion_analysis_count": analysis_count,
+            "participation_demotion_traded_before": traded_before,
+            "participation_demotion_had_recent_fallback_edge": had_recent_fallback_edge,
         }
         return True, "pre_analysis_fallback_edge_high_churn", metadata
     family = market_family(market)
@@ -3977,11 +4133,10 @@ def _pre_analysis_hard_rejection(
             and not traded_before
         ):
             metadata = {
-                "legacy_pre_analysis_hard_reject": True,
-                "pre_analysis_hard_reject_reason": "zero_action_family",
-                "pre_analysis_hard_reject_family": family,
-                "pre_analysis_hard_reject_family_sample_size": family_sample_size,
-                "pre_analysis_hard_reject_family_action_rate": family_action_rate,
+                "participation_demotion_reason": "zero_action_family",
+                "participation_demotion_family": family,
+                "participation_demotion_family_sample_size": family_sample_size,
+                "participation_demotion_family_action_rate": family_action_rate,
             }
             return True, "pre_analysis_zero_action_family", metadata
     if (
@@ -4005,13 +4160,12 @@ def _pre_analysis_hard_rejection(
             and fallback_rate >= settings.PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD
         ):
             metadata = {
-                "legacy_pre_analysis_hard_reject": True,
-                "pre_analysis_hard_reject_reason": "crypto_historically_unprofitable",
-                "pre_analysis_hard_reject_family": family,
-                "pre_analysis_hard_reject_historical_pnl": historical_pnl_total,
-                "pre_analysis_hard_reject_historical_samples": historical_sample_size,
-                "pre_analysis_hard_reject_fallback_rate": fallback_rate,
-                "pre_analysis_hard_reject_fallback_samples": fallback_samples,
+                "participation_demotion_reason": "crypto_historically_unprofitable",
+                "participation_demotion_family": family,
+                "participation_demotion_historical_pnl": historical_pnl_total,
+                "participation_demotion_historical_samples": historical_sample_size,
+                "participation_demotion_fallback_rate": fallback_rate,
+                "participation_demotion_fallback_samples": fallback_samples,
             }
             return True, "pre_analysis_crypto_historically_unprofitable", metadata
     terminal_outcome = str(state.last_terminal_outcome or "").strip().lower()
@@ -4024,40 +4178,27 @@ def _pre_analysis_hard_rejection(
         and terminal_outcome in _PRE_ANALYSIS_HARD_REJECTION_TERMINAL_OUTCOMES
         and not traded_before
     ):
-        hard_reject_reason = "repeated_non_actionable_market"
+        demotion_reason = "repeated_non_actionable_market"
         if family in {"generic", "crypto"} and _WEATHER_BIN_TICKER_PATTERN.search(market.id or ""):
-            hard_reject_reason = "repeated_non_actionable_bin_market"
+            demotion_reason = "repeated_non_actionable_bin_market"
         metadata = {
-            "legacy_pre_analysis_hard_reject": True,
-            "pre_analysis_hard_reject_reason": hard_reject_reason,
-            "pre_analysis_hard_reject_family": family,
-            "pre_analysis_hard_reject_terminal_outcome": terminal_outcome,
-            "pre_analysis_hard_reject_non_actionable_streak": non_actionable_streak,
-            "pre_analysis_hard_reject_analysis_count": analysis_count,
-            "pre_analysis_hard_reject_traded_before": traded_before,
+            "participation_demotion_reason": demotion_reason,
+            "participation_demotion_family": family,
+            "participation_demotion_terminal_outcome": terminal_outcome,
+            "participation_demotion_non_actionable_streak": non_actionable_streak,
+            "participation_demotion_analysis_count": analysis_count,
+            "participation_demotion_traded_before": traded_before,
         }
-        return True, f"pre_analysis_{hard_reject_reason}", metadata
+        return True, f"pre_analysis_{demotion_reason}", metadata
     if analysis_count >= 4 and non_actionable_streak >= 3 and not traded_before:
         metadata = {
-            "legacy_pre_analysis_hard_reject": True,
-            "pre_analysis_hard_reject_reason": "repeated_churn_market",
-            "pre_analysis_hard_reject_non_actionable_streak": non_actionable_streak,
-            "pre_analysis_hard_reject_analysis_count": analysis_count,
-            "pre_analysis_hard_reject_traded_before": traded_before,
+            "participation_demotion_reason": "repeated_churn_market",
+            "participation_demotion_non_actionable_streak": non_actionable_streak,
+            "participation_demotion_analysis_count": analysis_count,
+            "participation_demotion_traded_before": traded_before,
         }
         return True, "pre_analysis_repeated_churn_market", metadata
     return False, None, {}
-
-
-def _pre_analysis_participation_hold(
-    **kwargs: Any,
-) -> tuple[bool, str | None, dict[str, Any]]:
-    """Compatibility wrapper for pre-analysis execution holds.
-
-    The old helper name is preserved for tests/imports, but call sites use this
-    term because most outcomes are research or monitor routing, not hard rejects.
-    """
-    return _pre_analysis_hard_rejection(**kwargs)
 
 
 def _cap_analysis_candidates(
@@ -5580,7 +5721,7 @@ def main(max_cycles: int | None = None) -> None:
                 short_prefix_score_penalty, short_prefix_metrics = (
                     _evaluate_short_prefix_score_penalty(market_id=market.id)
                 )
-                pre_analysis_hard_reject, pre_analysis_hard_reject_reason, pre_analysis_hard_reject_data = (
+                pre_analysis_demoted, pre_analysis_demotion_reason, pre_analysis_demotion_data = (
                     _pre_analysis_participation_hold(
                         market=market,
                         state=state if isinstance(state, MarketState) else None,
@@ -5596,17 +5737,17 @@ def main(max_cycles: int | None = None) -> None:
                         historical_gate_metrics=historical_gate_metrics,
                     )
                 )
-                if pre_analysis_hard_reject:
+                if pre_analysis_demoted:
                     pre_analysis_blocked += 1
                     pre_analysis_research_routed_count += 1
-                    if pre_analysis_hard_reject_reason:
+                    if pre_analysis_demotion_reason:
                         _record_rejection_reason(
                             pre_analysis_rejection_breakdown,
-                            pre_analysis_hard_reject_reason,
+                            pre_analysis_demotion_reason,
                         )
                         _record_rejection_reason(
                             rejection_breakdown,
-                            pre_analysis_hard_reject_reason,
+                            pre_analysis_demotion_reason,
                         )
                     participation_result = classify_participation(
                         historical_gate=HistoricalGateResult(
@@ -5625,8 +5766,8 @@ def main(max_cycles: int | None = None) -> None:
                                 )
                             ),
                         ) if historical_gate_metrics else None,
-                        pre_analysis_rejection_reason=pre_analysis_hard_reject_reason,
-                        pre_analysis_metadata=pre_analysis_hard_reject_data,
+                        pre_analysis_rejection_reason=pre_analysis_demotion_reason,
+                        pre_analysis_metadata=pre_analysis_demotion_data,
                     )
                     participation_tier_str = str(participation_result.tier)
                     _record_rejection_reason(
@@ -5640,7 +5781,7 @@ def main(max_cycles: int | None = None) -> None:
                         confidence=0.50,
                         bet_size_pct=0.0,
                         reasoning=(
-                            f"[ResearchOnly reason={pre_analysis_hard_reject_reason or 'pre_analysis_soft_research'}] "
+                            f"[ResearchOnly reason={pre_analysis_demotion_reason or 'pre_analysis_soft_research'}] "
                             "Soft-demoted by historical or repeated no-action performance; queued for learning, not execution."
                         ),
                         edge_source="none",
@@ -5654,7 +5795,7 @@ def main(max_cycles: int | None = None) -> None:
                         research_queue_position = _enqueue_research_candidate(
                             market=market,
                             decision=research_only_decision,
-                            reason=pre_analysis_hard_reject_reason
+                            reason=pre_analysis_demotion_reason
                             or "pre_analysis_soft_research",
                             gate_name="pre_analysis_performance",
                             threshold_gap=0.0,
@@ -5671,7 +5812,7 @@ def main(max_cycles: int | None = None) -> None:
                                 market_id=market.id,
                                 cycle_id=cycle_id,
                                 gate_name="pre_analysis_performance",
-                                reason=pre_analysis_hard_reject_reason or "pre_analysis_soft_research",
+                                reason=pre_analysis_demotion_reason or "pre_analysis_soft_research",
                                 threshold_gap=0.0,
                                 what_to_learn_next=participation_result.what_to_learn_next,
                                 last_decision_json=_safe_json_dumps(
@@ -5694,20 +5835,26 @@ def main(max_cycles: int | None = None) -> None:
                             )
                         except Exception:
                             pass
-                    _deduped_reject_data = {
+                    # Strip canonical keys emitted explicitly by _build_execution_audit
+                    # below so pre_analysis metadata cannot double-write them.
+                    _demotion_audit_extra = {
                         k: v
-                        for k, v in pre_analysis_hard_reject_data.items()
+                        for k, v in pre_analysis_demotion_data.items()
                         if k not in {
                             "participation_tier",
                             "participation_decision",
+                            "participation_demotion_reason",
                             "why_not_execution_eligible",
                             "what_to_learn_next",
                             "sample_size_signal",
-                            "pre_analysis_hard_reject",
-                            "legacy_pre_analysis_hard_reject",
-                            "pre_analysis_hard_reject_reason",
                         }
                     }
+                    _demotion_counterfactuals = _build_counterfactual_audit_fields(
+                        reason=pre_analysis_demotion_reason,
+                        settings=settings,
+                        pre_analysis_score=None,
+                        historical_metrics=historical_gate_metrics,
+                    )
                     _research_audit = _build_execution_audit(
                         decision_terminal=not queue_for_pre_analysis_research,
                         final_action=(
@@ -5715,12 +5862,12 @@ def main(max_cycles: int | None = None) -> None:
                             if queue_for_pre_analysis_research
                             else "skip"
                         ),
-                        final_reason=pre_analysis_hard_reject_reason
+                        final_reason=pre_analysis_demotion_reason
                         or "pre_analysis_soft_research",
                         market_family=family_name,
                         pre_analysis_score=_PRE_ANALYSIS_RESEARCH_ONLY_SCORE,
                         pre_analysis_soft_research_only=True,
-                        pre_analysis_soft_research_reason=pre_analysis_hard_reject_reason,
+                        pre_analysis_soft_research_reason=pre_analysis_demotion_reason,
                         research_queue_position=research_queue_position,
                         historical_gate_allowed=historical_gate_allowed,
                         historical_gate_reason=historical_gate_reason,
@@ -5733,16 +5880,15 @@ def main(max_cycles: int | None = None) -> None:
                         participation_decision=str(participation_result.primary_reason),
                         why_not_execution_eligible=participation_result.why_not_execution_eligible,
                         what_to_learn_next=participation_result.what_to_learn_next,
-                        pre_analysis_demotion_reason=pre_analysis_hard_reject_reason,
-                        counterfactual_required_confidence=settings.MIN_CONFIDENCE,
-                        counterfactual_required_evidence_quality=settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+                        pre_analysis_demotion_reason=pre_analysis_demotion_reason,
                         decision_origin="synthetic_research_queue",
                         market_judgment_available=False,
                         skip_due_to=_skip_due_to_for_reason(
-                            pre_analysis_hard_reject_reason,
+                            pre_analysis_demotion_reason,
                             historical_gate_metrics,
                         ),
-                        **_deduped_reject_data,
+                        **_demotion_counterfactuals,
+                        **_demotion_audit_extra,
                     )
                     log_trade_decision(
                         market_id=market.id,
@@ -5753,7 +5899,7 @@ def main(max_cycles: int | None = None) -> None:
                     logger.debug(
                         "Soft-demoted %s to research-only pre-analysis path (%s) tier=%s",
                         market.id,
-                        pre_analysis_hard_reject_reason or "pre_analysis_hard_reject",
+                        pre_analysis_demotion_reason or "pre_analysis_soft_research",
                         participation_tier_str,
                         data={
                             "market_id": market.id,
@@ -5765,7 +5911,7 @@ def main(max_cycles: int | None = None) -> None:
                             "research_queue_position": research_queue_position,
                             "participation_tier": participation_tier_str,
                             "what_to_learn_next": participation_result.what_to_learn_next,
-                            **_deduped_reject_data,
+                            **_demotion_audit_extra,
                         },
                     )
                     continue
@@ -5849,6 +5995,12 @@ def main(max_cycles: int | None = None) -> None:
                             )
                         except Exception:
                             pass
+                    _cap_counterfactuals = _build_counterfactual_audit_fields(
+                        reason=_cap_reason,
+                        settings=settings,
+                        pre_analysis_score=None,
+                        historical_metrics=None,
+                    )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -5873,6 +6025,7 @@ def main(max_cycles: int | None = None) -> None:
                                 f"Reached {_analysis_count_for_cap} analyses; wait for outcome learning."
                             ),
                             skip_due_to="not_execution_quality_now",
+                            **_cap_counterfactuals,
                         ),
                     )
                     logger.debug(
@@ -6026,6 +6179,12 @@ def main(max_cycles: int | None = None) -> None:
                                     )
                                 except Exception:
                                     pass
+                            _soft_counterfactuals = _build_counterfactual_audit_fields(
+                                reason=_rejection_tag,
+                                settings=settings,
+                                pre_analysis_score=pre_analysis_score,
+                                historical_metrics=None,
+                            )
                             log_trade_decision(
                                 market_id=market.id,
                                 question=market.question,
@@ -6048,12 +6207,10 @@ def main(max_cycles: int | None = None) -> None:
                                     what_to_learn_next=(
                                         _soft_participation_result.what_to_learn_next
                                     ),
-                                    counterfactual_required_pre_analysis_score=(
-                                        settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
-                                    ),
                                     decision_origin="synthetic_research_queue",
                                     market_judgment_available=False,
                                     skip_due_to="weak_edge",
+                                    **_soft_counterfactuals,
                                 ),
                             )
                             logger.debug(
@@ -6274,6 +6431,12 @@ def main(max_cycles: int | None = None) -> None:
                         rejection_breakdown,
                         "research_only_repeated_non_actionable",
                     )
+                    _research_only_counterfactuals = _build_counterfactual_audit_fields(
+                        reason="repeated_non_actionable_research_only",
+                        settings=settings,
+                        pre_analysis_score=candidate.get("pre_analysis_score"),
+                        historical_metrics=candidate.get("historical_gate_metrics"),
+                    )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -6295,6 +6458,14 @@ def main(max_cycles: int | None = None) -> None:
                             short_prefix_score_penalty=candidate.get("short_prefix_score_penalty"),
                             research_only=True,
                             research_queue_position=research_queue_position,
+                            participation_tier=str(
+                                ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+                            ),
+                            participation_decision="repeated_non_actionable_research_only",
+                            decision_origin="synthetic_research_queue",
+                            market_judgment_available=False,
+                            skip_due_to="not_execution_quality_now",
+                            **_research_only_counterfactuals,
                         ),
                     )
                     research_only_emissions += 1
@@ -6936,6 +7107,12 @@ def main(max_cycles: int | None = None) -> None:
                             else "skip"
                         )
                     )
+                    _failure_counterfactuals = _build_counterfactual_audit_fields(
+                        reason=_failure_reason,
+                        settings=settings,
+                        pre_analysis_score=None,
+                        historical_metrics=None,
+                    )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -6958,6 +7135,7 @@ def main(max_cycles: int | None = None) -> None:
                             search_profile=analysis_result.get("analysis_search_profile"),
                             error_type=analysis_result.get("analysis_error_type"),
                             error_message=analysis_result.get("analysis_error"),
+                            **_failure_counterfactuals,
                         ),
                     )
                     logger.info(
@@ -10318,7 +10496,7 @@ def main(max_cycles: int | None = None) -> None:
                     "filtered": len(markets),
                     "deduped": len(markets),
                     "pre_scored": original_analysis_candidates_count,
-                    "hard_rejected": pre_analysis_blocked,
+                    "pre_analysis_demoted": pre_analysis_blocked,
                     "analyzed": markets_analyzed,
                     "decided": decisions_made,
                     "research_queued": research_queue_size,
@@ -10466,7 +10644,7 @@ def main(max_cycles: int | None = None) -> None:
                 "(closed=%d recently=%d other=%d) "
                 "analyzed=%d refined=%d flip_precheck_skipped=%d flip_guard_triggered=%d "
                 "flip_guard_blocked=%d execution_candidates=%d research_queue_size=%d should_trade_blocked=%d order_attempts=%d "
-                "skipped_kelly_sub_floor=%d",
+                "skipped_kelly_sub_floor=%d tiers=%s",
                 fetched_count,
                 len(markets),
                 filter_stats.get("skipped_resolved", 0),
@@ -10485,6 +10663,7 @@ def main(max_cycles: int | None = None) -> None:
                 should_trade_but_blocked,
                 trades_attempted,
                 trades_skipped_kelly_sub_floor,
+                _format_tier_breakdown_for_log(participation_tier_breakdown),
                 data={
                     "fetched": fetched_count,
                     "filtered": len(markets),

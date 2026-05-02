@@ -705,3 +705,123 @@ def test_strong_direct_evidence_override_rejects_non_whitelisted_source() -> Non
     )
     assert allowed is False
     assert override_path == "none"
+
+
+# --- Strong proxy evidence override tests ---
+
+
+def _proxy_override_settings(**overrides) -> Settings:
+    defaults = dict(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.62,
+        STRONG_EVIDENCE_CONFIDENCE_FLOOR=0.55,
+        STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY=0.85,
+        STRONG_EVIDENCE_PROXY_MIN_EVIDENCE_QUALITY=0.95,
+        STRONG_EVIDENCE_PROXY_MIN_EDGE=0.20,
+        DIRECT_SOURCE_WHITELIST=("wsj.com", "weather.gov", "espn.com"),
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def test_strong_proxy_evidence_override_allows_kxgoldw_canary() -> None:
+    """KXGOLDW canary: whitelisted WSJ source, basis=proxy, eq=1.0,
+    edge=0.24, conf=0.55 -> strong_proxy_evidence, allowed=True."""
+    settings = _proxy_override_settings()
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.55,
+        bet_size_pct=0.38,
+        reasoning="Gold futures proxy evidence from WSJ",
+        evidence_basis="proxy",
+        evidence_quality=1.0,
+        edge_source="computed",
+        edge_external=0.24,
+        primary_source_url="https://www.wsj.com/market-data/quotes/futures/GCK26",
+    )
+    allowed, floor, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.24,
+    )
+    assert allowed is True
+    assert override_path == "strong_proxy_evidence"
+    assert floor == 0.55
+
+
+def test_strong_proxy_evidence_rejects_low_eq() -> None:
+    """eq=0.85 passes the direct floor (0.85) but fails the proxy floor
+    (0.95) -> blocked."""
+    settings = _proxy_override_settings()
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.55,
+        bet_size_pct=0.30,
+        reasoning="Proxy evidence with moderate quality",
+        evidence_basis="proxy",
+        evidence_quality=0.85,
+        edge_source="computed",
+        edge_external=0.24,
+        primary_source_url="https://www.wsj.com/market-data/quotes/futures/GCK26",
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.24,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def test_strong_proxy_evidence_rejects_low_edge() -> None:
+    """edge=0.15 passes the default threshold (0.10) but fails the proxy
+    threshold (0.20) -> blocked."""
+    settings = _proxy_override_settings()
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.55,
+        bet_size_pct=0.25,
+        reasoning="Proxy evidence with small edge",
+        evidence_basis="proxy",
+        evidence_quality=0.95,
+        edge_source="computed",
+        edge_external=0.15,
+        primary_source_url="https://www.wsj.com/market-data/quotes/futures/GCK26",
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.15,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def test_strong_proxy_evidence_rejects_non_whitelisted_source() -> None:
+    """Non-whitelisted source URL -> proxy override doesn't trigger even
+    when eq and edge are strong."""
+    settings = _proxy_override_settings()
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.55,
+        bet_size_pct=0.30,
+        reasoning="Proxy evidence from untrusted source",
+        evidence_basis="proxy",
+        evidence_quality=1.0,
+        edge_source="computed",
+        edge_external=0.30,
+        primary_source_url="https://randomblog.example.com/futures/gold",
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.30,
+    )
+    assert allowed is False
+    assert override_path == "none"
