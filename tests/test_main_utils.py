@@ -4,16 +4,21 @@ import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from calibration_gates import PerformanceStats
 from config import Settings
 from main import (
     _available_orderbook_sell_quantity,
     _analysis_result_rank,
     _analyze_market_candidate,
+    _apply_runtime_score_receipt,
     _best_orderbook_sell_price,
     _build_order_request_from_market,
     _build_kalshi_market_fetch_window,
+    _build_counterfactual_audit_fields,
     _build_execution_audit,
+    _build_previous_analysis,
     _build_reasoning_hash,
+    _format_tier_breakdown_for_log,
     _can_use_lenient_stale_refresh_fallback,
     _cap_analysis_candidates,
     _cap_effective_confidence_for_market,
@@ -28,6 +33,7 @@ from main import (
     _edge_threshold_for_market,
     _event_concentration_blocked,
     _event_side_conflict_blocked,
+    _should_apply_definitive_side_override,
     _event_ticker_prefix,
     _effective_position_override_threshold,
     _extract_order_cancel_reason,
@@ -38,13 +44,17 @@ from main import (
     _log_settings_summary,
     _max_confidence_for_market,
     _min_evidence_quality_for_market,
-    _pre_analysis_hard_rejection,
+    _non_definitive_confidence_ceiling,
+    _pre_analysis_participation_hold,
     _pre_analysis_opportunity_score,
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
     _resolve_dynamic_analysis_candidate_cap,
+    _resolve_min_bet_floor,
     _score_breakdown_from_execution_audit,
+    _score_gate_critical_rejection_reasons,
+    _should_queue_research_for_blocked_trade,
     _should_skip_for_balance,
     _ticker_resolution_date,
     _should_adjust_position,
@@ -56,6 +66,8 @@ from main import (
     _parse_exchange_position_row,
 )
 from models import Market, MarketOutcome, MarketState, Position, TradeDecision
+from research_profiles import build_market_search_config
+from score_engine import compute_final_score
 
 
 class DummyStateManager:
@@ -77,6 +89,16 @@ class DummyGrokClient:
 class FailingGrokClient:
     def analyze_market(self, market, search_config=None, previous_analysis=None):
         raise RuntimeError("StatusCode.INTERNAL: internal server error")
+
+
+class RecordingGrokClient:
+    def __init__(self, decision: TradeDecision) -> None:
+        self.decision = decision
+        self.last_search_config = None
+
+    def analyze_market(self, market, search_config=None, previous_analysis=None):
+        self.last_search_config = search_config
+        return self.decision
 
 
 class TestMainUtils(unittest.TestCase):
@@ -145,6 +167,140 @@ class TestMainUtils(unittest.TestCase):
         lower = {"decision": tradeable, "pre_execution_final_score": 0.10}
         higher = {"decision": tradeable, "pre_execution_final_score": 0.30}
         self.assertGreater(_analysis_result_rank(higher), _analysis_result_rank(lower))
+
+    def test_analysis_result_rank_demotes_critical_score_rejections(self) -> None:
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.75,
+            bet_size_pct=0.2,
+            reasoning="tradeable",
+            evidence_quality=0.9,
+            edge_source="computed",
+        )
+        clean = {
+            "decision": decision,
+            "pre_execution_final_score": 0.30,
+            "pre_execution_rejection_reasons": (),
+        }
+        critical = {
+            "decision": decision,
+            "pre_execution_final_score": 0.90,
+            "pre_execution_rejection_reasons": ("non_positive_market_edge",),
+        }
+        self.assertGreater(_analysis_result_rank(clean), _analysis_result_rank(critical))
+
+    def test_runtime_score_receipt_overwrites_pre_execution_score_fields(self) -> None:
+        market = Market(
+            id="KXMLBGAME-26APR121610TEXLAD-LAD",
+            question="Will the Dodgers beat the Rangers?",
+            liquidity_usdc=1000.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.78,
+            bet_size_pct=0.2,
+            reasoning="Direct source says final score is settled.",
+            evidence_quality=0.86,
+            edge_source="computed",
+            evidence_basis="direct",
+            primary_source_url="https://www.espn.com/mlb/game/_/gameId/test",
+        )
+        runtime_score = compute_final_score(
+            market,
+            decision,
+            implied_prob_market=0.55,
+            evidence_basis_class="direct",
+            edge_source="computed",
+        )
+        audit_context = {
+            "score_final": -0.10,
+            "score_breakdown": {"score_final": -0.10},
+        }
+
+        score_fields = _apply_runtime_score_receipt(
+            audit_context,
+            score_result=runtime_score,
+            score_threshold_effective=0.30,
+            pre_execution_final_score=-0.10,
+            score_gate_score_source="runtime_recomputed",
+            score_gate_critical_reasons=(),
+        )
+
+        self.assertEqual(score_fields["score_final"], runtime_score.final_score)
+        self.assertEqual(audit_context["score_final"], runtime_score.final_score)
+        self.assertEqual(
+            audit_context["score_breakdown"]["score_final"],
+            runtime_score.final_score,
+        )
+        self.assertEqual(audit_context["execution_score_final"], runtime_score.final_score)
+        self.assertEqual(audit_context["execution_score_threshold"], 0.30)
+        self.assertEqual(audit_context["score_gate_score_source"], "runtime_recomputed")
+        self.assertAlmostEqual(
+            audit_context["pre_vs_runtime_score_delta"],
+            runtime_score.final_score - (-0.10),
+        )
+
+    def test_research_queued_audit_preserves_learning_fields(self) -> None:
+        audit = _build_execution_audit(
+            decision_terminal=False,
+            final_action="research_queued",
+            final_reason="historical_prefix_small_sample_negative",
+            historical_prefix_action="research_queued",
+            learning_hold_reason="historical_prefix_small_sample_negative",
+            what_to_learn_next="Review settled prefix outcomes before execution.",
+            score_gate_score_source="runtime_recomputed",
+        )
+
+        self.assertEqual(audit["final_action"], "research_queued")
+        self.assertEqual(
+            audit["learning_hold_reason"],
+            "historical_prefix_small_sample_negative",
+        )
+        self.assertEqual(audit["historical_prefix_action"], "research_queued")
+        self.assertEqual(
+            audit["what_to_learn_next"],
+            "Review settled prefix outcomes before execution.",
+        )
+        self.assertEqual(audit["score_gate_score_source"], "runtime_recomputed")
+
+    def test_score_gate_critical_rejection_blocks_fallback_source_failures(self) -> None:
+        reasons = _score_gate_critical_rejection_reasons(
+            rejection_reasons=("fallback_edge_penalty", "no_external_odds_penalty"),
+            evidence_basis_class="proxy",
+            edge_source="fallback",
+        )
+        self.assertEqual(
+            reasons,
+            ("fallback_edge_penalty", "no_external_odds_penalty"),
+        )
+
+    def test_analysis_result_rank_prefers_profitable_family_when_scores_equal(self) -> None:
+        tradeable = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.2,
+            reasoning="tradeable",
+            evidence_quality=0.8,
+        )
+        result = {"decision": tradeable, "pre_execution_final_score": 0.25}
+        profitable_family_rank = _analysis_result_rank(
+            result,
+            historical_family_pnl_total=12.0,
+            historical_family_sample_size=10,
+        )
+        weak_family_rank = _analysis_result_rank(
+            result,
+            historical_family_pnl_total=-4.0,
+            historical_family_sample_size=10,
+        )
+        self.assertGreater(profitable_family_rank, weak_family_rank)
 
     def test_event_ticker_prefix_prefers_event_ticker_field(self) -> None:
         market = Market(
@@ -276,6 +432,128 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(payload.get("rejection_stage"), "score_gate")
         self.assertEqual(payload.get("rejection_reason"), "score_gate_blocked")
+        self.assertEqual(payload.get("skip_reasons"), ["score_gate_blocked"])
+
+    def test_build_execution_audit_marks_research_queued_skip_reason(self) -> None:
+        payload = _build_execution_audit(
+            decision_terminal=False,
+            final_action="research_queued",
+            final_reason="edge_gate_blocked",
+        )
+        self.assertEqual(payload.get("final_action"), "research_queued")
+        self.assertEqual(payload.get("skip_reasons"), ["edge_gate_blocked"])
+        self.assertEqual(payload.get("rejection_reason"), "edge_gate_blocked")
+
+    def test_should_queue_research_for_blocked_trade_accepts_edge_above_reasonable_max(self) -> None:
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.92,
+            bet_size_pct=0.3,
+            reasoning="direct source signal",
+            evidence_basis="direct",
+        )
+        should_queue = _should_queue_research_for_blocked_trade(
+            settings=Settings(RESEARCH_QUEUE_ENABLED=True),
+            decision=decision,
+            evidence_basis="direct",
+            gate_name="edge",
+            threshold_gap=0.0,
+            edge_reason="edge_above_reasonable_max",
+        )
+        self.assertTrue(should_queue)
+
+    def test_should_queue_research_for_blocked_trade_accepts_hallucinated_edge(self) -> None:
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.84,
+            bet_size_pct=0.2,
+            reasoning="Direct evidence but edge anomaly.",
+            evidence_basis="direct",
+        )
+        should_queue = _should_queue_research_for_blocked_trade(
+            settings=Settings(RESEARCH_QUEUE_ENABLED=True),
+            decision=decision,
+            evidence_basis="direct",
+            gate_name="hallucinated_edge",
+            threshold_gap=0.05,
+        )
+        self.assertTrue(should_queue)
+
+    def test_should_queue_research_for_blocked_trade_accepts_extreme_market_edge(self) -> None:
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.86,
+            bet_size_pct=0.2,
+            reasoning="Direct evidence with oversized market edge.",
+            evidence_basis="direct",
+        )
+        should_queue = _should_queue_research_for_blocked_trade(
+            settings=Settings(RESEARCH_QUEUE_ENABLED=True),
+            decision=decision,
+            evidence_basis="direct",
+            gate_name="extreme_market_edge",
+            threshold_gap=0.10,
+        )
+        self.assertTrue(should_queue)
+
+    def test_analysis_result_rank_prefers_lower_overconfidence_gap(self) -> None:
+        safer = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.2,
+            reasoning="Safer calibrated setup",
+            evidence_quality=0.72,
+        )
+        overconfident = safer.model_copy(update={"confidence": 0.88, "evidence_quality": 0.50})
+        safer_rank = _analysis_result_rank({"decision": safer, "pre_execution_final_score": 0.25})
+        overconfident_rank = _analysis_result_rank(
+            {"decision": overconfident, "pre_execution_final_score": 0.25}
+        )
+        self.assertGreater(safer_rank, overconfident_rank)
+
+    def test_analysis_result_rank_uses_historical_family_win_rate_tie_breaker(self) -> None:
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.78,
+            bet_size_pct=0.2,
+            reasoning="Tie-breaker check",
+            evidence_quality=0.74,
+        )
+        high_win_rate_rank = _analysis_result_rank(
+            {"decision": decision, "pre_execution_final_score": 0.20},
+            historical_family_pnl_total=12.0,
+            historical_family_sample_size=10,
+            historical_family_win_rate=0.72,
+        )
+        low_win_rate_rank = _analysis_result_rank(
+            {"decision": decision, "pre_execution_final_score": 0.20},
+            historical_family_pnl_total=12.0,
+            historical_family_sample_size=10,
+            historical_family_win_rate=0.41,
+        )
+        self.assertGreater(high_win_rate_rank, low_win_rate_rank)
+
+    def test_build_execution_audit_non_sports_primary_source_skip_no_duplicate_market_family(self) -> None:
+        audit_context = {
+            "market_family": "generic",
+            "pre_analysis_score": 0.7,
+            "edge_market": 0.05,
+        }
+        payload = _build_execution_audit(
+            decision_terminal=True,
+            final_action="skip",
+            final_reason="non_sports_missing_primary_source",
+            primary_source_url=None,
+            **audit_context,
+        )
+        self.assertEqual(payload.get("market_family"), "generic")
+        self.assertEqual(payload.get("final_reason"), "non_sports_missing_primary_source")
+        self.assertIsNone(payload.get("primary_source_url"))
 
     def test_build_execution_audit_keeps_explicit_score_breakdown(self) -> None:
         payload = _build_execution_audit(
@@ -290,6 +568,120 @@ class TestMainUtils(unittest.TestCase):
             {"final_score": 0.28, "score_threshold": 0.38},
         )
         self.assertEqual(payload.get("score_final"), 0.28)
+
+    def test_build_execution_audit_accepts_audit_context_with_edge_market(self) -> None:
+        payload = _build_execution_audit(
+            decision_phase="post_sizing",
+            decision_terminal=True,
+            final_action="skip",
+            final_reason="zero_bet_after_sizing",
+            **{"edge_market": 0.12, "edge_external": 0.08},
+        )
+        self.assertEqual(payload.get("edge_market"), 0.12)
+        self.assertEqual(payload.get("edge_external"), 0.08)
+        self.assertEqual(payload.get("rejection_reason"), "zero_bet_after_sizing")
+
+    def test_build_execution_audit_prefers_canonical_over_alias_when_both_present(self) -> None:
+        payload = _build_execution_audit(
+            final_reason="test",
+            edge=0.10,
+            edge_market=0.12,
+            implied_prob=0.51,
+            implied_prob_market=0.54,
+        )
+        self.assertEqual(payload.get("edge_market"), 0.12)
+        self.assertEqual(payload.get("implied_prob_market"), 0.54)
+        self.assertNotIn("edge", payload)
+        self.assertNotIn("implied_prob", payload)
+
+    def test_build_execution_audit_replays_post_sizing_signature_without_collision(self) -> None:
+        audit_context = {
+            "market_family": "generic",
+            "pre_execution_final_score": 0.11,
+            "edge_market": 0.12,
+            "edge_external": 0.05,
+        }
+        payload = _build_execution_audit(
+            decision_phase="post_sizing",
+            decision_terminal=True,
+            final_action="skip",
+            final_reason="zero_bet_after_sizing",
+            sizing_mode="kelly",
+            adjusted_bet_pct=0.0,
+            bet_amount_usdc=0.0,
+            kelly_raw=0.02,
+            kelly_fraction_value=0.25,
+            posterior_for_kelly=0.57,
+            bayesian_posterior_raw=0.58,
+            bayesian_posterior_applied=0.57,
+            bayesian_applied=True,
+            bayesian_update_count=2,
+            bayesian_min_updates=1,
+            likelihood_ratio=1.4,
+            implied_prob_market=0.45,
+            min_edge_for_kelly=0.10,
+            lmsr_execution_price=0.46,
+            lmsr_inefficiency_signal=0.03,
+            lmsr_liquidity_param_b=100000.0,
+            **audit_context,
+        )
+        self.assertEqual(payload.get("edge_market"), 0.12)
+        self.assertEqual(payload.get("edge_external"), 0.05)
+        self.assertEqual(payload.get("final_reason"), "zero_bet_after_sizing")
+        self.assertIsNone(payload.get("rejection_stage"))
+
+    def test_kelly_zero_routed_through_fallback_edge_scaling_floors_at_min_bet(self) -> None:
+        (
+            bet_amount,
+            bet_pct,
+            min_floor_applied,
+            kelly_sub_floor_skipped,
+            policy_applied,
+        ) = _resolve_min_bet_floor(
+            bet_amount=0.0,
+            min_bet_usdc=8.0,
+            max_bet_usdc=16.0,
+            kelly_path_active=True,
+            min_bet_policy="fallback_edge_scaling",
+            edge_scaling_bet_pct=0.20,
+        )
+        self.assertEqual(policy_applied, "fallback_edge_scaling")
+        self.assertEqual(bet_amount, 8.0)
+        self.assertEqual(bet_pct, 0.5)
+        self.assertTrue(min_floor_applied)
+        self.assertFalse(kelly_sub_floor_skipped)
+
+    def test_kelly_zero_with_skip_policy_still_hard_skips(self) -> None:
+        (
+            bet_amount,
+            bet_pct,
+            min_floor_applied,
+            kelly_sub_floor_skipped,
+            policy_applied,
+        ) = _resolve_min_bet_floor(
+            bet_amount=0.0,
+            min_bet_usdc=8.0,
+            max_bet_usdc=16.0,
+            kelly_path_active=True,
+            min_bet_policy="skip",
+            edge_scaling_bet_pct=0.40,
+        )
+        self.assertEqual(policy_applied, "skip")
+        self.assertEqual(bet_amount, 0.0)
+        self.assertEqual(bet_pct, 0.0)
+        self.assertFalse(min_floor_applied)
+        self.assertTrue(kelly_sub_floor_skipped)
+
+    def test_audit_contains_sizing_zero_reason(self) -> None:
+        payload = _build_execution_audit(
+            decision_phase="post_sizing",
+            decision_terminal=True,
+            final_action="skip",
+            final_reason="zero_bet_after_sizing",
+            sizing_mode="kelly",
+            sizing_zero_reason="kelly_posterior_edge_below_min",
+        )
+        self.assertEqual(payload.get("sizing_zero_reason"), "kelly_posterior_edge_below_min")
 
     def test_score_breakdown_from_execution_audit_infers_score_fields(self) -> None:
         score_breakdown = _score_breakdown_from_execution_audit(
@@ -349,7 +741,28 @@ class TestMainUtils(unittest.TestCase):
         self.assertGreater(breakdown["pre_score_family_penalty"], 0.0)
         self.assertGreater(breakdown["pre_score_non_actionable_penalty"], 0.0)
 
-    def test_pre_analysis_hard_rejection_blocks_repeated_non_actionable_family(self) -> None:
+    def test_pre_analysis_opportunity_score_records_actionability_penalties(self) -> None:
+        market = Market(
+            id="KXWHCDATTEND-26-MRUB",
+            question="Will Marco Rubio attend the dinner?",
+            category="politics",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=12),
+            resolution_criteria="",
+        )
+        score, breakdown = _pre_analysis_opportunity_score(
+            market,
+            MarketState(market_id=market.id),
+            Settings(),
+            traded_before=False,
+        )
+        self.assertLess(score, 0.80)
+        self.assertGreater(breakdown["pre_score_source_difficulty_penalty"], 0.0)
+        self.assertGreater(breakdown["pre_score_ambiguous_market_penalty"], 0.0)
+        self.assertGreater(breakdown["pre_score_ambiguous_resolution_penalty"], 0.0)
+
+    def test_pre_analysis_demotion_for_repeated_non_actionable_family(self) -> None:
         market = Market(
             id="KXPERSONMENTION-26APR09-TERM",
             question="Will candidate mention term?",
@@ -363,7 +776,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=7,
             last_terminal_outcome="evidence_quality_below_min",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -371,9 +784,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_repeated_non_actionable_market")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "speech")
+        self.assertEqual(metadata["participation_demotion_family"], "speech")
 
-    def test_pre_analysis_hard_rejection_blocks_repeated_non_actionable_generic_bin(self) -> None:
+    def test_pre_analysis_demotion_for_repeated_non_actionable_generic_bin(self) -> None:
         market = Market(
             id="KXNASDAQ100-26APR10H1600-B25250",
             question="Will the Nasdaq-100 be between 25200 and 25299.99?",
@@ -387,7 +800,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=7,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -395,9 +808,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_repeated_non_actionable_bin_market")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "generic")
+        self.assertEqual(metadata["participation_demotion_family"], "generic")
 
-    def test_pre_analysis_hard_rejection_blocks_zero_action_family(self) -> None:
+    def test_pre_analysis_demotion_for_zero_action_family(self) -> None:
         market = Market(
             id="KXPERSONMENTION-26APR09-TERM",
             question="Will candidate mention term?",
@@ -418,7 +831,7 @@ class TestMainUtils(unittest.TestCase):
             PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES=20,
             PRE_ANALYSIS_HARD_REJECTION_FAMILIES=("speech", "mention"),
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=settings,
@@ -427,9 +840,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_zero_action_family")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "speech")
+        self.assertEqual(metadata["participation_demotion_family"], "speech")
 
-    def test_pre_analysis_hard_rejection_blocks_fallback_edge_high_churn(self) -> None:
+    def test_pre_analysis_demotion_for_fallback_edge_high_churn(self) -> None:
         market = Market(
             id="KXBTCD-26APR0917-T70499.99",
             question="Bitcoin threshold",
@@ -443,7 +856,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=3,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -452,9 +865,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_fallback_edge_high_churn")
-        self.assertTrue(metadata["pre_analysis_hard_reject_had_recent_fallback_edge"])
+        self.assertTrue(metadata["participation_demotion_had_recent_fallback_edge"])
 
-    def test_pre_analysis_hard_rejection_blocks_repeated_churn_market(self) -> None:
+    def test_pre_analysis_demotion_for_repeated_churn_market(self) -> None:
         market = Market(
             id="KXWTI-26APR14-T96.99",
             question="WTI settlement threshold",
@@ -468,7 +881,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=3,
             last_terminal_outcome="manual_skip",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(),
@@ -476,9 +889,9 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_repeated_churn_market")
-        self.assertEqual(metadata["pre_analysis_hard_reject_analysis_count"], 5)
+        self.assertEqual(metadata["participation_demotion_analysis_count"], 5)
 
-    def test_pre_analysis_hard_rejection_blocks_unprofitable_crypto_fallback_family(self) -> None:
+    def test_pre_analysis_demotion_for_unprofitable_crypto_fallback_family(self) -> None:
         market = Market(
             id="KXBTCD-26APR1217-T70999.99",
             question="Bitcoin threshold",
@@ -492,7 +905,7 @@ class TestMainUtils(unittest.TestCase):
             non_actionable_streak=1,
             last_terminal_outcome="no_trade_recommended",
         )
-        rejected, reason, metadata = _pre_analysis_hard_rejection(
+        rejected, reason, metadata = _pre_analysis_participation_hold(
             market=market,
             state=state,
             settings=Settings(
@@ -511,7 +924,7 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertTrue(rejected)
         self.assertEqual(reason, "pre_analysis_crypto_historically_unprofitable")
-        self.assertEqual(metadata["pre_analysis_hard_reject_family"], "crypto")
+        self.assertEqual(metadata["participation_demotion_family"], "crypto")
 
     def test_pre_analysis_opportunity_score_penalizes_generic_bin_churn(self) -> None:
         market = Market(
@@ -636,18 +1049,132 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(future_breakdown["pre_score_post_event_bonus"], 0.0)
         self.assertGreater(past_score, future_score)
 
+    def test_pre_analysis_opportunity_score_boosts_priority_mlb_markets(self) -> None:
+        settings = Settings()
+        priority_market = Market(
+            id="KXMLBGAME-26APR201335NYYBOS-NYY",
+            question="Will this contract settle above the listed strike?",
+            category="finance",
+            liquidity_usdc=600.0,
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+            resolution_criteria="Official settlement source",
+        )
+        non_priority_market = priority_market.model_copy(
+            update={"id": "KXGENERIC-26APR201335NYYBOS-P1.5"}
+        )
+        priority_score, priority_breakdown = _pre_analysis_opportunity_score(
+            priority_market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        non_priority_score, non_priority_breakdown = _pre_analysis_opportunity_score(
+            non_priority_market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        self.assertEqual(priority_breakdown["pre_score_mlb_priority_bonus"], 0.05)
+        self.assertEqual(non_priority_breakdown["pre_score_mlb_priority_bonus"], 0.0)
+        self.assertGreater(priority_score, non_priority_score)
+
+    def test_pre_analysis_opportunity_score_applies_mlb_subfamily_and_zero_trade_penalties(self) -> None:
+        settings = Settings(
+            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=True,
+            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=0.06,
+            PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.04,
+            HISTORICAL_TICKER_PREFIX_LEN=12,
+            HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
+        )
+        market = Market(
+            id="KXMLBSPREAD-26APR201335NYYBOS-BOS2",
+            question="MLB spread contract",
+            category="sports",
+            liquidity_usdc=700.0,
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+            resolution_criteria="Official box score",
+        )
+        market_prefix = market.id[: settings.HISTORICAL_TICKER_PREFIX_LEN]
+        historical_prefix_stats = {
+            market_prefix: PerformanceStats(
+                sample_size=6,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-4.0,
+            )
+        }
+        penalized_score, penalized_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_prefix_stats=historical_prefix_stats,
+        )
+        disabled_settings = Settings(
+            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=False,
+            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=0.06,
+            PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.0,
+            HISTORICAL_TICKER_PREFIX_LEN=12,
+            HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
+        )
+        unpenalized_score, unpenalized_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            disabled_settings,
+            traded_before=False,
+            historical_prefix_stats=historical_prefix_stats,
+        )
+        self.assertEqual(penalized_breakdown["pre_score_mlb_subfamily_penalty"], 0.06)
+        self.assertEqual(penalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.04)
+        self.assertEqual(unpenalized_breakdown["pre_score_mlb_subfamily_penalty"], 0.0)
+        self.assertEqual(unpenalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.0)
+        self.assertLess(penalized_score, unpenalized_score)
+
+    def test_pre_analysis_demotion_for_historical_prefix_loss_gate(self) -> None:
+        market = Market(
+            id="KXTESTMARKET-26APR20-T50",
+            question="Test market",
+            category="generic",
+            outcomes=[MarketOutcome(name="YES", price=0.5), MarketOutcome(name="NO", price=0.5)],
+        )
+        state = MarketState(
+            market_id=market.id,
+            analysis_count=2,
+            non_actionable_streak=1,
+            last_terminal_outcome="no_trade_recommended",
+        )
+        rejected, reason, metadata = _pre_analysis_participation_hold(
+            market=market,
+            state=state,
+            settings=Settings(),
+            traded_before=False,
+            historical_gate_allowed=False,
+            historical_gate_reason="historical_prefix_pnl_block",
+            historical_gate_metrics={
+                "historical_gate_prefix_sample_size": 6,
+                "historical_gate_prefix_win_rate": 0.25,
+                "historical_gate_prefix_pnl_total": -12.0,
+            },
+        )
+        self.assertTrue(rejected)
+        self.assertEqual(reason, "pre_analysis_historical_prefix_pnl_block")
+        self.assertEqual(metadata["historical_gate_prefix_sample_size"], 6)
+
     def test_resolve_dynamic_analysis_candidate_cap_reduces_when_best_score_low(self) -> None:
         settings = Settings(
             MAX_MARKETS_PER_CYCLE=6,
             PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=0.50,
             PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=3,
         )
-        cap, applied = _resolve_dynamic_analysis_candidate_cap(
+        cap, applied, neg_floor = _resolve_dynamic_analysis_candidate_cap(
             settings=settings,
             best_pre_analysis_score=0.42,
         )
         self.assertEqual(cap, 3)
         self.assertTrue(applied)
+        self.assertFalse(neg_floor)
 
     def test_resolve_dynamic_analysis_candidate_cap_keeps_default_when_score_high(self) -> None:
         settings = Settings(
@@ -655,12 +1182,28 @@ class TestMainUtils(unittest.TestCase):
             PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=0.50,
             PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=3,
         )
-        cap, applied = _resolve_dynamic_analysis_candidate_cap(
+        cap, applied, neg_floor = _resolve_dynamic_analysis_candidate_cap(
             settings=settings,
             best_pre_analysis_score=0.75,
         )
         self.assertEqual(cap, 6)
         self.assertFalse(applied)
+        self.assertFalse(neg_floor)
+
+    def test_resolve_dynamic_analysis_candidate_cap_negative_floor_applied(self) -> None:
+        settings = Settings(
+            MAX_MARKETS_PER_CYCLE=6,
+            PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=0.50,
+            PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=3,
+            NEGATIVE_BEST_SCORE_DEEP_ANALYSIS_FLOOR=0.05,
+        )
+        cap, applied, neg_floor = _resolve_dynamic_analysis_candidate_cap(
+            settings=settings,
+            best_pre_analysis_score=-0.10,
+        )
+        self.assertEqual(cap, 1)
+        self.assertTrue(applied)
+        self.assertTrue(neg_floor)
 
     def test_pre_analysis_opportunity_score_penalizes_weak_historical_family_performance(self) -> None:
         market = Market(
@@ -723,12 +1266,12 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertAlmostEqual(
             breakdown["pre_score_historical_family_pnl_penalty"],
-            0.21,
+            0.15,
             places=6,
         )
         self.assertAlmostEqual(
             breakdown["pre_score_historical_family_pnl_ratio"],
-            2.1,
+            0.525,
             places=6,
         )
 
@@ -751,6 +1294,7 @@ class TestMainUtils(unittest.TestCase):
         market = Market(
             id="m-refresh",
             question="Will team win?",
+            category="sports",
             outcomes=[MarketOutcome(name="YES", price=0.70), MarketOutcome(name="NO", price=0.30)],
         )
         decision = TradeDecision(
@@ -763,7 +1307,7 @@ class TestMainUtils(unittest.TestCase):
         ok, implied_prob, edge, reason = _passes_refreshed_edge_guard(
             market,
             decision,
-            Settings(MIN_EDGE=0.05),
+            Settings(MIN_EDGE=0.05, NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False),
         )
         self.assertFalse(ok)
         self.assertEqual(implied_prob, 0.70)
@@ -1190,53 +1734,60 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(capped[0]["market"], "m0")
         self.assertEqual(capped[-1]["market"], "m2")
 
-    def test_cap_analysis_candidates_uses_family_round_robin(self) -> None:
+    def test_cap_analysis_candidates_uses_global_risk_adjusted_rank(self) -> None:
         candidates = [
             {
                 "market": Market(
                     id="c1",
                     question="Will Bitcoin close above $70k?",
                     category="crypto",
-                )
+                ),
+                "pre_analysis_score": 0.90,
             },
             {
                 "market": Market(
                     id="c2",
                     question="Will Ethereum close above $4k?",
                     category="crypto",
-                )
+                ),
+                "pre_analysis_score": 0.95,
             },
             {
                 "market": Market(
                     id="c3",
                     question="Will Solana close above $200?",
                     category="crypto",
-                )
+                ),
+                "pre_analysis_score": 0.10,
             },
             {
                 "market": Market(
                     id="s1",
                     question="Will the Lakers win tonight?",
                     category="sports",
-                )
+                ),
+                "pre_analysis_score": 0.80,
             },
             {
                 "market": Market(
                     id="s2",
                     question="Will the Celtics win tonight?",
                     category="sports",
-                )
+                ),
+                "pre_analysis_score": 0.20,
             },
             {
                 "market": Market(
                     id="p1",
                     question="Will candidate X win the election?",
                     category="politics",
-                )
+                ),
+                "pre_analysis_score": 0.70,
             },
         ]
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=4)
-        self.assertEqual([item["market"].id for item in capped], ["c1", "s1", "p1", "c2"])
+        self.assertEqual([item["market"].id for item in capped], ["c2", "c1", "s1", "p1"])
+        self.assertIn("selection_rank_components", capped[0])
 
     def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
         candidates = [
@@ -1252,7 +1803,12 @@ class TestMainUtils(unittest.TestCase):
             max_markets_per_cycle=5,
             max_weather_candidates_per_cycle=1,
         )
-        self.assertEqual([item["market"].id for item in capped], ["w1", "c1", "p1", "s1"])
+        capped_ids = [item["market"].id for item in capped]
+        self.assertEqual(len([market_id for market_id in capped_ids if market_id.startswith("w")]), 1)
+        self.assertIn("w1", capped_ids)
+        self.assertIn("c1", capped_ids)
+        self.assertIn("s1", capped_ids)
+        self.assertIn("p1", capped_ids)
 
     def test_cap_analysis_candidates_limits_crypto_candidates(self) -> None:
         candidates = [
@@ -1302,14 +1858,17 @@ class TestMainUtils(unittest.TestCase):
             {
                 "market": Market(id="w-high-streak", question="Weather A", category="weather"),
                 "non_actionable_streak": 5,
+                "pre_analysis_score": 0.90,
             },
             {
                 "market": Market(id="w-low-streak", question="Weather B", category="weather"),
                 "non_actionable_streak": 1,
+                "pre_analysis_score": 0.90,
             },
             {
                 "market": Market(id="c1", question="Crypto", category="crypto"),
                 "non_actionable_streak": 0,
+                "pre_analysis_score": 0.80,
             },
         ]
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
@@ -1561,6 +2120,53 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_min_evidence_quality_for_market(weather_market, settings), 0.7)
         self.assertEqual(_min_evidence_quality_for_market(generic_market, settings), 0.5)
 
+    def test_min_evidence_quality_relaxes_for_whitelisted_direct_sources(self) -> None:
+        settings = Settings(
+            MIN_EVIDENCE_QUALITY_FOR_TRADE=0.75,
+            WEATHER_MIN_EVIDENCE_QUALITY=0.80,
+            DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT=0.68,
+            DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER=0.72,
+            DIRECT_SOURCE_WHITELIST=("weather.gov", "coindesk.com"),
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        weather_market = Market(
+            id="KXLOWTNOLA-26APR20-T60",
+            question="Will low temperature be above threshold in NOLA?",
+            category="weather",
+        )
+        weather_decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.4,
+            reasoning="direct weather source",
+            evidence_basis="direct",
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=29.95&lon=-90.07",
+        )
+        generic_market = Market(
+            id="KXBTCD-26APR2016-T76299.99",
+            question="Will BTC close above threshold?",
+            category="crypto",
+        )
+        generic_decision = weather_decision.model_copy(
+            update={"primary_source_url": "https://www.coindesk.com/price/bitcoin"}
+        )
+        proxy_decision = weather_decision.model_copy(update={"evidence_basis": "proxy"})
+        self.assertEqual(
+            _min_evidence_quality_for_market(weather_market, settings, weather_decision),
+            0.72,
+        )
+        self.assertEqual(
+            _min_evidence_quality_for_market(generic_market, settings, generic_decision),
+            0.68,
+        )
+        self.assertEqual(
+            _min_evidence_quality_for_market(generic_market, settings, proxy_decision),
+            0.75,
+        )
+
     def test_max_confidence_for_weather_market_uses_weather_cap(self) -> None:
         settings = Settings(
             MAX_WEATHER_CONFIDENCE=0.79,
@@ -1689,9 +2295,9 @@ class TestMainUtils(unittest.TestCase):
         calibrated = result["decision"]
         self.assertTrue(result["confidence_calibration_applied"])
         self.assertAlmostEqual(result["confidence_before_calibration"], 0.90)
-        self.assertAlmostEqual(result["confidence_after_calibration"], 0.62)
-        self.assertAlmostEqual(result["raw_vs_calibrated_delta"], 0.28)
-        self.assertAlmostEqual(calibrated.confidence, 0.62)
+        self.assertAlmostEqual(result["confidence_after_calibration"], 0.612)
+        self.assertAlmostEqual(result["raw_vs_calibrated_delta"], 0.288)
+        self.assertAlmostEqual(calibrated.confidence, 0.612)
         self.assertLess(calibrated.bet_size_pct, decision.bet_size_pct)
         self.assertIn("Confidence calibrated", calibrated.reasoning)
 
@@ -1708,6 +2314,15 @@ class TestMainUtils(unittest.TestCase):
                 consecutive_zero_order_cycles=3,
             ),
             600,
+        )
+
+    def test_dry_streak_sleep_seconds_disabled_returns_none(self) -> None:
+        self.assertIsNone(
+            _dry_streak_sleep_seconds(
+                base_poll_interval_sec=300,
+                consecutive_zero_order_cycles=5,
+                enabled=False,
+            )
         )
 
     def test_entry_price_too_low_skip_uses_decision_payload(self) -> None:
@@ -2024,6 +2639,492 @@ class TestMainUtils(unittest.TestCase):
         override_edge, market_edge = _confidence_gate_override_metrics(market, decision)
         self.assertAlmostEqual(market_edge or 0.0, 0.30)
         self.assertAlmostEqual(override_edge or 0.0, 0.30)
+
+    def test_analyze_market_candidate_uses_extended_research_profile(self) -> None:
+        market = Market(
+            id="m-extended-research",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=200.0,
+            category="sports",
+            close_time=datetime.now(timezone.utc) + timedelta(hours=12),
+        )
+        settings = Settings(
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.84,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 55%, My prob: 72%, Edge: 17%",
+            implied_prob_external=0.55,
+            my_prob=0.72,
+            edge_external=0.17,
+            evidence_quality=0.7,
+        )
+        client = RecordingGrokClient(decision)
+        baseline_config = build_market_search_config(settings, market)
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=client,
+            force_extended_research=True,
+        )
+        self.assertTrue(result["used_extended_research"])
+        self.assertIsNotNone(client.last_search_config)
+        self.assertGreater(
+            int(client.last_search_config.lookback_hours or 0),
+            int(baseline_config.lookback_hours or 0),
+        )
+
+    def test_analyze_market_candidate_uses_high_confidence_shrinkage_factor(self) -> None:
+        market = Market(
+            id="m-high-shrinkage",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            category="sports",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.89,
+            bet_size_pct=0.5,
+            reasoning="High confidence baseline",
+            evidence_quality=0.8,
+        )
+        settings = Settings(
+            CONFIDENCE_SHRINKAGE_FLOOR=0.50,
+            CONFIDENCE_SHRINKAGE_FACTOR=0.40,
+            CONFIDENCE_SHRINKAGE_FACTOR_HIGH=0.20,
+            MAX_GLOBAL_CONFIDENCE=1.0,
+            MAX_SPORTS_CONFIDENCE=1.0,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(decision),
+        )
+        self.assertAlmostEqual(result["confidence_after_calibration"], 0.578)
+
+class TestDefinitiveSideOverride(unittest.TestCase):
+    def _make_decision(self, **kw):
+        defaults = dict(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.5,
+            reasoning="AP confirmed game over",
+            evidence_quality=0.90,
+            evidence_basis="direct",
+            definitive_outcome_detected=True,
+            likelihood_ratio=15.0,
+            raw_confidence=0.90,
+        )
+        defaults.update(kw)
+        return TradeDecision(**defaults)
+
+    def test_definitive_direct_ap_source_grants_override(self) -> None:
+        decision = self._make_decision()
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="direct",
+            primary_source_whitelisted=True,
+            cycle_overrides_applied=0,
+            max_overrides_per_cycle=2,
+        )
+        self.assertTrue(result)
+
+    def test_definitive_proxy_evidence_blocked(self) -> None:
+        decision = self._make_decision(evidence_basis="proxy")
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="proxy",
+            primary_source_whitelisted=True,
+            cycle_overrides_applied=0,
+            max_overrides_per_cycle=2,
+        )
+        self.assertFalse(result)
+
+    def test_non_definitive_blocked(self) -> None:
+        decision = self._make_decision(definitive_outcome_detected=False)
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="direct",
+            primary_source_whitelisted=True,
+            cycle_overrides_applied=0,
+            max_overrides_per_cycle=2,
+        )
+        self.assertFalse(result)
+
+    def test_cap_exceeded_blocks_override(self) -> None:
+        decision = self._make_decision()
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="direct",
+            primary_source_whitelisted=True,
+            cycle_overrides_applied=2,
+            max_overrides_per_cycle=2,
+        )
+        self.assertFalse(result)
+
+    def test_low_likelihood_ratio_blocked(self) -> None:
+        decision = self._make_decision(likelihood_ratio=5.0)
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="direct",
+            primary_source_whitelisted=True,
+            cycle_overrides_applied=0,
+            max_overrides_per_cycle=2,
+        )
+        self.assertFalse(result)
+
+    def test_low_raw_confidence_blocked(self) -> None:
+        decision = self._make_decision(raw_confidence=0.70, confidence=0.70)
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="direct",
+            primary_source_whitelisted=True,
+            cycle_overrides_applied=0,
+            max_overrides_per_cycle=2,
+        )
+        self.assertFalse(result)
+
+    def test_not_whitelisted_source_blocked(self) -> None:
+        decision = self._make_decision()
+        result = _should_apply_definitive_side_override(
+            decision=decision,
+            evidence_basis="direct",
+            primary_source_whitelisted=False,
+            cycle_overrides_applied=0,
+            max_overrides_per_cycle=2,
+        )
+        self.assertFalse(result)
+
+
+class TestAuditPayloadResearchProfile(unittest.TestCase):
+    def test_audit_payload_includes_research_profile(self) -> None:
+        payload = _build_execution_audit(
+            final_action="order_attempt",
+            final_reason="all_gates_passed",
+            research_profile="commodity",
+        )
+        self.assertEqual(payload.get("research_profile"), "commodity")
+
+    def test_audit_payload_research_profile_none_when_absent(self) -> None:
+        payload = _build_execution_audit(
+            final_action="order_attempt",
+            final_reason="all_gates_passed",
+        )
+        self.assertNotIn("research_profile", payload)
+
+
+class TestNonDefinitiveConfidenceCeiling(unittest.TestCase):
+    def _make_decision(self, **kwargs) -> TradeDecision:
+        defaults = {
+            "should_trade": True,
+            "outcome": "YES",
+            "confidence": 0.92,
+            "bet_size_pct": 0.5,
+            "reasoning": "test",
+            "evidence_quality": 0.80,
+        }
+        defaults.update(kwargs)
+        return TradeDecision(**defaults)
+
+    def test_non_definitive_caps_at_089(self) -> None:
+        decision = self._make_decision(
+            confidence=0.95,
+            evidence_basis="proxy",
+        )
+        settings = Settings()
+        ceiling = _non_definitive_confidence_ceiling(decision, settings)
+        self.assertLessEqual(ceiling, 0.89)
+
+    def test_definitive_allows_above_089(self) -> None:
+        decision = self._make_decision(
+            confidence=0.95,
+            evidence_basis="direct",
+            definitive_outcome_detected=True,
+            primary_source_url="https://apnews.com/article/example",
+        )
+        settings = Settings()
+        ceiling = _non_definitive_confidence_ceiling(decision, settings)
+        self.assertGreater(ceiling, 0.89)
+
+    def test_direct_evidence_uses_direct_cap(self) -> None:
+        decision = self._make_decision(
+            confidence=0.92,
+            evidence_basis="direct",
+        )
+        settings = Settings(MAX_GLOBAL_CONFIDENCE_DIRECT=0.89)
+        ceiling = _non_definitive_confidence_ceiling(decision, settings)
+        self.assertEqual(ceiling, 0.89)
+
+
+class TestPreAnalysisOpportunityResearchBand(unittest.TestCase):
+    def test_score_in_research_band_gets_soft_research_tag(self) -> None:
+        """Score in [min - band, min) should produce soft_research rejection tag."""
+        settings = Settings(
+            PRE_ANALYSIS_OPPORTUNITY_ENABLED=True,
+            PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.60,
+            PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND=0.20,
+            PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED=True,
+        )
+        market = Market(
+            id="KXTEST-RESEARCH-BAND",
+            question="Test market for research band",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+            liquidity_usdc=200.0,
+            close_time=datetime.now(timezone.utc) + timedelta(days=1),
+        )
+        score, breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        research_floor = settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE - settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND
+        self.assertAlmostEqual(research_floor, 0.40, places=6)
+        self.assertLess(research_floor + 1e-9, settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE)
+
+    def test_config_research_band_defaults(self) -> None:
+        settings = Settings()
+        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND, 0.20)
+        self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED)
+
+
+class TestLifetimeAnalysisCap(unittest.TestCase):
+    def test_config_defaults(self) -> None:
+        settings = Settings()
+        self.assertEqual(settings.MAX_LIFETIME_ANALYSES_PER_MARKET, 8)
+
+    def test_cap_zero_disables_check(self) -> None:
+        settings = Settings(MAX_LIFETIME_ANALYSES_PER_MARKET=0)
+        self.assertEqual(settings.MAX_LIFETIME_ANALYSES_PER_MARKET, 0)
+
+
+class TestSyntheticDecisionMarker(unittest.TestCase):
+    def test_synthetic_research_queue_origin_marks_audit(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            final_reason="pre_analysis_score_soft_research",
+            decision_origin="synthetic_research_queue",
+        )
+        self.assertTrue(audit.get("synthetic_decision"))
+
+    def test_synthetic_operational_hold_origin_marks_audit(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            final_reason="grok_stream_timeout",
+            decision_origin="synthetic_operational_hold",
+        )
+        self.assertTrue(audit.get("synthetic_decision"))
+
+    def test_real_decision_origin_is_not_synthetic(self) -> None:
+        audit = _build_execution_audit(
+            final_action="skip",
+            final_reason="confidence_below_min",
+            decision_origin="grok_initial",
+        )
+        self.assertFalse(audit.get("synthetic_decision"))
+
+    def test_missing_decision_origin_defaults_to_not_synthetic(self) -> None:
+        audit = _build_execution_audit(
+            final_action="order_submitted",
+        )
+        self.assertFalse(audit.get("synthetic_decision"))
+
+
+class TestHistoricalFamilyFlattening(unittest.TestCase):
+    def test_breakdown_fields_lift_to_top_level(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            pre_analysis_breakdown={
+                "pre_score_historical_family_samples": 138.0,
+                "pre_score_historical_family_pnl_total": -16.64,
+                "pre_score_historical_family_win_rate": 0.536,
+                "pre_score_historical_family_pnl_ratio": -0.121,
+            },
+        )
+        self.assertEqual(audit.get("historical_family_samples"), 138.0)
+        self.assertAlmostEqual(audit.get("historical_family_pnl_total"), -16.64)
+        self.assertAlmostEqual(audit.get("historical_family_win_rate"), 0.536)
+        self.assertAlmostEqual(audit.get("historical_family_pnl_ratio"), -0.121)
+
+    def test_top_level_value_wins_over_breakdown(self) -> None:
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            historical_family_samples=99,
+            pre_analysis_breakdown={
+                "pre_score_historical_family_samples": 138.0,
+            },
+        )
+        self.assertEqual(audit.get("historical_family_samples"), 99)
+
+
+class TestCounterfactualAuditFields(unittest.TestCase):
+    def test_helper_emits_all_universal_thresholds(self) -> None:
+        settings = Settings()
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_score_soft_research",
+            settings=settings,
+            pre_analysis_score=0.55,
+        )
+        self.assertEqual(fields["counterfactual_required_confidence"], settings.MIN_CONFIDENCE)
+        self.assertEqual(
+            fields["counterfactual_required_evidence_quality"],
+            settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+        )
+        self.assertEqual(fields["counterfactual_required_edge_min"], settings.MIN_EDGE)
+        self.assertAlmostEqual(
+            fields["counterfactual_required_pre_analysis_score"],
+            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
+        )
+
+    def test_helper_emits_threshold_gap_when_score_provided(self) -> None:
+        settings = Settings(PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.60)
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_score_soft_research",
+            settings=settings,
+            pre_analysis_score=0.45,
+        )
+        self.assertAlmostEqual(fields["pre_analysis_threshold_gap"], 0.15)
+
+    def test_helper_emits_prefix_sample_size_for_historical_prefix_reason(self) -> None:
+        settings = Settings()
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_historical_prefix_pnl_block",
+            settings=settings,
+        )
+        self.assertEqual(
+            fields["counterfactual_required_prefix_sample_size"],
+            settings.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES,
+        )
+
+    def test_helper_emits_family_sample_size_for_family_reason(self) -> None:
+        settings = Settings()
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_historical_family_pnl_block",
+            settings=settings,
+        )
+        self.assertEqual(
+            fields["counterfactual_required_family_sample_size"],
+            settings.HISTORICAL_FAMILY_MIN_SAMPLES,
+        )
+
+    def test_helper_quantifies_prefix_sample_shortfall(self) -> None:
+        settings = Settings(HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES=20)
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_historical_prefix_pnl_block",
+            settings=settings,
+            historical_metrics={"historical_gate_prefix_sample_size": 7},
+        )
+        self.assertEqual(fields["counterfactual_prefix_samples_short_by"], 13)
+
+
+class TestPreviousAnalysisAnchorEvidence(unittest.TestCase):
+    def test_anchor_evidence_fields_preserved(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.74,
+            "reasoning": "Found settlement-aligned source.",
+            "evidence_quality": 0.82,
+            "edge_source": "computed",
+            "evidence_basis": "direct",
+            "implied_prob_external": 0.55,
+            "edge_external": 0.12,
+            "my_prob": 0.67,
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertAlmostEqual(prev.evidence_quality, 0.82)
+        self.assertEqual(prev.edge_source, "computed")
+        self.assertEqual(prev.evidence_basis, "direct")
+        self.assertAlmostEqual(prev.implied_prob_external, 0.55)
+        self.assertAlmostEqual(prev.edge_external, 0.12)
+        self.assertAlmostEqual(prev.my_prob, 0.67)
+
+    def test_direct_evidence_anchor_appends_material_change_hint(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.74,
+            "reasoning": "Found settlement-aligned source.",
+            "evidence_quality": 0.82,
+            "edge_source": "computed",
+            "evidence_basis": "direct",
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertIn("material change", prev.reasoning.lower())
+
+    def test_proxy_evidence_anchor_does_not_append_hint(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.50,
+            "reasoning": "Looked at proxy data only.",
+            "evidence_quality": 0.40,
+            "edge_source": "fallback",
+            "evidence_basis": "proxy",
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertNotIn("material change", prev.reasoning.lower())
+
+    def test_missing_evidence_fields_default_safely(self) -> None:
+        anchor = {
+            "outcome": "YES",
+            "confidence": 0.50,
+            "reasoning": "Minimal anchor.",
+        }
+        prev = _build_previous_analysis(anchor)
+        assert prev is not None
+        self.assertEqual(prev.evidence_quality, 0.0)
+        self.assertIsNone(prev.edge_source)
+        self.assertIsNone(prev.evidence_basis)
+
+
+class TestTierBreakdownFormat(unittest.TestCase):
+    def test_empty_breakdown_renders_empty_braces(self) -> None:
+        self.assertEqual(_format_tier_breakdown_for_log(None), "{}")
+        self.assertEqual(_format_tier_breakdown_for_log({}), "{}")
+
+    def test_single_tier_renders_label(self) -> None:
+        result = _format_tier_breakdown_for_log({"research_only_learning_queue": 142})
+        self.assertEqual(result, "{research:142}")
+
+    def test_multiple_tiers_render_alphabetically_by_key(self) -> None:
+        result = _format_tier_breakdown_for_log(
+            {
+                "research_only_learning_queue": 100,
+                "skip_for_now_with_reason": 5,
+                "monitor_only": 2,
+            }
+        )
+        self.assertIn("research:100", result)
+        self.assertIn("skip:5", result)
+        self.assertIn("monitor:2", result)
+
+    def test_zero_count_tiers_omitted(self) -> None:
+        result = _format_tier_breakdown_for_log(
+            {"research_only_learning_queue": 0, "monitor_only": 3}
+        )
+        self.assertNotIn("research:0", result)
+        self.assertIn("monitor:3", result)
+
+    def test_unknown_tier_falls_back_to_raw_label(self) -> None:
+        result = _format_tier_breakdown_for_log({"some_future_tier": 1})
+        self.assertIn("some_future_tier:1", result)
+
 
 if __name__ == "__main__":
     unittest.main()

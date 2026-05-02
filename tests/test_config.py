@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import config
@@ -141,20 +142,37 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KELLY_FRACTION_WEATHER, 0.45)
 
     def test_weather_profitability_defaults_are_conservative(self) -> None:
-        self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.70)
+        self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.65)
         self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
         self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.80)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
-        self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.20)
+        self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.12)
-        self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 2)
+        self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
     def test_profit_tuning_defaults_are_loaded(self) -> None:
-        self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.18)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_THRESHOLD, 0.25)
-        self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.25)
+        self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.28)
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
-        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.38)
+        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
+
+    def test_env_example_profit_thresholds_match_conservative_defaults(self) -> None:
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        expected_lines = {
+            "MIN_EDGE=0.12",
+            "LOW_PRICE_MIN_EDGE=0.18",
+            "VERY_LOW_PRICE_MIN_EDGE=0.28",
+            "FALLBACK_EDGE_MIN_EDGE=0.30",
+            "MAX_REASONABLE_EDGE=0.32",
+            "SCORE_GATE_THRESHOLD=0.52",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.30",
+            "MAX_MARKETS_PER_CYCLE=3",
+            "MAX_TRADES_PER_CYCLE=2",
+            "MAX_TRADES_PER_DAY=6",
+        }
+        for expected_line in expected_lines:
+            self.assertIn(expected_line, env_example)
 
     def test_historical_family_penalty_settings_overrides(self) -> None:
         env = {
@@ -299,7 +317,7 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.BAYESIAN_SKIP_STALE_UPDATES)
         self.assertEqual(settings.BAYESIAN_PRIOR_DEFAULT, 0.58)
         self.assertEqual(settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
-        self.assertEqual(settings.BAYESIAN_MAX_POSTERIOR, 0.97)
+        self.assertEqual(settings.BAYESIAN_MAX_POSTERIOR, 0.90)
         self.assertTrue(settings.LMSR_ENABLED)
         self.assertEqual(settings.LMSR_LIQUIDITY_PARAM_B, 120000.0)
         self.assertEqual(settings.LMSR_MIN_INEFFICIENCY, 0.04)
@@ -316,18 +334,21 @@ class TestConfig(unittest.TestCase):
     def test_profit_guardrail_defaults(self) -> None:
         settings = config.Settings()
         self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.75)
+        self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER, 0.72)
+        self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
+        self.assertIn("weather.gov", settings.DIRECT_SOURCE_WHITELIST)
         self.assertEqual(settings.SCORE_GATE_MODE, "active")
-        self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.38)
+        self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.60)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.08)
-        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.45)
-        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 6)
-        self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 3)
+        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.60)
+        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 3)
+        self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 1)
         self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 0)
         self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 0)
-        self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 5)
+        self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
-        self.assertEqual(settings.MAX_TRADES_PER_DAY, 15)
+        self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
         self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
         self.assertTrue(settings.POSITION_SYNC_ENABLED)
         self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
@@ -340,31 +361,67 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 10)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
-        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 120)
-        self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 180)
-        self.assertTrue(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
+        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
+        self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 240)
+        self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
         self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 40.0)
-        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.10)
+        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.25)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
         self.assertEqual(settings.SCORE_GENERIC_BIN_PENALTY_BASE, 0.04)
         self.assertEqual(settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE, 0.08)
-        self.assertEqual(settings.SCORE_OVERCONFIDENCE_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.SCORE_OVERCONFIDENCE_PENALTY_BASE, 0.11)
         self.assertEqual(settings.MENTION_MARKET_SCORE_PENALTY, 0.10)
         self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
-        self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.15)
-        self.assertEqual(settings.PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY, 0.05)
+        self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.25)
+        self.assertEqual(settings.PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY, 0.15)
         self.assertIn("generic", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
         self.assertIn("crypto", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
         self.assertEqual(settings.GROK_PROXY_CONFIDENCE_CAP, 0.78)
         self.assertEqual(settings.GROK_LOW_INFO_CONFIDENCE_CAP, 0.70)
-        self.assertEqual(settings.MAX_GLOBAL_CONFIDENCE, 0.85)
+        self.assertEqual(settings.MAX_GLOBAL_CONFIDENCE, 0.82)
         self.assertEqual(settings.MAX_INDEX_CONFIDENCE, 0.70)
         self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
-        self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.80)
+        self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.72)
+        self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.65)
+        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.32)
+        self.assertTrue(settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
+        self.assertTrue(settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
+        self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)
+        self.assertTrue(settings.HISTORICAL_TICKER_PREFIX_GATE_ENABLED)
+        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES, 3)
+        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES, 20)
+        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF, -2.0)
+        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_WIN_RATE_CUTOFF, 0.40)
+        self.assertEqual(settings.HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY, 0.08)
+        self.assertTrue(settings.HISTORICAL_FAMILY_GATE_ENABLED)
+        self.assertEqual(settings.HISTORICAL_FAMILY_MIN_SAMPLES, 12)
+        self.assertEqual(settings.HISTORICAL_FAMILY_PNL_CUTOFF, -12.0)
+        self.assertEqual(settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF, 0.40)
+        self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.22)
+        self.assertEqual(settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE, 0.12)
         self.assertEqual(settings.MAX_SPEECH_CONFIDENCE, 0.65)
-        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FLOOR, 0.52)
-        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FACTOR, 0.40)
+        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FLOOR, 0.55)
+        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FACTOR, 0.32)
+        self.assertEqual(settings.CONFIDENCE_SHRINKAGE_FACTOR_HIGH, 0.28)
+        self.assertTrue(settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED)
+        self.assertEqual(settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_SAMPLES, 15)
+        self.assertEqual(settings.HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS, 30)
+        self.assertEqual(settings.SCORE_EXTREME_CONFIDENCE_THRESHOLD, 0.90)
+        self.assertEqual(settings.SCORE_EXTREME_CONFIDENCE_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_LEN, 5)
+        self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_MIN_SAMPLES, 3)
+        self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_PNL_CUTOFF, -5.0)
+        self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_SCORE_PENALTY, 0.10)
+        self.assertEqual(settings.EXTENDED_RESEARCH_AFTER_STREAK, 2)
+        self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 5)
+        self.assertEqual(settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST, 2.0)
+        self.assertTrue(settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED)
+        self.assertEqual(settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY, 0.06)
+        self.assertEqual(settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY, 0.04)
+        self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
+        self.assertTrue(settings.RESEARCH_QUEUE_PRIORITY_ENABLED)
         self.assertIn("KXPERSONMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
         self.assertIn("KXSURVIVORMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
         self.assertIn("KXSNLMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
@@ -380,6 +437,30 @@ class TestConfig(unittest.TestCase):
         self.assertIn("flashscore.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
         self.assertIn("atptour", config.Settings.SPORTS_ALLOWED_X_HANDLES)
         self.assertIn("WTA", config.Settings.SPORTS_ALLOWED_X_HANDLES)
+
+    def test_profit_leak_fix_defaults(self) -> None:
+        """Verify the profit-leak-fix defaults match .env.example values."""
+        defaults = config.Settings
+        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.40)
+        self.assertEqual(defaults.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
+        self.assertEqual(defaults.MAX_REANALYSES_PER_MARKET_PER_DAY, 2)
+        self.assertEqual(defaults.MAX_LIFETIME_ANALYSES_PER_MARKET, 8)
+        self.assertEqual(defaults.GROK_STREAM_TIMEOUT_SECONDS, 75)
+        self.assertEqual(defaults.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF, -2.0)
+        self.assertEqual(defaults.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES, 20)
+        self.assertTrue(defaults.XAI_QUOTA_BREAKER_ENABLED)
+        self.assertEqual(defaults.XAI_QUOTA_PAUSE_MINUTES, 30)
+
+    def test_quota_breaker_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "XAI_QUOTA_BREAKER_ENABLED": "false",
+            "XAI_QUOTA_PAUSE_MINUTES": "60",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.XAI_QUOTA_BREAKER_ENABLED)
+        self.assertEqual(settings.XAI_QUOTA_PAUSE_MINUTES, 60)
 
 
 if __name__ == "__main__":

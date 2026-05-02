@@ -160,10 +160,12 @@ class MarketScheduler:
         reanalysis_cooldown_hours: int = 6,
         urgent_days_before_close: int = 2,
         urgent_reanalysis_cooldown_hours: int = 1,
+        max_reanalyses_per_market_per_day: int = 3,
     ) -> None:
         self.reanalysis_cooldown_hours = reanalysis_cooldown_hours
         self.urgent_days_before_close = urgent_days_before_close
         self.urgent_reanalysis_cooldown_hours = urgent_reanalysis_cooldown_hours
+        self.max_reanalyses_per_market_per_day = max_reanalyses_per_market_per_day
 
     def prioritize_markets(
         self,
@@ -223,6 +225,7 @@ class MarketScheduler:
         self,
         market: Market,
         state: MarketState | None,
+        state_manager: MarketStateManager | None = None,
     ) -> tuple[bool, str]:
         """Determine if market should be skipped based on cooldown and close time."""
         now = datetime.now(timezone.utc)
@@ -230,6 +233,14 @@ class MarketScheduler:
             close_time = _normalize_timestamp(market.close_time)
             if close_time <= now:
                 return True, "market closed"
+
+        if (
+            state_manager is not None
+            and self.max_reanalyses_per_market_per_day > 0
+            and state_manager.get_market_analysis_count_today(market.id)
+            >= self.max_reanalyses_per_market_per_day
+        ):
+            return True, "daily_reanalysis_cap_reached"
 
         remaining_seconds = remaining_reanalysis_cooldown_seconds(
             market,

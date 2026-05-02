@@ -97,6 +97,10 @@ class TradeDecision(BaseModel):
         default=None,
         description=_TRADE_DECISION_DESCRIPTIONS["evidence_basis"],
     )
+    primary_source_url: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["primary_source_url"],
+    )
     likelihood_ratio: float | None = Field(
         default=None,
         gt=0.0,
@@ -145,6 +149,14 @@ class TradeDecision(BaseModel):
     evidence_quality_floor_applied: str | None = Field(
         default=None,
         description=_TRADE_DECISION_DESCRIPTIONS["evidence_quality_floor_applied"],
+    )
+    source_match_class: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["source_match_class"],
+    )
+    evidence_floor_suppressed_reason: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["evidence_floor_suppressed_reason"],
     )
     prompt_tokens: int | None = Field(
         default=None,
@@ -219,6 +231,7 @@ class MarketState(BaseModel):
     last_terminal_outcome: str | None = None
     non_actionable_streak: int = 0
     fill_failure_count: int = 0
+    next_eligible_cycle: int = 0
 
 
 class Position(BaseModel):

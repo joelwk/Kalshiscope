@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 _EDGE_MIN = 0.03
@@ -7,6 +8,15 @@ _EDGE_MAX = 0.07
 _SPREAD_MIN = 0.06
 _SPREAD_MAX = 0.12
 _DEFAULT_EDGE_THRESHOLDS = (0.03, 0.04, 0.05, 0.06)
+
+
+@dataclass(frozen=True)
+class HistoricalConfidenceShrinkResult:
+    calibrated_confidence: float
+    observed_win_rate: float | None
+    sample_size: int
+    applied: bool
+    family_used: str
 
 
 def build_counterfactual_flags(
@@ -81,6 +91,72 @@ def compute_adaptive_thresholds(
         "insufficient_edge_data": not has_min_edge_data,
         "insufficient_spread_data": not has_min_spread_data,
     }
+
+
+def historical_confidence_shrink(
+    raw_confidence: float,
+    *,
+    family: str,
+    calibration_buckets: dict[str, dict[float, dict[str, float | int]]] | None,
+    min_samples: int = 15,
+) -> HistoricalConfidenceShrinkResult:
+    """Apply a conservative confidence shrink based on historical bucket outcomes."""
+    bounded_confidence = _clamp(float(raw_confidence), 0.0, 1.0)
+    normalized_family = str(family or "").strip().lower() or "unknown"
+    if not calibration_buckets:
+        return HistoricalConfidenceShrinkResult(
+            calibrated_confidence=bounded_confidence,
+            observed_win_rate=None,
+            sample_size=0,
+            applied=False,
+            family_used="none",
+        )
+
+    confidence_bucket = int(bounded_confidence * 10.0) / 10.0
+    family_bucket = calibration_buckets.get(normalized_family) or {}
+    all_bucket = calibration_buckets.get("all") or {}
+    family_stats = family_bucket.get(confidence_bucket) if family_bucket else None
+    all_stats = all_bucket.get(confidence_bucket) if all_bucket else None
+
+    candidate_stats = None
+    family_used = "none"
+    if family_stats and int(family_stats.get("sample_size", 0) or 0) >= int(min_samples):
+        candidate_stats = family_stats
+        family_used = normalized_family
+    elif all_stats and int(all_stats.get("sample_size", 0) or 0) >= int(min_samples):
+        candidate_stats = all_stats
+        family_used = "all"
+
+    if not candidate_stats:
+        return HistoricalConfidenceShrinkResult(
+            calibrated_confidence=bounded_confidence,
+            observed_win_rate=None,
+            sample_size=0,
+            applied=False,
+            family_used="none",
+        )
+
+    sample_size = int(candidate_stats.get("sample_size", 0) or 0)
+    observed_win_rate = _clamp(float(candidate_stats.get("win_rate", 0.0) or 0.0), 0.0, 1.0)
+    if observed_win_rate >= bounded_confidence:
+        return HistoricalConfidenceShrinkResult(
+            calibrated_confidence=bounded_confidence,
+            observed_win_rate=observed_win_rate,
+            sample_size=sample_size,
+            applied=False,
+            family_used=family_used,
+        )
+
+    confidence_gap = bounded_confidence - observed_win_rate
+    calibrated_confidence = bounded_confidence - (confidence_gap * 0.60)
+    calibrated_confidence = _clamp(calibrated_confidence, 0.0, bounded_confidence)
+    return HistoricalConfidenceShrinkResult(
+        calibrated_confidence=calibrated_confidence,
+        observed_win_rate=observed_win_rate,
+        sample_size=sample_size,
+        applied=calibrated_confidence < bounded_confidence,
+        family_used=family_used,
+    )
 
 
 def _quantile(values: list[float], q: float) -> float:

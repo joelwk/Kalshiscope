@@ -157,6 +157,116 @@ def test_receipt_persistence_tables(tmp_path) -> None:
         manager.close()
 
 
+def test_decision_receipt_infers_order_summary_from_audit(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_decision_receipt(
+            cycle_id="cycle-order",
+            market_id="m-order",
+            decision={"should_trade": True, "confidence": 0.72},
+            execution_audit={
+                "final_action": "order_attempt",
+                "final_reason": "order_submitted",
+                "order_id": "order-123",
+                "order_status": "filled",
+                "order_fill_count": 4,
+            },
+        )
+
+        row = manager._conn.execute(
+            "SELECT order_json FROM decision_receipts WHERE market_id = 'm-order'"
+        ).fetchone()
+        assert row is not None
+        order_payload = json.loads(row["order_json"])
+        assert order_payload["order_id"] == "order-123"
+        assert order_payload["order_status"] == "filled"
+        assert order_payload["order_fill_count"] == 4
+    finally:
+        manager.close()
+
+
+def test_decision_receipt_audit_json_populated_on_abstain_and_skip(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_decision_receipt(
+            cycle_id="cycle-audit",
+            market_id="m-abstain",
+            decision={"should_trade": False, "abstain": True, "confidence": 0.41},
+            execution_audit={
+                "final_action": "skip",
+                "final_reason": "abstain_low_evidence",
+                "score_breakdown": {"score_final": 0.05},
+            },
+        )
+        manager.record_decision_receipt(
+            cycle_id="cycle-audit",
+            market_id="m-research",
+            decision={"should_trade": False, "abstain": False, "confidence": 0.55},
+            execution_audit={
+                "final_action": "research_queued",
+                "final_reason": "hallucinated_edge",
+                "score_breakdown": {"score_final": 0.21},
+            },
+        )
+        rows = manager._conn.execute(
+            """
+            SELECT market_id, audit_json
+            FROM decision_receipts
+            WHERE cycle_id = 'cycle-audit'
+            ORDER BY market_id
+            """
+        ).fetchall()
+        assert len(rows) == 2
+        for row in rows:
+            payload = json.loads(row["audit_json"])
+            assert payload.get("final_action") in {"skip", "research_queued"}
+            assert payload.get("final_reason")
+            assert "score_breakdown" in payload
+    finally:
+        manager.close()
+
+
+def test_load_confidence_calibration_buckets_groups_all_and_family(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        resolved_at = datetime.now(timezone.utc).isoformat()
+        with manager._conn:
+            manager._conn.execute(
+                "INSERT OR REPLACE INTO markets (id, question, close_time, category) VALUES (?, ?, ?, ?)",
+                ("KXRAINNYC-TEST", "Will NYC rain tomorrow?", "", "weather"),
+            )
+            manager._conn.execute(
+                "INSERT OR REPLACE INTO markets (id, question, close_time, category) VALUES (?, ?, ?, ?)",
+                ("KXMLBGAME-TEST", "Will Team A beat Team B?", "", "sports"),
+            )
+            manager._conn.execute(
+                """
+                INSERT OR REPLACE INTO trade_outcomes (
+                    market_id, confidence, won, resolved_at, last_updated
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("KXRAINNYC-TEST", 0.84, 0, resolved_at, resolved_at),
+            )
+            manager._conn.execute(
+                """
+                INSERT OR REPLACE INTO trade_outcomes (
+                    market_id, confidence, won, resolved_at, last_updated
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("KXMLBGAME-TEST", 0.86, 1, resolved_at, resolved_at),
+            )
+        buckets = manager.load_confidence_calibration_buckets(days=30)
+        assert "all" in buckets
+        assert 0.8 in buckets["all"]
+        assert buckets["all"][0.8]["sample_size"] == 2
+        assert "weather" in buckets
+        assert buckets["weather"][0.8]["sample_size"] == 1
+    finally:
+        manager.close()
+
+
 def test_record_resolution_idempotent(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:
@@ -478,5 +588,65 @@ def test_fill_failure_count_tracking(tmp_path) -> None:
         state = manager.get_market_state(market_id)
         assert state is not None
         assert state.fill_failure_count == 0
+    finally:
+        manager.close()
+
+
+def test_market_cooldown_cycle_tracking(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "m-cooldown"
+        manager.set_market_cooldown_cycle(market_id, 11)
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.next_eligible_cycle == 11
+
+        manager.record_terminal_outcome(market_id, "no_trade_recommended")
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.next_eligible_cycle == 11
+
+        manager.set_market_cooldown_cycle(market_id, 0)
+        state = manager.get_market_state(market_id)
+        assert state is not None
+        assert state.next_eligible_cycle == 0
+    finally:
+        manager.close()
+
+
+def test_backfill_outcomes_from_settlements(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        manager._conn.execute(
+            """INSERT INTO trade_outcomes (market_id, predicted_outcome, confidence, last_updated)
+               VALUES (?, ?, ?, ?)""",
+            ("MARKET_A", "YES", 0.75, now_iso),
+        )
+        manager._conn.execute(
+            """INSERT INTO exchange_settlements
+               (settlement_id, market_id, won, pnl_realized, contracts, avg_price, settled_at, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("S1", "MARKET_A", 1, 5.50, 10, 0.55, now_iso, "{}"),
+        )
+        manager._conn.commit()
+
+        row_before = manager._conn.execute(
+            "SELECT won, pnl_estimate FROM trade_outcomes WHERE market_id = 'MARKET_A'"
+        ).fetchone()
+        assert row_before["won"] is None
+
+        updated = manager.backfill_outcomes_from_settlements()
+        assert updated == 1
+
+        row_after = manager._conn.execute(
+            "SELECT won, pnl_estimate, resolution_state FROM trade_outcomes WHERE market_id = 'MARKET_A'"
+        ).fetchone()
+        assert row_after["won"] == 1
+        assert row_after["pnl_estimate"] == 5.50
+        assert row_after["resolution_state"] == "resolved_valid"
+
+        updated_again = manager.backfill_outcomes_from_settlements()
+        assert updated_again == 0
     finally:
         manager.close()

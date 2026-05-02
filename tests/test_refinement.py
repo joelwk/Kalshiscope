@@ -190,3 +190,67 @@ def test_perform_refinement_skips_second_pass_on_negative_edge() -> None:
     result = refinement.perform_refinement(grok, market, initial)
     assert result.edge_external == -0.05
     assert grok.calls == 1
+
+
+def test_flip_rejected_when_confidence_below_078_non_direct() -> None:
+    """A non-direct flip at confidence < 0.78 should be rejected."""
+    from refinement import FLIP_CONFIDENCE_FLOOR_NON_DIRECT
+
+    market = _market("m-flip-reject", datetime.now(timezone.utc) + timedelta(hours=12))
+    initial = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.72,
+        bet_size_pct=0.4,
+        reasoning="initial",
+        edge_external=0.08,
+        evidence_quality=0.60,
+        evidence_basis="proxy",
+    )
+    flipped = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.75,
+        bet_size_pct=0.5,
+        reasoning="flip to NO with proxy evidence",
+        edge_external=0.15,
+        evidence_quality=0.60,
+        evidence_basis="proxy",
+    )
+    grok = DummyGrok([flipped])
+    refinement = RefinementStrategy(market=market)
+    result = refinement.perform_refinement(grok, market, initial)
+    assert result.outcome == "YES", "Flip should be rejected for non-direct below 0.78"
+    assert result.confidence < initial.confidence, "Confidence should be reduced on rejected flip"
+    assert FLIP_CONFIDENCE_FLOOR_NON_DIRECT == 0.78
+
+
+def test_flip_accepted_when_evidence_basis_direct_and_primary_source_url() -> None:
+    """A flip with direct evidence + primary_source_url at conf >= 0.70 should be accepted."""
+    market = _market("m-flip-accept", datetime.now(timezone.utc) + timedelta(hours=12))
+    initial = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        bet_size_pct=0.4,
+        reasoning="initial",
+        edge_external=0.05,
+        evidence_quality=0.70,
+        evidence_basis="proxy",
+    )
+    flipped = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.75,
+        bet_size_pct=0.5,
+        reasoning="flip to NO with direct AP source",
+        edge_external=0.15,
+        evidence_quality=0.85,
+        evidence_basis="direct",
+        primary_source_url="https://apnews.com/article/example",
+    )
+    grok = DummyGrok([flipped])
+    refinement = RefinementStrategy(market=market)
+    result = refinement.perform_refinement(grok, market, initial)
+    assert result.outcome == "NO", "Flip should be accepted with direct evidence + URL"
+    assert result.confidence >= 0.70

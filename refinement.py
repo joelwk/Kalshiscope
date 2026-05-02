@@ -12,6 +12,8 @@ logger = get_logger(__name__)
 REFINEMENT_CONFIDENCE_MIN = 0.55
 REFINEMENT_CONFIDENCE_MAX = 0.80
 HIGH_CONFIDENCE_THRESHOLD = 0.70
+FLIP_CONFIDENCE_FLOOR_NON_DIRECT = 0.78
+FLIP_EDGE_IMPROVEMENT_THRESHOLD = 0.05
 LOW_CONFIDENCE_EARLY_EXIT = 0.50
 MAX_REFINEMENT_PASSES = 2
 LOW_EVIDENCE_REFINE_THRESHOLD = 0.40
@@ -145,11 +147,29 @@ class RefinementStrategy:
                 decision.confidence,
                 decision.outcome,
             )
-            new_decision = grok.analyze_market_deep(
-                market,
-                previous_analysis=decision,
-                search_config=search_config,
-            )
+            try:
+                new_decision = grok.analyze_market_deep(
+                    market,
+                    previous_analysis=decision,
+                    search_config=search_config,
+                )
+            except Exception as deep_exc:
+                logger.warning(
+                    "Deep refinement failed; falling back to prior decision: "
+                    "market=%s pass=%d error=%s",
+                    market.id,
+                    pass_index,
+                    deep_exc,
+                    data={
+                        "market_id": market.id,
+                        "refinement_pass": pass_index,
+                        "error": str(deep_exc),
+                        "error_type": type(deep_exc).__name__,
+                        "fallback_outcome": decision.outcome,
+                        "fallback_confidence": decision.confidence,
+                    },
+                )
+                return decision
             
             # FLIP-FLOP PROTECTION: If outcome changed, require higher confidence
             if new_decision.outcome != initial_outcome:
@@ -170,15 +190,33 @@ class RefinementStrategy:
                         "new_edge": new_edge,
                     },
                 )
-                # Only accept flip if confidence is HIGH (strong conviction)
-                if new_decision.confidence < HIGH_CONFIDENCE_THRESHOLD:
+                new_evidence_basis = str(
+                    getattr(new_decision, "evidence_basis", "") or ""
+                ).strip().lower()
+                new_has_primary_url = bool(
+                    str(getattr(new_decision, "primary_source_url", "") or "").strip()
+                )
+                _flip_has_direct_source = (
+                    new_evidence_basis == "direct" and new_has_primary_url
+                )
+                _flip_conf_floor = (
+                    HIGH_CONFIDENCE_THRESHOLD
+                    if _flip_has_direct_source
+                    else FLIP_CONFIDENCE_FLOOR_NON_DIRECT
+                )
+                if new_decision.confidence < _flip_conf_floor:
                     logger.info(
-                        "Rejecting flip: confidence %.2f < %.2f threshold, reverting to initial",
+                        "Rejecting flip: confidence %.2f < %.2f threshold "
+                        "(direct_source=%s), reverting to initial",
                         new_decision.confidence,
-                        HIGH_CONFIDENCE_THRESHOLD,
-                        data={"market_id": market.id},
+                        _flip_conf_floor,
+                        _flip_has_direct_source,
+                        data={
+                            "market_id": market.id,
+                            "flip_conf_floor": _flip_conf_floor,
+                            "flip_has_direct_source": _flip_has_direct_source,
+                        },
                     )
-                    # Reduce confidence of initial decision due to uncertainty
                     return TradeDecision(
                         should_trade=initial.should_trade and initial.confidence >= 0.60,
                         outcome=initial_outcome,
@@ -193,13 +231,15 @@ class RefinementStrategy:
                 if (
                     current_edge is not None
                     and new_edge is not None
-                    and new_edge < (current_edge + 0.03)
+                    and new_edge < (current_edge + FLIP_EDGE_IMPROVEMENT_THRESHOLD)
                     and new_decision.confidence < (decision.confidence + 0.05)
                 ):
                     logger.info(
-                        "Rejecting flip: no materially better edge/confidence (current_edge=%.3f new_edge=%.3f)",
+                        "Rejecting flip: no materially better edge/confidence "
+                        "(current_edge=%.3f new_edge=%.3f required_improvement=%.3f)",
                         current_edge,
                         new_edge,
+                        FLIP_EDGE_IMPROVEMENT_THRESHOLD,
                         data={"market_id": market.id},
                     )
                     return decision

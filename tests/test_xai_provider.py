@@ -57,6 +57,38 @@ def test_create_chat_retries_and_recovers() -> None:
     assert flaky_chat.calls == 3
 
 
+def test_create_chat_uses_request_specific_timeout_client() -> None:
+    default_chat = _FlakyChat(fail_times=0)
+    override_chat = _FlakyChat(fail_times=0)
+    with patch(
+        "xai_provider.Client",
+        side_effect=[_FakeClient(default_chat), _FakeClient(override_chat)],
+    ) as client_ctor:
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+        provider._is_real_xai_client = lambda: True
+        with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+            "xai_provider.x_search", return_value={"tool": "x"}
+        ):
+            response = provider.create_chat(
+                model="grok-test",
+                response_format=dict,
+                config=_search_config(),
+                enable_multimedia=False,
+                timeout_seconds=7,
+            )
+
+    assert response["ok"] is True
+    assert default_chat.calls == 0
+    assert override_chat.calls == 1
+    assert client_ctor.call_args_list[0].kwargs["timeout"] == 5.0
+    assert client_ctor.call_args_list[1].kwargs["timeout"] == 7.0
+
+
 def test_create_chat_raises_after_retry_exhaustion() -> None:
     flaky_chat = _FlakyChat(fail_times=5)
     with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):

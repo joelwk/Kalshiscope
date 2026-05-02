@@ -61,6 +61,24 @@ class FailingClient:
         self.chat = FailingChatClient(error)
 
 
+class SequencedChatClient:
+    def __init__(self, responses: list[Exception | str]) -> None:
+        self.responses = responses
+        self.create_calls = 0
+
+    def create(self, **kwargs):
+        self.create_calls += 1
+        response = self.responses[min(self.create_calls - 1, len(self.responses) - 1)]
+        if isinstance(response, Exception):
+            return FailingChatSession(response)
+        return DummyChatSession(response)
+
+
+class SequencedClient:
+    def __init__(self, responses: list[Exception | str]) -> None:
+        self.chat = SequencedChatClient(responses)
+
+
 class TestGrokClient(unittest.TestCase):
     def test_extract_json(self) -> None:
         payload = _extract_json("prefix {\"foo\": 1} suffix")
@@ -92,6 +110,104 @@ class TestGrokClient(unittest.TestCase):
         err = RuntimeError("some random error")
         self.assertFalse(_is_timeout_class_error(err))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_grpc_rst_stream_is_retriable_even_when_slow(self) -> None:
+        err = RuntimeError(
+            '_MultiThreadedRendezvous ... status = StatusCode.INTERNAL '
+            'details = "Received RST_STREAM with error code 2"'
+        )
+        self.assertFalse(_is_timeout_class_error(err))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=19_000.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_grpc_unavailable_is_retriable_even_when_slow(self) -> None:
+        err = RuntimeError(
+            'StatusCode.UNAVAILABLE details = "connection reset by peer"'
+        )
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=30_000.0))
+
+    def test_stream_deadline_clamps_to_remaining_budget(self) -> None:
+        client = GrokClient(api_key="x")
+        client.stream_timeout_seconds = 90
+        full = client._resolve_stream_deadline_seconds(None)
+        clamped = client._resolve_stream_deadline_seconds(20_000.0)
+        uncapped = client._resolve_stream_deadline_seconds(200_000.0)
+        self.assertEqual(full, 90.0)
+        self.assertLess(clamped, 20.0)
+        self.assertGreater(clamped, 18.0)
+        self.assertEqual(uncapped, 90.0)
+
+    def test_rpc_timeout_is_capped_to_stream_deadline(self) -> None:
+        client = GrokClient(
+            api_key="x",
+            settings=Settings(
+                XAI_CLIENT_TIMEOUT_SECONDS=120,
+                GROK_STREAM_TIMEOUT_SECONDS=100,
+            ),
+        )
+
+        self.assertEqual(client._resolve_rpc_timeout_seconds(100.0), 100.0)
+        self.assertEqual(client._resolve_rpc_timeout_seconds(150.0), 120.0)
+        self.assertEqual(client._resolve_rpc_timeout_seconds(0.25), 1.0)
+
+    def test_recovered_retriable_analysis_attempt_does_not_log_error(self) -> None:
+        market = Market(
+            id="m-recovered-timeout",
+            question="Will the minimum temperature be above 50F?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "No durable edge.", '
+            '"evidence_quality": 0.5}'
+        )
+        client = GrokClient(api_key="x")
+        client.client = SequencedClient(
+            [
+                RuntimeError('StatusCode.DEADLINE_EXCEEDED details = "Deadline Exceeded"'),
+                content,
+            ]
+        )
+
+        with patch("grok_client.logger.error") as error_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            decision = client.analyze_market(market)
+
+        self.assertFalse(decision.should_trade)
+        error_mock.assert_not_called()
+        self.assertTrue(
+            any(
+                call.kwargs.get("data", {}).get("will_retry") is True
+                for call in warning_mock.call_args_list
+            )
+        )
+
+    def test_deep_analysis_does_not_retry_on_failure(self) -> None:
+        market = Market(
+            id="m-deep-noretry",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        client = GrokClient(api_key="x")
+        failing = FailingClient(TimeoutError("Grok stream exceeded 90.0s for market m-deep-noretry"))
+        client.client = failing
+        with self.assertRaises(TimeoutError):
+            client.analyze_market_deep(market)
+        self.assertEqual(failing.chat.create_calls, 1)
+
+    def test_initial_analysis_still_retries_on_retriable_error(self) -> None:
+        market = Market(
+            id="m-initial-retry",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        client = GrokClient(api_key="x")
+        failing = FailingClient(TimeoutError("Grok stream exceeded 90.0s for market m-initial-retry"))
+        client.client = failing
+        with self.assertRaises(TimeoutError):
+            client.analyze_market(market)
+        self.assertGreaterEqual(failing.chat.create_calls, 2)
 
     def test_analyze_market_stops_when_budget_exhausted(self) -> None:
         market = Market(
@@ -350,6 +466,56 @@ class TestGrokClient(unittest.TestCase):
         self.assertAlmostEqual(decision.confidence, 0.74, places=6)
         self.assertAlmostEqual(decision.edge_external or 0.0, 0.0, places=6)
 
+    def test_normalize_preserves_probability_boundary_one_point_zero(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"confidence": 1.0, "my_prob": 1.0}
+        with patch("grok_client.logger.warning") as warning_mock:
+            normalized = client._normalize_numeric_fields(payload, market_id="m-boundary-prob")
+        self.assertEqual(normalized["confidence"], 1.0)
+        self.assertEqual(normalized["my_prob"], 1.0)
+        warning_mock.assert_not_called()
+
+    def test_normalize_preserves_edge_boundary_negative_one_point_zero(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"edge_external": -1.0}
+        normalized = client._normalize_numeric_fields(payload, market_id="m-boundary-edge")
+        self.assertEqual(normalized["edge_external"], -1.0)
+
+    def test_normalize_still_converts_percentages_above_one(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"my_prob": 50, "edge_external": -1.07}
+        normalized = client._normalize_numeric_fields(payload, market_id="m-percent-convert")
+        self.assertAlmostEqual(float(normalized["my_prob"]), 0.5, places=6)
+        self.assertAlmostEqual(float(normalized["edge_external"]), -0.0107, places=6)
+
+    def test_normalize_edge_near_boundary_logs_debug(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"edge_external": -1.02}
+        with patch("grok_client.logger.debug") as debug_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            normalized = client._normalize_numeric_fields(
+                payload,
+                market_id="m-edge-debug-boundary",
+            )
+        self.assertAlmostEqual(float(normalized["edge_external"]), -0.0102, places=6)
+        debug_mock.assert_called_once()
+        warning_mock.assert_not_called()
+
+    def test_normalize_edge_above_one_point_five_still_warns(self) -> None:
+        client = GrokClient(api_key="x")
+        payload = {"edge_external": -1.8}
+        with patch("grok_client.logger.debug") as debug_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            normalized = client._normalize_numeric_fields(
+                payload,
+                market_id="m-edge-warning",
+            )
+        self.assertAlmostEqual(float(normalized["edge_external"]), -0.018, places=6)
+        warning_mock.assert_called_once()
+        debug_mock.assert_not_called()
+
     def test_analyze_market_deep_normalizes_edge_at_negative_one_boundary(self) -> None:
         market = Market(
             id="m12-boundary",
@@ -535,6 +701,43 @@ class TestGrokClient(unittest.TestCase):
             profile_name="generic",
         )
         self.assertLessEqual(validated.evidence_quality, 0.5)
+
+    def test_validate_and_enrich_treats_wire_preview_as_proxy_without_floor(self) -> None:
+        market = Market(
+            id="m9-preview",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the matchup and probable starters. "
+                "No external odds found. Implied prob: unknown. My prob: 66%. Edge: 16%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.66,
+            edge_external=0.16,
+            edge_source="fallback",
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertIsNone(validated.evidence_quality_floor_applied)
+        self.assertEqual(
+            validated.evidence_floor_suppressed_reason,
+            "preview_or_proxy_source",
+        )
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+        self.assertFalse(validated.should_trade)
 
     def test_validate_and_enrich_prefers_computed_edge_over_reasoning_text(self) -> None:
         market = Market(
@@ -729,6 +932,8 @@ class TestGrokClient(unittest.TestCase):
         self.assertTrue(validated.definitive_outcome_detected)
         self.assertGreaterEqual(validated.evidence_quality, 0.72)
         self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
 
     def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
         market = Market(
@@ -899,6 +1104,38 @@ class TestGrokClient(unittest.TestCase):
         self.assertFalse(validated.should_trade)
         self.assertEqual(validated.bet_size_pct, 0.0)
         self.assertIn("[Outcome mismatch]", validated.reasoning)
+
+
+class TestQuotaExhaustedClassification(unittest.TestCase):
+    """Verify _is_quota_exhausted_grok_error detects xAI spending-limit errors."""
+
+    def test_resource_exhausted_detected(self) -> None:
+        from grok_client import _is_quota_exhausted_grok_error
+
+        exc = RuntimeError(
+            "RESOURCE_EXHAUSTED: Your team has either used all available credits "
+            "or reached its monthly spending limit."
+        )
+        self.assertTrue(_is_quota_exhausted_grok_error(exc))
+
+    def test_monthly_spending_limit_detected(self) -> None:
+        from grok_client import _is_quota_exhausted_grok_error
+
+        exc = RuntimeError("reached its monthly spending limit")
+        self.assertTrue(_is_quota_exhausted_grok_error(exc))
+
+    def test_transient_internal_not_quota(self) -> None:
+        from grok_client import _is_quota_exhausted_grok_error
+
+        exc = RuntimeError("StatusCode.INTERNAL: internal server error")
+        self.assertFalse(_is_quota_exhausted_grok_error(exc))
+
+    def test_retriable_excludes_quota(self) -> None:
+        exc = RuntimeError(
+            "RESOURCE_EXHAUSTED: monthly spending limit"
+        )
+        result = _is_retriable_grok_error(exc, 100.0)
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

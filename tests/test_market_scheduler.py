@@ -263,3 +263,52 @@ def test_fill_failure_count_applies_cooldown_multiplier() -> None:
     should_skip, reason = scheduler.should_skip(market, state)
     assert should_skip is True
     assert reason == "recently analyzed"
+
+
+def test_should_skip_returns_daily_reanalysis_cap_reached_after_threshold() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(
+        reanalysis_cooldown_hours=1,
+        urgent_days_before_close=2,
+        max_reanalyses_per_market_per_day=3,
+    )
+    market = _market("m-cap-test", now + timedelta(days=2))
+    state = MarketState(
+        market_id="m-cap-test",
+        last_analysis=now - timedelta(hours=2),
+        analysis_count=5,
+        last_confidence=0.70,
+        confidence_trend=[0.7],
+    )
+
+    class FakeStateManager:
+        def get_market_analysis_count_today(self, market_id: str) -> int:
+            return 3
+
+    should_skip, reason = scheduler.should_skip(market, state, state_manager=FakeStateManager())
+    assert should_skip is True
+    assert reason == "daily_reanalysis_cap_reached"
+
+
+def test_should_skip_allows_under_daily_cap() -> None:
+    now = datetime.now(timezone.utc)
+    scheduler = MarketScheduler(
+        reanalysis_cooldown_hours=1,
+        urgent_days_before_close=2,
+        max_reanalyses_per_market_per_day=3,
+    )
+    market = _market("m-cap-ok", now + timedelta(days=2))
+    state = MarketState(
+        market_id="m-cap-ok",
+        last_analysis=now - timedelta(hours=2),
+        analysis_count=2,
+        last_confidence=0.70,
+        confidence_trend=[0.7],
+    )
+
+    class FakeStateManager:
+        def get_market_analysis_count_today(self, market_id: str) -> int:
+            return 2
+
+    should_skip, reason = scheduler.should_skip(market, state, state_manager=FakeStateManager())
+    assert should_skip is False

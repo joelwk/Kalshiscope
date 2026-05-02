@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from pydantic import ValidationError
 
 from config import Settings
@@ -12,6 +14,7 @@ from main import (
 )
 from market_state import MarketStateManager
 from models import Market, MarketOutcome, TradeDecision
+from score_engine import compute_final_score
 
 
 def test_applied_bayesian_posterior_respects_min_updates() -> None:
@@ -175,3 +178,40 @@ def test_flip_refinement_precheck_blocks_unreachable_conf_gain() -> None:
     assert reason is not None
     assert "conf_gain_unreachable" in reason
     assert payload is not None
+
+
+def test_score_changes_do_not_regress_profitable_book() -> None:
+    """KXMLBGAME-shaped fixture (high direct evidence, +PnL prefix) must pass gate."""
+    market = Market(
+        id="KXMLBGAME-26APR191420NYMCHC-CHC",
+        question="NYM vs CHC: Who wins?",
+        outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        liquidity_usdc=1500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=3),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.80,
+        bet_size_pct=0.5,
+        reasoning="test regression guard",
+        edge_external=0.12,
+        evidence_quality=0.85,
+    )
+    result = compute_final_score(
+        market=market,
+        decision=decision,
+        implied_prob_market=0.55,
+        evidence_basis_class="direct",
+        edge_source="computed",
+        market_family="sports",
+        historical_prefix_pnl_per_trade=1.88,
+        historical_prefix_sample_size=26,
+        confidence_calibration_floor=0.78,
+        confidence_calibration_penalty_scale=0.50,
+    )
+    assert result.final_score >= 0.25, (
+        f"KXMLBGAME-shaped trade must pass typical score gate; got {result.final_score:.4f}"
+    )
+    assert result.coinflip_sports_penalty == 0.0
+    assert result.historical_prefix_bonus > 0

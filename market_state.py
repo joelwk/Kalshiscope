@@ -60,7 +60,8 @@ class MarketStateManager:
                     category TEXT,
                     last_terminal_outcome TEXT,
                     non_actionable_streak INTEGER DEFAULT 0,
-                    fill_failure_count INTEGER DEFAULT 0
+                    fill_failure_count INTEGER DEFAULT 0,
+                    next_eligible_cycle INTEGER DEFAULT 0
                 )
                 """
             )
@@ -222,6 +223,25 @@ class MarketStateManager:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_exchange_settlements_market_id ON exchange_settlements (market_id)"
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS research_queue_entries (
+                    market_id TEXT PRIMARY KEY,
+                    cycle_id TEXT,
+                    queued_at TEXT NOT NULL,
+                    gate_name TEXT,
+                    reason TEXT,
+                    threshold_gap REAL,
+                    what_to_learn_next TEXT,
+                    last_seen TEXT NOT NULL,
+                    expires_at TEXT,
+                    last_decision_json TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rq_last_seen ON research_queue_entries (last_seen)"
+            )
             self._run_migrations()
             self._backfill_resolution_state()
 
@@ -229,7 +249,7 @@ class MarketStateManager:
         market_row = self._conn.execute(
             """
             SELECT last_terminal_outcome, non_actionable_streak
-                , fill_failure_count
+                , fill_failure_count, next_eligible_cycle
             FROM markets
             WHERE id = ?
             """,
@@ -248,6 +268,11 @@ class MarketStateManager:
         fill_failure_count = (
             int(market_row["fill_failure_count"] or 0)
             if market_row and market_row["fill_failure_count"] is not None
+            else 0
+        )
+        next_eligible_cycle = (
+            int(market_row["next_eligible_cycle"] or 0)
+            if market_row and market_row["next_eligible_cycle"] is not None
             else 0
         )
         latest_row = self._conn.execute(
@@ -275,6 +300,7 @@ class MarketStateManager:
                 last_terminal_outcome=last_terminal_outcome,
                 non_actionable_streak=non_actionable_streak,
                 fill_failure_count=fill_failure_count,
+                next_eligible_cycle=next_eligible_cycle,
             )
 
         trend_rows = self._conn.execute(
@@ -298,6 +324,7 @@ class MarketStateManager:
             last_terminal_outcome=last_terminal_outcome,
             non_actionable_streak=non_actionable_streak,
             fill_failure_count=fill_failure_count,
+            next_eligible_cycle=next_eligible_cycle,
         )
 
     def get_position(self, market_id: str) -> Position | None:
@@ -585,6 +612,22 @@ class MarketStateManager:
                 (market_id, terminal_outcome, next_streak),
             )
 
+    def set_market_cooldown_cycle(self, market_id: str, next_eligible_cycle: int) -> None:
+        normalized_market_id = str(market_id or "").strip()
+        if not normalized_market_id:
+            return
+        normalized_cycle = max(0, int(next_eligible_cycle or 0))
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (id, next_eligible_cycle)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    next_eligible_cycle = excluded.next_eligible_cycle
+                """,
+                (normalized_market_id, normalized_cycle),
+            )
+
     def record_cycle_receipt(self, cycle_id: str, cycle_number: int, payload: dict[str, Any]) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         payload_json = json.dumps(payload, sort_keys=True, default=str)
@@ -621,6 +664,21 @@ class MarketStateManager:
         final_reason = (
             str((execution_audit or {}).get("final_reason", "")).strip() or None
         )
+        normalized_order = order
+        if normalized_order is None and isinstance(execution_audit, dict):
+            order_summary = {
+                key: execution_audit.get(key)
+                for key in (
+                    "order_id",
+                    "order_status",
+                    "order_cancel_reason",
+                    "order_fill_count",
+                    "fallback_order_id",
+                    "fallback_order_status",
+                )
+                if execution_audit.get(key) is not None
+            }
+            normalized_order = order_summary or None
         with self._conn:
             self._conn.execute(
                 """
@@ -637,7 +695,9 @@ class MarketStateManager:
                     final_reason,
                     timestamp,
                     json.dumps(decision or {}, sort_keys=True, default=str),
-                    json.dumps(order, sort_keys=True, default=str) if order is not None else None,
+                    json.dumps(normalized_order, sort_keys=True, default=str)
+                    if normalized_order is not None
+                    else None,
                     json.dumps(execution_audit, sort_keys=True, default=str)
                     if execution_audit is not None
                     else None,
@@ -1025,6 +1085,127 @@ class MarketStateManager:
             )
         return snapshot
 
+    def get_confidence_bucket_calibration(
+        self,
+        *,
+        lookback_days: int = 14,
+    ) -> list[dict[str, float | int | str]]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days)))).isoformat()
+        rows = self._conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN confidence >= 0.90 THEN '0.90+'
+                    WHEN confidence >= 0.80 THEN '0.80-0.89'
+                    WHEN confidence >= 0.70 THEN '0.70-0.79'
+                    WHEN confidence >= 0.60 THEN '0.60-0.69'
+                    WHEN confidence >= 0.50 THEN '0.50-0.59'
+                    ELSE '<0.50'
+                END AS bucket,
+                COUNT(*) AS sample_size,
+                SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) AS wins,
+                AVG(COALESCE(confidence, 0.0)) AS mean_confidence
+            FROM trade_outcomes
+            WHERE confidence IS NOT NULL
+              AND won IS NOT NULL
+              AND COALESCE(resolved_at, last_updated, '') >= ?
+            GROUP BY bucket
+            ORDER BY
+                CASE bucket
+                    WHEN '0.90+' THEN 1
+                    WHEN '0.80-0.89' THEN 2
+                    WHEN '0.70-0.79' THEN 3
+                    WHEN '0.60-0.69' THEN 4
+                    WHEN '0.50-0.59' THEN 5
+                    ELSE 6
+                END
+            """,
+            (cutoff,),
+        ).fetchall()
+        calibration_rows: list[dict[str, float | int | str]] = []
+        for row in rows:
+            sample_size = int(row["sample_size"] or 0)
+            wins = int(row["wins"] or 0)
+            calibration_rows.append(
+                {
+                    "bucket": str(row["bucket"] or ""),
+                    "sample_size": sample_size,
+                    "wins": wins,
+                    "win_rate": (wins / sample_size) if sample_size > 0 else 0.0,
+                    "mean_confidence": float(row["mean_confidence"] or 0.0),
+                }
+            )
+        return calibration_rows
+
+    def load_confidence_calibration_buckets(
+        self,
+        *,
+        days: int = 30,
+    ) -> dict[str, dict[float, dict[str, float | int]]]:
+        """Return confidence-bucket outcomes for global and family-specific calibration."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+        ).isoformat()
+        rows = self._conn.execute(
+            """
+            SELECT
+                t.market_id AS market_id,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category,
+                t.confidence AS confidence,
+                t.won AS won
+            FROM trade_outcomes t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE t.confidence IS NOT NULL
+              AND t.won IS NOT NULL
+              AND COALESCE(t.resolved_at, t.last_updated, '') >= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+        grouped: dict[str, dict[float, dict[str, float | int]]] = defaultdict(dict)
+        for row in rows:
+            confidence_value = float(row["confidence"] or 0.0)
+            bounded_confidence = max(0.0, min(1.0, confidence_value))
+            bucket = int(bounded_confidence * 10.0) / 10.0
+            won = int(row["won"] or 0) == 1
+            family = self._infer_family_from_state_row(
+                market_id=str(row["market_id"] or ""),
+                question=str(row["question"] or ""),
+                category=str(row["category"] or ""),
+            )
+            for family_key in ("all", family):
+                bucket_state = grouped[family_key].get(bucket)
+                if bucket_state is None:
+                    bucket_state = {
+                        "sample_size": 0,
+                        "wins": 0,
+                        "total_confidence": 0.0,
+                    }
+                    grouped[family_key][bucket] = bucket_state
+                bucket_state["sample_size"] = int(bucket_state["sample_size"]) + 1
+                if won:
+                    bucket_state["wins"] = int(bucket_state["wins"]) + 1
+                bucket_state["total_confidence"] = float(bucket_state["total_confidence"]) + bounded_confidence
+
+        snapshot: dict[str, dict[float, dict[str, float | int]]] = {}
+        for family_key, bucket_map in grouped.items():
+            snapshot[family_key] = {}
+            for bucket, bucket_state in bucket_map.items():
+                sample_size = int(bucket_state["sample_size"])
+                wins = int(bucket_state["wins"])
+                total_confidence = float(bucket_state["total_confidence"])
+                snapshot[family_key][float(bucket)] = {
+                    "sample_size": sample_size,
+                    "wins": wins,
+                    "win_rate": (wins / sample_size) if sample_size > 0 else 0.0,
+                    "mean_confidence": (
+                        total_confidence / sample_size
+                        if sample_size > 0
+                        else 0.0
+                    ),
+                }
+        return snapshot
+
     def get_exchange_realized_pnl_total(self) -> float:
         row = self._conn.execute(
             """
@@ -1036,12 +1217,55 @@ class MarketStateManager:
             return 0.0
         return float(row["pnl_total"] or 0.0)
 
+    def get_prefix_pnl_stats(self, prefix: str) -> dict[str, float | int]:
+        """Aggregate settlement PnL for markets whose id starts with *prefix*.
+
+        Returns ``{n, wins, total_pnl}`` from ``exchange_settlements``.
+        """
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS n,
+                COALESCE(SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(pnl_realized), 0.0) AS total_pnl
+            FROM exchange_settlements
+            WHERE market_id LIKE ? || '%'
+            """,
+            (prefix,),
+        ).fetchone()
+        if not row:
+            return {"n": 0, "wins": 0, "total_pnl": 0.0}
+        return {
+            "n": int(row["n"] or 0),
+            "wins": int(row["wins"] or 0),
+            "total_pnl": float(row["total_pnl"] or 0.0),
+        }
+
+    def get_market_analysis_count_today(self, market_id: str) -> int:
+        """Count analyses for *market_id* since midnight UTC today."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM analyses
+            WHERE market_id = ?
+              AND timestamp >= date('now')
+            """,
+            (market_id,),
+        ).fetchone()
+        return int(row["cnt"] or 0) if row else 0
+
     def get_family_action_snapshot(
         self,
         *,
         lookback: int = 400,
+        deep_only: bool = False,
     ) -> dict[str, dict[str, float | int]]:
-        """Return decision action rates grouped by inferred family."""
+        """Return decision action rates grouped by inferred family.
+
+        When *deep_only* is True the denominator excludes pre-analysis
+        rejections so the action rate is not self-fulfillingly zero for
+        families that have only ever been gated out before deep analysis.
+        """
         window = max(1, int(lookback))
         rows = self._conn.execute(
             """
@@ -1062,6 +1286,8 @@ class MarketStateManager:
             family = str(row["market_family"] or "generic").strip().lower() or "generic"
             final_action = str(row["final_action"] or "").strip().lower()
             final_reason = str(row["final_reason"] or "").strip().lower()
+            if deep_only and final_reason.startswith("pre_analysis_"):
+                continue
             bucket = grouped[family]
             bucket["sample_size"] = int(bucket["sample_size"]) + 1
             if final_action == "order_attempt" and final_reason != "dry_run":
@@ -1076,6 +1302,84 @@ class MarketStateManager:
                 "action_rate": (order_attempts / sample_size) if sample_size > 0 else 0.0,
             }
         return snapshot
+
+    def record_research_queue_entry(
+        self,
+        *,
+        market_id: str,
+        cycle_id: str,
+        gate_name: str,
+        reason: str,
+        threshold_gap: float = 0.0,
+        what_to_learn_next: str | None = None,
+        expires_at: str | None = None,
+        last_decision_json: str | None = None,
+    ) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(market_id) DO UPDATE SET
+                cycle_id = excluded.cycle_id,
+                gate_name = excluded.gate_name,
+                reason = excluded.reason,
+                threshold_gap = excluded.threshold_gap,
+                what_to_learn_next = excluded.what_to_learn_next,
+                last_seen = excluded.last_seen,
+                expires_at = excluded.expires_at,
+                last_decision_json = COALESCE(excluded.last_decision_json, last_decision_json)
+            """,
+            (
+                market_id,
+                cycle_id,
+                now_iso,
+                gate_name,
+                reason,
+                round(max(0.0, threshold_gap), 4),
+                what_to_learn_next,
+                now_iso,
+                expires_at,
+                last_decision_json,
+            ),
+        )
+        self._conn.commit()
+
+    def get_active_research_entries(
+        self,
+        lookback_hours: int = 6,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))
+        ).isoformat()
+        rows = self._conn.execute(
+            """
+            SELECT market_id, cycle_id, queued_at, gate_name, reason,
+                   threshold_gap, what_to_learn_next, last_seen, expires_at,
+                   last_decision_json
+            FROM research_queue_entries
+            WHERE last_seen >= ?
+              AND (expires_at IS NULL OR expires_at >= ?)
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (cutoff, now_iso, max(1, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_expired_research_entries(self) -> int:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor = self._conn.execute(
+            "DELETE FROM research_queue_entries WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now_iso,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     @staticmethod
     def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:
@@ -1557,6 +1861,7 @@ class MarketStateManager:
         self._ensure_column("markets", "last_terminal_outcome", "TEXT")
         self._ensure_column("markets", "non_actionable_streak", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
+        self._ensure_column("markets", "next_eligible_cycle", "INTEGER DEFAULT 0")
         self._ensure_column("decision_receipts", "score_json", "TEXT")
         self._ensure_column(
             "trade_outcomes",
@@ -1600,6 +1905,49 @@ class MarketStateManager:
                 """,
                 tuple(unresolved_tokens),
             )
+
+
+    def backfill_outcomes_from_settlements(self) -> int:
+        """Forward-fill won/pnl_estimate into trade_outcomes from exchange_settlements.
+
+        Returns the number of rows updated.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE trade_outcomes
+                SET
+                    won = (
+                        SELECT es.won
+                        FROM exchange_settlements es
+                        WHERE es.market_id = trade_outcomes.market_id
+                          AND es.won IS NOT NULL
+                        LIMIT 1
+                    ),
+                    pnl_estimate = COALESCE(trade_outcomes.pnl_estimate, (
+                        SELECT es.pnl_realized
+                        FROM exchange_settlements es
+                        WHERE es.market_id = trade_outcomes.market_id
+                          AND es.pnl_realized IS NOT NULL
+                        LIMIT 1
+                    )),
+                    resolution_state = 'resolved_valid',
+                    resolved_at = COALESCE(trade_outcomes.resolved_at, (
+                        SELECT es.settled_at
+                        FROM exchange_settlements es
+                        WHERE es.market_id = trade_outcomes.market_id
+                        LIMIT 1
+                    ))
+                WHERE trade_outcomes.won IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM exchange_settlements es
+                      WHERE es.market_id = trade_outcomes.market_id
+                        AND es.won IS NOT NULL
+                  )
+                """
+            )
+        return cursor.rowcount
 
 
 def _parse_order_ids(raw: str | None) -> list[str]:

@@ -233,6 +233,25 @@ def run(db_path: str) -> None:
                 print("\nDecision receipt evidence-basis mix:")
                 for row in evidence_rows:
                     print(f"  {row['evidence_basis_class']}: n={int(row['n'])}")
+            source_match_rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(json_extract(audit_json, '$.source_match_class'), 'unknown') AS source_match_class,
+                    COUNT(*) AS n,
+                    SUM(CASE WHEN COALESCE(json_extract(audit_json, '$.final_action'), '') IN ('order_attempt', 'order_submitted', 'dry_run') THEN 1 ELSE 0 END) AS attempted
+                FROM decision_receipts
+                GROUP BY source_match_class
+                ORDER BY n DESC
+                LIMIT 12
+                """
+            ).fetchall()
+            if source_match_rows:
+                print("\nDecision receipt source-match mix:")
+                for row in source_match_rows:
+                    print(
+                        f"  {row['source_match_class']}: n={int(row['n'])} "
+                        f"attempted={int(row['attempted'] or 0)}"
+                    )
             outcome_rows = conn.execute(
                 """
                 SELECT
@@ -319,6 +338,65 @@ def run(db_path: str) -> None:
                     blocked_rate = (blocked / total) if total > 0 else 0.0
                     print(
                         f"  {row['market_family']}: total={total} blocked={blocked} blocked_rate={blocked_rate:.2%}"
+                    )
+
+            rank_rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(CAST(json_extract(audit_json, '$.ranking_rank') AS INTEGER), 0) AS ranking_rank,
+                    COUNT(*) AS n,
+                    SUM(CASE WHEN COALESCE(json_extract(audit_json, '$.final_action'), '') IN ('order_attempt', 'order_submitted', 'dry_run') THEN 1 ELSE 0 END) AS attempted,
+                    AVG(COALESCE(CAST(json_extract(audit_json, '$.pre_execution_final_score') AS REAL), 0.0)) AS avg_score
+                FROM decision_receipts
+                WHERE json_extract(audit_json, '$.ranking_rank') IS NOT NULL
+                GROUP BY ranking_rank
+                ORDER BY ranking_rank ASC
+                LIMIT 10
+                """
+            ).fetchall()
+            if rank_rows:
+                print("\nDecision rank yield:")
+                for row in rank_rows:
+                    n = int(row["n"] or 0)
+                    attempted = int(row["attempted"] or 0)
+                    attempted_rate = (attempted / n) if n > 0 else 0.0
+                    print(
+                        f"  rank={int(row['ranking_rank'] or 0)} n={n} "
+                        f"attempted={attempted} attempted_rate={attempted_rate:.2%} "
+                        f"avg_score={float(row['avg_score'] or 0.0):.4f}"
+                    )
+
+            high_edge_rows = conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN MAX(
+                            ABS(COALESCE(CAST(json_extract(audit_json, '$.score_edge_market') AS REAL), 0.0)),
+                            ABS(COALESCE(CAST(json_extract(audit_json, '$.score_edge_external') AS REAL), 0.0))
+                        ) >= 0.45 THEN 'extreme_45_plus'
+                        WHEN MAX(
+                            ABS(COALESCE(CAST(json_extract(audit_json, '$.score_edge_market') AS REAL), 0.0)),
+                            ABS(COALESCE(CAST(json_extract(audit_json, '$.score_edge_external') AS REAL), 0.0))
+                        ) >= 0.32 THEN 'high_32_to_45'
+                        ELSE 'normal'
+                    END AS edge_band,
+                    COUNT(*) AS n,
+                    SUM(CASE WHEN COALESCE(json_extract(audit_json, '$.score_rejection_reasons'), '') LIKE '%high_edge_calibration_penalty%' THEN 1 ELSE 0 END) AS high_edge_penalty,
+                    SUM(CASE WHEN COALESCE(json_extract(audit_json, '$.score_rejection_reasons'), '') LIKE '%extreme_edge_learning_queue%' THEN 1 ELSE 0 END) AS learning_queue
+                FROM decision_receipts
+                WHERE json_extract(audit_json, '$.score_edge_market') IS NOT NULL
+                   OR json_extract(audit_json, '$.score_edge_external') IS NOT NULL
+                GROUP BY edge_band
+                ORDER BY n DESC
+                """
+            ).fetchall()
+            if high_edge_rows:
+                print("\nHigh-edge calibration guards:")
+                for row in high_edge_rows:
+                    print(
+                        f"  {row['edge_band']}: n={int(row['n'])} "
+                        f"high_edge_penalty={int(row['high_edge_penalty'] or 0)} "
+                        f"learning_queue={int(row['learning_queue'] or 0)}"
                     )
 
             penalty_avg_row = conn.execute(
@@ -472,6 +550,19 @@ def run(db_path: str) -> None:
                     print("  evidence_basis_breakdown:")
                     for basis in sorted(evidence_basis_counts):
                         print(f"    {basis}: n={evidence_basis_counts[basis]}")
+
+            quota_paused_cycles = sum(
+                1
+                for row in cycle_rows
+                if row["payload_json"]
+                and isinstance(
+                    (lambda r: json.loads(r) if r else {})(row["payload_json"]),
+                    dict,
+                )
+                and json.loads(row["payload_json"]).get("xai_quota_paused")
+            )
+            if quota_paused_cycles > 0:
+                print(f"  xai_quota_paused_cycles={quota_paused_cycles}")
 
         profitable_row = conn.execute(
             """
