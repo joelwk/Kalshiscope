@@ -61,6 +61,24 @@ class FailingClient:
         self.chat = FailingChatClient(error)
 
 
+class SequencedChatClient:
+    def __init__(self, responses: list[Exception | str]) -> None:
+        self.responses = responses
+        self.create_calls = 0
+
+    def create(self, **kwargs):
+        self.create_calls += 1
+        response = self.responses[min(self.create_calls - 1, len(self.responses) - 1)]
+        if isinstance(response, Exception):
+            return FailingChatSession(response)
+        return DummyChatSession(response)
+
+
+class SequencedClient:
+    def __init__(self, responses: list[Exception | str]) -> None:
+        self.chat = SequencedChatClient(responses)
+
+
 class TestGrokClient(unittest.TestCase):
     def test_extract_json(self) -> None:
         payload = _extract_json("prefix {\"foo\": 1} suffix")
@@ -118,6 +136,52 @@ class TestGrokClient(unittest.TestCase):
         self.assertLess(clamped, 20.0)
         self.assertGreater(clamped, 18.0)
         self.assertEqual(uncapped, 90.0)
+
+    def test_rpc_timeout_is_capped_to_stream_deadline(self) -> None:
+        client = GrokClient(
+            api_key="x",
+            settings=Settings(
+                XAI_CLIENT_TIMEOUT_SECONDS=120,
+                GROK_STREAM_TIMEOUT_SECONDS=100,
+            ),
+        )
+
+        self.assertEqual(client._resolve_rpc_timeout_seconds(100.0), 100.0)
+        self.assertEqual(client._resolve_rpc_timeout_seconds(150.0), 120.0)
+        self.assertEqual(client._resolve_rpc_timeout_seconds(0.25), 1.0)
+
+    def test_recovered_retriable_analysis_attempt_does_not_log_error(self) -> None:
+        market = Market(
+            id="m-recovered-timeout",
+            question="Will the minimum temperature be above 50F?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "No durable edge.", '
+            '"evidence_quality": 0.5}'
+        )
+        client = GrokClient(api_key="x")
+        client.client = SequencedClient(
+            [
+                RuntimeError('StatusCode.DEADLINE_EXCEEDED details = "Deadline Exceeded"'),
+                content,
+            ]
+        )
+
+        with patch("grok_client.logger.error") as error_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            decision = client.analyze_market(market)
+
+        self.assertFalse(decision.should_trade)
+        error_mock.assert_not_called()
+        self.assertTrue(
+            any(
+                call.kwargs.get("data", {}).get("will_retry") is True
+                for call in warning_mock.call_args_list
+            )
+        )
 
     def test_deep_analysis_does_not_retry_on_failure(self) -> None:
         market = Market(

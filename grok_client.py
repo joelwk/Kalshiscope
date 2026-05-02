@@ -1110,12 +1110,14 @@ class GrokClient:
         config: SearchConfig,
         enable_multimedia: bool,
         model: str | None = None,
+        timeout_seconds: float | None = None,
     ):
         return self.provider.create_chat(
             model=model or self.model,
             response_format=TradeDecision,
             config=config,
             enable_multimedia=enable_multimedia,
+            timeout_seconds=timeout_seconds,
         )
 
     def _build_market_prompt(
@@ -1224,6 +1226,13 @@ class GrokClient:
         )
         return min(base_timeout, budget_seconds)
 
+    def _resolve_rpc_timeout_seconds(self, stream_deadline_seconds: float) -> float:
+        """Align the SDK gRPC deadline with the bot's per-attempt stream window."""
+        return max(
+            1.0,
+            min(float(self.xai_client_timeout_seconds), float(stream_deadline_seconds)),
+        )
+
     def _stream_chat_content(
         self,
         chat,
@@ -1232,6 +1241,7 @@ class GrokClient:
         budget_remaining_ms: float | None = None,
         search_profile: str | None = None,
         deep: bool = False,
+        deadline_seconds: float | None = None,
     ) -> tuple[str, int, dict[str, int | None]]:
         content = ""
         chunk_count = 0
@@ -1241,11 +1251,12 @@ class GrokClient:
             "reasoning_tokens": None,
             "cached_tokens": None,
         }
-        deadline_seconds = self._resolve_stream_deadline_seconds(
-            budget_remaining_ms,
-            search_profile=search_profile,
-            deep=deep,
-        )
+        if deadline_seconds is None:
+            deadline_seconds = self._resolve_stream_deadline_seconds(
+                budget_remaining_ms,
+                search_profile=search_profile,
+                deep=deep,
+            )
         deadline = time.monotonic() + deadline_seconds
         for response, chunk in chat.stream():
             if time.monotonic() > deadline:
@@ -1300,6 +1311,7 @@ class GrokClient:
                     deep=deep,
                     retry_attempt=attempt,
                     budget_remaining_ms=budget_remaining_ms,
+                    max_attempts=max_attempts,
                 )
             except Exception as exc:
                 last_error = exc
@@ -1346,6 +1358,7 @@ class GrokClient:
         deep: bool,
         retry_attempt: int,
         budget_remaining_ms: float,
+        max_attempts: int,
     ) -> TradeDecision:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
@@ -1370,6 +1383,11 @@ class GrokClient:
 
         content = ""
         try:
+            stream_deadline_seconds = self._resolve_stream_deadline_seconds(
+                budget_remaining_ms,
+                search_profile=getattr(active_config, "profile_name", None),
+                deep=deep,
+            )
             enable_multimedia = self._should_enable_multimedia(
                 market,
                 decision=previous_analysis,
@@ -1379,6 +1397,9 @@ class GrokClient:
                 active_config,
                 enable_multimedia,
                 model=model,
+                timeout_seconds=self._resolve_rpc_timeout_seconds(
+                    stream_deadline_seconds
+                ),
             )
             chat.append(
                 self.provider.system_message(
@@ -1401,6 +1422,7 @@ class GrokClient:
                 budget_remaining_ms=budget_remaining_ms,
                 search_profile=getattr(active_config, "profile_name", None),
                 deep=deep,
+                deadline_seconds=stream_deadline_seconds,
             )
             data = self._parse_response_payload(market.id, content, deep=deep)
             raw_payload = dict(data)
@@ -1509,6 +1531,13 @@ class GrokClient:
             return decision
         except Exception as exc:
             duration = (time.monotonic() - start_time) * 1000
+            retriable = _is_retriable_grok_error(exc, duration)
+            budget_after_error_ms = max(0.0, budget_remaining_ms - duration)
+            will_retry = (
+                retriable
+                and retry_attempt < max_attempts
+                and budget_after_error_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0
+            )
             if content:
                 logger.debug(
                     "Model response preview for failed %s: market=%s preview=%s",
@@ -1520,7 +1549,8 @@ class GrokClient:
                         "response_preview": _response_preview(content),
                     },
                 )
-            logger.error(
+            log_fn = logger.warning if will_retry else logger.error
+            log_fn(
                 "%s failed: id=%s, error=%s, duration=%.2fms",
                 phase_label.capitalize(),
                 market.id,
@@ -1531,10 +1561,11 @@ class GrokClient:
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                     "duration_ms": round(duration, 2),
-                    "retriable": _is_retriable_grok_error(exc, duration),
+                    "retriable": retriable,
+                    "will_retry": will_retry,
                     "quota_exhausted": _is_quota_exhausted_grok_error(exc),
                     "retry_attempt": retry_attempt,
-                    "budget_remaining_ms": round(max(0.0, budget_remaining_ms - duration), 2),
+                    "budget_remaining_ms": round(budget_after_error_ms, 2),
                     "previous_analysis": previous_summary if deep else None,
                     "search_profile": active_config.profile_name,
                 },
