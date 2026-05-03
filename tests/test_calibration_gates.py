@@ -187,10 +187,10 @@ def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
     """With n=3 and negative PnL, the tiered evaluator should produce
     SOFT_DEMOTE, not HARD_DENY."""
     result = evaluate_market_tiered(
-        market_id="KXMLBHIT-26A-TEST",
+        market_id="KXTESTHIT-26A-TEST",
         family="generic",
         prefix_stats={
-            "KXMLBHIT-26A": PerformanceStats(
+            "KXTESTHIT-26": PerformanceStats(
                 sample_size=3,
                 wins=0,
                 win_rate=0.0,
@@ -278,10 +278,10 @@ def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     """With n=12 >= hard_block_min_samples and low Wilson LB, the tiered
     evaluator should produce HARD_DENY."""
     result = evaluate_market_tiered(
-        market_id="KXMLBHIT-26A-TEST",
+        market_id="KXTESTHIT-26A-TEST",
         family="generic",
         prefix_stats={
-            "KXMLBHIT-26A": PerformanceStats(
+            "KXTESTHIT-26": PerformanceStats(
                 sample_size=12,
                 wins=1,
                 win_rate=0.083,
@@ -305,10 +305,10 @@ def test_tiered_n12_low_wilson_is_hard_deny() -> None:
 def test_legacy_wrapper_returns_allowed_true_for_soft_demote() -> None:
     """Soft-demoted markets remain eligible for scoring/research prioritization."""
     allowed, reason, metrics = evaluate_market(
-        market_id="KXMLBHIT-26A-TEST",
+        market_id="KXTESTHIT-26A-TEST",
         family="generic",
         prefix_stats={
-            "KXMLBHIT-26A": PerformanceStats(
+            "KXTESTHIT-26": PerformanceStats(
                 sample_size=4,
                 wins=1,
                 win_rate=0.25,

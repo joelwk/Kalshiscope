@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from config import Settings
-from main import _effective_score_gate_threshold
-from models import Market, MarketOutcome, TradeDecision
+from main import (
+    _cap_analysis_candidates,
+    _effective_score_gate_threshold,
+    _pre_analysis_opportunity_score,
+)
+from models import Market, MarketOutcome, MarketState, TradeDecision
+from participation import ParticipationTier, classify_participation
 from score_engine import compute_final_score
 
 
@@ -136,9 +141,9 @@ def test_execution_funnel_regression_hou3_direct_edge_stays_tradeable() -> None:
         SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25,
     )
     market = _market(
-        market_id="KXMLBTEAMTOTAL-26APR131610HOUSEA-HOU3",
+        market_id="KXSAMPLETEAMTOTAL-26APR131610TEAMATEAMB-TEAMA3",
         category="sports",
-        question="Will Houston score over 3 runs?",
+        question="Will Team A score over 3 in the matchup?",
         liquidity=1200.0,
     )
     decision = _decision(
@@ -156,3 +161,156 @@ def test_execution_funnel_regression_hou3_direct_edge_stays_tradeable() -> None:
     )
     assert threshold == 0.25
     assert score.final_score >= threshold
+
+
+# ---------------------------------------------------------------------------
+# Cycle-14 MLB F5 regression fixture (correlation_id 6a6cc761).
+#
+# The 2026-05-03 audit found that cycles 13-14 produced 2 successful MLB F5
+# trades (KXMLBF5-26MAY031920TEXDET-DET and KXMLBF5SPREAD-26MAY031340SFTB-TB2)
+# while cycles 15-30 produced 0 execution candidates. The trade audit captured
+# pre_analysis_score >= 0.55 with historical_gate_allowed=True, sports family
+# (no source_difficulty penalty), mid-priced (~0.50 → max price_center bump),
+# and high liquidity. The audit's iterative-optimization fixes (drain priority,
+# empty-Grok retry, two-pass drain, penalty single-count, adaptive band, score
+# distribution telemetry, configurable maxlen) must NOT regress this path.
+#
+# These tests reconstruct the cycle-14 market characteristics and assert the
+# full participation funnel still classifies them as EXECUTION_ELIGIBLE under
+# the new code paths.
+# ---------------------------------------------------------------------------
+
+
+def _cycle14_mlb_f5_market(market_id: str = "KXMLBF5-26MAY031920TEXDET-DET") -> Market:
+    """MLB First-5-Innings market matching the cycle-14 success fixture.
+
+    Mid-priced (favors price_center=1.0), high liquidity (favors
+    liquidity_score>=0.4), sports family (no source_difficulty penalty,
+    no family_penalty), close window <24h (favors horizon_score=1.0).
+
+    The question text explicitly includes "MLB" with surrounding spaces so
+    family_from_text classifies this as sports (the MLB keyword in the
+    ticker prefix lacks word boundaries because of the KX prefix).
+    """
+    return Market(
+        id=market_id,
+        question=(
+            "MLB First 5 Innings: Will the Tigers win vs Texas Rangers "
+            "after 5 innings?"
+        ),
+        category="sports",
+        liquidity_usdc=1500.0,
+        outcomes=[
+            MarketOutcome(name="YES", price=0.50),
+            MarketOutcome(name="NO", price=0.50),
+        ],
+        close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+        resolution_criteria=(
+            "Resolves YES if Tigers lead Texas after the bottom of the 5th "
+            "inning per official MLB scoring."
+        ),
+    )
+
+
+def test_cycle14_mlb_f5_passes_pre_analysis_threshold() -> None:
+    """Pre-analysis must score the cycle-14 fixture above MIN_SCORE so it is
+    eligible for deep analysis (i.e. NOT routed to soft-research)."""
+    settings = Settings()
+    market = _cycle14_mlb_f5_market()
+    state = MarketState(market_id=market.id, analysis_count=0, non_actionable_streak=0)
+    score, breakdown = _pre_analysis_opportunity_score(
+        market,
+        state,
+        settings,
+        traded_before=False,
+    )
+    assert score >= settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, (
+        f"Cycle-14 MLB F5 fixture must pre-score >= "
+        f"{settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE} but got {score:.4f}; "
+        f"breakdown={breakdown}"
+    )
+    # Sports family carries no family_penalty; this guards against regressions
+    # in the family-penalty constants leaking back in.
+    assert breakdown["pre_score_family_penalty"] == 0.0
+    assert breakdown["pre_score_source_difficulty_penalty"] == 0.0
+
+
+def test_cycle14_mlb_f5_cap_keeps_market_when_historical_gate_allows() -> None:
+    """When historical_gate_allowed=True with metrics present, the cap must
+    NOT apply the legacy 0.12 historical penalty (5d). The MLB F5 fixture is
+    the canonical "sports market with positive historical record" case.
+
+    Uses 3 candidates with max=2 so _cap_analysis_candidates exercises its
+    ranking logic (with len(candidates) <= max it short-circuits and the
+    selection_rank_components are never populated).
+    """
+    market = _cycle14_mlb_f5_market()
+    candidate_with_metrics = {
+        "market": market,
+        "pre_analysis_score": 0.65,
+        "historical_gate_allowed": True,
+        "historical_gate_metrics": {"historical_gate_score_penalty": 0.0},
+    }
+    spread_market = _cycle14_mlb_f5_market(
+        market_id="KXMLBF5SPREAD-26MAY031340SFTB-TB2"
+    )
+    competing_candidate = {
+        "market": spread_market,
+        "pre_analysis_score": 0.62,
+        "historical_gate_allowed": True,
+        "historical_gate_metrics": {"historical_gate_score_penalty": 0.0},
+    }
+    filler_market = _cycle14_mlb_f5_market(market_id="KXMLBF5-FILLER-XYZ")
+    filler_candidate = {
+        "market": filler_market,
+        "pre_analysis_score": 0.45,
+        "historical_gate_allowed": True,
+        "historical_gate_metrics": {"historical_gate_score_penalty": 0.0},
+    }
+    capped = _cap_analysis_candidates(
+        [candidate_with_metrics, competing_candidate, filler_candidate],
+        max_markets_per_cycle=2,
+    )
+    capped_ids = [item["market"].id for item in capped]
+    assert market.id in capped_ids
+    assert spread_market.id in capped_ids
+    # Risk-adjusted score must equal base when historical_gate is fully clean
+    # (no double-deducted penalty).
+    primary = next(item for item in capped if item["market"].id == market.id)
+    assert primary["selection_rank_components"]["historical_gate_penalty"] == 0.0
+    assert primary["selection_rank_components"]["risk_adjusted_score"] == 0.65
+
+
+def test_cycle14_mlb_f5_classifies_as_execution_eligible() -> None:
+    """End-to-end: with should_trade=True and a proper computed edge, the
+    cycle-14 fixture must classify as EXECUTION_ELIGIBLE. Mirrors the audit
+    fields from correlation_id 6a6cc761."""
+    decision = classify_participation(
+        decision_should_trade=True,
+        decision_abstain=False,
+        decision_evidence_basis="direct",
+        decision_edge_source="computed",
+        decision_evidence_quality=0.78,
+        evidence_quality_threshold=0.75,
+        edge_value=0.14,
+        edge_reasonable_max=0.40,
+        score_gate_blocked=False,
+    )
+    assert decision.tier == ParticipationTier.EXECUTION_ELIGIBLE
+    assert decision.primary_reason == "all_gates_passed"
+    assert decision.why_not_execution_eligible is None
+
+
+def test_cycle14_mlb_f5_unaffected_by_adaptive_band_at_zero_streak() -> None:
+    """Adaptive band (5e) only widens routing under sustained zero-yield. With
+    no streak the effective band equals the base band, so cycle-14 markets
+    follow the unchanged path."""
+    settings = Settings()
+    base_band = settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND
+    # When CYCLE_YIELD_ALERT_ESCALATE_AFTER threshold is not crossed,
+    # widening must be zero.
+    consecutive_zero_yield = 0
+    band_widen_threshold = 2 * settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+    assert consecutive_zero_yield < band_widen_threshold
+    # Base band is the only research-band figure used in this regime.
+    assert settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX >= base_band

@@ -236,6 +236,110 @@ class TestKalshiClient(unittest.TestCase):
         params = request_mock.call_args.kwargs["params"]
         self.assertEqual(params["close_time_start"], "2026-04-06T00:00:00+00:00")
         self.assertEqual(params["close_time_end"], "2026-04-07T00:00:00+00:00")
+        self.assertNotIn("mve_filter", params)
+
+    def test_get_markets_forwards_mve_filter_query_param(self) -> None:
+        """Cycle 2 review fix: the mve_filter=exclude server-side parameter
+        drops KXMVE combo markets so the page cap is filled with individual
+        sports/weather/crypto/music markets instead of combinatorial noise."""
+        client = self._client()
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-INDIVIDUAL-1", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+
+        with patch.object(client, "_request", side_effect=pages) as request_mock:
+            markets = client.get_markets(mve_filter="exclude")
+        self.assertEqual([m.id for m in markets], ["MKT-INDIVIDUAL-1"])
+        params = request_mock.call_args.kwargs["params"]
+        self.assertEqual(params["mve_filter"], "exclude")
+        self.assertEqual(client.last_fetch_mve_filter, "exclude")
+        self.assertEqual(client.last_fetch_pages, 1)
+        self.assertFalse(client.last_fetch_cap_hit)
+
+    def test_get_markets_normalizes_mve_filter_case_and_whitespace(self) -> None:
+        client = self._client()
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-A", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+
+        with patch.object(client, "_request", side_effect=pages) as request_mock:
+            client.get_markets(mve_filter="  EXCLUDE  ")
+        self.assertEqual(request_mock.call_args.kwargs["params"]["mve_filter"], "exclude")
+
+    def test_get_markets_drops_unsupported_mve_filter_value(self) -> None:
+        """An invalid mve_filter value should not be forwarded to Kalshi (which
+        would 400 the request); a warning is logged and the param is omitted."""
+        client = self._client()
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-A", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+
+        with patch.object(client, "_request", side_effect=pages) as request_mock:
+            client.get_markets(mve_filter="weird-value")
+        params = request_mock.call_args.kwargs["params"]
+        self.assertNotIn("mve_filter", params)
+        self.assertIsNone(client.last_fetch_mve_filter)
+
+    def test_get_markets_omits_mve_filter_when_unset(self) -> None:
+        client = self._client()
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-A", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "",
+                }
+            ),
+        ]
+
+        with patch.object(client, "_request", side_effect=pages) as request_mock:
+            client.get_markets()
+        params = request_mock.call_args.kwargs["params"]
+        self.assertNotIn("mve_filter", params)
+        self.assertIsNone(client.last_fetch_mve_filter)
+
+    def test_get_markets_tracks_pagination_metadata_when_cap_hit(self) -> None:
+        """When the page cap stops pagination with a remaining cursor, the
+        client should expose last_fetch_pages and last_fetch_cap_hit so the
+        cycle receipt can record catalog topology."""
+        client = self._client()
+        client.max_fetch_pages = 1
+        pages = [
+            _DummyResponse(
+                {
+                    "markets": [
+                        {"ticker": "MKT-1", "title": "Q1", "yes_ask": 55},
+                    ],
+                    "cursor": "next-1",
+                }
+            ),
+        ]
+        with patch.object(client, "_request", side_effect=pages):
+            client.get_markets()
+        self.assertEqual(client.last_fetch_pages, 1)
+        self.assertTrue(client.last_fetch_cap_hit)
 
     def test_get_markets_respects_max_fetch_pages_cap(self) -> None:
         client = self._client()

@@ -100,6 +100,11 @@ class KalshiClient:
         )
         self.private_key = self._load_private_key(private_key_path)
         self.session = self._create_session()
+        # Per-fetch pagination metadata exposed for cycle receipts and the
+        # adaptive top-up path. Updated on every ``get_markets`` call.
+        self.last_fetch_pages: int = 0
+        self.last_fetch_cap_hit: bool = False
+        self.last_fetch_mve_filter: str | None = None
         logger.debug(
             "KalshiClient initialized: base_url=%s timeout=%ds order_price_improvement_cents=%d default_time_in_force=%s",
             self.base_url,
@@ -206,12 +211,36 @@ class KalshiClient:
         *,
         close_time_start: datetime | None = None,
         close_time_end: datetime | None = None,
+        mve_filter: str | None = None,
     ) -> list[Market]:
-        """Fetch all paginated markets from Kalshi."""
+        """Fetch all paginated markets from Kalshi.
+
+        ``mve_filter`` is the Kalshi server-side filter for multivariate
+        events (combos). Pass ``"exclude"`` to drop combo markets server-side
+        (cycle 2 review found combo markets dominate the catalog ordering and
+        starve the page cap of meaningful individual markets), ``"only"`` to
+        return only combo markets, or leave ``None``/empty for the Kalshi
+        default (include both).
+        """
+        normalized_mve_filter = (mve_filter or "").strip().lower() or None
+        if normalized_mve_filter is not None and normalized_mve_filter not in {
+            "exclude",
+            "only",
+        }:
+            logger.warning(
+                "Ignoring unsupported mve_filter value=%r; expected 'exclude' or 'only'",
+                mve_filter,
+                data={"mve_filter": mve_filter},
+            )
+            normalized_mve_filter = None
         markets: list[Market] = []
         seen_market_ids: set[str] = set()
         cursor: str | None = None
         pages_fetched = 0
+        cap_hit = False
+        self.last_fetch_pages = 0
+        self.last_fetch_cap_hit = False
+        self.last_fetch_mve_filter = normalized_mve_filter
         while True:
             params: dict[str, Any] = {"limit": limit}
             if status:
@@ -222,6 +251,8 @@ class KalshiClient:
                 params["close_time_start"] = close_time_start.astimezone(timezone.utc).isoformat()
             if close_time_end is not None:
                 params["close_time_end"] = close_time_end.astimezone(timezone.utc).isoformat()
+            if normalized_mve_filter is not None:
+                params["mve_filter"] = normalized_mve_filter
             page_attempt = 0
             while True:
                 page_attempt += 1
@@ -275,17 +306,21 @@ class KalshiClient:
             cursor = payload.get("cursor") if isinstance(payload, dict) else None
             if self.max_fetch_pages is not None and pages_fetched >= self.max_fetch_pages:
                 if cursor:
+                    cap_hit = True
                     logger.warning(
                         "Kalshi market fetch stopped at configured page cap: pages=%d",
                         pages_fetched,
                         data={
                             "pages_fetched": pages_fetched,
                             "max_fetch_pages": self.max_fetch_pages,
+                            "mve_filter": normalized_mve_filter,
                         },
                     )
                 break
             if not cursor:
                 break
+        self.last_fetch_pages = pages_fetched
+        self.last_fetch_cap_hit = cap_hit
         return markets
 
     def get_market(self, market_ticker: str) -> Market:

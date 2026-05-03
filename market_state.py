@@ -12,6 +12,7 @@ from typing import Any, Iterable
 from bayesian_engine import BayesianState
 from logging_config import get_logger
 from models import MarketState, OrderResponse, Position, TradeDecision
+from research_profiles import family_from_text
 
 logger = get_logger(__name__)
 
@@ -1388,6 +1389,7 @@ class MarketStateManager:
         max_age_hours: float = 12.0,
         limit: int = 5,
         excluded_market_ids: tuple[str, ...] | None = None,
+        min_priority: float | None = None,
     ) -> list[dict[str, Any]]:
         """Return research-queue entries eligible for forced re-analysis.
 
@@ -1396,6 +1398,17 @@ class MarketStateManager:
         candidate list, already-traded markets, or recently-resolved markets) so
         we don't double-promote. Results are ordered oldest-first to give the
         longest-waiting entries a turn before fresher ones.
+
+        ``min_priority`` (optional) filters out entries whose proxied priority is
+        below the cutoff. Priority is read from
+        ``estimate_research_entry_priority``: ``last_decision_json.audit
+        .pre_analysis_score`` when present, otherwise ``1.0 - threshold_gap``.
+        Entries without enough metadata to estimate a priority are kept (treated
+        as "unknown" rather than penalized). When the filter is active the
+        function over-fetches so the oldest-first ordering still yields enough
+        qualifying rows after pruning. Callers that need per-cycle telemetry
+        on how many were skipped should call ``estimate_research_entry_priority``
+        themselves; this entry point only returns the qualifying rows.
         """
         now = datetime.now(timezone.utc)
         max_cutoff_iso = (
@@ -1409,6 +1422,10 @@ class MarketStateManager:
             for mid in (excluded_market_ids or ())
             if str(mid or "").strip()
         )
+        effective_limit = max(0, int(limit))
+        fetch_limit = effective_limit
+        if min_priority is not None and effective_limit > 0:
+            fetch_limit = max(effective_limit, effective_limit * 4)
         if excluded:
             placeholders = ",".join("?" * len(excluded))
             sql = f"""
@@ -1428,7 +1445,7 @@ class MarketStateManager:
                 min_cutoff_iso,
                 now.isoformat(),
                 *excluded,
-                max(0, int(limit)),
+                fetch_limit,
             )
         else:
             sql = """
@@ -1446,35 +1463,56 @@ class MarketStateManager:
                 max_cutoff_iso,
                 min_cutoff_iso,
                 now.isoformat(),
-                max(0, int(limit)),
+                fetch_limit,
             )
         rows = self._conn.execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        results = [dict(row) for row in rows]
+        if min_priority is None or not results:
+            return results[:effective_limit] if effective_limit else results
+        cutoff = float(min_priority)
+        filtered: list[dict[str, Any]] = []
+        for entry in results:
+            priority = self.estimate_research_entry_priority(entry)
+            if priority is None or priority >= cutoff:
+                filtered.append(entry)
+            if len(filtered) >= effective_limit:
+                break
+        return filtered
+
+    @staticmethod
+    def estimate_research_entry_priority(entry: dict[str, Any]) -> float | None:
+        """Best-effort priority for a queued research entry.
+
+        Reads ``last_decision_json.audit.pre_analysis_score`` first (most
+        accurate), falls back to ``last_decision_json.pre_analysis_score`` for
+        legacy payloads, then to ``1.0 - threshold_gap`` for entries that have
+        only the gap metadata. Returns ``None`` when no signal is available so
+        callers can treat unknown-priority entries as "skip-worthy" rather than
+        "low-priority".
+        """
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                payload = json.loads(decision_json)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                audit = payload.get("audit")
+                if isinstance(audit, dict):
+                    score = audit.get("pre_analysis_score")
+                    if isinstance(score, (int, float)):
+                        return float(score)
+                score = payload.get("pre_analysis_score")
+                if isinstance(score, (int, float)):
+                    return float(score)
+        threshold_gap = entry.get("threshold_gap")
+        if isinstance(threshold_gap, (int, float)):
+            return max(0.0, 1.0 - float(threshold_gap))
+        return None
 
     @staticmethod
     def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:
-        text = f"{market_id} {question} {category}".upper()
-        if any(token in text for token in ("KXKBOGAME", "KXNPBGAME", "SPORT", "MATCH", "WINNER")):
-            return "sports"
-        if any(token in text for token in ("KXBTC", "KXETH", "KXSOL", "KXXRP", "KXDOGE", "KXBNB", "CRYPTO")):
-            return "crypto"
-        if any(token in text for token in ("MENTION", "SPEECH", "TRANSCRIPT", "LASTWORD", "TRUTHSOCIAL")):
-            return "speech"
-        if any(token in text for token in ("STREAM", "SPOTIFY", "ARTIST", "SONG", "MUSIC", "LUMINATE")):
-            return "music"
-        if any(
-            token in text
-            for token in ("KXHIGH", "KXLOW", "KXTEMP", "KXRAIN", "WEATHER", "TEMPERATURE")
-        ):
-            return "weather"
-        if any(
-            token in text
-            for token in ("KXGOLD", "KXSILVER", "KXNATGAS", "KXBRENT", "KXHOIL", "KXSUGAR", "KXCOFFEE", "KXCORN", "KXSOYBEAN")
-        ):
-            return "commodities"
-        if any(token in text for token in ("KXINX", "KXNASDAQ", "S&P", "NASDAQ", "DOW")):
-            return "index"
-        return "generic"
+        return family_from_text(f"{market_id} {question} {category}")
 
     def record_resolution(
         self,

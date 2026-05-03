@@ -54,7 +54,12 @@ class Settings:
     MAX_HEATING_OIL_CONFIDENCE: float = 0.70
     MAX_CORN_CONFIDENCE: float = 0.70
     MAX_CRYPTO_CONFIDENCE: float = 0.72
-    MAX_REASONABLE_EDGE: float = 0.32
+    # Hard sanity cap on model-vs-market edge to catch hallucinated
+    # opportunities. Raised from 0.32 to 0.40 after cycle 1 review showed a
+    # validated direct + settlement-aligned music chart trade with edge=0.56
+    # being hard-blocked before its score could be evaluated. The score gate
+    # threshold + stacked penalties continue to scale on edges above 0.32.
+    MAX_REASONABLE_EDGE: float = 0.40
     NON_SPORTS_REQUIRES_DIRECT_EVIDENCE: bool = True
     NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL: bool = True
     MAX_SPEECH_CONFIDENCE: float = 0.65
@@ -63,31 +68,9 @@ class Settings:
     MARKET_CATEGORIES_ALLOWLIST: tuple[str, ...] = ()
     MARKET_CATEGORIES_BLOCKLIST: tuple[str, ...] = ()
     MARKET_FAMILY_BLOCKLIST: tuple[str, ...] = ()
-    MARKET_TICKER_BLOCKLIST_PREFIXES: tuple[str, ...] = (
-        "KXBTC15M-",
-        "KXETH15M-",
-        "KXSOL15M-",
-        "KXDOGE15M-",
-        "KXBNB15M-",
-        "KXXRP15M-",
-        "KXHYPE15M-",
-        "KXNETFLIX",
-        "KXSPOTIFY",
-        "KXMADDOW",
-        "KXPOLITICSMENTION-",
-        "KXPERSONMENTION-",
-        "KXSURVIVORMENTION-",
-        "KXKHANNAMENTION-",
-        "KXCARNEYMENTION-",
-        "KXSNLMENTION-",
-        "KXLASTWORDCOUNT-",
-        "KXVANCEMENTION-",
-        "KXALBUMSTREAMSU-",
-        "KXSPOTSTREAMGLOBAL-",
-        "KXARTISTSTREAMSU-",
-    )
-    SKIP_WEATHER_BIN_MARKETS: bool = True
-    CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED: bool = True
+    MARKET_TICKER_BLOCKLIST_PREFIXES: tuple[str, ...] = ()
+    SKIP_WEATHER_BIN_MARKETS: bool = False
+    CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED: bool = False
     MIN_VOLUME_24H: float = 10.0
     MIN_OPEN_INTEREST: float = 25.0
     EXTREME_YES_PRICE_LOWER: float = 0.02
@@ -297,7 +280,32 @@ class Settings:
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
     KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
-    KALSHI_MAX_FETCH_PAGES: int = 10
+    # Hard cap on paginated market fetch requests per cycle (0 = unlimited).
+    # Cycle 1 review settled at 30 pages, cycle 2 follow-up found those pages
+    # were dominated by KXMVE combo markets and added KALSHI_MVE_FILTER=exclude
+    # to drop them server-side. Estimating ~10% of the unbounded 494K-market
+    # catalog is non-MVE (~50K markets) means 30 pages * 1000 covers ~60%
+    # of the non-MVE window — 50 pages closes the gap. Adaptive top-up
+    # (KALSHI_FETCH_TOPUP_ENABLED) and the eligible_floor warning will tell
+    # us if we still need to push higher (e.g. 80) under particular catalog
+    # conditions.
+    KALSHI_MAX_FETCH_PAGES: int = 50
+    # Server-side multivariate-event filter for /markets. Cycle 2 follow-up
+    # found multivariate-event combo markets dominate the catalog ordering,
+    # so excluding them server-side is the cheapest way to keep the page cap
+    # focused on individual markets. Allowed values: "exclude" (drop MVE),
+    # "only" (keep only MVE), "" / unset (Kalshi default = include both).
+    KALSHI_MVE_FILTER: str = "exclude"
+    # When eligible_markets falls below this floor on a cycle that hit the
+    # page cap, log a structured WARNING so operators can detect "we are
+    # running out of catalog before we run out of cap" before the symptom
+    # becomes a sustained cycle_yield_alert ERROR.
+    KALSHI_ELIGIBLE_FLOOR: int = 100
+    # Reserved for the future adaptive top-up path: when True, a cycle that
+    # falls below KALSHI_ELIGIBLE_FLOOR with the page cap hit will
+    # automatically issue a one-shot follow-up fetch with a doubled cap.
+    # Default False — observe the warnings first, then enable.
+    KALSHI_FETCH_TOPUP_ENABLED: bool = False
 
     # Execution
     DRY_RUN: bool = True
@@ -340,8 +348,16 @@ class Settings:
     MAX_MARKETS_PER_CYCLE: int = 3
     MAX_WEATHER_CANDIDATES_PER_CYCLE: int = 1
     MAX_CRYPTO_CANDIDATES_PER_CYCLE: int = 1
-    MAX_SPEECH_CANDIDATES_PER_CYCLE: int = 0
-    MAX_MUSIC_CANDIDATES_PER_CYCLE: int = 0
+    # Music/speech candidates per cycle were raised from 1 to 2 after the
+    # cycle 1 review: the only high-conviction trade in cycle 1 was a music
+    # market (KXPUREALBUMS-KEH26APR30-39K) and pre-analysis routinely surfaces
+    # a dozen+ music candidates per cycle. Cycle 1 family availability was
+    # weather=53, music=14, crypto=10, generic=5 — bumping the music/speech
+    # caps shifts selection toward families where direct evidence is most
+    # likely. Total per-cycle throughput is still bounded by
+    # MAX_MARKETS_PER_CYCLE.
+    MAX_SPEECH_CANDIDATES_PER_CYCLE: int = 2
+    MAX_MUSIC_CANDIDATES_PER_CYCLE: int = 2
     MAX_TRADES_PER_CYCLE: int = 2
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
@@ -418,9 +434,17 @@ class Settings:
         "nhl.com",
     )
     PRE_ANALYSIS_OPPORTUNITY_ENABLED: bool = True
-    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.60
+    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.55
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND: float = 0.20
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED: bool = True
+    # Adaptive widening of the soft-research band when sustained zero-execution
+    # cycles indicate calibration drift. Only widens the routing band that
+    # captures markets for learning; the deep-analysis MIN_SCORE itself is
+    # NEVER moved by this knob, so execution gating stays unchanged. The
+    # widening is linear: per cycle beyond 2 * CYCLE_YIELD_ALERT_ESCALATE_AFTER
+    # consecutive zero-execution cycles, the band grows by 0.02 up to BAND_MAX.
+    PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED: bool = True
+    PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX: float = 0.30
     PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD: float = 0.50
     PRE_ANALYSIS_REDUCED_MAX_CANDIDATES: int = 3
     PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY: float = 0.25
@@ -433,8 +457,6 @@ class Settings:
     PRE_ANALYSIS_FAMILY_PENALTY_WEATHER_BIN: float = 0.05
     PRE_ANALYSIS_FAMILY_PENALTY_GENERIC_BIN: float = 0.10
     PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN: float = 0.06
-    PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED: bool = True
-    PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY: float = 0.06
     PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY: float = 0.04
     PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD: float = 0.80
     PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY: float = 0.12
@@ -457,14 +479,7 @@ class Settings:
     PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES: int = 5
     PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED: bool = True
     PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES: int = 20
-    PRE_ANALYSIS_HARD_REJECTION_FAMILIES: tuple[str, ...] = (
-        "speech",
-        "music",
-        "mention",
-        "generic",
-        "crypto",
-        "weather",
-    )
+    PRE_ANALYSIS_HARD_REJECTION_FAMILIES: tuple[str, ...] = ()
     HISTORICAL_TICKER_PREFIX_GATE_ENABLED: bool = True
     HISTORICAL_TICKER_PREFIX_LEN: int = 12
     HISTORICAL_TICKER_PREFIX_LOOKBACK_DAYS: int = 30
@@ -505,6 +520,12 @@ class Settings:
     RESEARCH_QUEUE_PERSIST_TO_DB: bool = True
     RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS: int = 6
     RESEARCH_QUEUE_PRIORITY_ENABLED: bool = True
+    # Bound on the per-cycle research-queue capture log used for cycle-receipt
+    # telemetry and the "Research queue captured N blocked opportunities" log
+    # line. The DB persists EVERY entry regardless of this cap; only the
+    # in-memory cycle log is bounded. Operators can raise this when triaging
+    # large queue cycles or lower to reduce log payload size.
+    RESEARCH_QUEUE_CYCLE_LOG_MAXLEN: int = 200
     # Periodically promote stale research-queued markets back to deep analysis so
     # the queue is not a write-only black hole. Conservative defaults: at most one
     # forced probe per cycle, only after the entry has aged at least an hour.
@@ -518,7 +539,16 @@ class Settings:
     PRE_ANALYSIS_ZERO_ACTION_FAMILY_USE_DEEP_ANALYZED_DENOMINATOR: bool = True
     PRE_ANALYSIS_ZERO_ACTION_FAMILY_FORCE_PROBE_PER_DAY: int = 1
     DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR: float = 0.80
-    DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX: float = 0.40
+    # Edge cap for definitive-outcome and high-quality direct settled markets.
+    # Raised from 0.40 to 0.50 alongside the MAX_REASONABLE_EDGE bump so the
+    # "validated" path retains a meaningful headroom over the generic cap.
+    DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX: float = 0.50
+    # Minimum evidence_quality for the high-quality settlement-aligned exemption
+    # used by the edge gate and hallucinated_edge penalty suppression. The
+    # exemption recognizes direct + settlement_aligned + whitelisted-source
+    # evidence without requiring definitive_outcome_detected=True; the strict
+    # eq floor compensates by demanding near-perfect evidence quality.
+    HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ: float = 0.95
     PARTICIPATION_TIER_AUDIT_ENABLED: bool = True
     PARTICIPATION_TIER_GATING_ENABLED: bool = True
     # Escalate the per-cycle "zero execution candidates with research_queue >50"
@@ -529,6 +559,10 @@ class Settings:
     CRYPTO_PREFLIGHT_ENABLED: bool = False
     CRYPTO_THRESHOLD_BUFFER_AUTO_NO_TRADE_PCT: float = 0.50
     GROK_STREAM_TIMEOUT_SECONDS_CRYPTO: int = 120
+    # Weather profile per-attempt timeout. Falls back to
+    # GROK_STREAM_TIMEOUT_SECONDS when set to 0. Heavy NWS observation
+    # prompts routinely stream 90-100s; 120s avoids clipping the p95 tail.
+    GROK_STREAM_TIMEOUT_SECONDS_WEATHER: int = 120
     TIMEOUT_RETRY_AS_MONITOR_ONLY_ENABLED: bool = True
 
     # Bayesian + LMSR + Kelly experimental layers
@@ -928,6 +962,16 @@ def load_settings() -> Settings:
         KALSHI_MAX_FETCH_PAGES=_read_env_int(
             "KALSHI_MAX_FETCH_PAGES", Settings.KALSHI_MAX_FETCH_PAGES
         ),
+        KALSHI_MVE_FILTER=_read_env_str(
+            "KALSHI_MVE_FILTER", Settings.KALSHI_MVE_FILTER
+        ),
+        KALSHI_ELIGIBLE_FLOOR=_read_env_int(
+            "KALSHI_ELIGIBLE_FLOOR", Settings.KALSHI_ELIGIBLE_FLOOR
+        ),
+        KALSHI_FETCH_TOPUP_ENABLED=_read_env_bool(
+            "KALSHI_FETCH_TOPUP_ENABLED",
+            Settings.KALSHI_FETCH_TOPUP_ENABLED,
+        ),
         DRY_RUN=_read_env_bool("DRY_RUN", Settings.DRY_RUN),
         POSITION_SYNC_ENABLED=_read_env_bool(
             "POSITION_SYNC_ENABLED", Settings.POSITION_SYNC_ENABLED
@@ -1248,6 +1292,14 @@ def load_settings() -> Settings:
             "PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED",
             Settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED,
         ),
+        PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED=_read_env_bool(
+            "PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED",
+            Settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED,
+        ),
+        PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX=_read_env_float(
+            "PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX",
+            Settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX,
+        ),
         PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=_read_env_float(
             "PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD",
             Settings.PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD,
@@ -1295,14 +1347,6 @@ def load_settings() -> Settings:
         PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN=_read_env_float(
             "PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN",
             Settings.PRE_ANALYSIS_FAMILY_PENALTY_CRYPTO_BIN,
-        ),
-        PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=_read_env_bool(
-            "PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED",
-            Settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED,
-        ),
-        PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=_read_env_float(
-            "PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY",
-            Settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY,
         ),
         PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=_read_env_float(
             "PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY",
@@ -1571,6 +1615,10 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_PRIORITY_ENABLED",
             Settings.RESEARCH_QUEUE_PRIORITY_ENABLED,
         ),
+        RESEARCH_QUEUE_CYCLE_LOG_MAXLEN=_read_env_int(
+            "RESEARCH_QUEUE_CYCLE_LOG_MAXLEN",
+            Settings.RESEARCH_QUEUE_CYCLE_LOG_MAXLEN,
+        ),
         RESEARCH_QUEUE_DRAIN_ENABLED=_read_env_bool(
             "RESEARCH_QUEUE_DRAIN_ENABLED",
             Settings.RESEARCH_QUEUE_DRAIN_ENABLED,
@@ -1615,6 +1663,10 @@ def load_settings() -> Settings:
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX",
             Settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX,
         ),
+        HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=_read_env_float(
+            "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ",
+            Settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ,
+        ),
         PARTICIPATION_TIER_AUDIT_ENABLED=_read_env_bool(
             "PARTICIPATION_TIER_AUDIT_ENABLED",
             Settings.PARTICIPATION_TIER_AUDIT_ENABLED,
@@ -1642,6 +1694,10 @@ def load_settings() -> Settings:
         GROK_STREAM_TIMEOUT_SECONDS_CRYPTO=_read_env_int(
             "GROK_STREAM_TIMEOUT_SECONDS_CRYPTO",
             Settings.GROK_STREAM_TIMEOUT_SECONDS_CRYPTO,
+        ),
+        GROK_STREAM_TIMEOUT_SECONDS_WEATHER=_read_env_int(
+            "GROK_STREAM_TIMEOUT_SECONDS_WEATHER",
+            Settings.GROK_STREAM_TIMEOUT_SECONDS_WEATHER,
         ),
         TIMEOUT_RETRY_AS_MONITOR_ONLY_ENABLED=_read_env_bool(
             "TIMEOUT_RETRY_AS_MONITOR_ONLY_ENABLED",

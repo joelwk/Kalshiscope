@@ -237,7 +237,7 @@ def test_load_confidence_calibration_buckets_groups_all_and_family(tmp_path) -> 
             )
             manager._conn.execute(
                 "INSERT OR REPLACE INTO markets (id, question, close_time, category) VALUES (?, ?, ?, ?)",
-                ("KXMLBGAME-TEST", "Will Team A beat Team B?", "", "sports"),
+                ("KXSAMPLEGAME-TEST", "Will Team A beat Team B?", "", "sports"),
             )
             manager._conn.execute(
                 """
@@ -255,7 +255,7 @@ def test_load_confidence_calibration_buckets_groups_all_and_family(tmp_path) -> 
                 )
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                ("KXMLBGAME-TEST", 0.86, 1, resolved_at, resolved_at),
+                ("KXSAMPLEGAME-TEST", 0.86, 1, resolved_at, resolved_at),
             )
         buckets = manager.load_confidence_calibration_buckets(days=30)
         assert "all" in buckets

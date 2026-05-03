@@ -214,40 +214,54 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
 
 
 def market_family(market: Market) -> str:
-    is_sports, is_esports = market_category_flags(market)
-    if is_sports or is_esports:
+    text = _market_text(market)
+    return family_from_text(text)
+
+
+def family_from_text(text: str) -> str:
+    """Classify a market family from any text blob (category, question, ticker).
+
+    Used by live trading via `market_family(market)` and by historical analytics
+    in `analytics.py` and `market_state.py` so every consumer shares the same
+    keyword-driven taxonomy without per-product ticker hardcoding.
+    """
+    normalized = (text or "").lower()
+    if _has_keyword_match(normalized, _SPORTS_KEYWORDS) or _has_keyword_match(
+        normalized, _ESPORTS_KEYWORDS
+    ):
         return "sports"
-    category = (market.category or "").lower()
-    question = market.question.lower()
-    text = f"{category} {question}"
-    if _has_keyword_match(text, _CRYPTO_KEYWORDS):
+    if _has_keyword_match(normalized, _CRYPTO_KEYWORDS):
         return "crypto"
-    if _has_keyword_match(text, _POLITICS_KEYWORDS):
+    if _has_keyword_match(normalized, _POLITICS_KEYWORDS):
         return "politics"
-    if _SPEECH_TICKER_PATTERN.search(market.id or "") or _has_keyword_match(text, _SPEECH_KEYWORDS):
+    if _SPEECH_TICKER_PATTERN.search(text or "") or _has_keyword_match(
+        normalized, _SPEECH_KEYWORDS
+    ):
         return "speech"
-    if _has_keyword_match(text, _MUSIC_KEYWORDS):
+    if _has_keyword_match(normalized, _MUSIC_KEYWORDS):
         return "music"
-    if _has_keyword_match(text, _WEATHER_KEYWORDS):
+    if _has_keyword_match(normalized, _WEATHER_KEYWORDS):
         return "weather"
     return "generic"
 
 
 def is_commodity_market(market: Market) -> bool:
-    category = (market.category or "").lower()
-    question = market.question.lower()
-    text = f"{category} {question}"
-    return _has_keyword_match(text, _COMMODITY_KEYWORDS)
+    return _has_keyword_match(_market_text(market), _COMMODITY_KEYWORDS)
 
 
 def _has_keyword_match(text: str, keywords: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
 
 
-def market_category_flags(market: Market) -> tuple[bool, bool]:
+def _market_text(market: Market) -> str:
     category = (market.category or "").lower()
-    question = market.question.lower()
-    text = f"{category} {question}"
+    question = (market.question or "").lower()
+    market_id = (market.id or "")
+    return f"{category} {question} {market_id}"
+
+
+def market_category_flags(market: Market) -> tuple[bool, bool]:
+    text = _market_text(market)
     is_esports = _has_keyword_match(text, _ESPORTS_KEYWORDS)
     is_sports = _has_keyword_match(text, _SPORTS_KEYWORDS)
     return is_sports, is_esports

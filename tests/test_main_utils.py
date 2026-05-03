@@ -107,9 +107,17 @@ class TestMainUtils(unittest.TestCase):
             self._responses = list(responses)
             self.calls = []
             self.reset_calls = 0
+            self.last_fetch_pages = 0
+            self.last_fetch_cap_hit = False
+            self.last_fetch_mve_filter = None
 
-        def get_markets(self, close_time_start=None, close_time_end=None):
-            self.calls.append((close_time_start, close_time_end))
+        def get_markets(
+            self,
+            close_time_start=None,
+            close_time_end=None,
+            mve_filter=None,
+        ):
+            self.calls.append((close_time_start, close_time_end, mve_filter))
             response = self._responses.pop(0)
             if isinstance(response, Exception):
                 raise response
@@ -192,8 +200,8 @@ class TestMainUtils(unittest.TestCase):
 
     def test_runtime_score_receipt_overwrites_pre_execution_score_fields(self) -> None:
         market = Market(
-            id="KXMLBGAME-26APR121610TEXLAD-LAD",
-            question="Will the Dodgers beat the Rangers?",
+            id="KXSAMPLEGAME-26APR121610TEAMA-TEAMA",
+            question="Will Team A beat Team B?",
             liquidity_usdc=1000.0,
             outcomes=[
                 MarketOutcome(name="YES", price=0.55),
@@ -209,7 +217,7 @@ class TestMainUtils(unittest.TestCase):
             evidence_quality=0.86,
             edge_source="computed",
             evidence_basis="direct",
-            primary_source_url="https://www.espn.com/mlb/game/_/gameId/test",
+            primary_source_url="https://www.example.com/game/test",
         )
         runtime_score = compute_final_score(
             market,
@@ -304,13 +312,13 @@ class TestMainUtils(unittest.TestCase):
 
     def test_event_ticker_prefix_prefers_event_ticker_field(self) -> None:
         market = Market(
-            id="KXMLBGAME-26APR121610TEXLAD-LAD",
-            event_ticker="KXMLBGAME-26APR121610TEXLAD",
+            id="KXSAMPLEGAME-26APR121610TEAMA-TEAMA",
+            event_ticker="KXSAMPLEGAME-26APR121610TEAMA",
             question="Test",
         )
         self.assertEqual(
             _event_ticker_prefix(market),
-            "KXMLBGAME-26APR121610TEXLAD",
+            "KXSAMPLEGAME-26APR121610TEAMA",
         )
 
     def test_event_ticker_prefix_falls_back_to_market_id_prefix(self) -> None:
@@ -1022,7 +1030,7 @@ class TestMainUtils(unittest.TestCase):
     def test_pre_analysis_opportunity_score_adds_post_event_bonus(self) -> None:
         settings = Settings()
         market_past = Market(
-            id="KXMLBGAME-PAST",
+            id="KXSAMPLEGAME-PAST",
             question="Post-event market",
             category="sports",
             liquidity_usdc=800.0,
@@ -1031,7 +1039,7 @@ class TestMainUtils(unittest.TestCase):
             resolution_criteria="Official box score",
         )
         market_future = market_past.model_copy(
-            update={"id": "KXMLBGAME-FUTURE", "close_time": datetime.now(timezone.utc) + timedelta(hours=3)}
+            update={"id": "KXSAMPLEGAME-FUTURE", "close_time": datetime.now(timezone.utc) + timedelta(hours=3)}
         )
         past_score, past_breakdown = _pre_analysis_opportunity_score(
             market_past,
@@ -1049,52 +1057,20 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(future_breakdown["pre_score_post_event_bonus"], 0.0)
         self.assertGreater(past_score, future_score)
 
-    def test_pre_analysis_opportunity_score_boosts_priority_mlb_markets(self) -> None:
-        settings = Settings()
-        priority_market = Market(
-            id="KXMLBGAME-26APR201335NYYBOS-NYY",
-            question="Will this contract settle above the listed strike?",
-            category="finance",
-            liquidity_usdc=600.0,
-            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
-            close_time=datetime.now(timezone.utc) + timedelta(hours=8),
-            resolution_criteria="Official settlement source",
-        )
-        non_priority_market = priority_market.model_copy(
-            update={"id": "KXGENERIC-26APR201335NYYBOS-P1.5"}
-        )
-        priority_score, priority_breakdown = _pre_analysis_opportunity_score(
-            priority_market,
-            None,
-            settings,
-            traded_before=False,
-        )
-        non_priority_score, non_priority_breakdown = _pre_analysis_opportunity_score(
-            non_priority_market,
-            None,
-            settings,
-            traded_before=False,
-        )
-        self.assertEqual(priority_breakdown["pre_score_mlb_priority_bonus"], 0.05)
-        self.assertEqual(non_priority_breakdown["pre_score_mlb_priority_bonus"], 0.0)
-        self.assertGreater(priority_score, non_priority_score)
-
-    def test_pre_analysis_opportunity_score_applies_mlb_subfamily_and_zero_trade_penalties(self) -> None:
+    def test_pre_analysis_opportunity_score_applies_zero_trade_rate_penalty_from_history(self) -> None:
         settings = Settings(
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=True,
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=0.06,
             PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.04,
             HISTORICAL_TICKER_PREFIX_LEN=12,
             HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
         )
         market = Market(
-            id="KXMLBSPREAD-26APR201335NYYBOS-BOS2",
-            question="MLB spread contract",
-            category="sports",
+            id="KXGENERIC-26APR201335-T1",
+            question="Generic threshold contract",
+            category="finance",
             liquidity_usdc=700.0,
             outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
             close_time=datetime.now(timezone.utc) + timedelta(hours=8),
-            resolution_criteria="Official box score",
+            resolution_criteria="Official settlement source",
         )
         market_prefix = market.id[: settings.HISTORICAL_TICKER_PREFIX_LEN]
         historical_prefix_stats = {
@@ -1113,8 +1089,6 @@ class TestMainUtils(unittest.TestCase):
             historical_prefix_stats=historical_prefix_stats,
         )
         disabled_settings = Settings(
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=False,
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=0.06,
             PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.0,
             HISTORICAL_TICKER_PREFIX_LEN=12,
             HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
@@ -1126,9 +1100,7 @@ class TestMainUtils(unittest.TestCase):
             traded_before=False,
             historical_prefix_stats=historical_prefix_stats,
         )
-        self.assertEqual(penalized_breakdown["pre_score_mlb_subfamily_penalty"], 0.06)
         self.assertEqual(penalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.04)
-        self.assertEqual(unpenalized_breakdown["pre_score_mlb_subfamily_penalty"], 0.0)
         self.assertEqual(unpenalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.0)
         self.assertLess(penalized_score, unpenalized_score)
 
@@ -1895,6 +1867,104 @@ class TestMainUtils(unittest.TestCase):
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
         self.assertEqual([item["market"].id for item in capped], ["w-high-score", "c1"])
 
+    def test_cap_analysis_candidates_does_not_double_count_historical_gate_penalty(self) -> None:
+        """Fix 5d: when historical_gate_metrics is present (gate ran and
+        surfaced its score penalty into _pre_analysis_opportunity_score),
+        _cap_analysis_candidates must NOT also deduct the legacy 0.12 flat
+        penalty. The score penalty would otherwise be double-counted.
+
+        Markets here use NBA-keyword questions so family_from_text resolves
+        them to sports family (zero source_difficulty_penalty), isolating
+        the historical_gate behavior under test.
+        """
+        market = Market(
+            id="KXSPORTS-METRICS-ATTACHED",
+            question="Will the NBA Lakers win the playoffs?",
+            category="sports",
+        )
+        candidates = [
+            {
+                "market": market,
+                "pre_analysis_score": 0.65,
+                "historical_gate_allowed": False,
+                "historical_gate_metrics": {
+                    "historical_gate_score_penalty": 0.05,
+                },
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.60,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER",
+                    question="Will the NBA Heat win the conference?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        with_metrics = next(
+            item for item in capped if item["market"].id == "KXSPORTS-METRICS-ATTACHED"
+        )
+        components = with_metrics["selection_rank_components"]
+        # Penalty must be exactly the metric-supplied value, NOT 0.12.
+        assert components["historical_gate_penalty"] == 0.05
+        assert components["risk_adjusted_score"] == 0.60  # 0.65 - 0.05
+
+    def test_cap_analysis_candidates_falls_back_to_flat_penalty_without_metrics(self) -> None:
+        """Backward-compat: when historical_gate_allowed is False but metrics
+        are missing entirely, the legacy flat 0.12 penalty still applies so
+        old code paths don't suddenly become more permissive.
+
+        The legacy market is given a high enough base score (0.85) that even
+        with the flat 0.12 penalty it still ranks ahead of the third
+        candidate, so the cap selection actually exercises the legacy path.
+        """
+        candidates = [
+            {
+                "market": Market(
+                    id="KXSPORTS-LEGACY-NO-METRICS",
+                    question="Will the NBA Lakers win the playoffs?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.85,
+                "historical_gate_allowed": False,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.60,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER",
+                    question="Will the NBA Heat win the conference?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        legacy = next(
+            item for item in capped if item["market"].id == "KXSPORTS-LEGACY-NO-METRICS"
+        )
+        components = legacy["selection_rank_components"]
+        assert components["historical_gate_penalty"] == 0.12
+        assert components["risk_adjusted_score"] == 0.73  # 0.85 - 0.12
+
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {
             "sells": [
@@ -2012,7 +2082,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(client.reset_calls, 1)
         self.assertEqual(len(client.calls), 3)
         # last call should be unfiltered fallback
-        self.assertEqual(client.calls[-1], (None, None))
+        self.assertEqual(client.calls[-1], (None, None, None))
 
     def test_cap_effective_confidence_for_market_respects_category_caps(self) -> None:
         settings = Settings(
@@ -3120,6 +3190,79 @@ class TestSyntheticDecisionAuditFields(unittest.TestCase):
         self.assertTrue(audit["analysis_skipped"])
         self.assertTrue(audit["synthetic_decision"])
 
+    def test_no_research_queued_audit_marks_hard_reject(self) -> None:
+        """Invariant: every production path that sets final_action=
+        research_queued routes through the synthetic-audit constant which
+        explicitly stamps pre_analysis_hard_reject=False. This regression
+        test exercises every reason string the audit currently emits with
+        research_queued and asserts the invariant holds."""
+        from main import _SYNTHETIC_DECISION_AUDIT_FIELDS, _build_execution_audit
+        research_queued_reasons = (
+            "pre_analysis_score_soft_research",
+            "pre_analysis_score_far_below_min",
+            "pre_analysis_historical_prefix_pnl_block",
+            "pre_analysis_historical_prefix_small_sample_negative",
+            "pre_analysis_historical_family_pnl_block",
+            "pre_analysis_zero_action_family",
+            "pre_analysis_crypto_historically_unprofitable",
+            "pre_analysis_repeated_non_actionable_market",
+            "pre_analysis_repeated_non_actionable_bin_market",
+            "pre_analysis_repeated_churn_market",
+            "pre_analysis_fallback_edge_high_churn",
+            "repeated_non_actionable_research_only",
+            "evidence_quality_below_min",
+            "confidence_below_min",
+            "edge_above_reasonable_max",
+            "score_gate_blocked",
+            "daily_drawdown_blocked",
+            "grok_stream_timeout",
+        )
+        for reason in research_queued_reasons:
+            audit = _build_execution_audit(
+                decision_terminal=False,
+                final_action="research_queued",
+                final_reason=reason,
+                decision_origin="synthetic_research_queue",
+                **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+            )
+            self.assertEqual(audit["final_action"], "research_queued")
+            self.assertFalse(
+                audit.get("pre_analysis_hard_reject", False),
+                f"Invariant violated for final_reason={reason}: "
+                f"pre_analysis_hard_reject must be False when "
+                f"final_action='research_queued'.",
+            )
+
+    def test_production_source_has_no_hard_reject_true(self) -> None:
+        """Static safety net: scan main.py source for any literal that sets
+        pre_analysis_hard_reject=True. Catches regressions that the runtime
+        invariant test would miss because they wouldn't go through the
+        _SYNTHETIC_DECISION_AUDIT_FIELDS constant."""
+        from pathlib import Path
+        import re
+        main_path = Path(__file__).resolve().parent.parent / "main.py"
+        src = main_path.read_text(encoding="utf-8")
+        # Strip lines that document the invariant (string literals / comments
+        # that mention the field name with True for pedagogical reasons).
+        # Match assignments only: optional quote, key, optional quote, then
+        # `=` or `:` separator, then `True`.
+        offending_lines: list[str] = []
+        pattern = re.compile(
+            r'["\']?pre_analysis_hard_reject["\']?\s*[:=]\s*True\b'
+        )
+        for line_no, line in enumerate(src.splitlines(), start=1):
+            stripped = line.lstrip()
+            # Skip comment-only lines.
+            if stripped.startswith("#"):
+                continue
+            if pattern.search(line):
+                offending_lines.append(f"{line_no}: {line.rstrip()}")
+        self.assertFalse(
+            offending_lines,
+            "Production code must never set pre_analysis_hard_reject=True; "
+            "found:\n" + "\n".join(offending_lines),
+        )
+
 
 class TestPreviousAnalysisAnchorEvidence(unittest.TestCase):
     def test_anchor_evidence_fields_preserved(self) -> None:
@@ -3213,6 +3356,66 @@ class TestTierBreakdownFormat(unittest.TestCase):
     def test_unknown_tier_falls_back_to_raw_label(self) -> None:
         result = _format_tier_breakdown_for_log({"some_future_tier": 1})
         self.assertIn("some_future_tier:1", result)
+
+
+class TestSummarizeDistribution(unittest.TestCase):
+    """Score-distribution helper used by cycle receipts (5f)."""
+
+    def _fn(self, samples):
+        from main import _summarize_distribution
+        return _summarize_distribution(samples)
+
+    def test_empty_samples_return_count_only(self) -> None:
+        result = self._fn([])
+        self.assertEqual(result, {"count": 0})
+
+    def test_single_sample_returns_collapsed_distribution(self) -> None:
+        result = self._fn([0.42])
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["min"], 0.42)
+        self.assertEqual(result["max"], 0.42)
+        self.assertEqual(result["p50"], 0.42)
+
+    def test_distribution_percentiles_match_linear_interpolation(self) -> None:
+        result = self._fn([0.10, 0.20, 0.30, 0.40, 0.50])
+        self.assertEqual(result["count"], 5)
+        self.assertEqual(result["min"], 0.10)
+        self.assertEqual(result["max"], 0.50)
+        self.assertEqual(result["p50"], 0.30)
+        self.assertAlmostEqual(result["p25"], 0.20)
+        self.assertAlmostEqual(result["p75"], 0.40)
+
+
+class TestResearchQueueCycleLogMaxlenSetting(unittest.TestCase):
+    """Configurable per-cycle research-queue capture log (5g)."""
+
+    def test_default_maxlen_is_200(self) -> None:
+        from config import Settings
+        self.assertEqual(Settings().RESEARCH_QUEUE_CYCLE_LOG_MAXLEN, 200)
+
+    def test_setting_can_be_overridden(self) -> None:
+        from config import Settings
+        custom = Settings(RESEARCH_QUEUE_CYCLE_LOG_MAXLEN=50)
+        self.assertEqual(custom.RESEARCH_QUEUE_CYCLE_LOG_MAXLEN, 50)
+
+
+class TestAdaptiveResearchBandSettings(unittest.TestCase):
+    """Adaptive widening of the soft-research routing band (5e)."""
+
+    def test_default_settings_enable_adaptive_band(self) -> None:
+        from config import Settings
+        s = Settings()
+        self.assertTrue(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED)
+        self.assertEqual(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX, 0.30)
+        self.assertGreaterEqual(
+            s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX,
+            s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND,
+        )
+
+    def test_adaptive_band_can_be_disabled(self) -> None:
+        from config import Settings
+        s = Settings(PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED=False)
+        self.assertFalse(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED)
 
 
 if __name__ == "__main__":

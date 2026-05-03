@@ -12,9 +12,12 @@ from main import (
     _extract_winning_outcome,
     _filter_markets,
     _is_confidence_override_allowed,
+    _is_definitive_validated,
+    _is_high_quality_settled_evidence,
     _is_uniform_implied_probability,
     _min_evidence_quality_for_market,
     _passes_edge_threshold,
+    _should_suppress_hallucinated_edge_penalty,
     _sizing_mode_label,
     _zero_bet_skip_message,
 )
@@ -96,8 +99,8 @@ def test_edge_gate_keeps_sports_path_with_direct_evidence() -> None:
         MAX_REASONABLE_EDGE=0.45,
     )
     market = Market(
-        id="KXMLBGAME-TEST",
-        question="MLB: Team A vs Team B winner",
+        id="KXSAMPLEGAME-TEST",
+        question="Sports: Team A vs Team B winner",
         category="sports",
     )
     decision = _decision(0.78).model_copy(update={"evidence_basis": "direct"})
@@ -516,8 +519,8 @@ def test_definitive_outcome_bypasses_evidence_quality_gate() -> None:
     direct basis, _min_evidence_quality_for_market should return the lower
     definitive floor instead of the normal threshold."""
     market = Market(
-        id="KXMLBGAME-26APR251915DETCIN-CIN",
-        question="Will CIN win?",
+        id="KXSAMPLEGAME-26APR251915TEAMATEAMB-TEAMB",
+        question="Will Team B win?",
         category="sports",
         outcomes=[
             MarketOutcome(name="YES", price=0.45),
@@ -558,8 +561,8 @@ def test_definitive_outcome_edge_cap_raised() -> None:
         source_match_class="settlement_aligned",
     )
     market = Market(
-        id="KXMLBF5-26APR251415SEASTL-SEA",
-        question="Will SEA win F5?",
+        id="KXSAMPLEPERIOD-26APR251415TEAMATEAMB-TEAMA",
+        question="Will Team A win the first period?",
         category="sports",
         outcomes=[
             MarketOutcome(name="YES", price=0.45),
@@ -604,6 +607,166 @@ def test_non_definitive_edge_049_still_blocked() -> None:
     )
     passed, edge_val, reason = _passes_edge_threshold(
         0.45, decision, settings, market=market
+    )
+    assert passed is False
+    assert reason == "edge_above_reasonable_max"
+
+
+# --- High-quality settlement-aligned evidence path tests ---
+#
+# Cycle 1 review found the bot's only high-conviction trade
+# (KXPUREALBUMS-KEH26APR30-39K) blocked by edge_above_reasonable_max even
+# though the analysis had evidence_basis=direct, source_match_class=
+# settlement_aligned, evidence_quality=1.0, and a whitelisted primary
+# source URL. ``_is_high_quality_settled_evidence`` recognizes this case
+# and unlocks the higher DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX cap so the
+# trade can be evaluated by the score gate instead of hard-blocked.
+
+
+def _kehlani_style_decision(
+    confidence: float = 0.80,
+    evidence_quality: float = 1.0,
+    primary_source_url: str = "https://www.hitsdailydouble.com/charts/hits-top-50",
+    source_match_class: str = "settlement_aligned",
+    evidence_basis: str = "direct",
+    definitive_outcome_detected: bool = False,
+) -> TradeDecision:
+    return TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=confidence,
+        bet_size_pct=0.5,
+        reasoning="Hits Daily Double chart shows 23,291 sales vs 39K threshold",
+        evidence_basis=evidence_basis,
+        evidence_quality=evidence_quality,
+        edge_source="computed",
+        primary_source_url=primary_source_url,
+        source_match_class=source_match_class,
+        definitive_outcome_detected=definitive_outcome_detected,
+    )
+
+
+def _kehlani_settings(**overrides) -> Settings:
+    defaults = dict(
+        MAX_REASONABLE_EDGE=0.40,
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50,
+        HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95,
+        DIRECT_SOURCE_WHITELIST=("hitsdailydouble.com", "billboard.com"),
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def test_high_quality_settled_evidence_recognizes_kehlani_canary() -> None:
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision()
+    assert _is_high_quality_settled_evidence(decision, settings) is True
+    assert _is_definitive_validated(decision, settings) is True
+
+
+def test_high_quality_settled_unlocks_higher_edge_cap() -> None:
+    """Cycle 1 canary: edge=0.50 (90 conf - 40 implied) clears the new
+    ``DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX`` cap of 0.50 instead of
+    being hard-blocked at the legacy 0.32 cap."""
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision(confidence=0.90)
+    market = Market(
+        id="KXPUREALBUMS-KEH26APR30-39K",
+        question="Will Kehlani have above 39000 Pure Album Sales?",
+        category="music",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.66),
+            MarketOutcome(name="NO", price=0.34),
+        ],
+    )
+    passed, edge_val, reason = _passes_edge_threshold(
+        0.40, decision, settings, market=market
+    )
+    assert passed is True, f"reason={reason}"
+    assert edge_val is not None
+    assert abs(edge_val - 0.50) < 0.001
+    assert reason == ""
+
+
+def test_high_quality_settled_requires_eq_floor() -> None:
+    """eq below the configured floor (default 0.95) does not qualify."""
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision(evidence_quality=0.94)
+    assert _is_high_quality_settled_evidence(decision, settings) is False
+    assert _is_definitive_validated(decision, settings) is False
+
+
+def test_high_quality_settled_requires_settlement_aligned() -> None:
+    """Direct + whitelisted + eq=1.0 but source_match_class=verifiable_unmatched
+    is not enough — settlement_aligned signal is required."""
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision(source_match_class="verifiable_unmatched")
+    assert _is_high_quality_settled_evidence(decision, settings) is False
+
+
+def test_high_quality_settled_requires_whitelisted_source() -> None:
+    """Direct + settlement_aligned + eq=1.0 but a non-whitelisted source
+    does not unlock the higher cap."""
+    settings = _kehlani_settings(
+        DIRECT_SOURCE_WHITELIST=("billboard.com",),
+    )
+    decision = _kehlani_style_decision(
+        primary_source_url="https://randomblog.example.com/charts"
+    )
+    assert _is_high_quality_settled_evidence(decision, settings) is False
+
+
+def test_high_quality_settled_requires_direct_basis() -> None:
+    """Proxy basis cannot trigger the high-quality settled exemption."""
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision(evidence_basis="proxy")
+    assert _is_high_quality_settled_evidence(decision, settings) is False
+
+
+def test_high_quality_settled_suppresses_hallucinated_edge_penalty() -> None:
+    """The hallucinated_edge penalty should be suppressed for the new path
+    so the score gate sees the unmodified score."""
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision()
+    assert (
+        _should_suppress_hallucinated_edge_penalty(
+            decision=decision,
+            evidence_basis="direct",
+            settings=settings,
+        )
+        is True
+    )
+
+
+def test_legacy_definitive_validated_path_unchanged() -> None:
+    """A definitive_outcome_detected=True trade with eq>=0.80 still
+    qualifies via the legacy strict path even when eq < the new
+    HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ floor."""
+    settings = _kehlani_settings(HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.99)
+    decision = _kehlani_style_decision(
+        evidence_quality=0.85,
+        definitive_outcome_detected=True,
+    )
+    assert _is_definitive_validated(decision, settings) is True
+    assert _is_high_quality_settled_evidence(decision, settings) is False
+
+
+def test_high_quality_settled_caps_extreme_edge_at_095() -> None:
+    """Even high-quality settled evidence cannot bypass the 0.95 hard limit."""
+    settings = _kehlani_settings()
+    decision = _kehlani_style_decision(confidence=0.99)
+    market = Market(
+        id="KXPUREALBUMS-CANARY",
+        question="Test?",
+        category="music",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.97),
+            MarketOutcome(name="NO", price=0.03),
+        ],
+    )
+    passed, _edge_val, reason = _passes_edge_threshold(
+        0.02, decision, settings, market=market
     )
     assert passed is False
     assert reason == "edge_above_reasonable_max"

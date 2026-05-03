@@ -93,6 +93,23 @@ class TestGrokClient(unittest.TestCase):
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=20_000.0))
 
+    def test_fast_empty_response_from_grok_is_retriable(self) -> None:
+        """A sub-_SLOW_FAILURE_THRESHOLD_MS empty response is treated as
+        upstream blip and retried (fix 5b). The 4707ms duration in the
+        recent error log is the canonical case."""
+        err = ValueError("Empty response from Grok")
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=4707.46))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=14_999.0))
+
+    def test_slow_empty_response_from_grok_stays_non_retriable(self) -> None:
+        """A slow empty response (>= _SLOW_FAILURE_THRESHOLD_MS) still falls
+        through to the slow-failure short-circuit so we don't burn budget on
+        genuine outages masquerading as empty streams."""
+        err = ValueError("Empty response from Grok")
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=15_000.0))
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
     def test_grpc_deadline_exceeded_is_retriable_regardless_of_duration(self) -> None:
         err = RuntimeError(
             'StatusCode.DEADLINE_EXCEEDED\ndetails = "Deadline Exceeded"'
@@ -136,6 +153,63 @@ class TestGrokClient(unittest.TestCase):
         self.assertLess(clamped, 20.0)
         self.assertGreater(clamped, 18.0)
         self.assertEqual(uncapped, 90.0)
+
+    def test_stream_deadline_uses_weather_profile_override(self) -> None:
+        """Cycle 1 review: weather analyses timed out at the legacy 100s
+        ceiling; the new ``GROK_STREAM_TIMEOUT_SECONDS_WEATHER`` setting
+        raises the per-attempt cap to 120s for the weather profile."""
+        settings = Settings(
+            GROK_STREAM_TIMEOUT_SECONDS=100,
+            GROK_STREAM_TIMEOUT_SECONDS_WEATHER=120,
+            GROK_STREAM_TIMEOUT_SECONDS_CRYPTO=120,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        client.stream_timeout_seconds = 100
+
+        weather_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile="weather"
+        )
+        crypto_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile="crypto"
+        )
+        generic_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile=None
+        )
+        self.assertEqual(weather_deadline, 120.0)
+        self.assertEqual(crypto_deadline, 120.0)
+        self.assertEqual(generic_deadline, 100.0)
+
+    def test_stream_deadline_weather_override_clamped_to_budget(self) -> None:
+        """Even with a weather override, the remaining analysis budget
+        still clamps the per-attempt deadline so a near-exhausted budget
+        doesn't pretend it has 120s left."""
+        settings = Settings(
+            GROK_STREAM_TIMEOUT_SECONDS=100,
+            GROK_STREAM_TIMEOUT_SECONDS_WEATHER=120,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        client.stream_timeout_seconds = 100
+
+        deadline = client._resolve_stream_deadline_seconds(
+            30_000.0, search_profile="weather"
+        )
+        self.assertLess(deadline, 30.0)
+        self.assertGreater(deadline, 28.0)
+
+    def test_stream_deadline_weather_override_disabled_when_zero(self) -> None:
+        """Setting GROK_STREAM_TIMEOUT_SECONDS_WEATHER=0 falls back to the
+        global stream timeout."""
+        settings = Settings(
+            GROK_STREAM_TIMEOUT_SECONDS=100,
+            GROK_STREAM_TIMEOUT_SECONDS_WEATHER=0,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        client.stream_timeout_seconds = 100
+
+        weather_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile="weather"
+        )
+        self.assertEqual(weather_deadline, 100.0)
 
     def test_rpc_timeout_is_capped_to_stream_deadline(self) -> None:
         client = GrokClient(

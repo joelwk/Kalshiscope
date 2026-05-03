@@ -189,12 +189,23 @@ def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
     and transport-layer resets (RST_STREAM / UNAVAILABLE) are always retriable
     regardless of duration, since they indicate an interrupted stream rather
     than a content failure.
+
+    A fast "Empty response from Grok" (sub-_SLOW_FAILURE_THRESHOLD_MS) is
+    treated as transient: a stream that finishes in single-digit seconds with
+    zero content is far more consistent with an upstream blip than a real
+    content failure. Slow empty responses still fall through to the slow-
+    failure short-circuit so we don't burn budget retrying genuine outages.
     """
     if _is_timeout_class_error(exc) or _is_transport_reset_error(exc):
         return True
+    error_text = str(exc).lower()
+    if (
+        "empty response from grok" in error_text
+        and duration_ms < _SLOW_FAILURE_THRESHOLD_MS
+    ):
+        return True
     if duration_ms >= _SLOW_FAILURE_THRESHOLD_MS:
         return False
-    error_text = str(exc).lower()
     retriable_markers = (
         "statuscode.internal",
         "internal server error",
@@ -1191,12 +1202,14 @@ class GrokClient:
     ) -> float:
         """Per-attempt stream deadline, clamped to the remaining analysis budget.
 
-        When *search_profile* is ``"crypto"`` the per-profile timeout from
-        settings (``GROK_STREAM_TIMEOUT_SECONDS_CRYPTO``) is preferred over
-        the generic default, giving crypto markets a longer window to avoid
-        frequent timeouts. When *deep* is True we use
-        ``GROK_STREAM_TIMEOUT_SECONDS_DEEP`` (defaults to a higher value than
-        the initial-pass timeout) since deep refinement runs richer prompts.
+        Profile-aware overrides (when set to a positive value) raise the
+        per-attempt cap above the generic ``GROK_STREAM_TIMEOUT_SECONDS``:
+
+        - ``deep=True`` → ``GROK_STREAM_TIMEOUT_SECONDS_DEEP``
+        - ``search_profile == "crypto"`` → ``GROK_STREAM_TIMEOUT_SECONDS_CRYPTO``
+        - ``search_profile == "weather"`` → ``GROK_STREAM_TIMEOUT_SECONDS_WEATHER``
+          (added after cycle 1 review observed weather analyses timing out at
+          exactly the legacy 100s ceiling on data-heavy NWS observation prompts)
         """
         base_timeout = float(self.stream_timeout_seconds)
         if (
@@ -1219,6 +1232,16 @@ class GrokClient:
             )
             if crypto_timeout is not None and int(crypto_timeout) > 0:
                 base_timeout = max(base_timeout, float(crypto_timeout))
+        if (
+            search_profile == "weather"
+            and hasattr(self, "settings")
+            and self.settings is not None
+        ):
+            weather_timeout = getattr(
+                self.settings, "GROK_STREAM_TIMEOUT_SECONDS_WEATHER", None
+            )
+            if weather_timeout is not None and int(weather_timeout) > 0:
+                base_timeout = max(base_timeout, float(weather_timeout))
         if budget_remaining_ms is None or budget_remaining_ms <= 0:
             return base_timeout
         budget_seconds = max(

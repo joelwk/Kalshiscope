@@ -3,9 +3,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from research_profiles import family_from_text  # noqa: E402
 
 DB_PATH = Path("data/market_state.db")
 SECTION_RULE = "=" * 78
@@ -30,23 +37,7 @@ def _safe_json_loads(text: object) -> dict | None:
 
 
 def _family(market_id: str) -> str:
-    normalized = (market_id or "").upper()
-    if "BTC" in normalized or "ETH" in normalized:
-        return "crypto"
-    if normalized.startswith(("KXNASDAQ100U-", "KXINXU-", "KXINX-")):
-        return "index"
-    if "MENTION" in normalized or "LASTWORDCOUNT" in normalized:
-        return "speech"
-    if any(
-        token in normalized
-        for token in ("GOLD", "SILVER", "WTI", "NATGAS", "COPPER", "CORN", "SOY", "WHEAT", "AAA", "BRENT", "HOIL", "LCATTLE")
-    ):
-        return "commodity"
-    if any(token in normalized for token in ("LOWT", "HIGHT", "TEMPNYC", "HIGH", "LOW")):
-        return "weather"
-    if "MLB" in normalized or "NBA" in normalized or "NFL" in normalized or "NHL" in normalized:
-        return "sports"
-    return "generic"
+    return family_from_text(market_id)
 
 
 def _tier(c: float) -> str:

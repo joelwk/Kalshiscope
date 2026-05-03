@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 import hashlib
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -161,24 +162,11 @@ _PRE_ANALYSIS_HARD_REJECTION_TERMINAL_OUTCOMES = {
     "confidence_below_min",
     "abstain_low_evidence",
 }
-_MLB_PRIORITY_PREFIXES = (
-    "KXMLBGAME-",
-    "KXMLBSPREAD-",
-    "KXMLBTEAMTOTAL-",
-    "KXMLBF5SPREAD-",
-    "KXMLBKS-",
-)
-_MLB_SUBFAMILY_PREFIXES = (
-    "KXMLBHRR-",
-    "KXMLBKS-",
-    "KXMLBSPREAD-",
-    "KXMLBTEAMTOTAL-",
-    "KXMLBF5TOTAL-",
-    "KXMLBF5-",
-    "KXMLBTOTAL-",
-)
-_MLB_NO_EDGE_CONFIDENCE_CAP = 0.70
-_RESEARCH_QUEUE_MAXLEN = 200
+# In-memory cap on the per-cycle research-queue capture log is governed by
+# settings.RESEARCH_QUEUE_CYCLE_LOG_MAXLEN (default 200). The DB table
+# research_queue_entries persists EVERY entry regardless of that cap; the
+# in-memory deque only bounds the per-cycle "Research queue captured N blocked
+# opportunities" log line and the per-cycle receipt summary.
 _RESEARCH_QUEUE_EVIDENCE_GAP_MAX = 0.08
 _RESEARCH_QUEUE_EDGE_GAP_MAX = 0.08
 _SCORE_GATE_ALWAYS_BLOCK_REASONS = frozenset(
@@ -1017,14 +1005,7 @@ def _passes_edge_threshold(
     )
     edge = effective_confidence - implied_prob
     is_definitive = _is_definitive_outcome_eligible(decision, settings)
-    is_definitive_validated = (
-        is_definitive
-        and bool(getattr(decision, "definitive_outcome_detected", False))
-        and float(getattr(decision, "evidence_quality", 0.0) or 0.0) >= 0.80
-        and _decision_evidence_basis(decision) == "direct"
-        and (getattr(decision, "source_match_class", "") or "").strip().lower()
-        == "settlement_aligned"
-    )
+    is_definitive_validated = _is_definitive_validated(decision, settings)
     max_reasonable_edge = (
         max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX)))
         if is_definitive_validated
@@ -1191,6 +1172,53 @@ def _is_whitelisted_primary_source_url(url: str, settings: Settings) -> bool:
     return False
 
 
+def _is_high_quality_settled_evidence(
+    decision: TradeDecision,
+    settings: Settings,
+) -> bool:
+    """Recognize concrete settlement-aligned chart/observation evidence.
+
+    Returns True when the decision has ALL of:
+    - ``evidence_basis == "direct"``
+    - ``source_match_class == "settlement_aligned"`` (Grok detected concrete
+      chart or observation data tied to the market's settlement criterion)
+    - validated ``evidence_quality`` at or above
+      ``settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ`` (default 0.95)
+    - whitelisted ``primary_source_url``
+
+    This handles cases where the underlying numeric reading isn't strictly
+    binary (e.g. 23,291 vs a 39,000 threshold yielding ``my_prob`` ~0.90)
+    so ``definitive_outcome_detected`` was not set, but the evidence is
+    concrete, well-sourced, and aligned with the settlement criterion. The
+    exemption lifts the ``MAX_REASONABLE_EDGE`` cap to
+    ``DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX`` and suppresses the matching
+    hallucinated-edge / high-edge calibration penalties so the trade can
+    reach the score gate, where calibration shrinkage and other penalties
+    continue to scale.
+    """
+    if _decision_evidence_basis(decision) != "direct":
+        return False
+    source_match = (
+        str(getattr(decision, "source_match_class", "") or "").strip().lower()
+    )
+    if source_match != "settlement_aligned":
+        return False
+    eq = float(decision.evidence_quality or 0.0)
+    eq_floor = float(
+        getattr(
+            settings,
+            "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ",
+            0.95,
+        )
+    )
+    if eq < eq_floor:
+        return False
+    primary_source_url = str(getattr(decision, "primary_source_url", "") or "").strip()
+    if not primary_source_url:
+        return False
+    return _is_whitelisted_primary_source_url(primary_source_url, settings)
+
+
 def _should_suppress_hallucinated_edge_penalty(
     *,
     decision: TradeDecision,
@@ -1199,12 +1227,14 @@ def _should_suppress_hallucinated_edge_penalty(
 ) -> bool:
     if str(evidence_basis or "").strip().lower() != "direct":
         return False
-    if not bool(getattr(decision, "definitive_outcome_detected", False)):
-        return False
     primary_source_url = str(getattr(decision, "primary_source_url", "") or "").strip()
     if not primary_source_url:
         return False
-    return _is_whitelisted_primary_source_url(primary_source_url, settings)
+    if not _is_whitelisted_primary_source_url(primary_source_url, settings):
+        return False
+    if bool(getattr(decision, "definitive_outcome_detected", False)):
+        return True
+    return _is_high_quality_settled_evidence(decision, settings)
 
 
 def _is_definitive_outcome_eligible(
@@ -1239,6 +1269,34 @@ def _is_definitive_outcome_eligible(
     except (TypeError, ValueError):
         return False
     return my_prob_value >= 0.95 or my_prob_value <= 0.05
+
+
+def _is_definitive_validated(
+    decision: TradeDecision,
+    settings: Settings,
+) -> bool:
+    """Strict validation that gates the higher ``DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX`` cap.
+
+    A decision is validated when EITHER:
+    - It is ``_is_definitive_outcome_eligible`` AND has the model-flagged
+      ``definitive_outcome_detected=True`` AND eq>=0.80 AND direct +
+      settlement_aligned source_match_class (the legacy strict path), OR
+    - It satisfies ``_is_high_quality_settled_evidence`` (direct +
+      settlement_aligned + eq>=HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ +
+      whitelisted source). The strict eq floor of 0.95 in the new path
+      compensates for the relaxed ``definitive_outcome_detected`` requirement.
+    """
+    legacy_validated = (
+        _is_definitive_outcome_eligible(decision, settings)
+        and bool(getattr(decision, "definitive_outcome_detected", False))
+        and float(getattr(decision, "evidence_quality", 0.0) or 0.0) >= 0.80
+        and _decision_evidence_basis(decision) == "direct"
+        and (getattr(decision, "source_match_class", "") or "").strip().lower()
+        == "settlement_aligned"
+    )
+    if legacy_validated:
+        return True
+    return _is_high_quality_settled_evidence(decision, settings)
 
 
 def _apply_definitive_outcome_floors(
@@ -2207,6 +2265,9 @@ def _log_settings_summary(settings) -> None:
             "weather_fallback_edge_min_edge": settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
             "kalshi_server_side_filters_enabled": settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
             "kalshi_max_fetch_pages": settings.KALSHI_MAX_FETCH_PAGES,
+            "kalshi_mve_filter": settings.KALSHI_MVE_FILTER,
+            "kalshi_eligible_floor": settings.KALSHI_ELIGIBLE_FLOOR,
+            "kalshi_fetch_topup_enabled": settings.KALSHI_FETCH_TOPUP_ENABLED,
             "score_gate_mode": settings.SCORE_GATE_MODE,
             "score_gate_threshold": settings.SCORE_GATE_THRESHOLD,
             "score_computed_edge_bonus": settings.SCORE_COMPUTED_EDGE_BONUS,
@@ -2314,13 +2375,15 @@ def _fetch_markets_with_optional_server_filters(
     use_server_side_filters: bool,
     fetch_window_start: datetime | None,
     fetch_window_end: datetime | None,
+    mve_filter: str | None = None,
 ) -> list[Market]:
     if not use_server_side_filters:
-        return kalshi_client.get_markets()
+        return kalshi_client.get_markets(mve_filter=mve_filter)
     try:
         return kalshi_client.get_markets(
             close_time_start=fetch_window_start,
             close_time_end=fetch_window_end,
+            mve_filter=mve_filter,
         )
     except Exception as exc:
         logger.warning(
@@ -2334,6 +2397,7 @@ def _fetch_markets_with_optional_server_filters(
                 "close_time_end": fetch_window_end.isoformat()
                 if fetch_window_end
                 else None,
+                "mve_filter": mve_filter,
             },
         )
         kalshi_client.reset_session()
@@ -2341,6 +2405,7 @@ def _fetch_markets_with_optional_server_filters(
             return kalshi_client.get_markets(
                 close_time_start=fetch_window_start,
                 close_time_end=fetch_window_end,
+                mve_filter=mve_filter,
             )
         except Exception as retry_exc:
             logger.warning(
@@ -2354,9 +2419,10 @@ def _fetch_markets_with_optional_server_filters(
                     "close_time_end": fetch_window_end.isoformat()
                     if fetch_window_end
                     else None,
+                    "mve_filter": mve_filter,
                 },
             )
-            return kalshi_client.get_markets()
+            return kalshi_client.get_markets(mve_filter=mve_filter)
 
 
 def _requires_market_refresh(
@@ -2492,6 +2558,38 @@ def _record_rejection_reason(
     reason: str,
 ) -> None:
     rejection_breakdown[reason] = rejection_breakdown.get(reason, 0) + 1
+
+
+def _summarize_distribution(samples: list[float]) -> dict[str, float | int]:
+    """Return a compact distribution summary for cycle-receipt telemetry.
+
+    Empty samples produce ``{"count": 0}`` so consumers can disambiguate
+    "no markets scored" from "all markets scored zero". Percentiles use a
+    simple linear interpolation that matches numpy's default ``linear``
+    method without pulling numpy into this module.
+    """
+    if not samples:
+        return {"count": 0}
+    ordered = sorted(samples)
+    count = len(ordered)
+
+    def _percentile(p: float) -> float:
+        if count == 1:
+            return float(ordered[0])
+        rank = (count - 1) * p
+        low = int(rank)
+        high = min(count - 1, low + 1)
+        weight = rank - low
+        return float(ordered[low] * (1.0 - weight) + ordered[high] * weight)
+
+    return {
+        "count": count,
+        "min": round(float(ordered[0]), 4),
+        "p25": round(_percentile(0.25), 4),
+        "p50": round(_percentile(0.50), 4),
+        "p75": round(_percentile(0.75), 4),
+        "max": round(float(ordered[-1]), 4),
+    }
 
 
 def _iter_exchange_position_rows(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -2815,10 +2913,6 @@ def _event_ticker_prefix(market: Market) -> str:
     if "-" in market_id:
         return market_id.rsplit("-", maxsplit=1)[0]
     return market_id
-
-
-def _is_mlb_market_id(market_id: str) -> bool:
-    return str(market_id or "").strip().upper().startswith("KXMLB")
 
 
 def _daily_balance_delta_usdc(
@@ -3728,6 +3822,65 @@ def _build_grok_client_for_worker(
     )
 
 
+# Per-thread storage for analysis worker GrokClient instances. The
+# ``ThreadPoolExecutor`` reuses worker threads across submitted tasks, so
+# stashing the client in ``threading.local`` lets each thread pay the
+# initialization cost once instead of every candidate. Cycle 1 review
+# observed 8+ "GrokClient initialized" debug messages per cycle (one per
+# candidate); with this cache it drops to one per worker thread.
+_worker_grok_client_storage = threading.local()
+
+
+def reset_worker_grok_client_cache() -> None:
+    """Reset the thread-local Grok client cache.
+
+    Primarily exposed for tests that need to verify per-thread reuse without
+    contamination between cycles. Each worker thread that calls
+    :func:`_get_or_create_worker_grok_client` after this reset will rebuild
+    its client on first use.
+    """
+    storage = _worker_grok_client_storage
+    if hasattr(storage, "client"):
+        delattr(storage, "client")
+
+
+def _get_or_create_worker_grok_client(
+    settings: Settings,
+    provider: XAIProvider | None = None,
+) -> GrokClient:
+    """Return the calling thread's GrokClient, building it lazily on first use."""
+    storage = _worker_grok_client_storage
+    client = getattr(storage, "client", None)
+    if client is None:
+        client = _build_grok_client_for_worker(settings, provider=provider)
+        storage.client = client
+    return client
+
+
+def _analyze_market_candidate_via_thread_local_client(
+    market: Market,
+    state: MarketState | None,
+    anchor_analysis: dict[str, Any] | None,
+    settings: Settings,
+    provider: XAIProvider | None,
+    historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
+    correlation_id: str | None = None,
+    force_extended_research: bool = False,
+) -> dict[str, Any]:
+    """Worker entry point that reuses one GrokClient per worker thread."""
+    grok_client = _get_or_create_worker_grok_client(settings, provider)
+    return _analyze_market_candidate_for_worker(
+        market=market,
+        state=state,
+        anchor_analysis=anchor_analysis,
+        settings=settings,
+        grok_client=grok_client,
+        historical_confidence_buckets=historical_confidence_buckets,
+        correlation_id=correlation_id,
+        force_extended_research=force_extended_research,
+    )
+
+
 def _analyze_market_candidate_for_worker(
     market: Market,
     state: MarketState | None,
@@ -3939,8 +4092,6 @@ def _pre_analysis_opportunity_score(
     ):
         historical_profit_bonus = _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS
     source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(family, 0.0)
-    if _is_mlb_market_id(market_id_upper):
-        source_difficulty_penalty *= 0.25
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
         ambiguous_resolution_penalty = 0.08
@@ -3955,22 +4106,10 @@ def _pre_analysis_opportunity_score(
         churn_penalty = 0.05
         if not traded_before:
             churn_penalty += 0.03
-    mlb_priority_bonus = 0.0
-    mlb_subfamily_penalty = 0.0
     zero_trade_rate_penalty = 0.0
     negative_prefix_penalty = 0.0
     historical_gate_score_penalty = 0.0
     historical_gate_sample_weight = 0.0
-    if any(
-        market_id_upper.startswith(prefix)
-        for prefix in _MLB_PRIORITY_PREFIXES
-    ):
-        mlb_priority_bonus = 0.05
-    if (
-        settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED
-        and any(market_id_upper.startswith(prefix) for prefix in _MLB_SUBFAMILY_PREFIXES)
-    ):
-        mlb_subfamily_penalty = max(0.0, settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY)
     if historical_prefix_stats and not traded_before:
         prefix_len = max(1, int(settings.HISTORICAL_TICKER_PREFIX_LEN))
         market_prefix = market_id_upper[:prefix_len]
@@ -4026,7 +4165,6 @@ def _pre_analysis_opportunity_score(
         + (0.35 * liquidity_score)
         + (0.25 * horizon_score)
         + post_event_bonus
-        + mlb_priority_bonus
         + historical_profit_bonus
         - repeated_analysis_penalty
         - non_actionable_penalty
@@ -4040,7 +4178,6 @@ def _pre_analysis_opportunity_score(
         - ambiguous_resolution_penalty
         - ambiguous_market_penalty
         - churn_penalty
-        - mlb_subfamily_penalty
         - zero_trade_rate_penalty
         - negative_prefix_penalty
         - historical_gate_score_penalty
@@ -4071,8 +4208,6 @@ def _pre_analysis_opportunity_score(
         "pre_score_ambiguous_resolution_penalty": ambiguous_resolution_penalty,
         "pre_score_ambiguous_market_penalty": ambiguous_market_penalty,
         "pre_score_churn_penalty": churn_penalty,
-        "pre_score_mlb_priority_bonus": mlb_priority_bonus,
-        "pre_score_mlb_subfamily_penalty": mlb_subfamily_penalty,
         "pre_score_zero_trade_rate_penalty": zero_trade_rate_penalty,
         "pre_score_negative_prefix_penalty": negative_prefix_penalty,
         "pre_score_historical_gate_score_penalty": historical_gate_score_penalty,
@@ -4146,9 +4281,16 @@ def _pre_analysis_participation_hold(
         str(name or "").strip().lower()
         for name in settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES
     }
-    if family not in rejection_families:
-        return False, None, {}
-    if settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED:
+    family_scope_active = bool(rejection_families)
+    family_in_scope = family in rejection_families
+    # Zero-action-family check is family-scoped (only fires when the operator
+    # listed the family in PRE_ANALYSIS_HARD_REJECTION_FAMILIES). All other
+    # gates below fire on their own data conditions regardless of family scope.
+    if (
+        family_scope_active
+        and family_in_scope
+        and settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED
+    ):
         action_stats = family_action_stats or {}
         family_sample_size = int(action_stats.get("sample_size", 0) or 0)
         family_action_rate = float(action_stats.get("action_rate", 0.0) or 0.0)
@@ -4263,7 +4405,8 @@ def _cap_analysis_candidates(
         historical_gate_allowed = candidate.get("historical_gate_allowed")
         historical_gate_metrics = candidate.get("historical_gate_metrics")
         historical_gate_metric_penalty = 0.0
-        if isinstance(historical_gate_metrics, dict):
+        historical_gate_metrics_present = isinstance(historical_gate_metrics, dict)
+        if historical_gate_metrics_present:
             try:
                 historical_gate_metric_penalty = float(
                     historical_gate_metrics.get("historical_gate_score_penalty", 0.0) or 0.0
@@ -4276,9 +4419,19 @@ def _cap_analysis_candidates(
             historical_loss_penalty = min(0.20, abs(historical_pnl) / 250.0)
             if historical_win_rate and historical_win_rate < 0.50:
                 historical_loss_penalty += min(0.06, (0.50 - historical_win_rate) * 0.20)
-        historical_gate_penalty = (
-            0.12 if historical_gate_allowed is False else max(0.0, historical_gate_metric_penalty)
-        )
+        # Avoid double-counting the historical-gate penalty: when the gate
+        # surfaced metrics, _pre_analysis_opportunity_score has already absorbed
+        # historical_gate_score_penalty into the base score. Re-deducting the
+        # 0.12 flat here would punish the same signal twice and over-demote
+        # markets that the gate already softened. Only fall back to the flat
+        # 0.12 when the gate ran but metrics never reached this candidate
+        # (legacy/backward-compat path).
+        if historical_gate_metrics_present:
+            historical_gate_penalty = max(0.0, historical_gate_metric_penalty)
+        elif historical_gate_allowed is False:
+            historical_gate_penalty = 0.12
+        else:
+            historical_gate_penalty = 0.0
         repeated_penalty = min(0.12, non_actionable_streak * 0.02)
         source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(
             family,
@@ -4807,7 +4960,15 @@ def main(max_cycles: int | None = None) -> None:
                 use_server_side_filters=settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
                 fetch_window_start=fetch_window_start,
                 fetch_window_end=fetch_window_end,
+                mve_filter=settings.KALSHI_MVE_FILTER,
             )
+            # Cycle 2 review: snapshot per-fetch pagination metadata so the
+            # cycle receipt can record catalog topology (pages_fetched,
+            # page_cap_hit, mve_filter active) without scanning DEBUG logs.
+            fetch_pages_fetched = int(getattr(kalshi_client, "last_fetch_pages", 0))
+            fetch_page_cap_hit = bool(getattr(kalshi_client, "last_fetch_cap_hit", False))
+            mve_filter_setting = (settings.KALSHI_MVE_FILTER or "").strip().lower()
+            mve_filter_active = mve_filter_setting in {"exclude", "only"}
             fetched_count = len(markets)
             logger.info("Fetched %d raw markets", fetched_count)
             _log_filter_diagnostics(
@@ -4839,6 +5000,42 @@ def main(max_cycles: int | None = None) -> None:
             )
             logger.info("Filtered to %d eligible markets", len(markets))
 
+            # Cycle 2 review: catalog-coverage early-warning. When the page
+            # cap was hit AND the post-filter eligible count is below the
+            # operator-set floor, log a structured WARNING so we can detect
+            # "running out of catalog before running out of cap" before the
+            # symptom becomes a sustained cycle_yield_alert ERROR. The auto
+            # top-up branch is gated by KALSHI_FETCH_TOPUP_ENABLED (default
+            # off) — we want the warning telemetry first, automation later.
+            eligible_floor = max(0, int(settings.KALSHI_ELIGIBLE_FLOOR))
+            eligible_floor_warning_triggered = False
+            if (
+                fetch_page_cap_hit
+                and eligible_floor > 0
+                and len(markets) < eligible_floor
+            ):
+                eligible_floor_warning_triggered = True
+                logger.warning(
+                    "Catalog-coverage gap: eligible_markets=%d below floor=%d "
+                    "with page cap hit (pages=%d, max=%d, mve_filter=%s); "
+                    "consider raising KALSHI_MAX_FETCH_PAGES or enabling "
+                    "KALSHI_FETCH_TOPUP_ENABLED",
+                    len(markets),
+                    eligible_floor,
+                    fetch_pages_fetched,
+                    settings.KALSHI_MAX_FETCH_PAGES,
+                    mve_filter_setting or "unset",
+                    data={
+                        "eligible_markets": len(markets),
+                        "kalshi_eligible_floor": eligible_floor,
+                        "pages_fetched": fetch_pages_fetched,
+                        "kalshi_max_fetch_pages": settings.KALSHI_MAX_FETCH_PAGES,
+                        "page_cap_hit": fetch_page_cap_hit,
+                        "mve_filter": mve_filter_setting or None,
+                        "kalshi_fetch_topup_enabled": settings.KALSHI_FETCH_TOPUP_ENABLED,
+                    },
+                )
+
             markets = _collapse_event_ladders(
                 markets,
                 ladder_collapse_threshold=settings.LADDER_COLLAPSE_THRESHOLD,
@@ -4847,6 +5044,12 @@ def main(max_cycles: int | None = None) -> None:
             markets = _dedupe_markets_by_matchup(markets)
 
             markets = scheduler.prioritize_markets(markets, state_manager)
+            # Counter of market_family for the post-prioritization eligible
+            # list. This shows operators *which* families survived the page
+            # cap (the exact question raised by the cycle 2 review).
+            eligible_market_families = dict(
+                Counter(market_family(m) for m in markets)
+            )
 
             cycle_bankroll: float | None = None
             cycle_cash_balance: float | None = None
@@ -5005,9 +5208,55 @@ def main(max_cycles: int | None = None) -> None:
             execution_family_stats: dict[str, dict[str, float]] = {}
             evidence_basis_breakdown: dict[str, int] = {}
             family_edge_samples: dict[str, list[float]] = {}
-            research_queue: deque[dict[str, Any]] = deque(maxlen=_RESEARCH_QUEUE_MAXLEN)
+            research_queue_cycle_log_maxlen = max(
+                1, int(settings.RESEARCH_QUEUE_CYCLE_LOG_MAXLEN)
+            )
+            research_queue: deque[dict[str, Any]] = deque(
+                maxlen=research_queue_cycle_log_maxlen
+            )
             pre_analysis_blocked = 0
             pre_analysis_research_routed_count = 0
+            # Per-cycle samples for score-distribution telemetry (5f). Surfaces
+            # calibration drift in the cycle receipt without forcing operators
+            # to grep individual trade audits.
+            cycle_pre_score_samples: list[float] = []
+            cycle_soft_research_threshold_gap_samples: list[float] = []
+            # Effective research band (5e): widens linearly under sustained
+            # zero-execution drought to capture more markets for learning. Only
+            # affects soft-research routing; the deep-analysis MIN_SCORE itself
+            # is never moved by this knob, so execution gating is unchanged.
+            _research_band_base = max(
+                0.0, float(settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND)
+            )
+            effective_research_band = _research_band_base
+            research_band_widened_by = 0.0
+            if (
+                settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED
+                and settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+            ):
+                _band_widen_threshold = (
+                    2 * settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                )
+                if (
+                    consecutive_zero_execution_yield_cycles
+                    >= _band_widen_threshold
+                ):
+                    _band_max = max(
+                        _research_band_base,
+                        float(settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX),
+                    )
+                    research_band_widened_by = min(
+                        _band_max - _research_band_base,
+                        0.02
+                        * (
+                            consecutive_zero_execution_yield_cycles
+                            - _band_widen_threshold
+                            + 1
+                        ),
+                    )
+                    effective_research_band = (
+                        _research_band_base + research_band_widened_by
+                    )
             should_trade_but_blocked = 0
             blocked_direct_evidence_count = 0
             participation_tier_breakdown: dict[str, int] = {}
@@ -5027,8 +5276,6 @@ def main(max_cycles: int | None = None) -> None:
             confidence_delta_samples: list[float] = []
             confidence_calibration_historical_win_rates: list[float] = []
             extended_research_market_ids: set[str] = set()
-            mlb_family_orders_attempted = 0
-            mlb_family_orders_filled = 0
             cycle_balance_start = cycle_bankroll
             last_known_balance = cycle_cash_balance
             last_known_portfolio_value = cycle_bankroll
@@ -5351,7 +5598,7 @@ def main(max_cycles: int | None = None) -> None:
                         )
                     )
                     research_queue.clear()
-                    research_queue.extend(queued[:_RESEARCH_QUEUE_MAXLEN])
+                    research_queue.extend(queued[:research_queue_cycle_log_maxlen])
                     for index, item in enumerate(research_queue, start=1):
                         if item.get("market_id") == market.id and item.get("reason") == reason:
                             return index
@@ -5378,10 +5625,8 @@ def main(max_cycles: int | None = None) -> None:
                 market_id: str,
                 outcome: str,
             ) -> None:
-                nonlocal daily_trade_count, mlb_family_orders_attempted
+                nonlocal daily_trade_count
                 daily_trade_count += 1
-                if _is_mlb_market_id(market_id):
-                    mlb_family_orders_attempted += 1
                 if event_key:
                     event_cycle_traded_market_ids.setdefault(event_key, set()).add(market_id)
                     normalized_outcome = _normalize_outcome_key(outcome)
@@ -5510,6 +5755,9 @@ def main(max_cycles: int | None = None) -> None:
 
             drainable_research_entries: dict[str, dict[str, Any]] = {}
             research_queue_drained_count = 0
+            research_queue_drain_skipped_stale_count = 0
+            research_queue_drain_skipped_low_priority_count = 0
+            research_queue_emergency_probes_count = 0
             if (
                 settings.RESEARCH_QUEUE_ENABLED
                 and settings.RESEARCH_QUEUE_PERSIST_TO_DB
@@ -5520,23 +5768,132 @@ def main(max_cycles: int | None = None) -> None:
                     excluded_ids = tuple(traded_market_ids)
                 except Exception:
                     excluded_ids = ()
+                # Snapshot the current cycle's tradeable market IDs so we don't
+                # "select" drain candidates that fell out of `_filter_markets`
+                # (closed, low-liquidity, expired, etc.) — without this guard
+                # the drain log claims selection but the per-market loop never
+                # marks the candidate as a probe and research_queue_drained_count
+                # stays at 0, producing misleading telemetry.
+                current_market_ids: set[str] = {
+                    str(getattr(m, "id", "") or "")
+                    for m in markets
+                    if isinstance(m, Market)
+                }
+                # Over-fetch beyond the per-cycle drain limit so the priority
+                # filter and stale-market filter don't starve the per-cycle quota.
+                drain_pool_limit = max(
+                    1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE * 5
+                )
+                _drain_min_priority = max(
+                    0.0, float(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY)
+                )
+                drain_per_cycle_quota = max(
+                    1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE
+                )
                 try:
                     drain_rows = state_manager.get_drainable_research_entries(
                         min_age_hours=settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS,
                         max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
-                        limit=max(1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE),
+                        limit=drain_pool_limit,
                         excluded_market_ids=excluded_ids,
                     )
+                    selected = 0
                     for entry in drain_rows:
                         mid = str(entry.get("market_id") or "").strip()
-                        if mid:
-                            drainable_research_entries[mid] = entry
+                        if not mid:
+                            continue
+                        if mid not in current_market_ids:
+                            research_queue_drain_skipped_stale_count += 1
+                            continue
+                        # Apply the operator-tuned priority floor here (not in
+                        # the SQL helper) so we can count low-priority skips
+                        # for cycle-receipt observability. Entries with no
+                        # priority signal (None) are admitted under the same
+                        # "unknown is admissible" rule the helper uses.
+                        if _drain_min_priority > 0.0:
+                            entry_priority = (
+                                state_manager.estimate_research_entry_priority(
+                                    entry
+                                )
+                            )
+                            if (
+                                entry_priority is not None
+                                and entry_priority < _drain_min_priority
+                            ):
+                                research_queue_drain_skipped_low_priority_count += 1
+                                continue
+                        drainable_research_entries[mid] = entry
+                        selected += 1
+                        if selected >= drain_per_cycle_quota:
+                            break
                 except Exception as exc:
                     logger.debug(
                         "Research queue drain lookup failed: %s",
                         exc,
                         data={"error": str(exc)},
                     )
+
+                # Emergency second-pass drain: when the normal drain selected
+                # nothing AND we're in sustained zero-execution-yield mode, the
+                # research queue has effectively become a write-only sink. Try
+                # one probe with the current_market_ids constraint relaxed and
+                # a halved minimum age so younger entries qualify. The probe
+                # still goes through deep analysis, can abstain, and respects
+                # the score gate; it is not a forced trade. This keeps the
+                # learning loop alive without weakening any execution gate.
+                emergency_eligible = (
+                    not drainable_research_entries
+                    and settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+                    and consecutive_zero_execution_yield_cycles
+                    >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                )
+                if emergency_eligible:
+                    try:
+                        emergency_min_age = max(
+                            0.0,
+                            float(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS) / 2.0,
+                        )
+                        emergency_rows = state_manager.get_drainable_research_entries(
+                            min_age_hours=emergency_min_age,
+                            max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
+                            limit=drain_pool_limit,
+                            excluded_market_ids=excluded_ids,
+                        )
+                        emergency_selected = 0
+                        for entry in emergency_rows:
+                            mid = str(entry.get("market_id") or "").strip()
+                            if not mid:
+                                continue
+                            # Skip if already on this cycle's filter list (the
+                            # normal drain pass would have picked it up). The
+                            # whole point of the emergency pass is to admit
+                            # entries that are NOT in current_market_ids.
+                            if mid in current_market_ids:
+                                continue
+                            if _drain_min_priority > 0.0:
+                                entry_priority = (
+                                    state_manager.estimate_research_entry_priority(
+                                        entry
+                                    )
+                                )
+                                if (
+                                    entry_priority is not None
+                                    and entry_priority < _drain_min_priority
+                                ):
+                                    research_queue_drain_skipped_low_priority_count += 1
+                                    continue
+                            entry["is_drain_emergency_probe"] = True
+                            drainable_research_entries[mid] = entry
+                            emergency_selected += 1
+                            if emergency_selected >= drain_per_cycle_quota:
+                                break
+                        research_queue_emergency_probes_count = emergency_selected
+                    except Exception as exc:
+                        logger.debug(
+                            "Emergency research-queue drain lookup failed: %s",
+                            exc,
+                            data={"error": str(exc)},
+                        )
                 if drainable_research_entries:
                     logger.info(
                         "Research queue drain selected %d candidate(s) for forced re-analysis",
@@ -5547,10 +5904,50 @@ def main(max_cycles: int | None = None) -> None:
                                     "market_id": mid,
                                     "queued_at": entry.get("queued_at"),
                                     "reason": entry.get("reason"),
-                                    "what_to_learn_next": entry.get("what_to_learn_next"),
+                                    "what_to_learn_next": entry.get(
+                                        "what_to_learn_next"
+                                    ),
+                                    "is_drain_emergency_probe": bool(
+                                        entry.get("is_drain_emergency_probe")
+                                    ),
                                 }
                                 for mid, entry in drainable_research_entries.items()
                             ],
+                            "research_queue_drain_skipped_stale_count": (
+                                research_queue_drain_skipped_stale_count
+                            ),
+                            "research_queue_drain_skipped_low_priority_count": (
+                                research_queue_drain_skipped_low_priority_count
+                            ),
+                            "research_queue_drain_min_priority": _drain_min_priority,
+                            "research_queue_emergency_probes_count": (
+                                research_queue_emergency_probes_count
+                            ),
+                            "consecutive_zero_execution_yield_cycles": (
+                                consecutive_zero_execution_yield_cycles
+                            ),
+                        },
+                    )
+                elif (
+                    research_queue_drain_skipped_stale_count > 0
+                    or research_queue_drain_skipped_low_priority_count > 0
+                ):
+                    logger.debug(
+                        "Research queue drain skipped %d stale + %d low-priority "
+                        "entries; no candidates promoted",
+                        research_queue_drain_skipped_stale_count,
+                        research_queue_drain_skipped_low_priority_count,
+                        data={
+                            "research_queue_drain_skipped_stale_count": (
+                                research_queue_drain_skipped_stale_count
+                            ),
+                            "research_queue_drain_skipped_low_priority_count": (
+                                research_queue_drain_skipped_low_priority_count
+                            ),
+                            "research_queue_drain_min_priority": _drain_min_priority,
+                            "consecutive_zero_execution_yield_cycles": (
+                                consecutive_zero_execution_yield_cycles
+                            ),
                         },
                     )
 
@@ -6142,6 +6539,10 @@ def main(max_cycles: int | None = None) -> None:
                         pre_analysis_breakdown["previous_research_reason"] = str(
                             research_entry.get("reason") or ""
                         )
+                    # Record the post-bump score for cycle-level distribution
+                    # telemetry. Includes drain probes so the receipt reflects
+                    # the actual score landscape across all scored markets.
+                    cycle_pre_score_samples.append(float(pre_analysis_score))
                     drain_entry = drainable_research_entries.get(market.id)
                     is_drain_probe = drain_entry is not None
                     if is_drain_probe:
@@ -6164,7 +6565,7 @@ def main(max_cycles: int | None = None) -> None:
                     if not is_drain_probe and pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:
                         _research_floor = (
                             settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
-                            - max(0.0, settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND)
+                            - effective_research_band
                         )
                         _route_to_soft_research = (
                             settings.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED
@@ -6173,6 +6574,12 @@ def main(max_cycles: int | None = None) -> None:
                         )
                         if _route_to_soft_research:
                             pre_analysis_research_routed_count += 1
+                            cycle_soft_research_threshold_gap_samples.append(
+                                float(
+                                    settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                                    - pre_analysis_score
+                                )
+                            )
                             _rejection_tag = "pre_analysis_score_soft_research"
                             _record_rejection_reason(
                                 pre_analysis_rejection_breakdown,
@@ -6782,21 +7189,21 @@ def main(max_cycles: int | None = None) -> None:
                     },
                 )
                 try:
+                    # Drop any cached worker GrokClient from a prior cycle so
+                    # the thread-local cache is rebuilt with the current
+                    # settings/provider on first use of each worker thread.
+                    reset_worker_grok_client_cache()
                     with ThreadPoolExecutor(max_workers=analysis_worker_count) as executor:
                         parallel_analysis_used = True
                         future_to_market = {}
                         for candidate in analysis_candidates:
-                            worker_client = _build_grok_client_for_worker(
-                                settings,
-                                provider=shared_xai_provider,
-                            )
                             future = executor.submit(
-                                _analyze_market_candidate_for_worker,
+                                _analyze_market_candidate_via_thread_local_client,
                                 candidate["market"],
                                 candidate["state"],
                                 candidate["anchor_analysis"],
                                 settings,
-                                worker_client,
+                                shared_xai_provider,
                                 historical_confidence_buckets,
                                 cycle_id,
                                 bool(candidate.get("force_extended_research")),
@@ -7924,42 +8331,6 @@ def main(max_cycles: int | None = None) -> None:
                         )
                         continue
 
-                # MLB no-edge confidence cap
-                if (
-                    not decision.abstain
-                    and decision.should_trade
-                    and any(
-                        (market.id or "").upper().startswith(p)
-                        for p in _MLB_PRIORITY_PREFIXES + _MLB_SUBFAMILY_PREFIXES
-                    )
-                ):
-                    _mlb_implied = _get_implied_probability(market, decision.outcome)
-                    _mlb_edge = (
-                        decision.confidence - _mlb_implied
-                        if _mlb_implied is not None
-                        else (decision.edge_external or 0.0)
-                    )
-                    if _mlb_edge is None or _mlb_edge <= 0:
-                        if decision.confidence > _MLB_NO_EDGE_CONFIDENCE_CAP:
-                            _original_mlb_conf = decision.confidence
-                            decision.confidence = _MLB_NO_EDGE_CONFIDENCE_CAP
-                            _record_rejection_reason(
-                                rejection_breakdown,
-                                "mlb_no_edge_confidence_cap_applied",
-                            )
-                            logger.info(
-                                "MLB no-edge confidence cap applied: %s conf %.4f -> %.4f",
-                                market.id,
-                                _original_mlb_conf,
-                                decision.confidence,
-                                data={
-                                    "market_id": market.id,
-                                    "original_confidence": _original_mlb_conf,
-                                    "capped_confidence": decision.confidence,
-                                    "reason": "mlb_no_edge_confidence_cap",
-                                },
-                            )
-
                 entry_price = _get_outcome_entry_price(market, decision.outcome)
                 implied_prob = _get_implied_probability(market, decision.outcome)
                 audit_context["audit_entry_price"] = entry_price
@@ -8292,14 +8663,7 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
-                _def_validated = (
-                    _is_definitive_outcome_eligible(decision_for_edge, settings)
-                    and bool(getattr(decision_for_edge, "definitive_outcome_detected", False))
-                    and float(getattr(decision_for_edge, "evidence_quality", 0.0) or 0.0) >= 0.80
-                    and _decision_evidence_basis(decision_for_edge) == "direct"
-                    and (getattr(decision_for_edge, "source_match_class", "") or "").strip().lower()
-                    == "settlement_aligned"
-                )
+                _def_validated = _is_definitive_validated(decision_for_edge, settings)
                 if _def_validated:
                     audit_context["definitive_edge_bypass_validated"] = True
                 calibration_payload = {
@@ -10345,8 +10709,6 @@ def main(max_cycles: int | None = None) -> None:
                     total_usd_deployed += bet_amount
                     family_stats["orders_filled"] += 1
                     family_stats["usd_deployed"] += bet_amount
-                    if _is_mlb_market_id(market.id):
-                        mlb_family_orders_filled += 1
                     state_manager.reset_fill_failure_count(market.id)
                     if last_known_balance is not None:
                         last_known_balance = max(0.0, float(last_known_balance) - float(bet_amount))
@@ -10632,6 +10994,17 @@ def main(max_cycles: int | None = None) -> None:
                 "cycle_id": cycle_id,
                 "duration_ms": round(cycle_duration, 2),
                 "fetched_markets": fetched_count,
+                # Cycle 2 review: catalog-topology fields so future log audits
+                # can answer "what survived the page cap?" without scanning
+                # DEBUG-level pre-analysis rejections.
+                "pages_fetched": fetch_pages_fetched,
+                "page_cap_hit": fetch_page_cap_hit,
+                "kalshi_max_fetch_pages": int(settings.KALSHI_MAX_FETCH_PAGES),
+                "mve_filter_active": mve_filter_active,
+                "mve_filter_setting": mve_filter_setting or None,
+                "kalshi_eligible_floor": eligible_floor,
+                "eligible_floor_warning_triggered": eligible_floor_warning_triggered,
+                "eligible_market_families": eligible_market_families,
                 "eligible_markets": len(markets),
                 "analysis_candidates": analysis_candidates_count,
                 "pre_analysis_passed": pre_analysis_passed,
@@ -10696,8 +11069,6 @@ def main(max_cycles: int | None = None) -> None:
                 "fallback_high_conf_blocks": int(
                     normalized_rejection_breakdown.get("fallback_high_confidence_trade", 0)
                 ),
-                "mlb_family_orders_attempted": mlb_family_orders_attempted,
-                "mlb_family_orders_filled": mlb_family_orders_filled,
                 "per_family_edge_p50": per_family_edge_p50,
                 "per_family_edge_p90": per_family_edge_p90,
                 "api_tokens_consumed": api_tokens_consumed,
@@ -10980,6 +11351,23 @@ def main(max_cycles: int | None = None) -> None:
                     "execution_candidates": execution_candidates,
                     "research_queue_size": research_queue_size,
                     "research_queue_drained_count": research_queue_drained_count,
+                    "research_queue_drain_skipped_stale_count": research_queue_drain_skipped_stale_count,
+                    "research_queue_drain_skipped_low_priority_count": (
+                        research_queue_drain_skipped_low_priority_count
+                    ),
+                    "research_queue_emergency_probes_count": (
+                        research_queue_emergency_probes_count
+                    ),
+                    "effective_research_band": round(effective_research_band, 4),
+                    "research_band_widened_by": round(research_band_widened_by, 4),
+                    "pre_score_distribution": _summarize_distribution(
+                        cycle_pre_score_samples
+                    ),
+                    "soft_research_threshold_gap_distribution": (
+                        _summarize_distribution(
+                            cycle_soft_research_threshold_gap_samples
+                        )
+                    ),
                     "daily_drawdown_preflight_blocked_count": daily_drawdown_preflight_blocked_count,
                     "should_trade_but_blocked": should_trade_but_blocked,
                     "should_trade_blocked_breakdown": should_trade_blocked_breakdown,

@@ -207,6 +207,143 @@ def test_drainable_entries_respects_limit() -> None:
     assert len(drainable) == 2
 
 
+def test_drain_priority_filter_drops_low_priority_audit() -> None:
+    """get_drainable_research_entries with min_priority must drop entries
+    whose last_decision_json.audit.pre_analysis_score is below the cutoff."""
+    mgr = _make_manager()
+    queued_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    high_priority_audit = (
+        '{"audit": {"pre_analysis_score": 0.62, '
+        '"final_action": "research_queued"}}'
+    )
+    low_priority_audit = (
+        '{"audit": {"pre_analysis_score": 0.30, '
+        '"final_action": "research_queued"}}'
+    )
+    for market_id, audit in (
+        ("KXHIGH-001", high_priority_audit),
+        ("KXLOW-001", low_priority_audit),
+    ):
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id, "c1", queued_at, "g1", "r1",
+                0.0, None, queued_at, None, audit,
+            ),
+        )
+    mgr._conn.commit()
+
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=10,
+        min_priority=0.55,
+    )
+    drained_ids = [entry["market_id"] for entry in drainable]
+    assert "KXHIGH-001" in drained_ids
+    assert "KXLOW-001" not in drained_ids
+
+
+def test_drain_priority_filter_admits_unknown_priority() -> None:
+    """Entries with no decision JSON and no threshold_gap signal must be
+    treated as 'unknown priority' rather than 'low priority' so the filter
+    only prunes *known* low-quality entries."""
+    mgr = _make_manager()
+    queued_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mgr._conn.execute(
+        """
+        INSERT INTO research_queue_entries
+            (market_id, cycle_id, queued_at, gate_name, reason,
+             threshold_gap, what_to_learn_next, last_seen, expires_at,
+             last_decision_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "KXUNKNOWN-001", "c1", queued_at, "g1", "r1",
+            None, None, queued_at, None, None,
+        ),
+    )
+    mgr._conn.commit()
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=5,
+        min_priority=0.55,
+    )
+    assert [entry["market_id"] for entry in drainable] == ["KXUNKNOWN-001"]
+
+
+def test_drain_priority_filter_uses_threshold_gap_fallback() -> None:
+    """When no decision JSON is present, the priority falls back to
+    1.0 - threshold_gap. A threshold_gap of 0.50 implies priority 0.50,
+    which is below the 0.55 cutoff and therefore filtered out."""
+    mgr = _make_manager()
+    queued_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mgr._conn.execute(
+        """
+        INSERT INTO research_queue_entries
+            (market_id, cycle_id, queued_at, gate_name, reason,
+             threshold_gap, what_to_learn_next, last_seen, expires_at,
+             last_decision_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "KXGAP-LOW", "c1", queued_at, "g1", "r1",
+            0.50, None, queued_at, None, None,
+        ),
+    )
+    mgr._conn.execute(
+        """
+        INSERT INTO research_queue_entries
+            (market_id, cycle_id, queued_at, gate_name, reason,
+             threshold_gap, what_to_learn_next, last_seen, expires_at,
+             last_decision_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "KXGAP-HIGH", "c1", queued_at, "g1", "r1",
+            0.10, None, queued_at, None, None,
+        ),
+    )
+    mgr._conn.commit()
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=5,
+        min_priority=0.55,
+    )
+    drained_ids = [entry["market_id"] for entry in drainable]
+    assert "KXGAP-HIGH" in drained_ids
+    assert "KXGAP-LOW" not in drained_ids
+
+
+def test_estimate_research_entry_priority_prefers_audit_over_gap() -> None:
+    """When both an audit pre_analysis_score and a threshold_gap are present,
+    the audit wins so we never lose precision to the gap heuristic."""
+    audit_priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "last_decision_json": (
+                '{"audit": {"pre_analysis_score": 0.42}}'
+            ),
+            "threshold_gap": 0.10,
+        }
+    )
+    assert audit_priority == 0.42
+
+
+def test_estimate_research_entry_priority_returns_none_when_no_signal() -> None:
+    """No JSON, no threshold_gap, no audit -> None so the caller can treat
+    the entry as 'unknown' rather than penalizing it."""
+    priority = MarketStateManager.estimate_research_entry_priority({})
+    assert priority is None
+
+
 def test_get_family_action_snapshot_deep_only() -> None:
     mgr = _make_manager()
     mgr._conn.execute(

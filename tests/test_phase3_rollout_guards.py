@@ -181,10 +181,10 @@ def test_flip_refinement_precheck_blocks_unreachable_conf_gain() -> None:
 
 
 def test_score_changes_do_not_regress_profitable_book() -> None:
-    """KXMLBGAME-shaped fixture (high direct evidence, +PnL prefix) must pass gate."""
+    """Sports-shaped fixture (high direct evidence, +PnL prefix) must pass gate."""
     market = Market(
-        id="KXMLBGAME-26APR191420NYMCHC-CHC",
-        question="NYM vs CHC: Who wins?",
+        id="KXSAMPLEGAME-26APR191420TEAMATEAMB-TEAMA",
+        question="Team A vs Team B: Who wins?",
         outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
         liquidity_usdc=1500.0,
         close_time=datetime.now(timezone.utc) + timedelta(hours=3),
@@ -211,7 +211,7 @@ def test_score_changes_do_not_regress_profitable_book() -> None:
         confidence_calibration_penalty_scale=0.50,
     )
     assert result.final_score >= 0.25, (
-        f"KXMLBGAME-shaped trade must pass typical score gate; got {result.final_score:.4f}"
+        f"Sports-shaped trade must pass typical score gate; got {result.final_score:.4f}"
     )
     assert result.coinflip_sports_penalty == 0.0
     assert result.historical_prefix_bonus > 0

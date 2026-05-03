@@ -28,6 +28,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from research_profiles import family_from_text  # noqa: E402
+
 DEFAULT_DB_PATH = "data/market_state.db"
 DEFAULT_WINDOW_DAYS = 7
 DEFAULT_LOG_FILES = ("logs/predictbot.log", "logs/predictbot.log.1")
@@ -105,24 +107,7 @@ def _coerce_dt(text: object) -> datetime | None:
 
 
 def _market_family_from_id(market_id: str) -> str:
-    normalized = (market_id or "").upper()
-    if "BTC" in normalized or "ETH" in normalized:
-        return "crypto"
-    if normalized.startswith(("KXNASDAQ100U-", "KXINXU-")):
-        return "index"
-    if "MENTION" in normalized or "LASTWORDCOUNT" in normalized:
-        return "speech"
-    if any(
-        token in normalized
-        for token in (
-            "GOLD", "SILVER", "WTI", "NATGAS", "COPPER", "CORN",
-            "SOY", "WHEAT", "AAA",
-        )
-    ):
-        return "commodity"
-    if any(token in normalized for token in ("LOWT", "HIGHT", "TEMPNYC")):
-        return "weather"
-    return "generic"
+    return family_from_text(market_id)
 
 
 def _safe_json_loads(raw: object) -> dict[str, Any] | None:

@@ -164,12 +164,17 @@ class TestConfig(unittest.TestCase):
             "LOW_PRICE_MIN_EDGE=0.18",
             "VERY_LOW_PRICE_MIN_EDGE=0.28",
             "FALLBACK_EDGE_MIN_EDGE=0.30",
-            "MAX_REASONABLE_EDGE=0.32",
+            "MAX_REASONABLE_EDGE=0.40",
+            "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
+            "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
             "SCORE_GATE_THRESHOLD=0.52",
             "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.30",
             "MAX_MARKETS_PER_CYCLE=3",
             "MAX_TRADES_PER_CYCLE=2",
             "MAX_TRADES_PER_DAY=6",
+            "KALSHI_MVE_FILTER=exclude",
+            "KALSHI_ELIGIBLE_FLOOR=100",
+            "KALSHI_FETCH_TOPUP_ENABLED=false",
         }
         for expected_line in expected_lines:
             self.assertIn(expected_line, env_example)
@@ -341,11 +346,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.60)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.08)
-        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.60)
+        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.55)
         self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 3)
         self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 1)
-        self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 0)
-        self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 0)
+        self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 2)
+        self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
@@ -358,7 +363,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.ORDER_SUBMISSION_MAX_PRICE, 0.97)
         self.assertEqual(settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(settings.MAX_TRADEABLE_IMPLIED_PRICE, 0.95)
-        self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 10)
+        self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 50)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
@@ -375,8 +380,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
         self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.25)
         self.assertEqual(settings.PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY, 0.15)
-        self.assertIn("generic", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
-        self.assertIn("crypto", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES, ())
         self.assertEqual(settings.GROK_PROXY_CONFIDENCE_CAP, 0.78)
         self.assertEqual(settings.GROK_LOW_INFO_CONFIDENCE_CAP, 0.70)
         self.assertEqual(settings.MAX_GLOBAL_CONFIDENCE, 0.82)
@@ -384,7 +388,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
         self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.72)
         self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.65)
-        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.32)
+        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.40)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
         self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)
@@ -417,16 +421,12 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.EXTENDED_RESEARCH_AFTER_STREAK, 2)
         self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 5)
         self.assertEqual(settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST, 2.0)
-        self.assertTrue(settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED)
-        self.assertEqual(settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY, 0.06)
         self.assertEqual(settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY, 0.04)
         self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
         self.assertTrue(settings.RESEARCH_QUEUE_PRIORITY_ENABLED)
-        self.assertIn("KXPERSONMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXSURVIVORMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXSNLMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXLASTWORDCOUNT-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXVANCEMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertEqual(settings.MARKET_TICKER_BLOCKLIST_PREFIXES, ())
+        self.assertFalse(settings.SKIP_WEATHER_BIN_MARKETS)
+        self.assertFalse(settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED)
         self.assertIn("billboard.com", settings.MUSIC_ALLOWED_DOMAINS)
         self.assertIn("SpotifyCharts", settings.MUSIC_ALLOWED_X_HANDLES)
 
@@ -441,7 +441,7 @@ class TestConfig(unittest.TestCase):
     def test_profit_leak_fix_defaults(self) -> None:
         """Verify the profit-leak-fix defaults match .env.example values."""
         defaults = config.Settings
-        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.40)
+        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.50)
         self.assertEqual(defaults.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
         self.assertEqual(defaults.MAX_REANALYSES_PER_MARKET_PER_DAY, 2)
         self.assertEqual(defaults.MAX_LIFETIME_ANALYSES_PER_MARKET, 8)
@@ -450,6 +450,59 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(defaults.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES, 20)
         self.assertTrue(defaults.XAI_QUOTA_BREAKER_ENABLED)
         self.assertEqual(defaults.XAI_QUOTA_PAUSE_MINUTES, 30)
+
+    def test_cycle1_review_defaults(self) -> None:
+        """Defaults introduced or tuned by the cycle 1 log review."""
+        defaults = config.Settings
+        self.assertEqual(defaults.MAX_REASONABLE_EDGE, 0.40)
+        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.50)
+        self.assertEqual(defaults.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.95)
+        self.assertEqual(defaults.GROK_STREAM_TIMEOUT_SECONDS_WEATHER, 120)
+
+    def test_high_quality_settled_evidence_min_eq_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ": "0.90",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.90)
+
+    def test_grok_stream_timeout_seconds_weather_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "GROK_STREAM_TIMEOUT_SECONDS_WEATHER": "150",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS_WEATHER, 150)
+
+    def test_cycle2_fetch_strategy_defaults(self) -> None:
+        """Defaults introduced by the cycle 2 fetch-strategy review."""
+        defaults = config.Settings
+        self.assertEqual(defaults.KALSHI_MVE_FILTER, "exclude")
+        self.assertEqual(defaults.KALSHI_ELIGIBLE_FLOOR, 100)
+        self.assertFalse(defaults.KALSHI_FETCH_TOPUP_ENABLED)
+
+    def test_kalshi_mve_filter_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "KALSHI_MVE_FILTER": "only",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.KALSHI_MVE_FILTER, "only")
+
+    def test_kalshi_eligible_floor_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "KALSHI_ELIGIBLE_FLOOR": "250",
+            "KALSHI_FETCH_TOPUP_ENABLED": "true",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.KALSHI_ELIGIBLE_FLOOR, 250)
+        self.assertTrue(settings.KALSHI_FETCH_TOPUP_ENABLED)
 
     def test_quota_breaker_env_override(self) -> None:
         env = {
