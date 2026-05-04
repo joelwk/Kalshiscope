@@ -4665,6 +4665,7 @@ def _analyze_market_candidate(
     refinement = RefinementStrategy(
         market=market,
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
+        skip_borderline_families=settings.REFINEMENT_SKIP_BORDERLINE_FAMILIES,
     )
     was_refined = False
     refinement_skipped_by_flip_precheck = False

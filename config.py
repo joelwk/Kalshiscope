@@ -343,6 +343,17 @@ class Settings:
     REANALYSIS_COOLDOWN_HOURS: int = 6
     URGENT_REANALYSIS_DAYS_BEFORE_CLOSE: int = 1
     URGENT_REANALYSIS_COOLDOWN_HOURS: int = 1
+    # Families for which the borderline-trade-confidence refinement trigger
+    # should be skipped. Refinement currently spends ~1.5-2 minutes on a
+    # second Grok pass for any should_trade=True with confidence in
+    # [0.60, 0.78]; for fast-moving markets (sports player props, F5, RFI)
+    # the price moves enough during refinement to drop edge below MIN_EDGE,
+    # killing the trade. Sports markets already have well-defined statistical
+    # priors so the deep pass adds little new information beyond fresher
+    # market price. Other refinement triggers (low_evidence_quality,
+    # missing_implied_probability, high_conf_small_edge, legacy_borderline_urgent)
+    # still fire for these families. Empty tuple disables this behavior.
+    REFINEMENT_SKIP_BORDERLINE_FAMILIES: tuple[str, ...] = ("sports",)
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 2
     MAX_MARKETS_PER_CYCLE: int = 3
@@ -1066,6 +1077,10 @@ def load_settings() -> Settings:
         URGENT_REANALYSIS_COOLDOWN_HOURS=_read_env_int(
             "URGENT_REANALYSIS_COOLDOWN_HOURS",
             Settings.URGENT_REANALYSIS_COOLDOWN_HOURS,
+        ),
+        REFINEMENT_SKIP_BORDERLINE_FAMILIES=_read_env_csv(
+            "REFINEMENT_SKIP_BORDERLINE_FAMILIES",
+            Settings.REFINEMENT_SKIP_BORDERLINE_FAMILIES,
         ),
         PARALLEL_ANALYSIS_ENABLED=_read_env_bool(
             "PARALLEL_ANALYSIS_ENABLED", Settings.PARALLEL_ANALYSIS_ENABLED

@@ -140,6 +140,24 @@ _MUSIC_KEYWORDS = (
 _LONG_HORIZON_HINTS = ("election", "presidential", "winner", "nominee")
 _SPEECH_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
 
+# Sports-league ticker prefixes used by Kalshi (case-insensitive). Required
+# because keyword-based detection on natural-language questions misses
+# markets like KXMLBTB-26MAY031605CLEATH-CLEJRAMREZ11-2 ("Will Jose Ramirez
+# get 2+ total bases?") whose question text never names "MLB". The
+# alphanumeric ticker also defeats `\bmlb\b` regex matching because the
+# leading "KX" prefix prevents a word boundary before "MLB". Without this
+# pattern, settled MLB outcomes were classified as "generic" family,
+# inheriting the negative generic-family historical penalty and mis-
+# triggering the confidence calibration shrink against the wrong bucket.
+# Word-boundary anchored: `\bKX...` matches when the ticker is preceded by
+# whitespace or beginning-of-string. `_market_text` concatenates
+# `f"{category} {question} {market_id}"`, so the ticker is at end-of-text
+# preceded by a space \u2014 the boundary fires correctly.
+_SPORTS_TICKER_PATTERN = re.compile(
+    r"\bKX(?:MLB|NBA|NFL|NHL|NCAA|EPL|UCL|UEFA|MLS|WNBA|AFL|ATP|WTA|UFC|MMA|BOX|F1)",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ResearchProfile:
@@ -224,7 +242,19 @@ def family_from_text(text: str) -> str:
     Used by live trading via `market_family(market)` and by historical analytics
     in `analytics.py` and `market_state.py` so every consumer shares the same
     keyword-driven taxonomy without per-product ticker hardcoding.
+
+    Detection precedence:
+    1. Sports-league ticker prefixes (KXMLB, KXNBA, KXNFL, ...) take the
+       highest priority — these markets often have player-prop questions
+       with no league name in the natural-language text, and the leading
+       "KX" prefix defeats `\\bmlb\\b`-style regex on the ticker. This was
+       a real bug that misrouted settled MLB markets to "generic" family
+       and triggered the wrong historical-PnL penalty bucket.
+    2. Otherwise fall back to keyword matching across the concatenated
+       category + question + ticker text.
     """
+    if _SPORTS_TICKER_PATTERN.search(text or ""):
+        return "sports"
     normalized = (text or "").lower()
     if _has_keyword_match(normalized, _SPORTS_KEYWORDS) or _has_keyword_match(
         normalized, _ESPORTS_KEYWORDS

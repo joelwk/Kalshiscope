@@ -18,6 +18,111 @@ def test_market_family_sports() -> None:
     assert market_family(market) == "sports"
 
 
+def test_market_family_mlb_player_prop_via_ticker_prefix() -> None:
+    """Regression: KXMLBTB-* (player-prop questions) must classify as sports
+    even when the natural-language question never names "MLB". The 7-cycle
+    follow-up audit found a settled-game trade (KXMLBTB-26MAY031605CLEATH-
+    CLEJRAMREZ11-2) was misrouted to "generic" and skipped because the
+    keyword regex `\\bmlb\\b` could not match the leading "KXMLB" without a
+    word boundary. Ticker-prefix detection in family_from_text now anchors
+    on `\\bKXMLB`."""
+    market = Market(
+        id="KXMLBTB-26MAY031605CLEATH-CLEJRAMREZ11-2",
+        question="Jose Ramirez: 2+ total bases?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_mlb_first_5_innings_via_ticker_prefix() -> None:
+    """KXMLBF5-* (cycle-14 success fixture) classifies as sports."""
+    market = Market(
+        id="KXMLBF5-26MAY031920TEXDET-DET",
+        question="Will Detroit win first 5 innings vs Texas?",
+        category="sports",
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_nba_player_prop_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNBA-PLAYER-PROP-XYZ",
+        question="Will player score 20+ points?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_nfl_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNFL-26WK1-PHI-DAL",
+        question="Will the home team win?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_nhl_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNHL-26FEB14-RANGERS-BRUINS",
+        question="Will the road team win?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_ncaa_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNCAAB-MARMAD2026-WIN",
+        question="Will the favored team advance?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_ticker_prefix_takes_precedence_over_keywords() -> None:
+    """Even if the question text contains a non-sports keyword, the sports
+    ticker prefix wins. Guards against accidental misclassification when
+    a sports market question references e.g. weather conditions."""
+    market = Market(
+        id="KXMLB-26AUG-RAINOUT",
+        question="Will the game be a rain-out (weather affecting play)?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_no_false_positive_on_non_sports_kx_ticker() -> None:
+    """Tickers like KXBTC, KXHIGHCHI, KXLOWTLAX must not be miscategorized
+    as sports just because they share the KX prefix. This guards against
+    the sports-ticker pattern accidentally matching everything starting
+    with KX. Family-specific classification (crypto/weather/etc) is
+    asserted in the dedicated tests above; here we only verify that the
+    sports-ticker pattern doesn't fire on non-sports prefixes."""
+    crypto = Market(
+        id="KXBTCD-26MAY0317-T78649.99",
+        question="Bitcoin range bin?",
+        category="crypto",
+    )
+    weather_temp = Market(
+        id="KXHIGHCHI-26MAY03-T70",
+        question="Will the high temperature in Chicago be above 70F?",
+        category=None,
+    )
+    music = Market(
+        id="KXBBCHARTPOSITIONSONG-26MAY09SOE-3",
+        question="Will Ordinary be on the Billboard Hot 100?",
+        category=None,
+    )
+    assert market_family(crypto) != "sports"
+    assert market_family(weather_temp) != "sports"
+    assert market_family(music) != "sports"
+    # And the keyword-based detection still works for these too.
+    assert market_family(crypto) == "crypto"
+    assert market_family(weather_temp) == "weather"
+    assert market_family(music) == "music"
+
+
 def test_market_family_olympics_hockey_question() -> None:
     market = Market(
         id="1b",
