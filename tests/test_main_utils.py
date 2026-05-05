@@ -1965,6 +1965,123 @@ class TestMainUtils(unittest.TestCase):
         assert components["historical_gate_penalty"] == 0.12
         assert components["risk_adjusted_score"] == 0.73  # 0.85 - 0.12
 
+    def test_cap_analysis_candidates_limits_sports_candidates(self) -> None:
+        """Cycle 4 recovery: sports props were monopolizing all analysis
+        slots even when other families had eligible candidates. The sports
+        cap must reserve room for non-sports markets so the cycle still
+        evaluates direct-evidence opportunities elsewhere."""
+        candidates = [
+            {
+                "market": Market(
+                    id="KXMLBHRR-1",
+                    question="Will the Yankees hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.90,
+            },
+            {
+                "market": Market(
+                    id="KXMLBHRR-2",
+                    question="Will the Red Sox hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.88,
+            },
+            {
+                "market": Market(
+                    id="KXMLBHRR-3",
+                    question="Will the Dodgers hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.86,
+            },
+            {
+                "market": Market(
+                    id="KXMLBHRR-4",
+                    question="Will the Braves hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.84,
+            },
+            {
+                "market": Market(
+                    id="KXBTCD-T70K",
+                    question="Will Bitcoin close above $70k?",
+                    category="crypto",
+                ),
+                "pre_analysis_score": 0.70,
+            },
+            {
+                "market": Market(
+                    id="KXHIGHCHI-T50",
+                    question="Will Chicago high be below 50F?",
+                    category="weather",
+                ),
+                "pre_analysis_score": 0.65,
+            },
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=4,
+            max_sports_candidates_per_cycle=2,
+            max_weather_candidates_per_cycle=1,
+            max_crypto_candidates_per_cycle=1,
+        )
+        capped_ids = [item["market"].id for item in capped]
+        sports_ids = [mid for mid in capped_ids if mid.startswith("KXMLBHRR-")]
+        self.assertEqual(len(sports_ids), 2)
+        self.assertIn("KXBTCD-T70K", capped_ids)
+        self.assertIn("KXHIGHCHI-T50", capped_ids)
+
+    def test_cap_analysis_candidates_sports_cap_none_keeps_legacy_behavior(self) -> None:
+        """Backward-compat: with max_sports_candidates_per_cycle=None the
+        previous behavior (no sports-specific cap) must remain so existing
+        operators are not surprised by silent diversification."""
+        candidates = [
+            {
+                "market": Market(
+                    id="KXMLB-1",
+                    question="Will Yankees win?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.90,
+            },
+            {
+                "market": Market(
+                    id="KXMLB-2",
+                    question="Will Red Sox win?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.85,
+            },
+            {
+                "market": Market(
+                    id="KXMLB-3",
+                    question="Will Dodgers win?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.80,
+            },
+            {
+                "market": Market(
+                    id="KXBTCD-T70K",
+                    question="Will Bitcoin close above $70k?",
+                    category="crypto",
+                ),
+                "pre_analysis_score": 0.50,
+            },
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=3,
+            max_sports_candidates_per_cycle=None,
+        )
+        capped_ids = [item["market"].id for item in capped]
+        self.assertEqual(
+            len([mid for mid in capped_ids if mid.startswith("KXMLB-")]),
+            3,
+        )
+
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {
             "sells": [

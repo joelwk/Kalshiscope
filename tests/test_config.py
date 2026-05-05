@@ -587,6 +587,41 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 24.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.65)
 
+    def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
+        """Cycle 4 recovery: a growing research queue (127+ entries) needs
+        more drain throughput per cycle. Verify the per-cycle setting can
+        be raised without other drain knobs silently changing."""
+        env = {
+            **self._required_env(),
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE": "2",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 2)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+
+    def test_max_sports_candidates_per_cycle_default_unset(self) -> None:
+        """Cycle 4 recovery: the new sports cap defaults to 0 (no cap) so
+        existing deployments retain prior behavior."""
+        env = self._required_env()
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.MAX_SPORTS_CANDIDATES_PER_CYCLE, 0)
+
+    def test_max_sports_candidates_per_cycle_env_override(self) -> None:
+        """Operators can opt into family diversification by setting the cap
+        to a positive integer."""
+        env = {
+            **self._required_env(),
+            "MAX_SPORTS_CANDIDATES_PER_CYCLE": "3",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.MAX_SPORTS_CANDIDATES_PER_CYCLE, 3)
+
     def test_daily_drawdown_preflight_setting_loads(self) -> None:
         env = {**self._required_env(), "DAILY_DRAWDOWN_PREFLIGHT_ENABLED": "false"}
         with patch.dict(os.environ, env, clear=True):

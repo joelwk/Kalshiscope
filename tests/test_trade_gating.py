@@ -988,3 +988,106 @@ def test_strong_proxy_evidence_rejects_non_whitelisted_source() -> None:
     )
     assert allowed is False
     assert override_path == "none"
+
+
+# --- Cycle 4 recovery: confidence override floor below MIN_CONFIDENCE ---
+#
+# Cycle 4 receipts showed should_trade=True candidates blocked at
+# `confidence_below_min` because runtime CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE
+# was set equal to MIN_CONFIDENCE, defeating the override path. These cases
+# pin the intended behavior: when the override floor is below the hard gate
+# AND the edge/evidence-quality thresholds are met, the candidate must be
+# allowed past the confidence gate.
+
+
+def test_confidence_override_below_min_confidence_allows_strong_edge_candidate() -> None:
+    """Override floor 0.55 < MIN_CONFIDENCE 0.62: a 0.58-confidence
+    candidate with strong edge and evidence must clear via edge_default."""
+    settings = Settings(
+        MIN_CONFIDENCE=0.62,
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.58,
+        bet_size_pct=0.3,
+        reasoning="High-quality edge with sub-MIN_CONFIDENCE rating",
+        evidence_quality=0.80,
+        edge_source="computed",
+        edge_external=0.15,
+    )
+    allowed, floor, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.15,
+    )
+    assert allowed is True
+    assert floor == 0.55
+    assert override_path == "edge_default"
+    assert decision.confidence < settings.MIN_CONFIDENCE
+    assert decision.confidence >= floor
+
+
+def test_confidence_override_floor_equal_to_min_confidence_blocks_sub_threshold() -> None:
+    """Regression for the cycle 4 misconfiguration: when the override
+    floor matches MIN_CONFIDENCE the override cannot rescue any candidate
+    below the hard gate, even with strong edge and evidence."""
+    settings = Settings(
+        MIN_CONFIDENCE=0.62,
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.62,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.585,
+        bet_size_pct=0.3,
+        reasoning="Cycle 4-style sub-floor candidate",
+        evidence_quality=0.80,
+        edge_source="computed",
+        edge_external=0.20,
+    )
+    allowed, floor, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+    )
+    assert allowed is False
+    assert floor == 0.62
+    assert override_path == "none"
+
+
+def test_confidence_override_below_min_confidence_still_requires_floor() -> None:
+    """Even when the override floor sits below MIN_CONFIDENCE, candidates
+    below the floor remain blocked: the override path must not collapse
+    safety to zero."""
+    settings = Settings(
+        MIN_CONFIDENCE=0.62,
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.10,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.70,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.50,
+        bet_size_pct=0.3,
+        reasoning="Sub-floor confidence even with strong edge",
+        evidence_quality=0.85,
+        edge_source="computed",
+        edge_external=0.20,
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+    )
+    assert allowed is False
+    assert override_path == "none"

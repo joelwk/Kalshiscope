@@ -369,6 +369,12 @@ class Settings:
     # MAX_MARKETS_PER_CYCLE.
     MAX_SPEECH_CANDIDATES_PER_CYCLE: int = 2
     MAX_MUSIC_CANDIDATES_PER_CYCLE: int = 2
+    # Cycle 4 review: sports props consumed every analysis slot even when
+    # other families had eligible candidates, leaving direct-evidence
+    # opportunities (weather, music, generic) un-analyzed. A positive
+    # value caps sports candidates per cycle to reserve room for other
+    # families. 0 (default) preserves legacy behavior (no sports-specific cap).
+    MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
     MAX_TRADES_PER_CYCLE: int = 2
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
@@ -1106,6 +1112,10 @@ def load_settings() -> Settings:
         MAX_MUSIC_CANDIDATES_PER_CYCLE=_read_env_int(
             "MAX_MUSIC_CANDIDATES_PER_CYCLE",
             Settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
+        ),
+        MAX_SPORTS_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_SPORTS_CANDIDATES_PER_CYCLE",
+            Settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
         ),
         MAX_TRADES_PER_CYCLE=_read_env_int(
             "MAX_TRADES_PER_CYCLE",

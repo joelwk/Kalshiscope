@@ -154,11 +154,14 @@ def classify_participation(
     decision_primary_source_whitelisted: bool = False,
     decision_evidence_quality: float | None = None,
     evidence_quality_threshold: float | None = None,
+    confidence_value: float | None = None,
+    confidence_threshold: float | None = None,
     edge_value: float | None = None,
     edge_reasonable_max: float = 0.35,
     definitive_edge_reasonable_max: float = 0.65,
     score_gate_blocked: bool = False,
     score_gate_reason: str | None = None,
+    downstream_gate_reason: str | None = None,
     probe_trade_enabled: bool = False,
     proven_winning_families: frozenset[str] | None = None,
 ) -> ParticipationDecision:
@@ -333,6 +336,30 @@ def classify_participation(
                 },
             )
 
+        if (
+            confidence_value is not None
+            and confidence_threshold is not None
+            and confidence_value < confidence_threshold
+            and not is_definitive
+        ):
+            return ParticipationDecision(
+                tier=ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
+                primary_reason="confidence_below_min",
+                why_not_execution_eligible=(
+                    f"confidence={confidence_value:.2f} "
+                    f"< threshold={confidence_threshold:.2f}"
+                ),
+                what_to_learn_next=(
+                    "Need stronger direct evidence or a valid configured "
+                    "confidence override before execution."
+                ),
+                tier_metadata={
+                    **metadata,
+                    "blocked_conviction": True,
+                    "skip_due_to": "weak_edge",
+                },
+            )
+
         effective_edge_max = (
             definitive_edge_reasonable_max if is_definitive else edge_reasonable_max
         )
@@ -364,6 +391,71 @@ def classify_participation(
                     "skip_due_to": score_gate_reason or "score_gate",
                 },
             )
+
+        if downstream_gate_reason:
+            normalized_gate_reason = str(downstream_gate_reason).strip().lower()
+            risk_cap_reasons = {
+                "balance_exhausted_skip",
+                "daily_drawdown_limit",
+                "daily_limit_reached",
+                "event_side_conflict_blocked",
+                "insufficient_balance",
+                "position_adjustment_blocked",
+                "position_saturated",
+            }
+            transient_price_reasons = {
+                "entry_price_too_low",
+                "order_price_outside_submission_band",
+                "refreshed_edge_gate_blocked",
+                "uniform_implied_probability",
+            }
+            terminal_reasons = {
+                "market_closed",
+                "market_closed_during_cycle",
+                "market_unavailable",
+                "outcome_mismatch_blocked",
+                "ambiguous_resolution",
+            }
+            if normalized_gate_reason in risk_cap_reasons:
+                return ParticipationDecision(
+                    tier=ParticipationTier.MONITOR_ONLY,
+                    primary_reason=normalized_gate_reason,
+                    why_not_execution_eligible=(
+                        "Transient risk, balance, position, or daily-limit gate blocked execution"
+                    ),
+                    what_to_learn_next="Re-evaluate after the risk cap or position constraint clears.",
+                    tier_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "risk_cap",
+                    },
+                )
+            if normalized_gate_reason in terminal_reasons:
+                return ParticipationDecision(
+                    tier=ParticipationTier.TERMINAL_REJECT,
+                    primary_reason=normalized_gate_reason,
+                    why_not_execution_eligible="Market is not currently tradable for this outcome",
+                    what_to_learn_next="Do not re-analyze unless market status or resolution metadata changes.",
+                    tier_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "ambiguous_resolution",
+                    },
+                )
+            if normalized_gate_reason in transient_price_reasons:
+                return ParticipationDecision(
+                    tier=ParticipationTier.MONITOR_ONLY,
+                    primary_reason=normalized_gate_reason,
+                    why_not_execution_eligible=(
+                        "Execution-quality market judgment was blocked by current price/orderbook state"
+                    ),
+                    what_to_learn_next="Refresh orderbook and entry price before reconsidering execution.",
+                    tier_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "stale_evidence",
+                    },
+                )
 
         return ParticipationDecision(
             tier=ParticipationTier.EXECUTION_ELIGIBLE,

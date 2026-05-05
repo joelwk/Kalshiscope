@@ -2261,6 +2261,7 @@ def _log_settings_summary(settings) -> None:
             "max_crypto_candidates_per_cycle": settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE,
             "max_speech_candidates_per_cycle": settings.MAX_SPEECH_CANDIDATES_PER_CYCLE,
             "max_music_candidates_per_cycle": settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
+            "max_sports_candidates_per_cycle": settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
             "weather_min_evidence_quality": settings.WEATHER_MIN_EVIDENCE_QUALITY,
             "weather_fallback_edge_min_edge": settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
             "kalshi_server_side_filters_enabled": settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
@@ -3116,6 +3117,253 @@ def _build_execution_audit(
             payload[canonical_key] = payload[alias_key]
         payload.pop(alias_key, None)
     return payload
+
+
+def _participation_decision_for_audit(
+    *,
+    audit: dict[str, Any],
+    decision: dict[str, Any] | None = None,
+    settings: Settings | None = None,
+) -> ParticipationDecision | None:
+    """Infer canonical participation fields for receipts that did not set them.
+
+    This is audit-only. It does not change routing, order submission, sizing, or
+    any risk gate; it only normalizes downstream skip/research/order receipts so
+    performance review can compare gates with the same participation vocabulary.
+    """
+    audit_payload = audit or {}
+    decision_payload = decision or {}
+    final_action = str(audit_payload.get("final_action") or "").strip().lower()
+    final_reason = str(audit_payload.get("final_reason") or "").strip()
+    normalized_reason = final_reason.lower()
+    if not final_action and not normalized_reason:
+        return None
+
+    if final_action in {"order_attempt", "order_submitted", "dry_run"}:
+        return ParticipationDecision(
+            tier=ParticipationTier.EXECUTION_ELIGIBLE,
+            primary_reason=final_reason or "all_gates_passed",
+            tier_metadata={"skip_due_to": None},
+        )
+
+    if "timeout" in normalized_reason:
+        timeout_streak = int(audit_payload.get("timeout_streak") or 1)
+        if final_action == "monitor_only":
+            timeout_streak = max(timeout_streak, 2)
+        return classify_participation(
+            timeout_state=TimeoutState(
+                timed_out=True,
+                retriable=True,
+                timeout_streak=timeout_streak,
+                search_profile=str(audit_payload.get("search_profile") or "generic"),
+            )
+        )
+
+    if "analysis_failure" in normalized_reason:
+        return classify_participation(
+            analysis_failed=True,
+            analysis_error_retriable="retriable" in normalized_reason,
+        )
+
+    if normalized_reason.startswith("pre_analysis_"):
+        historical_gate = None
+        if (
+            audit_payload.get("historical_gate_prefix_sample_size") is not None
+            or audit_payload.get("historical_gate_sample_size") is not None
+        ):
+            sample_size_raw = (
+                audit_payload.get("historical_gate_prefix_sample_size")
+                if audit_payload.get("historical_gate_prefix_sample_size") is not None
+                else audit_payload.get("historical_gate_sample_size")
+            )
+            sample_size = int(_coerce_float(sample_size_raw) or 0)
+            historical_gate = HistoricalGateResult(
+                allowed=bool(audit_payload.get("historical_gate_allowed", True)),
+                reason=audit_payload.get("historical_gate_reason"),
+                metrics=audit_payload,
+                sample_size=sample_size,
+                wilson_win_rate_lower_bound=_coerce_float(
+                    audit_payload.get("historical_gate_wilson_lb")
+                ),
+                shrunk_pnl_per_trade=_coerce_float(
+                    audit_payload.get("historical_gate_shrunk_pnl_per_trade")
+                ),
+            )
+        return classify_participation(
+            historical_gate=historical_gate,
+            pre_analysis_rejection_reason=final_reason,
+            pre_analysis_metadata=audit_payload,
+        )
+
+    if normalized_reason in {"abstain_low_evidence"}:
+        return classify_participation(
+            decision_abstain=True,
+            pre_analysis_metadata=audit_payload,
+        )
+    if normalized_reason in {"no_trade_recommended"}:
+        return classify_participation(
+            decision_should_trade=False,
+            pre_analysis_metadata=audit_payload,
+        )
+
+    should_trade_raw = decision_payload.get("should_trade")
+    should_trade = (
+        bool(should_trade_raw)
+        if isinstance(should_trade_raw, bool)
+        else str(should_trade_raw).strip().lower() in {"1", "true", "yes"}
+    )
+    if should_trade:
+        evidence_quality = _coerce_float(
+            decision_payload.get("evidence_quality", audit_payload.get("evidence_quality"))
+        )
+        confidence = _coerce_float(decision_payload.get("confidence"))
+        min_evidence_quality = _coerce_float(
+            audit_payload.get("min_evidence_quality")
+        )
+        if min_evidence_quality is None and settings is not None:
+            min_evidence_quality = float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE)
+        min_confidence = _coerce_float(
+            audit_payload.get("counterfactual_required_confidence")
+        )
+        if min_confidence is None and settings is not None:
+            min_confidence = float(settings.MIN_CONFIDENCE)
+        edge_value = _coerce_float(
+            audit_payload.get(
+                "gate_edge_actual",
+                audit_payload.get("edge_market", audit_payload.get("score_edge_market")),
+            )
+        )
+        primary_source_url = str(
+            decision_payload.get("primary_source_url")
+            or audit_payload.get("primary_source_url")
+            or ""
+        ).strip()
+        primary_source_whitelisted = (
+            _is_whitelisted_primary_source_url(primary_source_url, settings)
+            if settings is not None and primary_source_url
+            else False
+        )
+        score_gate_reason = (
+            normalized_reason
+            if "score_gate" in normalized_reason
+            else None
+        )
+        downstream_gate_reason = None
+        if (
+            normalized_reason
+            and normalized_reason
+            not in {
+                "confidence_below_min",
+                "evidence_quality_below_min",
+                "weather_evidence_quality_below_min",
+                "edge_gate_blocked",
+                "edge_above_reasonable_max",
+            }
+            and score_gate_reason is None
+        ):
+            downstream_gate_reason = normalized_reason
+        return classify_participation(
+            pre_analysis_metadata=audit_payload,
+            decision_should_trade=True,
+            decision_abstain=bool(decision_payload.get("abstain")),
+            decision_definitive_outcome=bool(
+                decision_payload.get("definitive_outcome_detected")
+            ),
+            decision_evidence_basis=str(
+                decision_payload.get("evidence_basis")
+                or audit_payload.get("evidence_basis_class")
+                or ""
+            ),
+            decision_edge_source=str(
+                decision_payload.get("edge_source")
+                or audit_payload.get("edge_source")
+                or ""
+            ),
+            decision_primary_source_whitelisted=primary_source_whitelisted,
+            decision_evidence_quality=evidence_quality,
+            evidence_quality_threshold=min_evidence_quality,
+            confidence_value=confidence,
+            confidence_threshold=(
+                min_confidence
+                if normalized_reason == "confidence_below_min"
+                else None
+            ),
+            edge_value=(
+                edge_value
+                if normalized_reason in {"edge_gate_blocked", "edge_above_reasonable_max"}
+                else None
+            ),
+            edge_reasonable_max=(
+                float(settings.MAX_REASONABLE_EDGE)
+                if settings is not None
+                else 0.35
+            ),
+            definitive_edge_reasonable_max=(
+                float(settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX)
+                if settings is not None
+                else 0.65
+            ),
+            score_gate_blocked=score_gate_reason is not None,
+            score_gate_reason=score_gate_reason,
+            downstream_gate_reason=downstream_gate_reason,
+        )
+
+    if final_action in {"skip", "research_queued", "monitor_only"}:
+        tier = (
+            ParticipationTier.MONITOR_ONLY
+            if final_action == "monitor_only"
+            else ParticipationTier.SKIP_FOR_NOW_WITH_REASON
+        )
+        return ParticipationDecision(
+            tier=tier,
+            primary_reason=final_reason or final_action,
+            why_not_execution_eligible=f"Final action {final_action}: {final_reason}",
+            what_to_learn_next="Review final gate reason and market outcome before promoting.",
+            tier_metadata={
+                **audit_payload,
+                "skip_due_to": _skip_due_to_for_reason(final_reason, audit_payload),
+            },
+        )
+
+    return None
+
+
+def _apply_participation_audit_fields(
+    audit: dict[str, Any],
+    *,
+    decision: dict[str, Any] | None = None,
+    settings: Settings | None = None,
+) -> bool:
+    """Stamp missing canonical participation fields onto an audit payload."""
+    if not isinstance(audit, dict):
+        return False
+    had_tier = bool(audit.get("participation_tier"))
+    participation_decision = _participation_decision_for_audit(
+        audit=audit,
+        decision=decision,
+        settings=settings,
+    )
+    if participation_decision is None:
+        return False
+    _, _, metadata = participation_decision.to_metadata_tuple()
+    for key, value in metadata.items():
+        if value is not None:
+            audit.setdefault(key, value)
+    audit.setdefault("participation_tier", str(participation_decision.tier))
+    audit.setdefault("participation_decision", participation_decision.primary_reason)
+    audit.setdefault(
+        "participation_terminal_reject",
+        participation_decision.tier == ParticipationTier.TERMINAL_REJECT,
+    )
+    if (
+        audit.get("final_action") in {"skip", "research_queued", "monitor_only"}
+        and "skip_due_to" not in audit
+    ):
+        audit["skip_due_to"] = _skip_due_to_for_reason(
+            audit.get("final_reason"),
+            audit,
+        )
+    return not had_tier and bool(audit.get("participation_tier"))
 
 
 # Audit/decision fields stamped on synthetic research-queue / cap / non-actionable
@@ -4375,6 +4623,7 @@ def _cap_analysis_candidates(
     max_crypto_candidates_per_cycle: int | None = None,
     max_speech_candidates_per_cycle: int | None = None,
     max_music_candidates_per_cycle: int | None = None,
+    max_sports_candidates_per_cycle: int | None = None,
     pre_scores: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply a hard cap using global risk-adjusted rank, then family caps."""
@@ -4480,6 +4729,7 @@ def _cap_analysis_candidates(
     selected_crypto_count = 0
     selected_speech_count = 0
     selected_music_count = 0
+    selected_sports_count = 0
     for _, candidate in sorted(ranked_candidates, key=lambda item: item[0]):
         if len(selected) >= max_markets_per_cycle:
             break
@@ -4511,6 +4761,12 @@ def _cap_analysis_candidates(
             and selected_music_count >= max_music_candidates_per_cycle
         ):
             continue
+        if (
+            family == "sports"
+            and max_sports_candidates_per_cycle is not None
+            and selected_sports_count >= max_sports_candidates_per_cycle
+        ):
+            continue
         selected.append(candidate)
         if family == "weather":
             selected_weather_count += 1
@@ -4520,6 +4776,8 @@ def _cap_analysis_candidates(
             selected_speech_count += 1
         elif family == "music":
             selected_music_count += 1
+        elif family == "sports":
+            selected_sports_count += 1
     if len(selected) < max_markets_per_cycle and invalid_candidates:
         selected.extend(invalid_candidates[: max_markets_per_cycle - len(selected)])
     return selected
@@ -4942,6 +5200,7 @@ def main(max_cycles: int | None = None) -> None:
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
+    zero_action_family_probe_counts: dict[tuple[str, str], int] = {}
 
     while True:
         cycle_count += 1
@@ -5071,6 +5330,7 @@ def main(max_cycles: int | None = None) -> None:
                 current_trade_day = cycle_trade_day
                 daily_trade_count = 0
                 daily_start_balance = cycle_bankroll
+                zero_action_family_probe_counts.clear()
             elif daily_start_balance is None and cycle_bankroll is not None:
                 daily_start_balance = cycle_bankroll
             if (
@@ -5222,6 +5482,7 @@ def main(max_cycles: int | None = None) -> None:
             # to grep individual trade audits.
             cycle_pre_score_samples: list[float] = []
             cycle_soft_research_threshold_gap_samples: list[float] = []
+            deprioritized_market_samples: list[dict[str, Any]] = []
             # Effective research band (5e): widens linearly under sustained
             # zero-execution drought to capture more markets for learning. Only
             # affects soft-research routing; the deep-analysis MIN_SCORE itself
@@ -5352,6 +5613,24 @@ def main(max_cycles: int | None = None) -> None:
                     ):
                         audit_payload[_source_audit_key] = normalized_decision.get(
                             _source_audit_key
+                        )
+                if settings.PARTICIPATION_TIER_AUDIT_ENABLED:
+                    audit_payload["participation_tier_audit_enabled"] = True
+                    audit_payload["participation_tier_gating_enabled"] = (
+                        settings.PARTICIPATION_TIER_GATING_ENABLED
+                    )
+                    participation_tier_inferred = _apply_participation_audit_fields(
+                        audit_payload,
+                        decision=normalized_decision,
+                        settings=settings,
+                    )
+                    inferred_tier = str(
+                        audit_payload.get("participation_tier") or ""
+                    ).strip()
+                    if participation_tier_inferred and inferred_tier:
+                        _record_rejection_reason(
+                            participation_tier_breakdown,
+                            inferred_tier,
                         )
                 if market_id in extended_research_market_ids:
                     audit_payload["extended_research_used"] = True
@@ -5728,7 +6007,6 @@ def main(max_cycles: int | None = None) -> None:
                         exc,
                         data={"error": str(exc)},
                     )
-                historical_family_stats_recent = {}
 
             recent_research_entries: dict[str, dict[str, Any]] = {}
             if settings.RESEARCH_QUEUE_ENABLED and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
@@ -6211,6 +6489,44 @@ def main(max_cycles: int | None = None) -> None:
                         historical_gate_metrics=historical_gate_metrics,
                     )
                 )
+                zero_action_probe_metadata: dict[str, Any] = {}
+                if (
+                    pre_analysis_demoted
+                    and pre_analysis_demotion_reason == "pre_analysis_zero_action_family"
+                    and settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_FORCE_PROBE_PER_DAY > 0
+                    and not traded_before
+                ):
+                    probe_day_key = current_trade_day.isoformat()
+                    probe_key = (probe_day_key, family_name)
+                    probes_used = zero_action_family_probe_counts.get(probe_key, 0)
+                    probe_quota = max(
+                        0,
+                        int(settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_FORCE_PROBE_PER_DAY),
+                    )
+                    if probes_used < probe_quota:
+                        zero_action_family_probe_counts[probe_key] = probes_used + 1
+                        pre_analysis_demoted = False
+                        zero_action_probe_metadata = {
+                            "zero_action_family_probe": True,
+                            "zero_action_family_probe_day": probe_day_key,
+                            "zero_action_family_probe_family": family_name,
+                            "zero_action_family_probe_count_for_day": probes_used + 1,
+                            "zero_action_family_probe_quota_per_day": probe_quota,
+                            "zero_action_family_probe_bypassed_reason": (
+                                pre_analysis_demotion_reason
+                            ),
+                        }
+                        logger.info(
+                            "Zero-action family probe admitted %s for family=%s (%d/%d today)",
+                            market.id,
+                            family_name,
+                            probes_used + 1,
+                            probe_quota,
+                            data={
+                                "market_id": market.id,
+                                **zero_action_probe_metadata,
+                            },
+                        )
                 if pre_analysis_demoted:
                     pre_analysis_blocked += 1
                     pre_analysis_research_routed_count += 1
@@ -6531,6 +6847,10 @@ def main(max_cycles: int | None = None) -> None:
                         historical_prefix_stats=historical_prefix_stats,
                         historical_gate_metrics=historical_gate_metrics,
                     )
+                    if zero_action_probe_metadata:
+                        if pre_analysis_breakdown is None:
+                            pre_analysis_breakdown = {}
+                        pre_analysis_breakdown.update(zero_action_probe_metadata)
                     research_entry = recent_research_entries.get(market.id)
                     if research_entry is not None:
                         pre_analysis_score += _RESEARCH_QUEUE_SCORE_BUMP
@@ -6800,6 +7120,8 @@ def main(max_cycles: int | None = None) -> None:
                             str(_research_context.get("what_to_learn_next") or "")
                             if _research_context else None
                         ),
+                        "zero_action_family_probe": bool(zero_action_probe_metadata),
+                        "zero_action_family_probe_metadata": zero_action_probe_metadata or None,
                         "is_research_queue_drain_probe": is_drain_probe,
                         "research_queue_drain_entry": (
                             drain_entry if is_drain_probe else None
@@ -6834,6 +7156,11 @@ def main(max_cycles: int | None = None) -> None:
                 0,
                 settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
             )
+            sports_candidate_cap = (
+                settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
+                if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
+                else None
+            )
             analysis_candidates = _cap_analysis_candidates(
                 analysis_candidates,
                 analysis_candidate_attempt_limit,
@@ -6841,6 +7168,7 @@ def main(max_cycles: int | None = None) -> None:
                 max_crypto_candidates_per_cycle=settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE,
                 max_speech_candidates_per_cycle=settings.MAX_SPEECH_CANDIDATES_PER_CYCLE,
                 max_music_candidates_per_cycle=settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
+                max_sports_candidates_per_cycle=sports_candidate_cap,
                 pre_scores=pre_analysis_scores,
             )
             selected_family_distribution = _analysis_candidate_family_counts(
