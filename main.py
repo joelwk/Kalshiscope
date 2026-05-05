@@ -4426,6 +4426,26 @@ def _pre_analysis_opportunity_score(
             except (TypeError, ValueError):
                 historical_gate_score_penalty = 0.0
             historical_gate_score_penalty = max(0.0, historical_gate_score_penalty)
+    # Cap stacked historical-family penalties so overlapping signals from the
+    # same poor-history data source (family PnL, prefix PnL, fallback rate,
+    # zero-trade-rate, gate soft-demote) cannot collapse a market's score by
+    # 0.6pp+ and force soft-research routing on its own. Each individual
+    # penalty is preserved at full strength when it is the only one firing.
+    stacked_historical_penalty = (
+        fallback_family_penalty
+        + historical_family_penalty
+        + historical_family_pnl_penalty
+        + zero_trade_rate_penalty
+        + negative_prefix_penalty
+        + historical_gate_score_penalty
+    )
+    stacked_cap = max(
+        0.0,
+        float(settings.PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP),
+    )
+    stacked_historical_excess_credited = 0.0
+    if stacked_cap > 0.0 and stacked_historical_penalty > stacked_cap:
+        stacked_historical_excess_credited = stacked_historical_penalty - stacked_cap
     score = (
         (0.40 * price_center_score)
         + (0.35 * liquidity_score)
@@ -4448,6 +4468,7 @@ def _pre_analysis_opportunity_score(
         - negative_prefix_penalty
         - historical_gate_score_penalty
         - coinflip_penalty
+        + stacked_historical_excess_credited
     )
     return score, {
         "pre_score_price_center": price_center_score,
@@ -4478,6 +4499,9 @@ def _pre_analysis_opportunity_score(
         "pre_score_negative_prefix_penalty": negative_prefix_penalty,
         "pre_score_historical_gate_score_penalty": historical_gate_score_penalty,
         "pre_score_historical_gate_sample_weight": historical_gate_sample_weight,
+        "pre_score_stacked_historical_penalty_raw": stacked_historical_penalty,
+        "pre_score_stacked_historical_penalty_cap": stacked_cap,
+        "pre_score_stacked_historical_excess_credited": stacked_historical_excess_credited,
         "pre_score_coinflip_penalty": coinflip_penalty,
         "pre_score_analysis_count": float(analysis_count),
         "pre_score_non_actionable_streak": float(non_actionable_streak),

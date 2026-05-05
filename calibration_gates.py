@@ -250,9 +250,15 @@ def evaluate_market_tiered(
                 }
             )
 
+            # Hard-deny requires both observed and Wilson-LB win rates to be
+            # below the cutoff. Adding the Wilson-LB requirement enforces
+            # statistical confidence on top of observed win-rate / PnL signals
+            # so even a sufficient-sample prefix is not hard-blocked unless
+            # the lower bound on its true win rate is below cutoff.
             if (
                 n >= hard_block_min
                 and prefix_snapshot.win_rate <= float(prefix_win_rate_cutoff)
+                and wlb <= float(prefix_win_rate_cutoff)
                 and shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
                 and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
             ):
@@ -326,6 +332,7 @@ def evaluate_market_tiered(
                 n_fam >= max(1, int(family_min_samples))
                 and family_snapshot.pnl_total <= float(family_pnl_cutoff)
                 and family_snapshot.win_rate <= float(family_win_rate_cutoff)
+                and wlb_fam <= float(family_win_rate_cutoff)
                 and shrunk_pnl_fam <= float(prefix_shrunk_pnl_cutoff)
             ):
                 return EvaluateMarketResult(
@@ -338,7 +345,9 @@ def evaluate_market_tiered(
                     sample_size=n_fam,
                     what_to_learn_next=(
                         f"Family '{normalized_family}' has {n_fam} samples, "
-                        f"Wilson LB={wlb_fam:.2f}; monitor for recovery."
+                        f"Wilson LB={wlb_fam:.2f}, shrunk PnL/trade={shrunk_pnl_fam:.2f}; "
+                        "execution requires direct settlement-aligned evidence and "
+                        "recovery in the family before this gate clears."
                     ),
                 )
 

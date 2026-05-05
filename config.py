@@ -486,6 +486,17 @@ class Settings:
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY: float = 0.10
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD: float = -15.0
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY: float = 0.15
+    # Cap on the combined "stacked historical-family penalty" set in
+    # _pre_analysis_opportunity_score. The fallback-family, historical-family
+    # win-rate, historical-family PnL, zero-trade-rate, negative-prefix and
+    # historical-gate score-penalty terms all draw from overlapping historical
+    # data sources; without a cap a single bad family/prefix can collapse a
+    # market's pre-analysis score by ~0.65pp and force soft-research routing
+    # even for liquid, well-priced near-event markets. Setting this to <=0
+    # disables the cap (legacy behavior); otherwise the excess is credited
+    # back to the score and recorded under
+    # ``pre_score_stacked_historical_excess_credited`` for telemetry.
+    PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP: float = 0.25
     PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED: bool = True
     PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_THRESHOLD: float = 0.0
     PRE_ANALYSIS_CRYPTO_FALLBACK_RATE_BLOCK_THRESHOLD: float = 0.55
@@ -1420,6 +1431,10 @@ def load_settings() -> Settings:
         PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=_read_env_float(
             "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY",
             Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY,
+        ),
+        PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=_read_env_float(
+            "PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP",
+            Settings.PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP,
         ),
         PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED=_read_env_bool(
             "PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED",

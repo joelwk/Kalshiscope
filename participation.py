@@ -97,6 +97,12 @@ _TIER_FOR_REJECTION_REASON: dict[str, ParticipationTier] = {
     "historical_prefix_small_sample_negative": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "historical_family_pnl_block": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "score_soft_research": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
+    # Score gates below the research band: routed to SKIP_FOR_NOW_WITH_REASON
+    # (not RESEARCH_ONLY) because the score is too far from the threshold to
+    # be a near-miss; surface them so operators can review structural penalty
+    # mix without populating the learning queue with low-priority entries.
+    "score_below_min": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
+    "score_far_below_min": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "fallback_edge_high_churn": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "zero_action_family": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "crypto_historically_unprofitable": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
@@ -123,6 +129,16 @@ _LEARN_NEXT_FOR_REASON: dict[str, str] = {
         "Pre-analysis score is near the execution threshold; learn whether better "
         "sources, fresher prices, or settlement context would make this actionable."
     ),
+    "score_below_min": (
+        "Pre-analysis score is below the research band; revisit only when the "
+        "score components (price center, liquidity, horizon, source quality) "
+        "improve materially or after a settlement outcome lands."
+    ),
+    "score_far_below_min": (
+        "Pre-analysis score is materially below the research band; this market "
+        "is unlikely to become actionable without a structural change in "
+        "pricing, liquidity, or evidence availability."
+    ),
     "zero_action_family": (
         "This family has never been deep-analyzed to execution; needs a probe "
         "trade to break the self-fulfilling loop."
@@ -136,6 +152,41 @@ _LEARN_NEXT_FOR_REASON: dict[str, str] = {
         "(new trading day or position close) before re-evaluating."
     ),
 }
+
+
+def _augment_with_threshold_gap(
+    base_message: str | None,
+    metadata: dict[str, Any],
+) -> str | None:
+    """Append a quantitative threshold-gap hint when one is available in metadata.
+
+    Helps research-only entries stay actionable: an operator scanning the
+    learning queue can immediately see how close the market was to passing
+    the gate without rerunning analytics scripts.
+    """
+    if not base_message:
+        return base_message
+    gap = metadata.get("pre_analysis_threshold_gap")
+    score = metadata.get("pre_analysis_score")
+    threshold = metadata.get("pre_analysis_threshold")
+    fragments: list[str] = []
+    try:
+        if gap is not None:
+            gap_value = float(gap)
+            if gap_value > 0.0:
+                fragments.append(f"threshold_gap={gap_value:.3f}")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if score is not None and threshold is not None:
+            fragments.append(
+                f"score={float(score):.3f} vs min={float(threshold):.3f}"
+            )
+    except (TypeError, ValueError):
+        pass
+    if not fragments:
+        return base_message
+    return f"{base_message} ({', '.join(fragments)})"
 
 
 def classify_participation(
@@ -178,6 +229,12 @@ def classify_participation(
             if timeout_state.retriable and timeout_state.timeout_streak <= 1
             else ParticipationTier.MONITOR_ONLY
         )
+        timeout_metadata = {
+            **metadata,
+            "operational_search_profile": str(timeout_state.search_profile or "generic"),
+            "operational_timeout_streak": int(timeout_state.timeout_streak),
+            "operational_retriable": bool(timeout_state.retriable),
+        }
         return ParticipationDecision(
             tier=timeout_tier,
             primary_reason="grok_stream_timeout",
@@ -188,7 +245,7 @@ def classify_participation(
                 f"streak={timeout_state.timeout_streak}"
             ),
             sample_size_signal=None,
-            tier_metadata=metadata,
+            tier_metadata=timeout_metadata,
         )
 
     if analysis_failed:
@@ -197,12 +254,16 @@ def classify_participation(
             if analysis_error_retriable
             else ParticipationTier.MONITOR_ONLY
         )
+        failure_metadata = {
+            **metadata,
+            "operational_retriable": bool(analysis_error_retriable),
+        }
         return ParticipationDecision(
             tier=tier,
             primary_reason="analysis_failure",
             why_not_execution_eligible="Analysis failed; no decision produced",
             what_to_learn_next="Retry on next cycle if retriable; otherwise monitor",
-            tier_metadata=metadata,
+            tier_metadata=failure_metadata,
         )
 
     if pre_analysis_rejection_reason:
@@ -224,6 +285,7 @@ def classify_participation(
                     f"need >=10 samples for confident gate. "
                     f"{what_to_learn or ''}"
                 )
+        what_to_learn = _augment_with_threshold_gap(what_to_learn, metadata)
 
         why_not = _why_not_for_reason(pre_analysis_rejection_reason, metadata)
 
@@ -271,11 +333,49 @@ def classify_participation(
             tier=ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
             primary_reason="abstain_low_evidence",
             why_not_execution_eligible="Model abstained due to low evidence",
-            what_to_learn_next="Gather better evidence sources for this market",
+            what_to_learn_next=(
+                "Find a settlement-aligned primary source (whitelisted "
+                "domain) or a current external odds reference; abstain "
+                "should clear once evidence_basis becomes direct."
+            ),
             tier_metadata=metadata,
         )
 
     if decision_should_trade is False:
+        normalized_evidence_basis_no = str(decision_evidence_basis or "").strip().lower()
+        normalized_edge_source_no = str(decision_edge_source or "").strip().lower()
+        # Distinguish between "model judgment says no" and "model couldn't
+        # research enough to form a market judgment". The placeholder triplet
+        # (eq=0/edge_source=none/basis=absence_only) is consistently a
+        # research gap, not a no-trade verdict on the market itself.
+        is_research_gap = (
+            normalized_evidence_basis_no == "absence_only"
+            or normalized_edge_source_no == "none"
+            or (
+                decision_evidence_quality is not None
+                and decision_evidence_quality <= 0.0
+            )
+        )
+        if is_research_gap:
+            return ParticipationDecision(
+                tier=ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
+                primary_reason="no_trade_research_gap",
+                why_not_execution_eligible=(
+                    "No-trade decision was driven by a research gap "
+                    "(absence_only / edge_source=none / evidence_quality=0), "
+                    "not a market-quality judgment"
+                ),
+                what_to_learn_next=(
+                    "Treat as a research failure: locate a settlement-aligned "
+                    "primary source and a usable orderbook before relying on "
+                    "this no-trade decision."
+                ),
+                tier_metadata={
+                    **metadata,
+                    "evidence_gap_classified_as_research": True,
+                    "skip_due_to": "lack_of_evidence",
+                },
+            )
         return ParticipationDecision(
             tier=ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
             primary_reason="no_trade_recommended",

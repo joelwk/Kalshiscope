@@ -430,3 +430,116 @@ def test_non_terminal_tiers_have_terminal_reject_false():
         assert metadata["participation_terminal_reject"] is False, (
             f"Tier {tier} should NOT set participation_terminal_reject=True"
         )
+
+
+def test_classify_no_trade_with_absence_only_is_research_gap_not_market_judgment() -> None:
+    """should_trade=False with the (eq=0/edge_source=none/basis=absence_only)
+    placeholder triplet must be classified as a research gap, not as a no-trade
+    market verdict. This protects the system from treating Grok's evidence
+    failures as market-quality decisions."""
+    decision = classify_participation(
+        decision_should_trade=False,
+        decision_evidence_basis="absence_only",
+        decision_edge_source="none",
+        decision_evidence_quality=0.0,
+    )
+    assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+    assert decision.primary_reason == "no_trade_research_gap"
+    assert decision.tier_metadata["evidence_gap_classified_as_research"] is True
+    assert decision.tier_metadata["skip_due_to"] == "lack_of_evidence"
+    assert "research gap" in (decision.why_not_execution_eligible or "").lower()
+
+
+def test_classify_no_trade_with_real_evidence_stays_no_trade_recommended() -> None:
+    """A genuine market judgment (direct evidence, computed edge) where the
+    model still abstains must not be reclassified as a research gap."""
+    decision = classify_participation(
+        decision_should_trade=False,
+        decision_evidence_basis="direct",
+        decision_edge_source="computed",
+        decision_evidence_quality=0.80,
+    )
+    assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+    assert decision.primary_reason == "no_trade_recommended"
+
+
+def test_classify_score_far_below_min_routes_to_skip_with_reason() -> None:
+    """pre_analysis_score_far_below_min should not pollute the learning queue
+    (the soft-research band is the right place for near-miss markets); it
+    routes to SKIP_FOR_NOW_WITH_REASON with an actionable learning hint."""
+    decision = classify_participation(
+        pre_analysis_rejection_reason="pre_analysis_score_far_below_min",
+        pre_analysis_metadata={
+            "pre_analysis_score": 0.10,
+            "pre_analysis_threshold": 0.42,
+            "pre_analysis_threshold_gap": 0.32,
+        },
+    )
+    assert decision.tier == ParticipationTier.SKIP_FOR_NOW_WITH_REASON
+    assert decision.what_to_learn_next is not None
+    assert "structural" in decision.what_to_learn_next.lower()
+
+
+def test_classify_score_soft_research_includes_threshold_gap_hint() -> None:
+    """Receipts in the learning queue should expose how close a market was
+    to passing the gate so operators can scan for near-misses without
+    rerunning analytics scripts."""
+    decision = classify_participation(
+        pre_analysis_rejection_reason="pre_analysis_score_soft_research",
+        pre_analysis_metadata={
+            "pre_analysis_score": 0.376,
+            "pre_analysis_threshold": 0.42,
+            "pre_analysis_threshold_gap": 0.044,
+        },
+    )
+    assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+    assert decision.what_to_learn_next is not None
+    assert "threshold_gap" in decision.what_to_learn_next
+    assert "0.044" in decision.what_to_learn_next
+
+
+def test_classify_timeout_metadata_includes_operational_context() -> None:
+    """Timeout-routed markets must surface the search profile, retriable
+    flag, and timeout streak in tier_metadata so persistence captures the
+    operational context for retry/monitor decisions."""
+    decision = classify_participation(
+        timeout_state=TimeoutState(
+            timed_out=True,
+            retriable=True,
+            timeout_streak=1,
+            search_profile="crypto",
+        ),
+    )
+    _, _, metadata = decision.to_metadata_tuple()
+    assert metadata["operational_search_profile"] == "crypto"
+    assert metadata["operational_timeout_streak"] == 1
+    assert metadata["operational_retriable"] is True
+
+
+def test_classify_repeated_timeout_metadata_marks_non_retriable_streak() -> None:
+    """Second timeout in a row should escalate to MONITOR_ONLY and the
+    streak count must persist into receipts."""
+    decision = classify_participation(
+        timeout_state=TimeoutState(
+            timed_out=True,
+            retriable=True,
+            timeout_streak=2,
+            search_profile="weather",
+        ),
+    )
+    assert decision.tier == ParticipationTier.MONITOR_ONLY
+    _, _, metadata = decision.to_metadata_tuple()
+    assert metadata["operational_search_profile"] == "weather"
+    assert metadata["operational_timeout_streak"] == 2
+
+
+def test_classify_analysis_failure_metadata_marks_retriable() -> None:
+    """Non-timeout analysis failures must capture retriable status in
+    tier_metadata for downstream operational alerting."""
+    decision = classify_participation(
+        analysis_failed=True,
+        analysis_error_retriable=False,
+    )
+    assert decision.tier == ParticipationTier.MONITOR_ONLY
+    _, _, metadata = decision.to_metadata_tuple()
+    assert metadata["operational_retriable"] is False

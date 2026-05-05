@@ -1273,6 +1273,175 @@ class TestMainUtils(unittest.TestCase):
             places=6,
         )
 
+    def test_pre_analysis_opportunity_score_caps_stacked_historical_penalties(
+        self,
+    ) -> None:
+        """Stacked historical/family penalties from overlapping data sources
+        (fallback rate + family PnL + severe family PnL + zero-trade-rate
+        + negative-prefix + historical-gate score-penalty) must not be allowed
+        to compound into a 0.5pp+ score collapse. The cap credits any excess
+        back into the score and surfaces the credit in the breakdown so the
+        receipts stay auditable.
+        """
+
+        from market_state import MarketState
+        from calibration_gates import PerformanceStats, GateTier
+
+        market = Market(
+            id="KXBADCRYPTO-1234-T100",
+            question="Will BTC settle above threshold?",
+            category="crypto",
+            liquidity_usdc=800.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.50),
+                MarketOutcome(name="NO", price=0.50),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+            resolution_criteria="Official settlement source",
+        )
+        cap = 0.20
+        settings = Settings(
+            PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD=0.50,
+            PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES=5,
+            PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY=0.20,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=0.45,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=0.18,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES=10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=-5.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=0.12,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=-15.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=0.20,
+            PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.04,
+            HISTORICAL_TICKER_PREFIX_LEN=12,
+            HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
+            HISTORICAL_TICKER_PREFIX_PNL_CUTOFF=-2.0,
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=cap,
+        )
+        # Build penalty stack from every overlapping source so we can verify
+        # the cap's credit-back behavior.
+        prefix_stats = {
+            "KXBADCRYPTO-": PerformanceStats(
+                sample_size=8,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-20.0,
+            )
+        }
+        historical_gate_metrics = {
+            "historical_gate_tier": GateTier.SOFT_DEMOTE,
+            "historical_gate_sample_weight": 0.8,
+            "historical_gate_score_penalty": 0.10,
+        }
+        score, breakdown = _pre_analysis_opportunity_score(
+            market,
+            MarketState(market_id=market.id, analysis_count=0),
+            settings,
+            traded_before=False,
+            fallback_family_edge_rate=0.95,
+            fallback_family_sample_size=80,
+            historical_family_stats={
+                "sample_size": 30,
+                "win_rate": 0.30,
+                "pnl_total": -25.0,
+            },
+            historical_prefix_stats=prefix_stats,
+            historical_gate_metrics=historical_gate_metrics,
+        )
+        raw_stack = breakdown["pre_score_stacked_historical_penalty_raw"]
+        excess = breakdown["pre_score_stacked_historical_excess_credited"]
+        cap_emitted = breakdown["pre_score_stacked_historical_penalty_cap"]
+        self.assertGreater(
+            raw_stack,
+            cap,
+            "Test setup should produce a raw stacked penalty exceeding the cap",
+        )
+        self.assertAlmostEqual(excess, raw_stack - cap, places=6)
+        self.assertAlmostEqual(cap_emitted, cap, places=6)
+
+        # Recompute the same market with the cap effectively disabled and
+        # verify the score recovers exactly the credited excess. This proves
+        # the cap purely adjusts the score arithmetic without altering the
+        # individual penalty fields the receipts depend on.
+        settings_uncapped = Settings(
+            PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD=settings.PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD,
+            PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES=settings.PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES,
+            PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY=settings.PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY,
+            PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY,
+            HISTORICAL_TICKER_PREFIX_LEN=settings.HISTORICAL_TICKER_PREFIX_LEN,
+            HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES,
+            HISTORICAL_TICKER_PREFIX_PNL_CUTOFF=settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF,
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=settings.HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.0,
+        )
+        score_uncapped, breakdown_uncapped = _pre_analysis_opportunity_score(
+            market,
+            MarketState(market_id=market.id, analysis_count=0),
+            settings_uncapped,
+            traded_before=False,
+            fallback_family_edge_rate=0.95,
+            fallback_family_sample_size=80,
+            historical_family_stats={
+                "sample_size": 30,
+                "win_rate": 0.30,
+                "pnl_total": -25.0,
+            },
+            historical_prefix_stats=prefix_stats,
+            historical_gate_metrics=historical_gate_metrics,
+        )
+        self.assertAlmostEqual(score_uncapped + excess, score, places=6)
+        self.assertEqual(
+            breakdown_uncapped["pre_score_stacked_historical_excess_credited"],
+            0.0,
+        )
+
+    def test_pre_analysis_opportunity_score_does_not_credit_when_below_cap(
+        self,
+    ) -> None:
+        """When stacked penalties stay under the cap, the cap must be a no-op."""
+        market = Market(
+            id="KXSTABLE-1234-T100",
+            question="Will the index settle above threshold?",
+            category="generic",
+            liquidity_usdc=400.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(
+            PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=0.45,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.40,
+        )
+        _, breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={
+                "sample_size": 20,
+                "win_rate": 0.40,
+                "pnl_total": -3.0,
+            },
+        )
+        self.assertEqual(
+            breakdown["pre_score_stacked_historical_excess_credited"],
+            0.0,
+        )
+
     def test_is_coinflip_signal_detects_low_information_decision(self) -> None:
         weak_decision = TradeDecision(
             should_trade=False,
