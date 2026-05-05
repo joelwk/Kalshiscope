@@ -409,6 +409,23 @@ def classify_participation(
                 "refreshed_edge_gate_blocked",
                 "uniform_implied_probability",
             }
+            research_gap_reasons = {
+                "evidence_quality_below_min",
+                "weather_evidence_quality_below_min",
+                "non_sports_missing_primary_source",
+                "non_sports_needs_direct",
+                "non_sports_needs_direct_evidence",
+            }
+            weak_edge_reasons = {
+                "edge_above_reasonable_max",
+                "edge_gate_blocked",
+                "hallucinated_edge",
+                "lmsr_gate_blocked",
+                "refreshed_edge_gate_blocked",
+                "score_gate_blocked",
+                "score_gate_critical_rejection",
+            }
+            weak_confidence_reasons = {"confidence_below_min"}
             terminal_reasons = {
                 "market_closed",
                 "market_closed_during_cycle",
@@ -428,6 +445,46 @@ def classify_participation(
                         **metadata,
                         "blocked_conviction": True,
                         "skip_due_to": "risk_cap",
+                    },
+                )
+            if normalized_gate_reason in research_gap_reasons:
+                return ParticipationDecision(
+                    tier=ParticipationTier.DEEP_RESEARCH_REQUIRED,
+                    primary_reason=normalized_gate_reason,
+                    why_not_execution_eligible="Execution blocked by missing or weak direct evidence",
+                    what_to_learn_next=(
+                        "Find a direct settlement-aligned primary source and recompute edge before execution."
+                    ),
+                    tier_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "lack_of_evidence",
+                    },
+                )
+            if normalized_gate_reason in weak_confidence_reasons:
+                return ParticipationDecision(
+                    tier=ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
+                    primary_reason=normalized_gate_reason,
+                    why_not_execution_eligible="Confidence gate blocked execution",
+                    what_to_learn_next="Need stronger direct evidence or a valid confidence override.",
+                    tier_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "weak_edge",
+                    },
+                )
+            if normalized_gate_reason in weak_edge_reasons:
+                return ParticipationDecision(
+                    tier=ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
+                    primary_reason=normalized_gate_reason,
+                    why_not_execution_eligible="Edge, score, or market-pricing gate blocked execution",
+                    what_to_learn_next=(
+                        "Verify the edge against refreshed orderbook data and source quality before execution."
+                    ),
+                    tier_metadata={
+                        **metadata,
+                        "blocked_conviction": True,
+                        "skip_due_to": "weak_edge",
                     },
                 )
             if normalized_gate_reason in terminal_reasons:

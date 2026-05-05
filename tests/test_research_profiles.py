@@ -155,6 +155,35 @@ def test_market_family_crypto() -> None:
     assert market_family(market) == "crypto"
 
 
+def test_market_family_crypto_15m_ticker_prefixes() -> None:
+    """15-minute crypto tickers must not fall into the generic family.
+
+    The cycle-7 logs showed KXSOL15M/KXXRP15M/KXBNB15M decisions using the
+    generic search profile, which gives them generic-family PnL penalties and
+    non-crypto source domains.
+    """
+    for ticker in (
+        "KXSOL15M-26MAY051345-45",
+        "KXXRP15M-26MAY051345-45",
+        "KXBNB15M-26MAY051345-45",
+        "KXDOGE15M-26MAY051345-45",
+    ):
+        market = Market(id=ticker, question="Price up in next 15 mins?", category=None)
+        assert market_family(market) == "crypto"
+
+
+def test_profile_for_crypto_15m_ticker_uses_crypto_profile() -> None:
+    settings = Settings()
+    market = Market(
+        id="KXSOL15M-26MAY051345-45",
+        question="SOL price up in next 15 mins?",
+        category=None,
+    )
+    profile = profile_for_market(settings, market)
+    assert profile.name == "crypto"
+    assert "coinbase.com" in profile.domains
+
+
 def test_market_family_politics() -> None:
     market = Market(id="3", question="Portugal Presidential Election Winner", category="politics")
     assert market_family(market) == "politics"

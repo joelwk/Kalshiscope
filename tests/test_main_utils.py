@@ -4,11 +4,15 @@ import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import main as main_module
 from calibration_gates import PerformanceStats
 from config import Settings
+from participation import ParticipationTier
 from main import (
     _available_orderbook_sell_quantity,
     _analysis_result_rank,
+    _analysis_candidate_attempt_limit,
+    _apply_participation_audit_fields,
     _analyze_market_candidate,
     _apply_runtime_score_receipt,
     _best_orderbook_sell_price,
@@ -1176,6 +1180,28 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(cap, 1)
         self.assertTrue(applied)
         self.assertTrue(neg_floor)
+
+    def test_parallel_attempt_limit_does_not_add_failure_buffer(self) -> None:
+        settings = Settings(MAX_MARKETS_PER_CYCLE=6, XAI_CIRCUIT_BREAKER_MAX_FAILURES=3)
+        self.assertEqual(
+            _analysis_candidate_attempt_limit(
+                settings,
+                dynamic_max_markets_per_cycle=6,
+                parallel_analysis_enabled=True,
+            ),
+            6,
+        )
+
+    def test_sequential_attempt_limit_keeps_failure_buffer(self) -> None:
+        settings = Settings(MAX_MARKETS_PER_CYCLE=6, XAI_CIRCUIT_BREAKER_MAX_FAILURES=3)
+        self.assertEqual(
+            _analysis_candidate_attempt_limit(
+                settings,
+                dynamic_max_markets_per_cycle=6,
+                parallel_analysis_enabled=False,
+            ),
+            9,
+        )
 
     def test_pre_analysis_opportunity_score_penalizes_weak_historical_family_performance(self) -> None:
         market = Market(
@@ -3132,6 +3158,52 @@ class TestSyntheticDecisionMarker(unittest.TestCase):
         self.assertFalse(audit.get("synthetic_decision"))
 
 
+class TestParticipationAuditStamping(unittest.TestCase):
+    def test_should_trade_confidence_skip_gets_canonical_participation_fields(self) -> None:
+        audit = _build_execution_audit(
+            final_action="skip",
+            final_reason="confidence_below_min",
+            counterfactual_required_confidence=0.62,
+            evidence_basis_class="direct",
+            edge_source="computed",
+        )
+        inferred = _apply_participation_audit_fields(
+            audit,
+            decision={
+                "should_trade": True,
+                "confidence": 0.58,
+                "evidence_quality": 0.90,
+                "evidence_basis": "direct",
+                "edge_source": "computed",
+            },
+            settings=Settings(MIN_CONFIDENCE=0.62),
+        )
+        self.assertTrue(inferred)
+        self.assertEqual(
+            audit["participation_tier"],
+            str(ParticipationTier.SKIP_FOR_NOW_WITH_REASON),
+        )
+        self.assertEqual(audit["participation_decision"], "confidence_below_min")
+        self.assertTrue(audit["blocked_conviction"])
+        self.assertEqual(audit["skip_due_to"], "weak_edge")
+
+    def test_order_attempt_gets_execution_eligible_tier(self) -> None:
+        audit = _build_execution_audit(
+            final_action="order_attempt",
+            final_reason="order_submitted",
+        )
+        inferred = _apply_participation_audit_fields(
+            audit,
+            decision={"should_trade": True, "confidence": 0.80},
+            settings=Settings(),
+        )
+        self.assertTrue(inferred)
+        self.assertEqual(
+            audit["participation_tier"],
+            str(ParticipationTier.EXECUTION_ELIGIBLE),
+        )
+
+
 class TestHistoricalFamilyFlattening(unittest.TestCase):
     def test_breakdown_fields_lift_to_top_level(self) -> None:
         audit = _build_execution_audit(
@@ -3157,6 +3229,25 @@ class TestHistoricalFamilyFlattening(unittest.TestCase):
             },
         )
         self.assertEqual(audit.get("historical_family_samples"), 99)
+
+
+class TestHistoricalFamilyStatsRuntimeLoad(unittest.TestCase):
+    def test_confidence_shrink_block_does_not_reset_recent_family_stats(self) -> None:
+        src = inspect.getsource(main_module.main)
+        confidence_block = src.split(
+            "if settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED:",
+            1,
+        )[1].split("recent_research_entries", 1)[0]
+        self.assertNotIn("historical_family_stats_recent = {}", confidence_block)
+
+    def test_emergency_research_drain_keeps_current_market_guard(self) -> None:
+        src = inspect.getsource(main_module.main)
+        emergency_block = src.split(
+            "Emergency second-pass drain:",
+            1,
+        )[1].split("if drainable_research_entries:", 1)[0]
+        self.assertIn("if mid not in current_market_ids:", emergency_block)
+        self.assertNotIn("if mid in current_market_ids:", emergency_block)
 
 
 class TestCounterfactualAuditFields(unittest.TestCase):

@@ -214,6 +214,40 @@ def test_classify_non_definitive_edge_049_blocked() -> None:
     assert "edge_above_reasonable_max" in decision.primary_reason
 
 
+def test_classify_should_trade_true_confidence_below_min_is_blocked_conviction() -> None:
+    decision = classify_participation(
+        decision_should_trade=True,
+        decision_evidence_basis="direct",
+        decision_edge_source="computed",
+        decision_evidence_quality=0.90,
+        evidence_quality_threshold=0.75,
+        confidence_value=0.58,
+        confidence_threshold=0.62,
+        edge_value=0.10,
+    )
+    assert decision.tier == ParticipationTier.SKIP_FOR_NOW_WITH_REASON
+    assert decision.primary_reason == "confidence_below_min"
+    assert decision.tier_metadata["blocked_conviction"] is True
+    assert decision.tier_metadata["skip_due_to"] == "weak_edge"
+
+
+def test_classify_should_trade_true_daily_limit_is_monitor_only() -> None:
+    decision = classify_participation(
+        decision_should_trade=True,
+        decision_evidence_basis="direct",
+        decision_edge_source="computed",
+        decision_evidence_quality=0.90,
+        evidence_quality_threshold=0.75,
+        confidence_value=0.70,
+        confidence_threshold=0.62,
+        edge_value=0.10,
+        downstream_gate_reason="daily_limit_reached",
+    )
+    assert decision.tier == ParticipationTier.MONITOR_ONLY
+    assert decision.primary_reason == "daily_limit_reached"
+    assert decision.tier_metadata["skip_due_to"] == "risk_cap"
+
+
 def test_classify_score_gate_blocked() -> None:
     decision = classify_participation(
         decision_should_trade=True,

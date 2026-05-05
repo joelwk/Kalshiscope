@@ -58,6 +58,8 @@ _CRYPTO_KEYWORDS = (
     "btc",
     "ethereum",
     "eth",
+    "dogecoin",
+    "solana",
     "defi",
     "fdv",
     "token",
@@ -157,6 +159,10 @@ _SPORTS_TICKER_PATTERN = re.compile(
     r"\bKX(?:MLB|NBA|NFL|NHL|NCAA|EPL|UCL|UEFA|MLS|WNBA|AFL|ATP|WTA|UFC|MMA|BOX|F1)",
     re.IGNORECASE,
 )
+_CRYPTO_TICKER_PATTERN = re.compile(
+    r"\bKX(?:BTC|ETH|DOGE|SOL|BNB|XRP|HYPE)(?:D|15M)?(?:-|$)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -244,17 +250,25 @@ def family_from_text(text: str) -> str:
     keyword-driven taxonomy without per-product ticker hardcoding.
 
     Detection precedence:
-    1. Sports-league ticker prefixes (KXMLB, KXNBA, KXNFL, ...) take the
-       highest priority — these markets often have player-prop questions
-       with no league name in the natural-language text, and the leading
-       "KX" prefix defeats `\\bmlb\\b`-style regex on the ticker. This was
-       a real bug that misrouted settled MLB markets to "generic" family
-       and triggered the wrong historical-PnL penalty bucket.
-    2. Otherwise fall back to keyword matching across the concatenated
+    1. Sports-league ticker prefixes (KXMLB, KXNBA, KXNFL, ...) and crypto
+       ticker prefixes (KXBTC, KXETH, KXSOL15M, ...) take priority. These
+       markets often have short questions with no family keyword, and the
+       leading "KX" prefix defeats word-boundary keyword checks.
+    2. Sports still takes precedence over crypto because sports markets often
+       mention weather or finance context incidentally, while crypto prefixes
+       are product-specific.
+    3. Otherwise fall back to keyword matching across the concatenated
        category + question + ticker text.
+
+    Historical note: the sports-prefix bug originally misrouted settled MLB
+    markets to "generic"; the same pattern later appeared for 15-minute crypto
+    tickers such as KXSOL15M/KXXRP15M/KXBNB15M, which then inherited generic
+    search domains and generic-family PnL penalties.
     """
     if _SPORTS_TICKER_PATTERN.search(text or ""):
         return "sports"
+    if _CRYPTO_TICKER_PATTERN.search(text or ""):
+        return "crypto"
     normalized = (text or "").lower()
     if _has_keyword_match(normalized, _SPORTS_KEYWORDS) or _has_keyword_match(
         normalized, _ESPORTS_KEYWORDS

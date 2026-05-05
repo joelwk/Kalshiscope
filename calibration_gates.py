@@ -209,6 +209,11 @@ def evaluate_market_tiered(
     metrics: dict[str, Any] = {
         "historical_gate_market_prefix": market_prefix,
         "historical_gate_market_family": normalized_family,
+        "historical_gate_prefix_len": normalized_prefix_len,
+        "historical_gate_prefix_specificity": (
+            "event_prefix" if normalized_prefix_len >= 12 else "short_family_prefix"
+        ),
+        "historical_gate_loss_source_uncertain": True,
     }
 
     if prefix_gate_enabled and prefix_stats:

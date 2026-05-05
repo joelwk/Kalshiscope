@@ -7,4 +7,5 @@ lines:
   - Do not use absence of mentions alone as a high-confidence trading signal.
   - If external odds are unavailable, keep evidence_quality < 0.50, set edge_source=none or fallback as appropriate, and default should_trade=false.
   - If evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only, name what direct source or price signal is missing in reasoning.
+  - Never treat evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only as an executable market judgment; classify it as a research failure or monitoring case.
   - For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.

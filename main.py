@@ -3256,8 +3256,6 @@ def _participation_decision_for_audit(
                 "confidence_below_min",
                 "evidence_quality_below_min",
                 "weather_evidence_quality_below_min",
-                "edge_gate_blocked",
-                "edge_above_reasonable_max",
             }
             and score_gate_reason is None
         ):
@@ -4165,6 +4163,26 @@ def _analysis_candidate_family_counts(
         family = market_family(market)
         counts[family] = counts.get(family, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _analysis_candidate_attempt_limit(
+    settings: Settings,
+    dynamic_max_markets_per_cycle: int,
+    *,
+    parallel_analysis_enabled: bool,
+) -> int:
+    """Return how many candidates may be sent to Grok this cycle.
+
+    Sequential mode keeps a small failure buffer because later candidates can
+    replace failed calls without increasing concurrent work. Parallel mode
+    should not add that buffer: all selected candidates are submitted at once,
+    so the old max+failure-buffer path paid for extra Grok calls and then the
+    execution loop processed only MAX_MARKETS_PER_CYCLE decisions.
+    """
+    base_limit = max(0, int(dynamic_max_markets_per_cycle))
+    if parallel_analysis_enabled:
+        return base_limit
+    return base_limit + max(0, int(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES))
 
 
 def _pre_analysis_opportunity_score(
@@ -6115,11 +6133,11 @@ def main(max_cycles: int | None = None) -> None:
                 # Emergency second-pass drain: when the normal drain selected
                 # nothing AND we're in sustained zero-execution-yield mode, the
                 # research queue has effectively become a write-only sink. Try
-                # one probe with the current_market_ids constraint relaxed and
-                # a halved minimum age so younger entries qualify. The probe
-                # still goes through deep analysis, can abstain, and respects
-                # the score gate; it is not a forced trade. This keeps the
-                # learning loop alive without weakening any execution gate.
+                # again with a halved minimum age so younger current-cycle
+                # entries qualify. Keep the current_market_ids guard: entries
+                # outside this cycle's filtered market list cannot be marked as
+                # probes by the per-market loop and would produce misleading
+                # "selected" telemetry without any actual analysis.
                 emergency_eligible = (
                     not drainable_research_entries
                     and settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
@@ -6143,11 +6161,10 @@ def main(max_cycles: int | None = None) -> None:
                             mid = str(entry.get("market_id") or "").strip()
                             if not mid:
                                 continue
-                            # Skip if already on this cycle's filter list (the
-                            # normal drain pass would have picked it up). The
-                            # whole point of the emergency pass is to admit
-                            # entries that are NOT in current_market_ids.
-                            if mid in current_market_ids:
+                            if mid in drainable_research_entries:
+                                continue
+                            if mid not in current_market_ids:
+                                research_queue_drain_skipped_stale_count += 1
                                 continue
                             if _drain_min_priority > 0.0:
                                 entry_priority = (
@@ -7073,6 +7090,64 @@ def main(max_cycles: int | None = None) -> None:
                                 rejection_breakdown,
                                 _far_tag,
                             )
+                            if len(deprioritized_market_samples) < 25:
+                                _far_participation = classify_participation(
+                                    pre_analysis_rejection_reason=_far_tag,
+                                    pre_analysis_metadata={
+                                        "pre_analysis_score": pre_analysis_score,
+                                        "pre_analysis_threshold": (
+                                            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                                        ),
+                                        "pre_analysis_threshold_gap": float(
+                                            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                                            - pre_analysis_score
+                                        ),
+                                        **(pre_analysis_breakdown or {}),
+                                    },
+                                )
+                                deprioritized_market_samples.append(
+                                    {
+                                        "market_id": market.id,
+                                        "market_family": family_name,
+                                        "reason": _far_tag,
+                                        "participation_tier": str(
+                                            _far_participation.tier
+                                        ),
+                                        "skip_due_to": _skip_due_to_for_reason(
+                                            _far_tag
+                                        ),
+                                        "pre_analysis_score": round(
+                                            float(pre_analysis_score),
+                                            4,
+                                        ),
+                                        "pre_analysis_threshold_gap": round(
+                                            float(
+                                                settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                                                - pre_analysis_score
+                                            ),
+                                            4,
+                                        ),
+                                        "what_to_learn_next": (
+                                            _far_participation.what_to_learn_next
+                                        ),
+                                        "breakdown": {
+                                            k: v
+                                            for k, v in (pre_analysis_breakdown or {}).items()
+                                            if k
+                                            in {
+                                                "pre_score_price_center",
+                                                "pre_score_liquidity",
+                                                "pre_score_horizon",
+                                                "pre_score_family_penalty",
+                                                "pre_score_historical_gate_score_penalty",
+                                                "pre_score_source_difficulty_penalty",
+                                                "pre_score_coinflip_penalty",
+                                                "zero_action_family_probe",
+                                                "research_queue_bump",
+                                            }
+                                        },
+                                    }
+                                )
                             logger.debug(
                                 "Skipping %s: pre-analysis opportunity score %.4f < %.4f",
                                 market.id,
@@ -7152,9 +7227,10 @@ def main(max_cycles: int | None = None) -> None:
             )
             if negative_score_floor_applied:
                 negative_best_score_skipped_count += 1
-            analysis_candidate_attempt_limit = dynamic_max_markets_per_cycle + max(
-                0,
-                settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES,
+            analysis_candidate_attempt_limit = _analysis_candidate_attempt_limit(
+                settings,
+                dynamic_max_markets_per_cycle,
+                parallel_analysis_enabled=bool(settings.PARALLEL_ANALYSIS_ENABLED),
             )
             sports_candidate_cap = (
                 settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
@@ -7972,12 +8048,34 @@ def main(max_cycles: int | None = None) -> None:
                         or analysis_result.get("analysis_error_retriable")
                         or is_timeout_failure
                     )
+                    timeout_streak = 1
+                    if is_timeout_failure and settings.TIMEOUT_RETRY_AS_MONITOR_ONLY_ENABLED:
+                        previous_timeout_signal = False
+                        if isinstance(state, MarketState):
+                            previous_terminal = str(
+                                state.last_terminal_outcome or ""
+                            ).strip().lower()
+                            previous_timeout_signal = previous_terminal in {
+                                "grok_stream_timeout",
+                                "monitor_only_timeout",
+                            }
+                        previous_research = recent_research_entries.get(market.id)
+                        if isinstance(previous_research, dict):
+                            previous_reason = str(
+                                previous_research.get("reason") or ""
+                            ).strip().lower()
+                            previous_timeout_signal = (
+                                previous_timeout_signal
+                                or previous_reason == "grok_stream_timeout"
+                            )
+                        if previous_timeout_signal:
+                            timeout_streak = 2
                     if is_timeout_failure:
                         participation_result = classify_participation(
                             timeout_state=TimeoutState(
                                 timed_out=True,
                                 retriable=is_retriable,
-                                timeout_streak=1,
+                                timeout_streak=timeout_streak,
                                 search_profile=str(
                                     analysis_result.get("analysis_search_profile")
                                     or "generic"
@@ -8108,6 +8206,7 @@ def main(max_cycles: int | None = None) -> None:
                             final_action=_failure_action,
                             final_reason=_failure_reason,
                             market_family=market_family_name,
+                            timeout_streak=timeout_streak if is_timeout_failure else None,
                             participation_tier=_failure_tier,
                             participation_decision=participation_result.primary_reason,
                             why_not_execution_eligible=(
@@ -11345,6 +11444,16 @@ def main(max_cycles: int | None = None) -> None:
                 "research_queue_size": research_queue_size,
                 "research_queue_emissions": research_queue_size,
                 "research_only_emissions": research_only_emissions,
+                "research_queue_drained_count": research_queue_drained_count,
+                "research_queue_drain_skipped_stale_count": (
+                    research_queue_drain_skipped_stale_count
+                ),
+                "research_queue_drain_skipped_low_priority_count": (
+                    research_queue_drain_skipped_low_priority_count
+                ),
+                "research_queue_emergency_probes_count": (
+                    research_queue_emergency_probes_count
+                ),
                 "no_grok_research_routed": (
                     pre_analysis_research_routed_count + research_only_emissions
                 ),
@@ -11361,6 +11470,20 @@ def main(max_cycles: int | None = None) -> None:
                 "should_trade_blocked_breakdown": dict(
                     sorted(should_trade_blocked_breakdown.items())
                 ),
+                "participation_tier_breakdown": dict(
+                    sorted(participation_tier_breakdown.items())
+                ),
+                "timeout_routed_to_monitor_only_count": timeout_routed_to_monitor_only_count,
+                "negative_best_score_skipped_count": negative_best_score_skipped_count,
+                "effective_research_band": round(effective_research_band, 4),
+                "research_band_widened_by": round(research_band_widened_by, 4),
+                "pre_score_distribution": _summarize_distribution(
+                    cycle_pre_score_samples
+                ),
+                "soft_research_threshold_gap_distribution": (
+                    _summarize_distribution(cycle_soft_research_threshold_gap_samples)
+                ),
+                "deprioritized_market_samples": deprioritized_market_samples,
                 "skip_counts": {
                     "no_trade": trades_skipped_no_trade,
                     "confidence": trades_skipped_confidence,
