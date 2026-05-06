@@ -208,6 +208,13 @@ _AMBIGUOUS_MARKET_TOKENS = (
     "album",
     "views",
 )
+_GENERIC_SUBFAMILY_KEYWORDS = (
+    ("commodity", ("oil", "wti", "brent", "gas", "fuel", "jet fuel", "gold", "silver")),
+    ("macro_release", ("jobless", "claims", "adp", "payroll", "cpi", "inflation", "gdp")),
+    ("rates", ("fed", "rate", "yield", "treasury", "basis point")),
+    ("index", ("nasdaq", "s&p", "sp500", "dow", "russell")),
+    ("transport", ("tsa", "airport", "flight", "airline")),
+)
 
 
 def _normalize_outcome_key(outcome: str | None) -> str:
@@ -3195,14 +3202,54 @@ def _participation_decision_for_audit(
             pre_analysis_metadata=audit_payload,
         )
 
+    evidence_quality_for_audit = _coerce_float(
+        decision_payload.get("evidence_quality", audit_payload.get("evidence_quality"))
+    )
+    evidence_basis_for_audit = str(
+        decision_payload.get("evidence_basis")
+        or audit_payload.get("evidence_basis")
+        or audit_payload.get("evidence_basis_class")
+        or ""
+    )
+    edge_source_for_audit = str(
+        decision_payload.get("edge_source")
+        or audit_payload.get("edge_source")
+        or ""
+    )
+    primary_source_url_for_audit = str(
+        decision_payload.get("primary_source_url")
+        or audit_payload.get("primary_source_url")
+        or ""
+    ).strip()
+    primary_source_whitelisted_for_audit = (
+        _is_whitelisted_primary_source_url(primary_source_url_for_audit, settings)
+        if settings is not None and primary_source_url_for_audit
+        else False
+    )
+    min_evidence_quality_for_audit = _coerce_float(
+        audit_payload.get("min_evidence_quality")
+    )
+    if min_evidence_quality_for_audit is None and settings is not None:
+        min_evidence_quality_for_audit = float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE)
+
     if normalized_reason in {"abstain_low_evidence"}:
         return classify_participation(
             decision_abstain=True,
+            decision_evidence_basis=evidence_basis_for_audit,
+            decision_edge_source=edge_source_for_audit,
+            decision_primary_source_whitelisted=primary_source_whitelisted_for_audit,
+            decision_evidence_quality=evidence_quality_for_audit,
+            evidence_quality_threshold=min_evidence_quality_for_audit,
             pre_analysis_metadata=audit_payload,
         )
     if normalized_reason in {"no_trade_recommended"}:
         return classify_participation(
             decision_should_trade=False,
+            decision_evidence_basis=evidence_basis_for_audit,
+            decision_edge_source=edge_source_for_audit,
+            decision_primary_source_whitelisted=primary_source_whitelisted_for_audit,
+            decision_evidence_quality=evidence_quality_for_audit,
+            evidence_quality_threshold=min_evidence_quality_for_audit,
             pre_analysis_metadata=audit_payload,
         )
 
@@ -3213,15 +3260,9 @@ def _participation_decision_for_audit(
         else str(should_trade_raw).strip().lower() in {"1", "true", "yes"}
     )
     if should_trade:
-        evidence_quality = _coerce_float(
-            decision_payload.get("evidence_quality", audit_payload.get("evidence_quality"))
-        )
+        evidence_quality = evidence_quality_for_audit
         confidence = _coerce_float(decision_payload.get("confidence"))
-        min_evidence_quality = _coerce_float(
-            audit_payload.get("min_evidence_quality")
-        )
-        if min_evidence_quality is None and settings is not None:
-            min_evidence_quality = float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE)
+        min_evidence_quality = min_evidence_quality_for_audit
         min_confidence = _coerce_float(
             audit_payload.get("counterfactual_required_confidence")
         )
@@ -3233,16 +3274,7 @@ def _participation_decision_for_audit(
                 audit_payload.get("edge_market", audit_payload.get("score_edge_market")),
             )
         )
-        primary_source_url = str(
-            decision_payload.get("primary_source_url")
-            or audit_payload.get("primary_source_url")
-            or ""
-        ).strip()
-        primary_source_whitelisted = (
-            _is_whitelisted_primary_source_url(primary_source_url, settings)
-            if settings is not None and primary_source_url
-            else False
-        )
+        primary_source_whitelisted = primary_source_whitelisted_for_audit
         score_gate_reason = (
             normalized_reason
             if "score_gate" in normalized_reason
@@ -3267,16 +3299,8 @@ def _participation_decision_for_audit(
             decision_definitive_outcome=bool(
                 decision_payload.get("definitive_outcome_detected")
             ),
-            decision_evidence_basis=str(
-                decision_payload.get("evidence_basis")
-                or audit_payload.get("evidence_basis_class")
-                or ""
-            ),
-            decision_edge_source=str(
-                decision_payload.get("edge_source")
-                or audit_payload.get("edge_source")
-                or ""
-            ),
+            decision_evidence_basis=str(evidence_basis_for_audit),
+            decision_edge_source=str(edge_source_for_audit),
             decision_primary_source_whitelisted=primary_source_whitelisted,
             decision_evidence_quality=evidence_quality,
             evidence_quality_threshold=min_evidence_quality,
@@ -3531,6 +3555,50 @@ def _research_priority_for_reason(
 
 def _safe_json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+_RESEARCH_QUEUE_AUDIT_MIRROR_KEYS = frozenset(
+    {
+        "decision_origin",
+        "market_judgment_available",
+        "final_action",
+        "final_reason",
+        "participation_tier",
+        "participation_decision",
+        "skip_due_to",
+        "why_not_execution_eligible",
+        "what_to_learn_next",
+        "pre_analysis_score",
+        "pre_analysis_breakdown",
+        "pre_analysis_hard_reject",
+        "research_priority",
+        "research_queue_position",
+        "synthetic_decision",
+    }
+)
+
+
+def _research_queue_last_decision_json(
+    decision: TradeDecision,
+    audit_fields: dict[str, Any],
+) -> str:
+    """Persist a decision payload with a nested audit object for queue replay.
+
+    Older queue rows stored only top-level decision/audit fragments. New rows
+    keep those compatibility fields while adding ``audit`` so drain priority and
+    performance review can read the exact participation context.
+    """
+    audit = {
+        str(key): value
+        for key, value in (audit_fields or {}).items()
+        if value is not None
+    }
+    payload = dict(decision.model_dump())
+    for key, value in audit.items():
+        if key in _RESEARCH_QUEUE_AUDIT_MIRROR_KEYS or key.startswith("counterfactual_"):
+            payload[key] = value
+    payload["audit"] = audit
+    return _safe_json_dumps(payload)
 
 
 def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
@@ -3966,6 +4034,22 @@ def _decision_evidence_basis(decision: TradeDecision) -> str:
     return "proxy"
 
 
+def _generic_market_subfamily(market: Market) -> str:
+    """Coarse scoring-only split for broad generic markets."""
+    text = " ".join(
+        (
+            str(getattr(market, "id", "") or ""),
+            str(getattr(market, "question", "") or ""),
+            str(getattr(market, "category", "") or ""),
+            str(getattr(market, "resolution_criteria", "") or ""),
+        )
+    ).lower()
+    for subfamily, keywords in _GENERIC_SUBFAMILY_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return f"generic_{subfamily}"
+    return "generic_other"
+
+
 def _passes_refreshed_edge_guard(
     market: Market,
     decision: TradeDecision,
@@ -4195,7 +4279,7 @@ def _pre_analysis_opportunity_score(
     historical_family_stats: dict[str, float | int] | None = None,
     historical_prefix_stats: dict[str, Any] | None = None,
     historical_gate_metrics: dict[str, Any] | None = None,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, Any]]:
     """Estimate opportunity quality before expensive enrichment/analysis."""
     now_utc = datetime.now(timezone.utc)
     implied_prob_yes = _get_implied_probability(market, "YES")
@@ -4229,6 +4313,7 @@ def _pre_analysis_opportunity_score(
     if raw_hours_to_close is not None and -6.0 <= raw_hours_to_close <= 0.0:
         post_event_bonus = 0.10
     family = market_family(market)
+    market_subfamily = _generic_market_subfamily(market) if family == "generic" else family
     market_id_upper = (market.id or "").upper()
     analysis_count = int(state.analysis_count) if state is not None and state.analysis_count is not None else 0
     non_actionable_streak = int(state.non_actionable_streak) if state is not None else 0
@@ -4343,6 +4428,15 @@ def _pre_analysis_opportunity_score(
                     max(0.0, settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY),
                 )
                 historical_family_pnl_penalty = min(0.25, historical_family_pnl_penalty)
+            if family == "generic" and historical_family_win_rate >= 0.50:
+                # "generic" blends unrelated market types; broad negative PnL
+                # with a solid hit rate points more to sizing/entry than to
+                # market-selection failure.
+                generic_penalty_cap = 0.04
+                historical_family_pnl_penalty = min(
+                    historical_family_pnl_penalty,
+                    generic_penalty_cap,
+                )
     if (
         fallback_family_penalty > 0.0
         and historical_family_pnl > 0.0
@@ -4499,6 +4593,7 @@ def _pre_analysis_opportunity_score(
         "pre_score_negative_prefix_penalty": negative_prefix_penalty,
         "pre_score_historical_gate_score_penalty": historical_gate_score_penalty,
         "pre_score_historical_gate_sample_weight": historical_gate_sample_weight,
+        "pre_score_market_subfamily": market_subfamily,
         "pre_score_stacked_historical_penalty_raw": stacked_historical_penalty,
         "pre_score_stacked_historical_penalty_cap": stacked_cap,
         "pre_score_stacked_historical_excess_credited": stacked_historical_excess_credited,
@@ -6117,6 +6212,7 @@ def main(max_cycles: int | None = None) -> None:
                         max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
                         limit=drain_pool_limit,
                         excluded_market_ids=excluded_ids,
+                        included_market_ids=tuple(current_market_ids),
                     )
                     selected = 0
                     for entry in drain_rows:
@@ -6179,6 +6275,7 @@ def main(max_cycles: int | None = None) -> None:
                             max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
                             limit=drain_pool_limit,
                             excluded_market_ids=excluded_ids,
+                            included_market_ids=tuple(current_market_ids),
                         )
                         emergency_selected = 0
                         for entry in emergency_rows:
@@ -6637,35 +6734,6 @@ def main(max_cycles: int | None = None) -> None:
                             what_to_learn_next=participation_result.what_to_learn_next,
                             decision_origin="synthetic_research_queue",
                         )
-                    if queue_for_pre_analysis_research and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
-                        try:
-                            state_manager.record_research_queue_entry(
-                                market_id=market.id,
-                                cycle_id=cycle_id,
-                                gate_name="pre_analysis_performance",
-                                reason=pre_analysis_demotion_reason or "pre_analysis_soft_research",
-                                threshold_gap=0.0,
-                                what_to_learn_next=participation_result.what_to_learn_next,
-                                last_decision_json=_safe_json_dumps(
-                                    {
-                                        **research_only_decision.model_dump(),
-                                        "decision_origin": "synthetic_research_queue",
-                                        "market_judgment_available": False,
-                                        "participation_tier": participation_tier_str,
-                                        "participation_decision": str(
-                                            participation_result.primary_reason
-                                        ),
-                                        "why_not_execution_eligible": (
-                                            participation_result.why_not_execution_eligible
-                                        ),
-                                        "what_to_learn_next": (
-                                            participation_result.what_to_learn_next
-                                        ),
-                                    }
-                                ),
-                            )
-                        except Exception:
-                            pass
                     # Strip canonical keys emitted explicitly by _build_execution_audit
                     # below so pre_analysis metadata cannot double-write them.
                     _demotion_audit_extra = {
@@ -6722,6 +6790,22 @@ def main(max_cycles: int | None = None) -> None:
                         **_demotion_counterfactuals,
                         **_demotion_audit_extra,
                     )
+                    if queue_for_pre_analysis_research and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                        try:
+                            state_manager.record_research_queue_entry(
+                                market_id=market.id,
+                                cycle_id=cycle_id,
+                                gate_name="pre_analysis_performance",
+                                reason=pre_analysis_demotion_reason or "pre_analysis_soft_research",
+                                threshold_gap=0.0,
+                                what_to_learn_next=participation_result.what_to_learn_next,
+                                last_decision_json=_research_queue_last_decision_json(
+                                    research_only_decision,
+                                    _research_audit,
+                                ),
+                            )
+                        except Exception:
+                            pass
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -6800,6 +6884,35 @@ def main(max_cycles: int | None = None) -> None:
                             ),
                             decision_origin="synthetic_research_queue",
                         )
+                    _cap_counterfactuals = _build_counterfactual_audit_fields(
+                        reason=_cap_reason,
+                        settings=settings,
+                        pre_analysis_score=None,
+                        historical_metrics=None,
+                    )
+                    _cap_audit = _build_execution_audit(
+                        decision_terminal=False,
+                        final_action="research_queued",
+                        final_reason=_cap_reason,
+                        market_family=family_name,
+                        analysis_count=_analysis_count_for_cap,
+                        research_queue_position=_cap_rq_pos,
+                        participation_tier=str(
+                            ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+                        ),
+                        participation_decision=_cap_reason,
+                        decision_origin="synthetic_research_queue",
+                        market_judgment_available=False,
+                        why_not_execution_eligible=(
+                            "Lifetime analysis cap reached without execution-quality signal"
+                        ),
+                        what_to_learn_next=(
+                            f"Reached {_analysis_count_for_cap} analyses; wait for outcome learning."
+                        ),
+                        skip_due_to="not_execution_quality_now",
+                        **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+                        **_cap_counterfactuals,
+                    )
                     if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
                         try:
                             state_manager.record_research_queue_entry(
@@ -6813,53 +6926,18 @@ def main(max_cycles: int | None = None) -> None:
                                     f"{settings.MAX_LIFETIME_ANALYSES_PER_MARKET}); "
                                     "waiting for settlement outcome."
                                 ),
-                                last_decision_json=_safe_json_dumps(
-                                    {
-                                        **_cap_decision.model_dump(),
-                                        "decision_origin": "synthetic_research_queue",
-                                        "market_judgment_available": False,
-                                        "participation_tier": str(
-                                            ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
-                                        ),
-                                        "participation_decision": _cap_reason,
-                                    }
+                                last_decision_json=_research_queue_last_decision_json(
+                                    _cap_decision,
+                                    _cap_audit,
                                 ),
                             )
                         except Exception:
                             pass
-                    _cap_counterfactuals = _build_counterfactual_audit_fields(
-                        reason=_cap_reason,
-                        settings=settings,
-                        pre_analysis_score=None,
-                        historical_metrics=None,
-                    )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=_cap_decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_terminal=False,
-                            final_action="research_queued",
-                            final_reason=_cap_reason,
-                            market_family=family_name,
-                            analysis_count=_analysis_count_for_cap,
-                            research_queue_position=_cap_rq_pos,
-                            participation_tier=str(
-                                ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
-                            ),
-                            participation_decision=_cap_reason,
-                            decision_origin="synthetic_research_queue",
-                            market_judgment_available=False,
-                            why_not_execution_eligible=(
-                                "Lifetime analysis cap reached without execution-quality signal"
-                            ),
-                            what_to_learn_next=(
-                                f"Reached {_analysis_count_for_cap} analyses; wait for outcome learning."
-                            ),
-                            skip_due_to="not_execution_quality_now",
-                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
-                            **_cap_counterfactuals,
-                        ),
+                        execution_audit=_cap_audit,
                     )
                     logger.debug(
                         "Lifetime analysis cap reached for %s: %d >= %d",
@@ -6875,7 +6953,7 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     continue
                 pre_analysis_score = None
-                pre_analysis_breakdown: dict[str, float] | None = None
+                pre_analysis_breakdown: dict[str, Any] | None = None
                 if settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED:
                     pre_analysis_score, pre_analysis_breakdown = _pre_analysis_opportunity_score(
                         market,
@@ -7009,6 +7087,36 @@ def main(max_cycles: int | None = None) -> None:
                                 ),
                                 decision_origin="synthetic_research_queue",
                             )
+                            _soft_counterfactuals = _build_counterfactual_audit_fields(
+                                reason=_rejection_tag,
+                                settings=settings,
+                                pre_analysis_score=pre_analysis_score,
+                                historical_metrics=None,
+                            )
+                            _soft_audit = _build_execution_audit(
+                                decision_terminal=False,
+                                final_action="research_queued",
+                                final_reason=_rejection_tag,
+                                market_family=family_name,
+                                pre_analysis_score=pre_analysis_score,
+                                pre_analysis_breakdown=pre_analysis_breakdown,
+                                research_queue_position=_soft_rq_pos,
+                                participation_tier=_soft_participation_tier,
+                                participation_decision=(
+                                    _soft_participation_result.primary_reason
+                                ),
+                                why_not_execution_eligible=(
+                                    _soft_participation_result.why_not_execution_eligible
+                                ),
+                                what_to_learn_next=(
+                                    _soft_participation_result.what_to_learn_next
+                                ),
+                                decision_origin="synthetic_research_queue",
+                                market_judgment_available=False,
+                                skip_due_to="weak_pre_analysis_score",
+                                **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+                                **_soft_counterfactuals,
+                            )
                             if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
                                 try:
                                     state_manager.record_research_queue_entry(
@@ -7025,60 +7133,18 @@ def main(max_cycles: int | None = None) -> None:
                                             f"{settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:.4f}; "
                                             "monitor for improved conditions."
                                         ),
-                                        last_decision_json=_safe_json_dumps(
-                                            {
-                                                **_soft_research_decision.model_dump(),
-                                                "decision_origin": "synthetic_research_queue",
-                                                "market_judgment_available": False,
-                                                "participation_tier": _soft_participation_tier,
-                                                "participation_decision": (
-                                                    _soft_participation_result.primary_reason
-                                                ),
-                                                "why_not_execution_eligible": (
-                                                    _soft_participation_result.why_not_execution_eligible
-                                                ),
-                                                "what_to_learn_next": (
-                                                    _soft_participation_result.what_to_learn_next
-                                                ),
-                                            }
+                                        last_decision_json=_research_queue_last_decision_json(
+                                            _soft_research_decision,
+                                            _soft_audit,
                                         ),
                                     )
                                 except Exception:
                                     pass
-                            _soft_counterfactuals = _build_counterfactual_audit_fields(
-                                reason=_rejection_tag,
-                                settings=settings,
-                                pre_analysis_score=pre_analysis_score,
-                                historical_metrics=None,
-                            )
                             log_trade_decision(
                                 market_id=market.id,
                                 question=market.question,
                                 decision=_soft_research_decision.model_dump(),
-                                execution_audit=_build_execution_audit(
-                                    decision_terminal=False,
-                                    final_action="research_queued",
-                                    final_reason=_rejection_tag,
-                                    market_family=family_name,
-                                    pre_analysis_score=pre_analysis_score,
-                                    pre_analysis_breakdown=pre_analysis_breakdown,
-                                    research_queue_position=_soft_rq_pos,
-                                    participation_tier=_soft_participation_tier,
-                                    participation_decision=(
-                                        _soft_participation_result.primary_reason
-                                    ),
-                                    why_not_execution_eligible=(
-                                        _soft_participation_result.why_not_execution_eligible
-                                    ),
-                                    what_to_learn_next=(
-                                        _soft_participation_result.what_to_learn_next
-                                    ),
-                                    decision_origin="synthetic_research_queue",
-                                    market_judgment_available=False,
-                                    skip_due_to="weak_pre_analysis_score",
-                                    **_SYNTHETIC_DECISION_AUDIT_FIELDS,
-                                    **_soft_counterfactuals,
-                                ),
+                                execution_audit=_soft_audit,
                             )
                             logger.debug(
                                 "Soft-research routed %s: pre-analysis score %.4f in research band [%.4f, %.4f)",
@@ -7380,27 +7446,6 @@ def main(max_cycles: int | None = None) -> None:
                                 what_to_learn_next=drawdown_what_to_learn,
                                 decision_origin="synthetic_research_queue",
                             )
-                        if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
-                            try:
-                                state_manager.record_research_queue_entry(
-                                    market_id=market_for_drawdown.id,
-                                    cycle_id=cycle_id,
-                                    gate_name="daily_drawdown_preflight",
-                                    reason=_drawdown_reason,
-                                    threshold_gap=0.0,
-                                    what_to_learn_next=drawdown_what_to_learn,
-                                    last_decision_json=_safe_json_dumps(
-                                        {
-                                            **drawdown_decision.model_dump(),
-                                            "decision_origin": "synthetic_research_queue",
-                                            "market_judgment_available": False,
-                                            "participation_tier": monitor_tier_str,
-                                            "participation_decision": _drawdown_reason,
-                                        }
-                                    ),
-                                )
-                            except Exception:
-                                pass
                         _record_rejection_reason(
                             rejection_breakdown,
                             _drawdown_reason,
@@ -7415,30 +7460,47 @@ def main(max_cycles: int | None = None) -> None:
                             pre_analysis_score=candidate.get("pre_analysis_score"),
                             historical_metrics=candidate.get("historical_gate_metrics"),
                         )
+                        drawdown_audit = _build_execution_audit(
+                            decision_terminal=False,
+                            final_action="research_queued",
+                            final_reason=_drawdown_reason,
+                            market_family=family_name_drawdown,
+                            pre_analysis_score=candidate.get("pre_analysis_score"),
+                            pre_analysis_breakdown=candidate.get("pre_analysis_breakdown"),
+                            research_queue_position=drawdown_rq_pos,
+                            participation_tier=monitor_tier_str,
+                            participation_decision=_drawdown_reason,
+                            why_not_execution_eligible=drawdown_why_not,
+                            what_to_learn_next=drawdown_what_to_learn,
+                            decision_origin="synthetic_research_queue",
+                            market_judgment_available=False,
+                            skip_due_to=_skip_due_to_for_reason(_drawdown_reason),
+                            daily_drawdown_usdc=round(preflight_drawdown, 2),
+                            max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+                            **drawdown_counterfactuals,
+                        )
+                        if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                            try:
+                                state_manager.record_research_queue_entry(
+                                    market_id=market_for_drawdown.id,
+                                    cycle_id=cycle_id,
+                                    gate_name="daily_drawdown_preflight",
+                                    reason=_drawdown_reason,
+                                    threshold_gap=0.0,
+                                    what_to_learn_next=drawdown_what_to_learn,
+                                    last_decision_json=_research_queue_last_decision_json(
+                                        drawdown_decision,
+                                        drawdown_audit,
+                                    ),
+                                )
+                            except Exception:
+                                pass
                         log_trade_decision(
                             market_id=market_for_drawdown.id,
                             question=market_for_drawdown.question,
                             decision=drawdown_decision.model_dump(),
-                            execution_audit=_build_execution_audit(
-                                decision_terminal=False,
-                                final_action="research_queued",
-                                final_reason=_drawdown_reason,
-                                market_family=family_name_drawdown,
-                                pre_analysis_score=candidate.get("pre_analysis_score"),
-                                pre_analysis_breakdown=candidate.get("pre_analysis_breakdown"),
-                                research_queue_position=drawdown_rq_pos,
-                                participation_tier=monitor_tier_str,
-                                participation_decision=_drawdown_reason,
-                                why_not_execution_eligible=drawdown_why_not,
-                                what_to_learn_next=drawdown_what_to_learn,
-                                decision_origin="synthetic_research_queue",
-                                market_judgment_available=False,
-                                skip_due_to=_skip_due_to_for_reason(_drawdown_reason),
-                                daily_drawdown_usdc=round(preflight_drawdown, 2),
-                                max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
-                                **_SYNTHETIC_DECISION_AUDIT_FIELDS,
-                                **drawdown_counterfactuals,
-                            ),
+                            execution_audit=drawdown_audit,
                         )
                         daily_drawdown_preflight_blocked_count += 1
                     logger.warning(
@@ -7522,37 +7584,64 @@ def main(max_cycles: int | None = None) -> None:
                         pre_analysis_score=candidate.get("pre_analysis_score"),
                         historical_metrics=candidate.get("historical_gate_metrics"),
                     )
+                    _research_only_audit = _build_execution_audit(
+                        decision_terminal=False,
+                        final_action="research_queued",
+                        final_reason="repeated_non_actionable_research_only",
+                        market_family=str(candidate.get("market_family") or market_family(market)),
+                        analysis_count=analysis_count_for_research,
+                        non_actionable_streak=non_actionable_streak_for_research,
+                        pre_analysis_score=candidate.get("pre_analysis_score"),
+                        pre_analysis_breakdown=candidate.get("pre_analysis_breakdown"),
+                        historical_gate_allowed=candidate.get("historical_gate_allowed"),
+                        historical_gate_reason=candidate.get("historical_gate_reason"),
+                        historical_gate_metrics=candidate.get("historical_gate_metrics"),
+                        historical_family_pnl_total=candidate.get("historical_family_pnl_total"),
+                        historical_family_sample_size=candidate.get("historical_family_sample_size"),
+                        short_prefix_score_penalty=candidate.get("short_prefix_score_penalty"),
+                        research_only=True,
+                        research_queue_position=research_queue_position,
+                        participation_tier=str(
+                            ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
+                        ),
+                        participation_decision="repeated_non_actionable_research_only",
+                        decision_origin="synthetic_research_queue",
+                        market_judgment_available=False,
+                        skip_due_to="not_execution_quality_now",
+                        why_not_execution_eligible=(
+                            "Repeated non-actionable analyses without execution-quality signal"
+                        ),
+                        what_to_learn_next=(
+                            "Wait for materially new evidence, price movement, or settlement outcome "
+                            "before spending another full analysis call."
+                        ),
+                        **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+                        **_research_only_counterfactuals,
+                    )
+                    if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                        try:
+                            state_manager.record_research_queue_entry(
+                                market_id=market.id,
+                                cycle_id=cycle_id,
+                                gate_name="research_only",
+                                reason="repeated_non_actionable_research_only",
+                                threshold_gap=0.0,
+                                what_to_learn_next=(
+                                    "Wait for materially new evidence, price movement, "
+                                    "or settlement outcome before spending another full analysis call."
+                                ),
+                                last_decision_json=_research_queue_last_decision_json(
+                                    research_only_decision,
+                                    _research_only_audit,
+                                ),
+                            )
+                        except Exception:
+                            pass
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=research_only_decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_terminal=False,
-                            final_action="research_queued",
-                            final_reason="repeated_non_actionable_research_only",
-                            market_family=str(candidate.get("market_family") or market_family(market)),
-                            analysis_count=analysis_count_for_research,
-                            non_actionable_streak=non_actionable_streak_for_research,
-                            pre_analysis_score=candidate.get("pre_analysis_score"),
-                            pre_analysis_breakdown=candidate.get("pre_analysis_breakdown"),
-                            historical_gate_allowed=candidate.get("historical_gate_allowed"),
-                            historical_gate_reason=candidate.get("historical_gate_reason"),
-                            historical_gate_metrics=candidate.get("historical_gate_metrics"),
-                            historical_family_pnl_total=candidate.get("historical_family_pnl_total"),
-                            historical_family_sample_size=candidate.get("historical_family_sample_size"),
-                            short_prefix_score_penalty=candidate.get("short_prefix_score_penalty"),
-                            research_only=True,
-                            research_queue_position=research_queue_position,
-                            participation_tier=str(
-                                ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
-                            ),
-                            participation_decision="repeated_non_actionable_research_only",
-                            decision_origin="synthetic_research_queue",
-                            market_judgment_available=False,
-                            skip_due_to="not_execution_quality_now",
-                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
-                            **_research_only_counterfactuals,
-                        ),
+                        execution_audit=_research_only_audit,
                     )
                     research_only_emissions += 1
                 if research_only_emissions > 0:
@@ -7644,13 +7733,50 @@ def main(max_cycles: int | None = None) -> None:
                             try:
                                 analysis_results[market.id] = future.result()
                             except Exception as exc:
+                                error_text = str(exc)
+                                is_timeout = (
+                                    isinstance(exc, TimeoutError)
+                                    or "grok stream exceeded" in error_text.lower()
+                                )
+                                is_retriable = is_timeout or _is_retriable_xai_error(error_text)
+                                try:
+                                    failure_search_profile = build_market_search_config(
+                                        settings,
+                                        market,
+                                    ).profile_name
+                                except Exception:
+                                    failure_search_profile = None
+                                analysis_results[market.id] = {
+                                    "analysis_failed": True,
+                                    "analysis_error": error_text,
+                                    "analysis_error_type": type(exc).__name__,
+                                    "analysis_error_retriable_xai": is_retriable,
+                                    "analysis_error_quota_exhausted": _is_quota_exhausted_xai_error(
+                                        error_text
+                                    ),
+                                    "analysis_is_timeout": is_timeout,
+                                    "analysis_search_profile": failure_search_profile,
+                                    "was_refined": False,
+                                    "refinement_reason_text": None,
+                                    "used_extended_research": False,
+                                    "flip_triggered": False,
+                                    "flip_blocked": False,
+                                    "refinement_skipped_by_flip_precheck": False,
+                                    "flip_precheck_reason": None,
+                                    "market_outcome_mismatch_counted": False,
+                                }
                                 logger.error(
                                     "Failed to analyze market %s: %s",
                                     market.id,
                                     exc,
-                                    data={"market_id": market.id, "error": str(exc)},
+                                    data={
+                                        "market_id": market.id,
+                                        "error": error_text,
+                                        "is_timeout": is_timeout,
+                                        "is_retriable": is_retriable,
+                                    },
                                 )
-                                if _is_quota_exhausted_xai_error(str(exc)):
+                                if _is_quota_exhausted_xai_error(error_text):
                                     if settings.XAI_QUOTA_BREAKER_ENABLED:
                                         pause_until = datetime.now(timezone.utc) + timedelta(
                                             minutes=max(1, settings.XAI_QUOTA_PAUSE_MINUTES)
@@ -7667,18 +7793,14 @@ def main(max_cycles: int | None = None) -> None:
                                             },
                                         )
                                 logger.info(
-                                    "Market %s skipped for this cycle due to analysis failure after retries",
+                                    "Market %s captured for participation-tier failure routing",
                                     market.id,
                                     data={
                                         "market_id": market.id,
-                                        "final_action": "skip",
-                                        "final_reason": "analysis_failure_after_retries",
+                                        "final_action": "pending_failure_routing",
+                                        "analysis_is_timeout": is_timeout,
+                                        "analysis_error_retriable_xai": is_retriable,
                                     },
-                                )
-                                _record_terminal_outcome(
-                                    state_manager,
-                                    market.id,
-                                    "analysis_failure",
                                 )
                     if parallel_analysis_used and settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES > 0:
                         xai_failure_count = sum(
@@ -8174,38 +8296,6 @@ def main(max_cycles: int | None = None) -> None:
                             what_to_learn_next=participation_result.what_to_learn_next,
                             decision_origin="synthetic_operational_hold",
                         )
-                    if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
-                        try:
-                            state_manager.record_research_queue_entry(
-                                market_id=market.id,
-                                cycle_id=cycle_id,
-                                gate_name=(
-                                    "grok_timeout"
-                                    if is_timeout_failure
-                                    else "analysis_failure"
-                                ),
-                                reason=_failure_reason,
-                                what_to_learn_next=participation_result.what_to_learn_next,
-                                last_decision_json=_safe_json_dumps(
-                                    {
-                                        **_failure_decision.model_dump(),
-                                        "decision_origin": "synthetic_operational_hold",
-                                        "market_judgment_available": False,
-                                        "participation_tier": _failure_tier,
-                                        "participation_decision": (
-                                            participation_result.primary_reason
-                                        ),
-                                        "why_not_execution_eligible": (
-                                            participation_result.why_not_execution_eligible
-                                        ),
-                                        "what_to_learn_next": (
-                                            participation_result.what_to_learn_next
-                                        ),
-                                    }
-                                ),
-                            )
-                        except Exception:
-                            pass
                     _failure_action = (
                         "research_queued"
                         if queue_failure_for_research
@@ -8221,32 +8311,52 @@ def main(max_cycles: int | None = None) -> None:
                         pre_analysis_score=None,
                         historical_metrics=None,
                     )
+                    _failure_audit = _build_execution_audit(
+                        decision_terminal=not queue_failure_for_research,
+                        final_action=_failure_action,
+                        final_reason=_failure_reason,
+                        market_family=market_family_name,
+                        timeout_streak=timeout_streak if is_timeout_failure else None,
+                        participation_tier=_failure_tier,
+                        participation_decision=participation_result.primary_reason,
+                        why_not_execution_eligible=(
+                            participation_result.why_not_execution_eligible
+                        ),
+                        what_to_learn_next=participation_result.what_to_learn_next,
+                        research_queue_position=_failure_queue_position,
+                        decision_origin="synthetic_operational_hold",
+                        market_judgment_available=False,
+                        skip_due_to=_skip_due_to_for_reason(_failure_reason),
+                        search_profile=analysis_result.get("analysis_search_profile"),
+                        error_type=analysis_result.get("analysis_error_type"),
+                        error_message=analysis_result.get("analysis_error"),
+                        **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+                        **_failure_counterfactuals,
+                    )
+                    if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                        try:
+                            state_manager.record_research_queue_entry(
+                                market_id=market.id,
+                                cycle_id=cycle_id,
+                                gate_name=(
+                                    "grok_timeout"
+                                    if is_timeout_failure
+                                    else "analysis_failure"
+                                ),
+                                reason=_failure_reason,
+                                what_to_learn_next=participation_result.what_to_learn_next,
+                                last_decision_json=_research_queue_last_decision_json(
+                                    _failure_decision,
+                                    _failure_audit,
+                                ),
+                            )
+                        except Exception:
+                            pass
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=_failure_decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_terminal=not queue_failure_for_research,
-                            final_action=_failure_action,
-                            final_reason=_failure_reason,
-                            market_family=market_family_name,
-                            timeout_streak=timeout_streak if is_timeout_failure else None,
-                            participation_tier=_failure_tier,
-                            participation_decision=participation_result.primary_reason,
-                            why_not_execution_eligible=(
-                                participation_result.why_not_execution_eligible
-                            ),
-                            what_to_learn_next=participation_result.what_to_learn_next,
-                            research_queue_position=_failure_queue_position,
-                            decision_origin="synthetic_operational_hold",
-                            market_judgment_available=False,
-                            skip_due_to=_skip_due_to_for_reason(_failure_reason),
-                            search_profile=analysis_result.get("analysis_search_profile"),
-                            error_type=analysis_result.get("analysis_error_type"),
-                            error_message=analysis_result.get("analysis_error"),
-                            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
-                            **_failure_counterfactuals,
-                        ),
+                        execution_audit=_failure_audit,
                     )
                     logger.info(
                         "Market %s routed after analysis failure: %s",

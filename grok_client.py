@@ -727,12 +727,20 @@ class GrokClient:
             if market_implied is not None
             else None
         )
+        primary_source_url = str(decision.primary_source_url or "").strip()
+        primary_source_required_for_direct = profile_name != "sports"
+        primary_source_satisfies_direct = (
+            bool(primary_source_url) or not primary_source_required_for_direct
+        )
+        if evidence_basis_class == "direct" and not primary_source_satisfies_direct:
+            evidence_basis_class = "proxy"
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
         verifiable_floor_allowed = (
             has_verifiable_signal
             and not low_information
             and source_match_class == "settlement_aligned"
+            and primary_source_satisfies_direct
         )
         if has_verifiable_signal and not verifiable_floor_allowed:
             if low_information:
@@ -741,6 +749,11 @@ class GrokClient:
                 evidence_floor_suppressed_reason = "preview_or_proxy_source"
             elif no_external_odds and source_match_class == "missing_or_absence_only":
                 evidence_floor_suppressed_reason = "no_external_odds"
+            elif (
+                source_match_class == "settlement_aligned"
+                and not primary_source_satisfies_direct
+            ):
+                evidence_floor_suppressed_reason = "missing_primary_source_url"
             else:
                 evidence_floor_suppressed_reason = "source_not_settlement_aligned"
         if verifiable_floor_allowed:
@@ -773,6 +786,7 @@ class GrokClient:
             profile_name == "weather"
             and (decision.raw_confidence or decision.confidence) >= _WEATHER_OBS_CONFIDENCE_FLOOR
             and _RE_WEATHER_OBS_LOCKED.search(decision.reasoning or "")
+            and primary_source_satisfies_direct
         ):
             if evidence_quality < _WEATHER_OBS_EVIDENCE_FLOOR:
                 evidence_quality = _WEATHER_OBS_EVIDENCE_FLOOR
@@ -783,6 +797,7 @@ class GrokClient:
             and decision.likelihood_ratio is not None
             and decision.likelihood_ratio >= 10.0
             and not low_information
+            and primary_source_satisfies_direct
         )
         if (
             definitive_outcome_detected

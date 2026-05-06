@@ -996,6 +996,7 @@ class TestGrokClient(unittest.TestCase):
             edge_source="fallback",
             likelihood_ratio=25.0,
             evidence_quality=0.10,
+            primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -1008,6 +1009,38 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.source_match_class, "settlement_aligned")
         self.assertEqual(validated.evidence_basis, "direct")
+
+    def test_validate_and_enrich_suppresses_non_sports_direct_floor_without_primary_url(self) -> None:
+        market = Market(
+            id="m-definitive-missing-source",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap from Reuters confirms settlement outcome."
+            ),
+            implied_prob_external=None,
+            my_prob=0.85,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertFalse(validated.definitive_outcome_detected)
+        self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+        self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
+        self.assertEqual(validated.evidence_basis, "proxy")
 
     def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
         market = Market(
@@ -1029,6 +1062,7 @@ class TestGrokClient(unittest.TestCase):
             edge_source="fallback",
             likelihood_ratio=25.0,
             evidence_quality=0.10,
+            primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(
             api_key="x",
@@ -1063,6 +1097,7 @@ class TestGrokClient(unittest.TestCase):
             my_prob=None,
             edge_external=0.22,
             evidence_quality=0.0,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=39.1&lon=-94.6",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -1091,6 +1126,7 @@ class TestGrokClient(unittest.TestCase):
             my_prob=None,
             edge_external=0.23,
             evidence_quality=0.0,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=39.1&lon=-94.6",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -1120,6 +1156,7 @@ class TestGrokClient(unittest.TestCase):
             edge_external=0.20,
             edge_source="fallback",
             evidence_quality=0.1,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=39.1&lon=-94.6",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(

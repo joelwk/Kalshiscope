@@ -49,6 +49,19 @@ def test_upsert_updates_existing_entry() -> None:
     assert len(entries) == 1
     assert entries[0]["cycle_id"] == "c2"
     assert entries[0]["reason"] == "reason2"
+    assert entries[0]["times_seen"] == 2
+
+
+def test_research_queue_times_seen_defaults_for_new_entry() -> None:
+    mgr = _make_manager()
+    mgr.record_research_queue_entry(
+        market_id="KXSEEN-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="reason1",
+    )
+    entries = mgr.get_active_research_entries(lookback_hours=1)
+    assert entries[0]["times_seen"] == 1
 
 
 def test_expired_entries_excluded_from_get() -> None:
@@ -174,6 +187,66 @@ def test_drainable_entries_excludes_specified_market_ids() -> None:
     )
     drained_ids = [entry["market_id"] for entry in drainable]
     assert drained_ids == ["KXKEEP-001"]
+
+
+def test_drainable_entries_can_filter_to_included_market_ids() -> None:
+    """Current-cycle include filtering prevents stale queue rows from burning
+    the drain pool before live candidates can be selected."""
+    mgr = _make_manager()
+    base = datetime.now(timezone.utc) - timedelta(hours=4)
+    for index, market_id in enumerate(
+        ("KXSTALE-001", "KXSTALE-002", "KXLIVE-001")
+    ):
+        queued_at = (base + timedelta(minutes=index)).isoformat()
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id, "c1", queued_at, "g1", "r1",
+                0.0, None, queued_at, None, None,
+            ),
+        )
+    mgr._conn.commit()
+
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=1,
+        included_market_ids=("KXLIVE-001",),
+    )
+
+    assert [entry["market_id"] for entry in drainable] == ["KXLIVE-001"]
+
+
+def test_drainable_entries_empty_include_returns_empty() -> None:
+    mgr = _make_manager()
+    queued_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mgr._conn.execute(
+        """
+        INSERT INTO research_queue_entries
+            (market_id, cycle_id, queued_at, gate_name, reason,
+             threshold_gap, what_to_learn_next, last_seen, expires_at,
+             last_decision_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "KXLIVE-001", "c1", queued_at, "g1", "r1",
+            0.0, None, queued_at, None, None,
+        ),
+    )
+    mgr._conn.commit()
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=5,
+        included_market_ids=(),
+    )
+    assert drainable == []
 
 
 def test_drainable_entries_respects_limit() -> None:

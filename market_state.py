@@ -236,7 +236,8 @@ class MarketStateManager:
                     what_to_learn_next TEXT,
                     last_seen TEXT NOT NULL,
                     expires_at TEXT,
-                    last_decision_json TEXT
+                    last_decision_json TEXT,
+                    times_seen INTEGER DEFAULT 1
                 )
                 """
             )
@@ -1322,8 +1323,8 @@ class MarketStateManager:
             INSERT INTO research_queue_entries
                 (market_id, cycle_id, queued_at, gate_name, reason,
                  threshold_gap, what_to_learn_next, last_seen, expires_at,
-                 last_decision_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_decision_json, times_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(market_id) DO UPDATE SET
                 cycle_id = excluded.cycle_id,
                 gate_name = excluded.gate_name,
@@ -1332,7 +1333,8 @@ class MarketStateManager:
                 what_to_learn_next = excluded.what_to_learn_next,
                 last_seen = excluded.last_seen,
                 expires_at = excluded.expires_at,
-                last_decision_json = COALESCE(excluded.last_decision_json, last_decision_json)
+                last_decision_json = COALESCE(excluded.last_decision_json, last_decision_json),
+                times_seen = COALESCE(research_queue_entries.times_seen, 0) + 1
             """,
             (
                 market_id,
@@ -1362,7 +1364,7 @@ class MarketStateManager:
             """
             SELECT market_id, cycle_id, queued_at, gate_name, reason,
                    threshold_gap, what_to_learn_next, last_seen, expires_at,
-                   last_decision_json
+                   last_decision_json, COALESCE(times_seen, 1) AS times_seen
             FROM research_queue_entries
             WHERE last_seen >= ?
               AND (expires_at IS NULL OR expires_at >= ?)
@@ -1389,6 +1391,7 @@ class MarketStateManager:
         max_age_hours: float = 12.0,
         limit: int = 5,
         excluded_market_ids: tuple[str, ...] | None = None,
+        included_market_ids: tuple[str, ...] | None = None,
         min_priority: float | None = None,
     ) -> list[dict[str, Any]]:
         """Return research-queue entries eligible for forced re-analysis.
@@ -1396,8 +1399,11 @@ class MarketStateManager:
         Eligibility window is ``min_age_hours <= age_since_queued <= max_age_hours``.
         Caller passes ``excluded_market_ids`` (e.g. tickers already on this cycle's
         candidate list, already-traded markets, or recently-resolved markets) so
-        we don't double-promote. Results are ordered oldest-first to give the
-        longest-waiting entries a turn before fresher ones.
+        we don't double-promote. ``included_market_ids`` optionally restricts
+        drain candidates to the current filtered market set, preventing stale
+        queue rows from consuming the over-fetch pool. Results are ordered
+        oldest-first to give the longest-waiting entries a turn before fresher
+        ones.
 
         ``min_priority`` (optional) filters out entries whose proxied priority is
         below the cutoff. Priority is read from
@@ -1422,49 +1428,48 @@ class MarketStateManager:
             for mid in (excluded_market_ids or ())
             if str(mid or "").strip()
         )
+        included: tuple[str, ...] | None = None
+        if included_market_ids is not None:
+            included = tuple(
+                str(mid).strip()
+                for mid in included_market_ids
+                if str(mid or "").strip()
+            )
+            if not included:
+                return []
         effective_limit = max(0, int(limit))
         fetch_limit = effective_limit
         if min_priority is not None and effective_limit > 0:
             fetch_limit = max(effective_limit, effective_limit * 4)
+        where_clauses = [
+            "queued_at >= ?",
+            "queued_at <= ?",
+            "(expires_at IS NULL OR expires_at >= ?)",
+        ]
+        params_list: list[Any] = [
+            max_cutoff_iso,
+            min_cutoff_iso,
+            now.isoformat(),
+        ]
+        if included:
+            placeholders = ",".join("?" * len(included))
+            where_clauses.append(f"market_id IN ({placeholders})")
+            params_list.extend(included)
         if excluded:
             placeholders = ",".join("?" * len(excluded))
-            sql = f"""
-                SELECT market_id, cycle_id, queued_at, gate_name, reason,
-                       threshold_gap, what_to_learn_next, last_seen, expires_at,
-                       last_decision_json
-                FROM research_queue_entries
-                WHERE queued_at >= ?
-                  AND queued_at <= ?
-                  AND (expires_at IS NULL OR expires_at >= ?)
-                  AND market_id NOT IN ({placeholders})
-                ORDER BY queued_at ASC
-                LIMIT ?
-            """
-            params: tuple[Any, ...] = (
-                max_cutoff_iso,
-                min_cutoff_iso,
-                now.isoformat(),
-                *excluded,
-                fetch_limit,
-            )
-        else:
-            sql = """
-                SELECT market_id, cycle_id, queued_at, gate_name, reason,
-                       threshold_gap, what_to_learn_next, last_seen, expires_at,
-                       last_decision_json
-                FROM research_queue_entries
-                WHERE queued_at >= ?
-                  AND queued_at <= ?
-                  AND (expires_at IS NULL OR expires_at >= ?)
-                ORDER BY queued_at ASC
-                LIMIT ?
-            """
-            params = (
-                max_cutoff_iso,
-                min_cutoff_iso,
-                now.isoformat(),
-                fetch_limit,
-            )
+            where_clauses.append(f"market_id NOT IN ({placeholders})")
+            params_list.extend(excluded)
+        sql = f"""
+            SELECT market_id, cycle_id, queued_at, gate_name, reason,
+                   threshold_gap, what_to_learn_next, last_seen, expires_at,
+                   last_decision_json, COALESCE(times_seen, 1) AS times_seen
+            FROM research_queue_entries
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY queued_at ASC
+            LIMIT ?
+        """
+        params_list.append(fetch_limit)
+        params: tuple[Any, ...] = tuple(params_list)
         rows = self._conn.execute(sql, params).fetchall()
         results = [dict(row) for row in rows]
         if min_priority is None or not results:
@@ -1971,6 +1976,11 @@ class MarketStateManager:
         self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "next_eligible_cycle", "INTEGER DEFAULT 0")
         self._ensure_column("decision_receipts", "score_json", "TEXT")
+        self._ensure_column(
+            "research_queue_entries",
+            "times_seen",
+            "INTEGER DEFAULT 1",
+        )
         self._ensure_column(
             "trade_outcomes",
             "resolution_state",

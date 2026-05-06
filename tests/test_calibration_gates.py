@@ -302,6 +302,35 @@ def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     assert result.allowed is False
 
 
+def test_high_win_rate_negative_pnl_is_entry_price_caution_not_hard_deny() -> None:
+    result = evaluate_market_tiered(
+        market_id="KXENTRYCAUT-26-TEST",
+        family="generic",
+        prefix_stats={
+            "KXENTRYCAUT": PerformanceStats(
+                sample_size=20,
+                wins=13,
+                win_rate=0.65,
+                pnl_total=-25.0,
+            )
+        },
+        family_stats={},
+        prefix_len=11,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        prefix_soft_demote_score_penalty=0.08,
+        family_gate_enabled=False,
+    )
+    assert result.allowed is True
+    assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.metrics["historical_gate_prefix_loss_mode"] == "sizing_or_entry_price"
+    assert result.metrics["historical_gate_score_penalty"] == 0.04
+
+
 def test_legacy_wrapper_returns_allowed_true_for_soft_demote() -> None:
     """Soft-demoted markets remain eligible for scoring/research prioritization."""
     allowed, reason, metrics = evaluate_market(

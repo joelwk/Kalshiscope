@@ -1,5 +1,6 @@
 import unittest
 import inspect
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -54,6 +55,7 @@ from main import (
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
+    _research_queue_last_decision_json,
     _resolve_dynamic_analysis_candidate_cap,
     _resolve_min_bet_floor,
     _score_breakdown_from_execution_audit,
@@ -1270,6 +1272,40 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(
             breakdown["pre_score_historical_family_pnl_ratio"],
             0.525,
+            places=6,
+        )
+
+    def test_generic_family_negative_pnl_penalty_is_capped(self) -> None:
+        market = Market(
+            id="KXJOBLESSCLAIMS-26MAY07-200000",
+            question="Will initial jobless claims be above 200,000?",
+            category="economic",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official Department of Labor release",
+        )
+        settings = Settings(
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=-10.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=0.10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=-15.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=0.15,
+        )
+        _, breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={
+                "sample_size": 40,
+                "win_rate": 0.55,
+                "pnl_total": -40.0,
+            },
+        )
+        self.assertEqual(breakdown["pre_score_market_subfamily"], "generic_macro_release")
+        self.assertAlmostEqual(
+            breakdown["pre_score_historical_family_pnl_penalty"],
+            0.04,
             places=6,
         )
 
@@ -3372,6 +3408,30 @@ class TestParticipationAuditStamping(unittest.TestCase):
             str(ParticipationTier.EXECUTION_ELIGIBLE),
         )
 
+    def test_no_trade_placeholder_is_research_gap(self) -> None:
+        audit = _build_execution_audit(
+            final_action="skip",
+            final_reason="no_trade_recommended",
+        )
+        inferred = _apply_participation_audit_fields(
+            audit,
+            decision={
+                "should_trade": False,
+                "confidence": 0.50,
+                "evidence_quality": 0.0,
+                "evidence_basis": "absence_only",
+                "edge_source": "none",
+            },
+            settings=Settings(),
+        )
+        self.assertTrue(inferred)
+        self.assertEqual(
+            audit["participation_tier"],
+            str(ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE),
+        )
+        self.assertEqual(audit["participation_decision"], "no_trade_research_gap")
+        self.assertEqual(audit["skip_due_to"], "lack_of_evidence")
+
 
 class TestHistoricalFamilyFlattening(unittest.TestCase):
     def test_breakdown_fields_lift_to_top_level(self) -> None:
@@ -3566,6 +3626,38 @@ class TestSyntheticDecisionAuditFields(unittest.TestCase):
         self.assertFalse(audit["pre_analysis_hard_reject"])
         self.assertTrue(audit["analysis_skipped"])
         self.assertTrue(audit["synthetic_decision"])
+
+    def test_research_queue_payload_embeds_audit_context(self) -> None:
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.50,
+            bet_size_pct=0.0,
+            reasoning="queued",
+            edge_source="none",
+            evidence_basis="absence_only",
+            evidence_quality=0.0,
+            abstain=True,
+        )
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            final_reason="pre_analysis_score_soft_research",
+            decision_origin="synthetic_research_queue",
+            participation_tier=str(ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE),
+            skip_due_to="weak_pre_analysis_score",
+            pre_analysis_score=0.41,
+            pre_analysis_breakdown={"pre_score_market_subfamily": "generic_macro_release"},
+            why_not_execution_eligible="score below threshold",
+            counterfactual_required_pre_analysis_score=0.55,
+        )
+        payload = json.loads(_research_queue_last_decision_json(decision, audit))
+        self.assertEqual(payload["audit"]["pre_analysis_score"], 0.41)
+        self.assertEqual(payload["participation_tier"], audit["participation_tier"])
+        self.assertEqual(payload["skip_due_to"], "weak_pre_analysis_score")
+        self.assertEqual(
+            payload["counterfactual_required_pre_analysis_score"],
+            0.55,
+        )
 
     def test_no_research_queued_audit_marks_hard_reject(self) -> None:
         """Invariant: every production path that sets final_action=
