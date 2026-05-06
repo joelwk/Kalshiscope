@@ -380,7 +380,6 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
         self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.25)
         self.assertEqual(settings.PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY, 0.15)
-        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES, ())
         self.assertEqual(settings.GROK_PROXY_CONFIDENCE_CAP, 0.78)
         self.assertEqual(settings.GROK_LOW_INFO_CONFIDENCE_CAP, 0.70)
         self.assertEqual(settings.MAX_GLOBAL_CONFIDENCE, 0.82)
@@ -527,18 +526,12 @@ class TestConfig(unittest.TestCase):
             "PRE_ANALYSIS_PARTICIPATION_MIN_STREAK": "7",
             "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES": "5",
             "PRE_ANALYSIS_PARTICIPATION_MIN_ANALYSES": "9",
-            "PRE_ANALYSIS_HARD_REJECTION_FAMILIES": "speech,music",
-            "PRE_ANALYSIS_PARTICIPATION_FAMILIES": "weather,crypto",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertTrue(settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED)
         self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK, 7)
         self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES, 9)
-        self.assertEqual(
-            settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
-            ("weather", "crypto"),
-        )
 
     def test_pre_analysis_legacy_name_still_works_when_alias_unset(self) -> None:
         """When the new alias is unset, the legacy PRE_ANALYSIS_HARD_REJECTION_*
@@ -548,17 +541,12 @@ class TestConfig(unittest.TestCase):
             "PRE_ANALYSIS_HARD_REJECTION_ENABLED": "false",
             "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK": "11",
             "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES": "13",
-            "PRE_ANALYSIS_HARD_REJECTION_FAMILIES": "sports",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertFalse(settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED)
         self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK, 11)
         self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES, 13)
-        self.assertEqual(
-            settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES,
-            ("sports",),
-        )
 
     def test_research_queue_drain_settings_load_with_defaults(self) -> None:
         env = self._required_env()

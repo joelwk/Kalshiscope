@@ -19,15 +19,15 @@ def test_record_and_get_research_queue_entry() -> None:
         market_id="KXBTCD-26APR2517-T77749.99",
         cycle_id="cycle-001",
         gate_name="pre_analysis_performance",
-        reason="pre_analysis_zero_action_family",
+        reason="pre_analysis_score_soft_research",
         threshold_gap=0.0,
-        what_to_learn_next="Need a probe trade",
+        what_to_learn_next="Need more data",
     )
     entries = mgr.get_active_research_entries(lookback_hours=1)
     assert len(entries) == 1
     assert entries[0]["market_id"] == "KXBTCD-26APR2517-T77749.99"
-    assert entries[0]["reason"] == "pre_analysis_zero_action_family"
-    assert entries[0]["what_to_learn_next"] == "Need a probe trade"
+    assert entries[0]["reason"] == "pre_analysis_score_soft_research"
+    assert entries[0]["what_to_learn_next"] == "Need more data"
 
 
 def test_upsert_updates_existing_entry() -> None:
@@ -417,38 +417,3 @@ def test_estimate_research_entry_priority_returns_none_when_no_signal() -> None:
     assert priority is None
 
 
-def test_get_family_action_snapshot_deep_only() -> None:
-    mgr = _make_manager()
-    mgr._conn.execute(
-        """
-        INSERT INTO decision_receipts (cycle_id, market_id, final_action, final_reason, timestamp, decision_json, audit_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "c1", "KXBTC-001", "research_queued",
-            "pre_analysis_zero_action_family",
-            datetime.now(timezone.utc).isoformat(),
-            '{}',
-            '{"market_family": "crypto"}',
-        ),
-    )
-    mgr._conn.execute(
-        """
-        INSERT INTO decision_receipts (cycle_id, market_id, final_action, final_reason, timestamp, decision_json, audit_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "c1", "KXBTC-002", "skip",
-            "no_trade_recommended",
-            datetime.now(timezone.utc).isoformat(),
-            '{}',
-            '{"market_family": "crypto"}',
-        ),
-    )
-    mgr._conn.commit()
-
-    snapshot_all = mgr.get_family_action_snapshot(lookback=100, deep_only=False)
-    assert snapshot_all.get("crypto", {}).get("sample_size", 0) == 2
-
-    snapshot_deep = mgr.get_family_action_snapshot(lookback=100, deep_only=True)
-    assert snapshot_deep.get("crypto", {}).get("sample_size", 0) == 1

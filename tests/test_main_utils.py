@@ -824,38 +824,6 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(reason, "pre_analysis_repeated_non_actionable_bin_market")
         self.assertEqual(metadata["participation_demotion_family"], "generic")
 
-    def test_pre_analysis_demotion_for_zero_action_family(self) -> None:
-        market = Market(
-            id="KXPERSONMENTION-26APR09-TERM",
-            question="Will candidate mention term?",
-            category="politics",
-            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
-            close_time=datetime.now(timezone.utc) + timedelta(hours=8),
-            resolution_criteria="Official transcript source",
-        )
-        state = MarketState(
-            market_id=market.id,
-            analysis_count=6,
-            non_actionable_streak=4,
-            last_terminal_outcome="no_trade_recommended",
-        )
-        settings = Settings(
-            PRE_ANALYSIS_HARD_REJECTION_ENABLED=True,
-            PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED=True,
-            PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES=20,
-            PRE_ANALYSIS_HARD_REJECTION_FAMILIES=("speech", "mention"),
-        )
-        rejected, reason, metadata = _pre_analysis_participation_hold(
-            market=market,
-            state=state,
-            settings=settings,
-            traded_before=False,
-            family_action_stats={"sample_size": 25, "action_rate": 0.0},
-        )
-        self.assertTrue(rejected)
-        self.assertEqual(reason, "pre_analysis_zero_action_family")
-        self.assertEqual(metadata["participation_demotion_family"], "speech")
-
     def test_pre_analysis_demotion_for_fallback_edge_high_churn(self) -> None:
         market = Market(
             id="KXBTCD-26APR0917-T70499.99",
@@ -3672,7 +3640,6 @@ class TestSyntheticDecisionAuditFields(unittest.TestCase):
             "pre_analysis_historical_prefix_pnl_block",
             "pre_analysis_historical_prefix_small_sample_negative",
             "pre_analysis_historical_family_pnl_block",
-            "pre_analysis_zero_action_family",
             "pre_analysis_crypto_historically_unprofitable",
             "pre_analysis_repeated_non_actionable_market",
             "pre_analysis_repeated_non_actionable_bin_market",

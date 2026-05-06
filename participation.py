@@ -104,7 +104,6 @@ _TIER_FOR_REJECTION_REASON: dict[str, ParticipationTier] = {
     "score_below_min": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "score_far_below_min": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "fallback_edge_high_churn": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
-    "zero_action_family": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "crypto_historically_unprofitable": ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE,
     "repeated_non_actionable_market": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
     "repeated_non_actionable_bin_market": ParticipationTier.SKIP_FOR_NOW_WITH_REASON,
@@ -138,10 +137,6 @@ _LEARN_NEXT_FOR_REASON: dict[str, str] = {
         "Pre-analysis score is materially below the research band; this market "
         "is unlikely to become actionable without a structural change in "
         "pricing, liquidity, or evidence availability."
-    ),
-    "zero_action_family": (
-        "This family has never been deep-analyzed to execution; needs a probe "
-        "trade to break the self-fulfilling loop."
     ),
     "crypto_historically_unprofitable": (
         "Crypto family historically unprofitable; monitor for improved "
@@ -637,14 +632,6 @@ def _why_not_for_reason(reason: str, metadata: dict[str, Any]) -> str:
         return (
             f"Historical prefix gate blocked: sample_size={sample}, "
             f"win_rate={wr}, pnl_total={pnl}"
-        )
-    if "zero_action" in reason:
-        fam = metadata.get("participation_demotion_family", "?")
-        sz = metadata.get("participation_demotion_family_sample_size", "?")
-        rate = metadata.get("participation_demotion_family_action_rate", "?")
-        return (
-            f"Family '{fam}' has zero action rate: "
-            f"sample_size={sz}, action_rate={rate}"
         )
     if "crypto" in reason:
         return "Crypto family historically unprofitable"

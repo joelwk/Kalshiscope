@@ -1256,55 +1256,6 @@ class MarketStateManager:
         ).fetchone()
         return int(row["cnt"] or 0) if row else 0
 
-    def get_family_action_snapshot(
-        self,
-        *,
-        lookback: int = 400,
-        deep_only: bool = False,
-    ) -> dict[str, dict[str, float | int]]:
-        """Return decision action rates grouped by inferred family.
-
-        When *deep_only* is True the denominator excludes pre-analysis
-        rejections so the action rate is not self-fulfillingly zero for
-        families that have only ever been gated out before deep analysis.
-        """
-        window = max(1, int(lookback))
-        rows = self._conn.execute(
-            """
-            SELECT
-                LOWER(COALESCE(json_extract(audit_json, '$.market_family'), 'generic')) AS market_family,
-                LOWER(COALESCE(final_action, '')) AS final_action,
-                LOWER(COALESCE(final_reason, '')) AS final_reason
-            FROM decision_receipts
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (window,),
-        ).fetchall()
-        grouped: dict[str, dict[str, float | int]] = defaultdict(
-            lambda: {"sample_size": 0, "order_attempts": 0}
-        )
-        for row in rows:
-            family = str(row["market_family"] or "generic").strip().lower() or "generic"
-            final_action = str(row["final_action"] or "").strip().lower()
-            final_reason = str(row["final_reason"] or "").strip().lower()
-            if deep_only and final_reason.startswith("pre_analysis_"):
-                continue
-            bucket = grouped[family]
-            bucket["sample_size"] = int(bucket["sample_size"]) + 1
-            if final_action == "order_attempt" and final_reason != "dry_run":
-                bucket["order_attempts"] = int(bucket["order_attempts"]) + 1
-        snapshot: dict[str, dict[str, float | int]] = {}
-        for family, values in grouped.items():
-            sample_size = int(values["sample_size"])
-            order_attempts = int(values["order_attempts"])
-            snapshot[family] = {
-                "sample_size": sample_size,
-                "order_attempts": order_attempts,
-                "action_rate": (order_attempts / sample_size) if sample_size > 0 else 0.0,
-            }
-        return snapshot
-
     def record_research_queue_entry(
         self,
         *,

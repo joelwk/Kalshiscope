@@ -4614,7 +4614,6 @@ def _pre_analysis_participation_hold(
     settings: Settings,
     traded_before: bool,
     had_recent_fallback_edge: bool = False,
-    family_action_stats: dict[str, float | int] | None = None,
     historical_family_stats: dict[str, float | int] | None = None,
     fallback_family_edge_rate: float | None = None,
     fallback_family_sample_size: int = 0,
@@ -4662,35 +4661,6 @@ def _pre_analysis_participation_hold(
         }
         return True, "pre_analysis_fallback_edge_high_churn", metadata
     family = market_family(market)
-    rejection_families = {
-        str(name or "").strip().lower()
-        for name in settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES
-    }
-    family_scope_active = bool(rejection_families)
-    family_in_scope = family in rejection_families
-    # Zero-action-family check is family-scoped (only fires when the operator
-    # listed the family in PRE_ANALYSIS_HARD_REJECTION_FAMILIES). All other
-    # gates below fire on their own data conditions regardless of family scope.
-    if (
-        family_scope_active
-        and family_in_scope
-        and settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED
-    ):
-        action_stats = family_action_stats or {}
-        family_sample_size = int(action_stats.get("sample_size", 0) or 0)
-        family_action_rate = float(action_stats.get("action_rate", 0.0) or 0.0)
-        if (
-            family_sample_size >= max(1, settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES)
-            and family_action_rate <= 0.0
-            and not traded_before
-        ):
-            metadata = {
-                "participation_demotion_reason": "zero_action_family",
-                "participation_demotion_family": family,
-                "participation_demotion_family_sample_size": family_sample_size,
-                "participation_demotion_family_action_rate": family_action_rate,
-            }
-            return True, "pre_analysis_zero_action_family", metadata
     if (
         family == "crypto"
         and settings.PRE_ANALYSIS_CRYPTO_NEGATIVE_PNL_BLOCK_ENABLED
@@ -5337,7 +5307,6 @@ def main(max_cycles: int | None = None) -> None:
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
-    zero_action_family_probe_counts: dict[tuple[str, str], int] = {}
 
     while True:
         cycle_count += 1
@@ -5467,7 +5436,6 @@ def main(max_cycles: int | None = None) -> None:
                 current_trade_day = cycle_trade_day
                 daily_trade_count = 0
                 daily_start_balance = cycle_bankroll
-                zero_action_family_probe_counts.clear()
             elif daily_start_balance is None and cycle_bankroll is not None:
                 daily_start_balance = cycle_bankroll
             if (
@@ -6065,7 +6033,6 @@ def main(max_cycles: int | None = None) -> None:
             analysis_candidates: list[dict[str, Any]] = []
             fallback_family_rate_cache: dict[str, tuple[float, int]] = {}
             historical_family_outcome_snapshot: dict[str, dict[str, float | int]] = {}
-            family_action_snapshot: dict[str, dict[str, float | int]] = {}
             historical_prefix_stats: dict[str, Any] = {}
             historical_short_prefix_stats: dict[str, Any] = {}
             historical_family_stats_recent: dict[str, Any] = {}
@@ -6082,18 +6049,6 @@ def main(max_cycles: int | None = None) -> None:
                     data={"error": str(exc)},
                 )
                 historical_family_outcome_snapshot = {}
-            try:
-                family_action_snapshot = state_manager.get_family_action_snapshot(
-                    lookback=max(100, settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES * 20),
-                    deep_only=settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_USE_DEEP_ANALYZED_DENOMINATOR,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Family action snapshot lookup failed: %s",
-                    exc,
-                    data={"error": str(exc)},
-                )
-                family_action_snapshot = {}
             try:
                 historical_prefix_stats = load_ticker_prefix_stats(
                     state_manager,
@@ -6399,12 +6354,6 @@ def main(max_cycles: int | None = None) -> None:
                     return {}
                 return dict(historical_family_outcome_snapshot.get(normalized_family, {}))
 
-            def _get_family_action_stats(family_name: str) -> dict[str, float | int]:
-                normalized_family = str(family_name or "").strip().lower()
-                if not normalized_family:
-                    return {}
-                return dict(family_action_snapshot.get(normalized_family, {}))
-
             def _evaluate_historical_gate(
                 *,
                 market_id: str,
@@ -6618,7 +6567,6 @@ def main(max_cycles: int | None = None) -> None:
                         settings=settings,
                         traded_before=traded_before,
                         had_recent_fallback_edge=had_recent_fallback_edge,
-                        family_action_stats=_get_family_action_stats(family_name),
                         historical_family_stats=historical_family_stats,
                         fallback_family_edge_rate=family_fallback_rate,
                         fallback_family_sample_size=family_fallback_samples,
@@ -6627,44 +6575,6 @@ def main(max_cycles: int | None = None) -> None:
                         historical_gate_metrics=historical_gate_metrics,
                     )
                 )
-                zero_action_probe_metadata: dict[str, Any] = {}
-                if (
-                    pre_analysis_demoted
-                    and pre_analysis_demotion_reason == "pre_analysis_zero_action_family"
-                    and settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_FORCE_PROBE_PER_DAY > 0
-                    and not traded_before
-                ):
-                    probe_day_key = current_trade_day.isoformat()
-                    probe_key = (probe_day_key, family_name)
-                    probes_used = zero_action_family_probe_counts.get(probe_key, 0)
-                    probe_quota = max(
-                        0,
-                        int(settings.PRE_ANALYSIS_ZERO_ACTION_FAMILY_FORCE_PROBE_PER_DAY),
-                    )
-                    if probes_used < probe_quota:
-                        zero_action_family_probe_counts[probe_key] = probes_used + 1
-                        pre_analysis_demoted = False
-                        zero_action_probe_metadata = {
-                            "zero_action_family_probe": True,
-                            "zero_action_family_probe_day": probe_day_key,
-                            "zero_action_family_probe_family": family_name,
-                            "zero_action_family_probe_count_for_day": probes_used + 1,
-                            "zero_action_family_probe_quota_per_day": probe_quota,
-                            "zero_action_family_probe_bypassed_reason": (
-                                pre_analysis_demotion_reason
-                            ),
-                        }
-                        logger.info(
-                            "Zero-action family probe admitted %s for family=%s (%d/%d today)",
-                            market.id,
-                            family_name,
-                            probes_used + 1,
-                            probe_quota,
-                            data={
-                                "market_id": market.id,
-                                **zero_action_probe_metadata,
-                            },
-                        )
                 if pre_analysis_demoted:
                     pre_analysis_blocked += 1
                     pre_analysis_research_routed_count += 1
@@ -6966,10 +6876,6 @@ def main(max_cycles: int | None = None) -> None:
                         historical_prefix_stats=historical_prefix_stats,
                         historical_gate_metrics=historical_gate_metrics,
                     )
-                    if zero_action_probe_metadata:
-                        if pre_analysis_breakdown is None:
-                            pre_analysis_breakdown = {}
-                        pre_analysis_breakdown.update(zero_action_probe_metadata)
                     research_entry = recent_research_entries.get(market.id)
                     if research_entry is not None:
                         pre_analysis_score += _RESEARCH_QUEUE_SCORE_BUMP
@@ -7232,7 +7138,6 @@ def main(max_cycles: int | None = None) -> None:
                                                 "pre_score_historical_gate_score_penalty",
                                                 "pre_score_source_difficulty_penalty",
                                                 "pre_score_coinflip_penalty",
-                                                "zero_action_family_probe",
                                                 "research_queue_bump",
                                             }
                                         },
@@ -7285,8 +7190,6 @@ def main(max_cycles: int | None = None) -> None:
                             str(_research_context.get("what_to_learn_next") or "")
                             if _research_context else None
                         ),
-                        "zero_action_family_probe": bool(zero_action_probe_metadata),
-                        "zero_action_family_probe_metadata": zero_action_probe_metadata or None,
                         "is_research_queue_drain_probe": is_drain_probe,
                         "research_queue_drain_entry": (
                             drain_entry if is_drain_probe else None

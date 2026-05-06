@@ -119,19 +119,6 @@ def test_classify_analysis_failure_non_retriable_returns_monitor_only() -> None:
     assert decision.tier == ParticipationTier.MONITOR_ONLY
 
 
-def test_classify_zero_action_family_returns_research_only() -> None:
-    decision = classify_participation(
-        pre_analysis_rejection_reason="pre_analysis_zero_action_family",
-        pre_analysis_metadata={
-            "participation_demotion_family": "crypto",
-            "participation_demotion_family_sample_size": 50,
-            "participation_demotion_family_action_rate": 0.0,
-        },
-    )
-    assert decision.tier == ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE
-    assert "probe" in (decision.what_to_learn_next or "").lower()
-
-
 def test_classify_score_soft_research_returns_research_only() -> None:
     decision = classify_participation(
         pre_analysis_rejection_reason="pre_analysis_score_soft_research",
