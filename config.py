@@ -206,6 +206,9 @@ class Settings:
         "FT",
     )
     SPEECH_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "drudgereport.com",
+        "realclearpolitics.com",
+        "zerohedge.com",
         "c-span.org",
         "youtube.com",
         "whitehouse.gov",
