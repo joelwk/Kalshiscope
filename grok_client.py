@@ -117,6 +117,10 @@ def _default_search_config(settings: Settings | None = None) -> SearchConfig:
         to_date=now,
         allowed_domains=list(resolved.SEARCH_ALLOWED_DOMAINS),
         allowed_x_handles=list(resolved.SEARCH_ALLOWED_X_HANDLES),
+        source_domains_pool=list(resolved.SEARCH_ALLOWED_DOMAINS),
+        source_x_handles_pool=list(resolved.SEARCH_ALLOWED_X_HANDLES),
+        max_allowed_domains=resolved.SEARCH_PROFILE_MAX_DOMAINS,
+        max_allowed_x_handles=resolved.SEARCH_PROFILE_MAX_X_HANDLES,
         multimedia_confidence_range=resolved.MULTIMEDIA_CONFIDENCE_THRESHOLD,
     )
 
@@ -309,6 +313,8 @@ def _category_research_hint(profile_name: str, market: Market | None = None) -> 
         return load_prompt("user/category_hints/speech_general")
     if profile_name == "music":
         return load_prompt("user/category_hints/music")
+    if profile_name == "entertainment":
+        return load_prompt("user/category_hints/entertainment")
     if market is not None and is_commodity_market(market):
         return load_prompt("user/category_hints/commodities")
     return load_prompt("user/category_hints/generic")
@@ -405,16 +411,28 @@ class GrokClient:
                 to_date=config.to_date or defaults.to_date,
                 allowed_domains=config.allowed_domains or defaults.allowed_domains,
                 allowed_x_handles=config.allowed_x_handles or defaults.allowed_x_handles,
+                source_domains_pool=config.source_domains_pool or defaults.source_domains_pool,
+                source_x_handles_pool=(
+                    config.source_x_handles_pool or defaults.source_x_handles_pool
+                ),
+                max_allowed_domains=(
+                    config.max_allowed_domains or defaults.max_allowed_domains
+                ),
+                max_allowed_x_handles=(
+                    config.max_allowed_x_handles or defaults.max_allowed_x_handles
+                ),
                 enable_multimedia=config.enable_multimedia,
                 multimedia_confidence_range=config.multimedia_confidence_range,
                 profile_name=config.profile_name,
                 lookback_hours=config.lookback_hours,
             )
         # Keep within xAI limits while preserving prioritized order from profile builder.
-        if len(config.allowed_domains) > 5:
-            config.allowed_domains = config.allowed_domains[:5]
-        if len(config.allowed_x_handles) > 10:
-            config.allowed_x_handles = config.allowed_x_handles[:10]
+        max_domains = max(1, int(config.max_allowed_domains or 5))
+        max_handles = max(1, int(config.max_allowed_x_handles or 10))
+        if len(config.allowed_domains) > max_domains:
+            config.allowed_domains = config.allowed_domains[:max_domains]
+        if len(config.allowed_x_handles) > max_handles:
+            config.allowed_x_handles = config.allowed_x_handles[:max_handles]
         return config
 
     def _should_enable_multimedia(

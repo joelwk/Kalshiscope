@@ -4912,26 +4912,69 @@ def _resolve_dynamic_analysis_candidate_cap(
     return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied, negative_score_floor_applied
 
 
-def _build_speech_reanalysis_search_config(base_config: SearchConfig) -> SearchConfig:
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        normalized = str(item or "").strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(normalized)
+    return ordered
+
+
+def _research_source_window(
+    *,
+    current_items: list[str],
+    pool_items: list[str],
+    offset: int,
+    limit: int,
+) -> list[str]:
+    """Pick a bounded source window, preferring fallback sources when present."""
+    max_items = max(1, int(limit or len(current_items) or 1))
+    pool = _dedupe_preserve_order(pool_items or current_items)
+    if not pool:
+        return []
+    resolved_offset = max(0, int(offset))
+    if resolved_offset >= len(pool):
+        resolved_offset = 0
+    rotated = [*pool[resolved_offset:], *pool[:resolved_offset]]
+    return rotated[:max_items]
+
+
+def _build_speech_reanalysis_search_config(
+    base_config: SearchConfig,
+    settings: Settings,
+) -> SearchConfig:
     """Expand lookback and rotate sources for low-evidence speech reanalysis."""
     now = datetime.now(timezone.utc)
     base_lookback_hours = base_config.lookback_hours or 24
     expanded_lookback_hours = max(base_lookback_hours, base_lookback_hours * 2)
-    rotated_domains = (
-        [*base_config.allowed_domains[1:], base_config.allowed_domains[0]]
-        if len(base_config.allowed_domains) > 1
-        else list(base_config.allowed_domains)
+    rotated_domains = _research_source_window(
+        current_items=base_config.allowed_domains,
+        pool_items=base_config.source_domains_pool,
+        offset=settings.EXTENDED_RESEARCH_SOURCE_OFFSET,
+        limit=base_config.max_allowed_domains,
     )
-    rotated_handles = (
-        [*base_config.allowed_x_handles[1:], base_config.allowed_x_handles[0]]
-        if len(base_config.allowed_x_handles) > 1
-        else list(base_config.allowed_x_handles)
+    rotated_handles = _research_source_window(
+        current_items=base_config.allowed_x_handles,
+        pool_items=base_config.source_x_handles_pool,
+        offset=settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET,
+        limit=base_config.max_allowed_x_handles,
     )
     return SearchConfig(
         from_date=now - timedelta(hours=expanded_lookback_hours),
         to_date=now,
         allowed_domains=rotated_domains,
         allowed_x_handles=rotated_handles,
+        source_domains_pool=list(base_config.source_domains_pool),
+        source_x_handles_pool=list(base_config.source_x_handles_pool),
+        max_allowed_domains=base_config.max_allowed_domains,
+        max_allowed_x_handles=base_config.max_allowed_x_handles,
         enable_multimedia=True,
         multimedia_confidence_range=base_config.multimedia_confidence_range,
         profile_name=base_config.profile_name,
@@ -4939,26 +4982,35 @@ def _build_speech_reanalysis_search_config(base_config: SearchConfig) -> SearchC
     )
 
 
-def _build_extended_reanalysis_search_config(base_config: SearchConfig) -> SearchConfig:
+def _build_extended_reanalysis_search_config(
+    base_config: SearchConfig,
+    settings: Settings,
+) -> SearchConfig:
     """Increase lookback and rotate sources for stale non-actionable markets."""
     now = datetime.now(timezone.utc)
     base_lookback_hours = base_config.lookback_hours or 24
     expanded_lookback_hours = max(base_lookback_hours + 24, base_lookback_hours * 2)
-    rotated_domains = (
-        [*base_config.allowed_domains[1:], base_config.allowed_domains[0]]
-        if len(base_config.allowed_domains) > 1
-        else list(base_config.allowed_domains)
+    rotated_domains = _research_source_window(
+        current_items=base_config.allowed_domains,
+        pool_items=base_config.source_domains_pool,
+        offset=settings.EXTENDED_RESEARCH_SOURCE_OFFSET,
+        limit=base_config.max_allowed_domains,
     )
-    rotated_handles = (
-        [*base_config.allowed_x_handles[1:], base_config.allowed_x_handles[0]]
-        if len(base_config.allowed_x_handles) > 1
-        else list(base_config.allowed_x_handles)
+    rotated_handles = _research_source_window(
+        current_items=base_config.allowed_x_handles,
+        pool_items=base_config.source_x_handles_pool,
+        offset=settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET,
+        limit=base_config.max_allowed_x_handles,
     )
     return SearchConfig(
         from_date=now - timedelta(hours=expanded_lookback_hours),
         to_date=now,
         allowed_domains=rotated_domains,
         allowed_x_handles=rotated_handles,
+        source_domains_pool=list(base_config.source_domains_pool),
+        source_x_handles_pool=list(base_config.source_x_handles_pool),
+        max_allowed_domains=base_config.max_allowed_domains,
+        max_allowed_x_handles=base_config.max_allowed_x_handles,
         enable_multimedia=True,
         multimedia_confidence_range=base_config.multimedia_confidence_range,
         profile_name=base_config.profile_name,
@@ -4980,7 +5032,10 @@ def _analyze_market_candidate(
     search_config = build_market_search_config(settings, market)
     used_extended_research = bool(force_extended_research)
     if used_extended_research:
-        search_config = _build_extended_reanalysis_search_config(search_config)
+        search_config = _build_extended_reanalysis_search_config(
+            search_config,
+            settings,
+        )
     try:
         decision = grok_client.analyze_market(
             market,
@@ -5060,6 +5115,7 @@ def _analyze_market_candidate(
         ):
             refinement_search_config = _build_speech_reanalysis_search_config(
                 search_config,
+                settings,
             )
             logger.debug(
                 "Expanded speech reanalysis search config: market=%s initial_lookback=%s expanded_lookback=%s",

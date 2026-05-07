@@ -3029,10 +3029,10 @@ class TestMainUtils(unittest.TestCase):
     def test_analyze_market_candidate_uses_extended_research_profile(self) -> None:
         market = Market(
             id="m-extended-research",
-            question="Will Team A win?",
+            question="NBA: Will Team A win?",
             outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
             liquidity_usdc=200.0,
-            category="sports",
+            category="nba",
             close_time=datetime.now(timezone.utc) + timedelta(hours=12),
         )
         settings = Settings(
@@ -3066,6 +3066,14 @@ class TestMainUtils(unittest.TestCase):
         self.assertGreater(
             int(client.last_search_config.lookback_hours or 0),
             int(baseline_config.lookback_hours or 0),
+        )
+        self.assertNotEqual(
+            client.last_search_config.allowed_domains,
+            baseline_config.allowed_domains,
+        )
+        self.assertEqual(
+            client.last_search_config.allowed_domains[0],
+            baseline_config.source_domains_pool[settings.EXTENDED_RESEARCH_SOURCE_OFFSET],
         )
 
     def test_analyze_market_candidate_uses_high_confidence_shrinkage_factor(self) -> None:

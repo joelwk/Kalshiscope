@@ -105,6 +105,10 @@ class TestConfig(unittest.TestCase):
             "SEARCH_ALLOWED_DOMAINS": "example.com, news.example",
             "SEARCH_ALLOWED_X_HANDLES": "Foo, Bar",
             "MULTIMEDIA_CONFIDENCE_THRESHOLD": "0.60, 0.70",
+            "SEARCH_PROFILE_MAX_DOMAINS": "4",
+            "SEARCH_PROFILE_MAX_X_HANDLES": "8",
+            "EXTENDED_RESEARCH_SOURCE_OFFSET": "4",
+            "EXTENDED_RESEARCH_X_HANDLE_OFFSET": "8",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -113,6 +117,10 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.SEARCH_ALLOWED_DOMAINS, ("example.com", "news.example"))
         self.assertEqual(settings.SEARCH_ALLOWED_X_HANDLES, ("Foo", "Bar"))
         self.assertEqual(settings.MULTIMEDIA_CONFIDENCE_THRESHOLD, (0.6, 0.7))
+        self.assertEqual(settings.SEARCH_PROFILE_MAX_DOMAINS, 4)
+        self.assertEqual(settings.SEARCH_PROFILE_MAX_X_HANDLES, 8)
+        self.assertEqual(settings.EXTENDED_RESEARCH_SOURCE_OFFSET, 4)
+        self.assertEqual(settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET, 8)
 
     def test_weather_profile_settings_overrides(self) -> None:
         env = {
@@ -163,18 +171,20 @@ class TestConfig(unittest.TestCase):
             "MIN_EDGE=0.12",
             "LOW_PRICE_MIN_EDGE=0.18",
             "VERY_LOW_PRICE_MIN_EDGE=0.28",
-            "FALLBACK_EDGE_MIN_EDGE=0.30",
-            "MAX_REASONABLE_EDGE=0.40",
+            "FALLBACK_EDGE_MIN_EDGE=0.25",
+            "MAX_REASONABLE_EDGE=0.35",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
-            "SCORE_GATE_THRESHOLD=0.52",
-            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.30",
-            "MAX_MARKETS_PER_CYCLE=3",
-            "MAX_TRADES_PER_CYCLE=2",
-            "MAX_TRADES_PER_DAY=6",
+            "SCORE_GATE_THRESHOLD=0.42",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25",
+            "MAX_MARKETS_PER_CYCLE=16",
+            "MAX_TRADES_PER_CYCLE=3",
+            "MAX_TRADES_PER_DAY=12",
             "KALSHI_MVE_FILTER=exclude",
             "KALSHI_ELIGIBLE_FLOOR=100",
             "KALSHI_FETCH_TOPUP_ENABLED=false",
+            "SEARCH_PROFILE_MAX_DOMAINS=5",
+            "EXTENDED_RESEARCH_SOURCE_OFFSET=5",
         }
         for expected_line in expected_lines:
             self.assertIn(expected_line, env_example)
@@ -199,6 +209,23 @@ class TestConfig(unittest.TestCase):
         self.assertIn("NWS", config.Settings.WEATHER_ALLOWED_X_HANDLES)
         self.assertIn("NWSSPC", config.Settings.WEATHER_ALLOWED_X_HANDLES)
         self.assertIn("NHC_Atlantic", config.Settings.WEATHER_ALLOWED_X_HANDLES)
+
+    def test_entertainment_profile_settings_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "ENTERTAINMENT_ALLOWED_DOMAINS": "netflix.com,flixpatrol.com",
+            "ENTERTAINMENT_ALLOWED_X_HANDLES": "Netflix,flixpatrol",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.ENTERTAINMENT_ALLOWED_DOMAINS,
+            ("netflix.com", "flixpatrol.com"),
+        )
+        self.assertEqual(
+            settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
+            ("Netflix", "flixpatrol"),
+        )
 
     def test_build_search_config(self) -> None:
         env = {

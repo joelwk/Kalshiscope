@@ -184,6 +184,16 @@ def test_profile_for_crypto_15m_ticker_uses_crypto_profile() -> None:
     assert "coinbase.com" in profile.domains
 
 
+def test_market_family_crypto_daily_alt_tickers_from_logs() -> None:
+    """KXSOLE/KXSHIBA were showing up as generic in recent participation logs."""
+    for ticker in (
+        "KXSOLE-26MAY0817-B88",
+        "KXSHIBA-26MAY0717-B0.0000062",
+    ):
+        market = Market(id=ticker, question="Crypto spot price range?", category=None)
+        assert market_family(market) == "crypto"
+
+
 def test_market_family_politics() -> None:
     market = Market(id="3", question="Portugal Presidential Election Winner", category="politics")
     assert market_family(market) == "politics"
@@ -234,6 +244,15 @@ def test_market_family_music_detected_from_streaming_keywords() -> None:
     assert market_family(market) == "music"
 
 
+def test_market_family_entertainment_ticker_precedes_streaming_keyword() -> None:
+    market = Market(
+        id="KXNETFLIXTOPVIEWSMOVIE-26MAY11-21",
+        question="Will this streaming movie be #1 on Netflix?",
+        category="entertainment",
+    )
+    assert market_family(market) == "entertainment"
+
+
 def test_profile_for_market_returns_music_profile() -> None:
     settings = Settings()
     market = Market(
@@ -245,6 +264,53 @@ def test_profile_for_market_returns_music_profile() -> None:
     assert profile.name == "music"
     assert "billboard.com" in profile.domains
     assert "SpotifyCharts" in profile.x_handles
+
+
+def test_profile_for_market_returns_entertainment_profile() -> None:
+    settings = Settings()
+    market = Market(
+        id="KXNETFLIXTOPVIEWSMOVIE-26MAY11-21",
+        question="Will the #1 Movie on Netflix have at least 21 million views?",
+        category=None,
+    )
+    profile = profile_for_market(settings, market)
+    assert profile.name == "entertainment"
+    assert "netflix.com" in profile.domains
+    assert "flixpatrol.com" in profile.domains
+
+
+def test_build_search_config_keeps_full_source_pool_for_extended_research() -> None:
+    now = datetime.now(timezone.utc)
+    settings = Settings(
+        ENTERTAINMENT_ALLOWED_DOMAINS=(
+            "netflix.com",
+            "top10.netflix.com",
+            "flixpatrol.com",
+            "boxofficemojo.com",
+            "the-numbers.com",
+            "variety.com",
+        ),
+        SEARCH_PROFILE_MAX_DOMAINS=3,
+    )
+    market = Market(
+        id="KXNETFLIXRANKMOVIE-26MAY11-REM",
+        question="Will this movie rank #1 on Netflix?",
+        close_time=now + timedelta(hours=12),
+    )
+    search_config = build_market_search_config(settings, market, now=now)
+    assert search_config.allowed_domains == [
+        "netflix.com",
+        "top10.netflix.com",
+        "flixpatrol.com",
+    ]
+    assert search_config.source_domains_pool == [
+        "netflix.com",
+        "top10.netflix.com",
+        "flixpatrol.com",
+        "boxofficemojo.com",
+        "the-numbers.com",
+        "variety.com",
+    ]
 
 
 def test_profile_for_market_returns_speech_profile() -> None:

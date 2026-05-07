@@ -136,6 +136,10 @@ class Settings:
         "intocryptoverse",
     )
     MULTIMEDIA_CONFIDENCE_THRESHOLD: tuple[float, float] = (0.55, 0.75)
+    SEARCH_PROFILE_MAX_DOMAINS: int = 5
+    SEARCH_PROFILE_MAX_X_HANDLES: int = 10
+    EXTENDED_RESEARCH_SOURCE_OFFSET: int = 5
+    EXTENDED_RESEARCH_X_HANDLE_OFFSET: int = 10
     # Dynamic search windows by market horizon
     SEARCH_LOOKBACK_SHORT_HOURS: int = 24
     SEARCH_LOOKBACK_MEDIUM_HOURS: int = 72
@@ -276,6 +280,25 @@ class Settings:
         "CNBC",
         "MarketWatch",
         "YahooFinance",
+    )
+    ENTERTAINMENT_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "netflix.com",
+        "top10.netflix.com",
+        "flixpatrol.com",
+        "boxofficemojo.com",
+        "the-numbers.com",
+        "variety.com",
+        "hollywoodreporter.com",
+        "deadline.com",
+    )
+    ENTERTAINMENT_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "Netflix",
+        "NetflixTudum",
+        "flixpatrol",
+        "BoxOfficeMojo",
+        "Variety",
+        "THR",
+        "DEADLINE",
     )
 
     # Kalshi
@@ -452,6 +475,11 @@ class Settings:
         "nfl.com",
         "nba.com",
         "nhl.com",
+        "netflix.com",
+        "top10.netflix.com",
+        "flixpatrol.com",
+        "boxofficemojo.com",
+        "the-numbers.com",
     )
     PRE_ANALYSIS_OPPORTUNITY_ENABLED: bool = True
     PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.55
@@ -918,6 +946,22 @@ def load_settings() -> Settings:
             "MULTIMEDIA_CONFIDENCE_THRESHOLD",
             Settings.MULTIMEDIA_CONFIDENCE_THRESHOLD,
         ),
+        SEARCH_PROFILE_MAX_DOMAINS=_read_env_int(
+            "SEARCH_PROFILE_MAX_DOMAINS",
+            Settings.SEARCH_PROFILE_MAX_DOMAINS,
+        ),
+        SEARCH_PROFILE_MAX_X_HANDLES=_read_env_int(
+            "SEARCH_PROFILE_MAX_X_HANDLES",
+            Settings.SEARCH_PROFILE_MAX_X_HANDLES,
+        ),
+        EXTENDED_RESEARCH_SOURCE_OFFSET=_read_env_int(
+            "EXTENDED_RESEARCH_SOURCE_OFFSET",
+            Settings.EXTENDED_RESEARCH_SOURCE_OFFSET,
+        ),
+        EXTENDED_RESEARCH_X_HANDLE_OFFSET=_read_env_int(
+            "EXTENDED_RESEARCH_X_HANDLE_OFFSET",
+            Settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET,
+        ),
         SEARCH_LOOKBACK_SHORT_HOURS=_read_env_int(
             "SEARCH_LOOKBACK_SHORT_HOURS",
             Settings.SEARCH_LOOKBACK_SHORT_HOURS,
@@ -971,6 +1015,14 @@ def load_settings() -> Settings:
         ),
         GENERIC_ALLOWED_X_HANDLES=_read_env_csv(
             "GENERIC_ALLOWED_X_HANDLES", Settings.GENERIC_ALLOWED_X_HANDLES
+        ),
+        ENTERTAINMENT_ALLOWED_DOMAINS=_read_env_csv(
+            "ENTERTAINMENT_ALLOWED_DOMAINS",
+            Settings.ENTERTAINMENT_ALLOWED_DOMAINS,
+        ),
+        ENTERTAINMENT_ALLOWED_X_HANDLES=_read_env_csv(
+            "ENTERTAINMENT_ALLOWED_X_HANDLES",
+            Settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
         ),
         KALSHI_API_BASE_URL=_read_env_str(
             "KALSHI_API_BASE_URL", Settings.KALSHI_API_BASE_URL
@@ -1885,6 +1937,10 @@ def build_search_config(settings: Settings) -> SearchConfig:
         to_date=search_now,
         allowed_domains=list(settings.SEARCH_ALLOWED_DOMAINS),
         allowed_x_handles=list(settings.SEARCH_ALLOWED_X_HANDLES),
+        source_domains_pool=list(settings.SEARCH_ALLOWED_DOMAINS),
+        source_x_handles_pool=list(settings.SEARCH_ALLOWED_X_HANDLES),
+        max_allowed_domains=settings.SEARCH_PROFILE_MAX_DOMAINS,
+        max_allowed_x_handles=settings.SEARCH_PROFILE_MAX_X_HANDLES,
         multimedia_confidence_range=settings.MULTIMEDIA_CONFIDENCE_THRESHOLD,
     )
 
@@ -1895,6 +1951,10 @@ class SearchConfig:
     to_date: "datetime | None" = None
     allowed_domains: list[str] = field(default_factory=list)
     allowed_x_handles: list[str] = field(default_factory=list)
+    source_domains_pool: list[str] = field(default_factory=list)
+    source_x_handles_pool: list[str] = field(default_factory=list)
+    max_allowed_domains: int = 5
+    max_allowed_x_handles: int = 10
     enable_multimedia: bool = False
     multimedia_confidence_range: tuple[float, float] = (0.55, 0.75)
     profile_name: str = "generic"

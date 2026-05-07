@@ -7,9 +7,6 @@ from datetime import datetime, timedelta, timezone
 from config import SearchConfig, Settings
 from models import Market
 
-_MAX_SEARCH_DOMAINS = 5
-_MAX_SEARCH_HANDLES = 10
-
 _SPORTS_KEYWORDS = (
     "nba",
     "nhl",
@@ -139,8 +136,22 @@ _MUSIC_KEYWORDS = (
     "hits daily double",
     "hot 100",
 )
+_ENTERTAINMENT_KEYWORDS = (
+    "netflix",
+    "top 10",
+    "movie",
+    "film",
+    "box office",
+    "views",
+    "tv show",
+    "television",
+)
 _LONG_HORIZON_HINTS = ("election", "presidential", "winner", "nominee")
 _SPEECH_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
+_ENTERTAINMENT_TICKER_PATTERN = re.compile(
+    r"\bKX(?:NETFLIX|BOXOFFICE|MOVIE|TVSHOW|STREAMING|APPSTORE|YOUTUBE|TWITCH)",
+    re.IGNORECASE,
+)
 
 # Sports-league ticker prefixes used by Kalshi (case-insensitive). Required
 # because keyword-based detection on natural-language questions misses
@@ -160,7 +171,7 @@ _SPORTS_TICKER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CRYPTO_TICKER_PATTERN = re.compile(
-    r"\bKX(?:BTC|ETH|DOGE|SOL|BNB|XRP|HYPE)(?:D|15M)?(?:-|$)",
+    r"\bKX(?:BTC|ETH|DOGE|SOL|SOLE|BNB|XRP|HYPE|SHIB|SHIBA)(?:D|15M|E)?(?:-|$)",
     re.IGNORECASE,
 )
 
@@ -184,8 +195,22 @@ def build_market_search_config(
     return SearchConfig(
         from_date=from_date,
         to_date=now,
-        allowed_domains=_prioritized_trim(profile.domains, _MAX_SEARCH_DOMAINS),
-        allowed_x_handles=_prioritized_trim(profile.x_handles, _MAX_SEARCH_HANDLES),
+        allowed_domains=_prioritized_trim(
+            profile.domains,
+            settings.SEARCH_PROFILE_MAX_DOMAINS,
+        ),
+        allowed_x_handles=_prioritized_trim(
+            profile.x_handles,
+            settings.SEARCH_PROFILE_MAX_X_HANDLES,
+        ),
+        source_domains_pool=list(
+            _prioritized_trim(profile.domains, len(profile.domains))
+        ),
+        source_x_handles_pool=list(
+            _prioritized_trim(profile.x_handles, len(profile.x_handles))
+        ),
+        max_allowed_domains=settings.SEARCH_PROFILE_MAX_DOMAINS,
+        max_allowed_x_handles=settings.SEARCH_PROFILE_MAX_X_HANDLES,
         multimedia_confidence_range=settings.MULTIMEDIA_CONFIDENCE_THRESHOLD,
         profile_name=profile.name,
         lookback_hours=lookback_hours,
@@ -229,6 +254,12 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
             name=family,
             domains=settings.WEATHER_ALLOWED_DOMAINS,
             x_handles=settings.WEATHER_ALLOWED_X_HANDLES,
+        )
+    if family == "entertainment":
+        return ResearchProfile(
+            name=family,
+            domains=settings.ENTERTAINMENT_ALLOWED_DOMAINS,
+            x_handles=settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
         )
     return ResearchProfile(
         name="generic",
@@ -282,6 +313,11 @@ def family_from_text(text: str) -> str:
         normalized, _SPEECH_KEYWORDS
     ):
         return "speech"
+    if _ENTERTAINMENT_TICKER_PATTERN.search(text or "") or _has_keyword_match(
+        normalized,
+        _ENTERTAINMENT_KEYWORDS,
+    ):
+        return "entertainment"
     if _has_keyword_match(normalized, _MUSIC_KEYWORDS):
         return "music"
     if _has_keyword_match(normalized, _WEATHER_KEYWORDS):
@@ -366,6 +402,8 @@ def _weather_lookback_hours(settings: Settings, market: Market, now: datetime) -
 
 
 def _prioritized_trim(items: tuple[str, ...], limit: int) -> list[str]:
+    if limit <= 0:
+        return []
     seen: set[str] = set()
     ordered: list[str] = []
     for item in items:
