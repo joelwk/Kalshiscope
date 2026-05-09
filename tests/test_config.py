@@ -105,6 +105,10 @@ class TestConfig(unittest.TestCase):
             "SEARCH_ALLOWED_DOMAINS": "example.com, news.example",
             "SEARCH_ALLOWED_X_HANDLES": "Foo, Bar",
             "MULTIMEDIA_CONFIDENCE_THRESHOLD": "0.60, 0.70",
+            "SEARCH_PROFILE_MAX_DOMAINS": "4",
+            "SEARCH_PROFILE_MAX_X_HANDLES": "8",
+            "EXTENDED_RESEARCH_SOURCE_OFFSET": "4",
+            "EXTENDED_RESEARCH_X_HANDLE_OFFSET": "8",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -113,6 +117,10 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.SEARCH_ALLOWED_DOMAINS, ("example.com", "news.example"))
         self.assertEqual(settings.SEARCH_ALLOWED_X_HANDLES, ("Foo", "Bar"))
         self.assertEqual(settings.MULTIMEDIA_CONFIDENCE_THRESHOLD, (0.6, 0.7))
+        self.assertEqual(settings.SEARCH_PROFILE_MAX_DOMAINS, 4)
+        self.assertEqual(settings.SEARCH_PROFILE_MAX_X_HANDLES, 8)
+        self.assertEqual(settings.EXTENDED_RESEARCH_SOURCE_OFFSET, 4)
+        self.assertEqual(settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET, 8)
 
     def test_weather_profile_settings_overrides(self) -> None:
         env = {
@@ -163,13 +171,20 @@ class TestConfig(unittest.TestCase):
             "MIN_EDGE=0.12",
             "LOW_PRICE_MIN_EDGE=0.18",
             "VERY_LOW_PRICE_MIN_EDGE=0.28",
-            "FALLBACK_EDGE_MIN_EDGE=0.30",
-            "MAX_REASONABLE_EDGE=0.32",
-            "SCORE_GATE_THRESHOLD=0.52",
-            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.30",
-            "MAX_MARKETS_PER_CYCLE=3",
-            "MAX_TRADES_PER_CYCLE=2",
-            "MAX_TRADES_PER_DAY=6",
+            "FALLBACK_EDGE_MIN_EDGE=0.25",
+            "MAX_REASONABLE_EDGE=0.35",
+            "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
+            "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
+            "SCORE_GATE_THRESHOLD=0.42",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25",
+            "MAX_MARKETS_PER_CYCLE=16",
+            "MAX_TRADES_PER_CYCLE=3",
+            "MAX_TRADES_PER_DAY=12",
+            "KALSHI_MVE_FILTER=exclude",
+            "KALSHI_ELIGIBLE_FLOOR=100",
+            "KALSHI_FETCH_TOPUP_ENABLED=false",
+            "SEARCH_PROFILE_MAX_DOMAINS=5",
+            "EXTENDED_RESEARCH_SOURCE_OFFSET=5",
         }
         for expected_line in expected_lines:
             self.assertIn(expected_line, env_example)
@@ -194,6 +209,23 @@ class TestConfig(unittest.TestCase):
         self.assertIn("NWS", config.Settings.WEATHER_ALLOWED_X_HANDLES)
         self.assertIn("NWSSPC", config.Settings.WEATHER_ALLOWED_X_HANDLES)
         self.assertIn("NHC_Atlantic", config.Settings.WEATHER_ALLOWED_X_HANDLES)
+
+    def test_entertainment_profile_settings_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "ENTERTAINMENT_ALLOWED_DOMAINS": "netflix.com,flixpatrol.com",
+            "ENTERTAINMENT_ALLOWED_X_HANDLES": "Netflix,flixpatrol",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.ENTERTAINMENT_ALLOWED_DOMAINS,
+            ("netflix.com", "flixpatrol.com"),
+        )
+        self.assertEqual(
+            settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
+            ("Netflix", "flixpatrol"),
+        )
 
     def test_build_search_config(self) -> None:
         env = {
@@ -341,11 +373,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.60)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.08)
-        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.60)
+        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.55)
         self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 3)
         self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 1)
-        self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 0)
-        self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 0)
+        self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 2)
+        self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
@@ -358,7 +390,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.ORDER_SUBMISSION_MAX_PRICE, 0.97)
         self.assertEqual(settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(settings.MAX_TRADEABLE_IMPLIED_PRICE, 0.95)
-        self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 10)
+        self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 50)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
@@ -375,8 +407,6 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
         self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.25)
         self.assertEqual(settings.PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY, 0.15)
-        self.assertIn("generic", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
-        self.assertIn("crypto", settings.PRE_ANALYSIS_HARD_REJECTION_FAMILIES)
         self.assertEqual(settings.GROK_PROXY_CONFIDENCE_CAP, 0.78)
         self.assertEqual(settings.GROK_LOW_INFO_CONFIDENCE_CAP, 0.70)
         self.assertEqual(settings.MAX_GLOBAL_CONFIDENCE, 0.82)
@@ -384,7 +414,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
         self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.72)
         self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.65)
-        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.32)
+        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.40)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
         self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)
@@ -417,16 +447,12 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.EXTENDED_RESEARCH_AFTER_STREAK, 2)
         self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 5)
         self.assertEqual(settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST, 2.0)
-        self.assertTrue(settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED)
-        self.assertEqual(settings.PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY, 0.06)
         self.assertEqual(settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY, 0.04)
         self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
         self.assertTrue(settings.RESEARCH_QUEUE_PRIORITY_ENABLED)
-        self.assertIn("KXPERSONMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXSURVIVORMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXSNLMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXLASTWORDCOUNT-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
-        self.assertIn("KXVANCEMENTION-", settings.MARKET_TICKER_BLOCKLIST_PREFIXES)
+        self.assertEqual(settings.MARKET_TICKER_BLOCKLIST_PREFIXES, ())
+        self.assertFalse(settings.SKIP_WEATHER_BIN_MARKETS)
+        self.assertFalse(settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED)
         self.assertIn("billboard.com", settings.MUSIC_ALLOWED_DOMAINS)
         self.assertIn("SpotifyCharts", settings.MUSIC_ALLOWED_X_HANDLES)
 
@@ -441,7 +467,7 @@ class TestConfig(unittest.TestCase):
     def test_profit_leak_fix_defaults(self) -> None:
         """Verify the profit-leak-fix defaults match .env.example values."""
         defaults = config.Settings
-        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.40)
+        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.50)
         self.assertEqual(defaults.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
         self.assertEqual(defaults.MAX_REANALYSES_PER_MARKET_PER_DAY, 2)
         self.assertEqual(defaults.MAX_LIFETIME_ANALYSES_PER_MARKET, 8)
@@ -450,6 +476,59 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(defaults.HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES, 20)
         self.assertTrue(defaults.XAI_QUOTA_BREAKER_ENABLED)
         self.assertEqual(defaults.XAI_QUOTA_PAUSE_MINUTES, 30)
+
+    def test_cycle1_review_defaults(self) -> None:
+        """Defaults introduced or tuned by the cycle 1 log review."""
+        defaults = config.Settings
+        self.assertEqual(defaults.MAX_REASONABLE_EDGE, 0.40)
+        self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.50)
+        self.assertEqual(defaults.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.95)
+        self.assertEqual(defaults.GROK_STREAM_TIMEOUT_SECONDS_WEATHER, 120)
+
+    def test_high_quality_settled_evidence_min_eq_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ": "0.90",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.90)
+
+    def test_grok_stream_timeout_seconds_weather_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "GROK_STREAM_TIMEOUT_SECONDS_WEATHER": "150",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS_WEATHER, 150)
+
+    def test_cycle2_fetch_strategy_defaults(self) -> None:
+        """Defaults introduced by the cycle 2 fetch-strategy review."""
+        defaults = config.Settings
+        self.assertEqual(defaults.KALSHI_MVE_FILTER, "exclude")
+        self.assertEqual(defaults.KALSHI_ELIGIBLE_FLOOR, 100)
+        self.assertFalse(defaults.KALSHI_FETCH_TOPUP_ENABLED)
+
+    def test_kalshi_mve_filter_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "KALSHI_MVE_FILTER": "only",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.KALSHI_MVE_FILTER, "only")
+
+    def test_kalshi_eligible_floor_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "KALSHI_ELIGIBLE_FLOOR": "250",
+            "KALSHI_FETCH_TOPUP_ENABLED": "true",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.KALSHI_ELIGIBLE_FLOOR, 250)
+        self.assertTrue(settings.KALSHI_FETCH_TOPUP_ENABLED)
 
     def test_quota_breaker_env_override(self) -> None:
         env = {
@@ -461,6 +540,120 @@ class TestConfig(unittest.TestCase):
             settings = config.load_settings()
         self.assertFalse(settings.XAI_QUOTA_BREAKER_ENABLED)
         self.assertEqual(settings.XAI_QUOTA_PAUSE_MINUTES, 60)
+
+    def test_pre_analysis_participation_alias_overrides_legacy(self) -> None:
+        """The new PRE_ANALYSIS_PARTICIPATION_* names take precedence over the
+        legacy PRE_ANALYSIS_HARD_REJECTION_* names so the rename is real but
+        non-breaking."""
+        env = {
+            **self._required_env(),
+            "PRE_ANALYSIS_HARD_REJECTION_ENABLED": "false",
+            "PRE_ANALYSIS_PARTICIPATION_GATING_ENABLED": "true",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK": "3",
+            "PRE_ANALYSIS_PARTICIPATION_MIN_STREAK": "7",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES": "5",
+            "PRE_ANALYSIS_PARTICIPATION_MIN_ANALYSES": "9",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertTrue(settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK, 7)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES, 9)
+
+    def test_pre_analysis_legacy_name_still_works_when_alias_unset(self) -> None:
+        """When the new alias is unset, the legacy PRE_ANALYSIS_HARD_REJECTION_*
+        env vars are still honored. Operators don't need to migrate today."""
+        env = {
+            **self._required_env(),
+            "PRE_ANALYSIS_HARD_REJECTION_ENABLED": "false",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK": "11",
+            "PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES": "13",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.PRE_ANALYSIS_HARD_REJECTION_ENABLED)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_STREAK, 11)
+        self.assertEqual(settings.PRE_ANALYSIS_HARD_REJECTION_MIN_ANALYSES, 13)
+
+    def test_research_queue_drain_settings_load_with_defaults(self) -> None:
+        env = self._required_env()
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 1)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+
+    def test_research_queue_drain_settings_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "RESEARCH_QUEUE_DRAIN_ENABLED": "false",
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE": "3",
+            "RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS": "0.25",
+            "RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS": "24.0",
+            "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY": "0.65",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 3)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 0.25)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 24.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.65)
+
+    def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
+        """Cycle 4 recovery: a growing research queue (127+ entries) needs
+        more drain throughput per cycle. Verify the per-cycle setting can
+        be raised without other drain knobs silently changing."""
+        env = {
+            **self._required_env(),
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE": "2",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 2)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+
+    def test_max_sports_candidates_per_cycle_default_unset(self) -> None:
+        """Cycle 4 recovery: the new sports cap defaults to 0 (no cap) so
+        existing deployments retain prior behavior."""
+        env = self._required_env()
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.MAX_SPORTS_CANDIDATES_PER_CYCLE, 0)
+
+    def test_max_sports_candidates_per_cycle_env_override(self) -> None:
+        """Operators can opt into family diversification by setting the cap
+        to a positive integer."""
+        env = {
+            **self._required_env(),
+            "MAX_SPORTS_CANDIDATES_PER_CYCLE": "3",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.MAX_SPORTS_CANDIDATES_PER_CYCLE, 3)
+
+    def test_daily_drawdown_preflight_setting_loads(self) -> None:
+        env = {**self._required_env(), "DAILY_DRAWDOWN_PREFLIGHT_ENABLED": "false"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.DAILY_DRAWDOWN_PREFLIGHT_ENABLED)
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertTrue(defaults.DAILY_DRAWDOWN_PREFLIGHT_ENABLED)
+
+    def test_cycle_yield_alert_escalation_setting_loads(self) -> None:
+        env = {**self._required_env(), "CYCLE_YIELD_ALERT_ESCALATE_AFTER": "5"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER, 5)
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.CYCLE_YIELD_ALERT_ESCALATE_AFTER, 2)
 
 
 if __name__ == "__main__":

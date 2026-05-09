@@ -12,6 +12,7 @@ from typing import Any, Iterable
 from bayesian_engine import BayesianState
 from logging_config import get_logger
 from models import MarketState, OrderResponse, Position, TradeDecision
+from research_profiles import family_from_text
 
 logger = get_logger(__name__)
 
@@ -235,7 +236,8 @@ class MarketStateManager:
                     what_to_learn_next TEXT,
                     last_seen TEXT NOT NULL,
                     expires_at TEXT,
-                    last_decision_json TEXT
+                    last_decision_json TEXT,
+                    times_seen INTEGER DEFAULT 1
                 )
                 """
             )
@@ -1254,55 +1256,6 @@ class MarketStateManager:
         ).fetchone()
         return int(row["cnt"] or 0) if row else 0
 
-    def get_family_action_snapshot(
-        self,
-        *,
-        lookback: int = 400,
-        deep_only: bool = False,
-    ) -> dict[str, dict[str, float | int]]:
-        """Return decision action rates grouped by inferred family.
-
-        When *deep_only* is True the denominator excludes pre-analysis
-        rejections so the action rate is not self-fulfillingly zero for
-        families that have only ever been gated out before deep analysis.
-        """
-        window = max(1, int(lookback))
-        rows = self._conn.execute(
-            """
-            SELECT
-                LOWER(COALESCE(json_extract(audit_json, '$.market_family'), 'generic')) AS market_family,
-                LOWER(COALESCE(final_action, '')) AS final_action,
-                LOWER(COALESCE(final_reason, '')) AS final_reason
-            FROM decision_receipts
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (window,),
-        ).fetchall()
-        grouped: dict[str, dict[str, float | int]] = defaultdict(
-            lambda: {"sample_size": 0, "order_attempts": 0}
-        )
-        for row in rows:
-            family = str(row["market_family"] or "generic").strip().lower() or "generic"
-            final_action = str(row["final_action"] or "").strip().lower()
-            final_reason = str(row["final_reason"] or "").strip().lower()
-            if deep_only and final_reason.startswith("pre_analysis_"):
-                continue
-            bucket = grouped[family]
-            bucket["sample_size"] = int(bucket["sample_size"]) + 1
-            if final_action == "order_attempt" and final_reason != "dry_run":
-                bucket["order_attempts"] = int(bucket["order_attempts"]) + 1
-        snapshot: dict[str, dict[str, float | int]] = {}
-        for family, values in grouped.items():
-            sample_size = int(values["sample_size"])
-            order_attempts = int(values["order_attempts"])
-            snapshot[family] = {
-                "sample_size": sample_size,
-                "order_attempts": order_attempts,
-                "action_rate": (order_attempts / sample_size) if sample_size > 0 else 0.0,
-            }
-        return snapshot
-
     def record_research_queue_entry(
         self,
         *,
@@ -1321,8 +1274,8 @@ class MarketStateManager:
             INSERT INTO research_queue_entries
                 (market_id, cycle_id, queued_at, gate_name, reason,
                  threshold_gap, what_to_learn_next, last_seen, expires_at,
-                 last_decision_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_decision_json, times_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(market_id) DO UPDATE SET
                 cycle_id = excluded.cycle_id,
                 gate_name = excluded.gate_name,
@@ -1331,7 +1284,8 @@ class MarketStateManager:
                 what_to_learn_next = excluded.what_to_learn_next,
                 last_seen = excluded.last_seen,
                 expires_at = excluded.expires_at,
-                last_decision_json = COALESCE(excluded.last_decision_json, last_decision_json)
+                last_decision_json = COALESCE(excluded.last_decision_json, last_decision_json),
+                times_seen = COALESCE(research_queue_entries.times_seen, 0) + 1
             """,
             (
                 market_id,
@@ -1361,7 +1315,7 @@ class MarketStateManager:
             """
             SELECT market_id, cycle_id, queued_at, gate_name, reason,
                    threshold_gap, what_to_learn_next, last_seen, expires_at,
-                   last_decision_json
+                   last_decision_json, COALESCE(times_seen, 1) AS times_seen
             FROM research_queue_entries
             WHERE last_seen >= ?
               AND (expires_at IS NULL OR expires_at >= ?)
@@ -1381,30 +1335,140 @@ class MarketStateManager:
         self._conn.commit()
         return cursor.rowcount
 
+    def get_drainable_research_entries(
+        self,
+        *,
+        min_age_hours: float = 1.0,
+        max_age_hours: float = 12.0,
+        limit: int = 5,
+        excluded_market_ids: tuple[str, ...] | None = None,
+        included_market_ids: tuple[str, ...] | None = None,
+        min_priority: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return research-queue entries eligible for forced re-analysis.
+
+        Eligibility window is ``min_age_hours <= age_since_queued <= max_age_hours``.
+        Caller passes ``excluded_market_ids`` (e.g. tickers already on this cycle's
+        candidate list, already-traded markets, or recently-resolved markets) so
+        we don't double-promote. ``included_market_ids`` optionally restricts
+        drain candidates to the current filtered market set, preventing stale
+        queue rows from consuming the over-fetch pool. Results are ordered
+        oldest-first to give the longest-waiting entries a turn before fresher
+        ones.
+
+        ``min_priority`` (optional) filters out entries whose proxied priority is
+        below the cutoff. Priority is read from
+        ``estimate_research_entry_priority``: ``last_decision_json.audit
+        .pre_analysis_score`` when present, otherwise ``1.0 - threshold_gap``.
+        Entries without enough metadata to estimate a priority are kept (treated
+        as "unknown" rather than penalized). When the filter is active the
+        function over-fetches so the oldest-first ordering still yields enough
+        qualifying rows after pruning. Callers that need per-cycle telemetry
+        on how many were skipped should call ``estimate_research_entry_priority``
+        themselves; this entry point only returns the qualifying rows.
+        """
+        now = datetime.now(timezone.utc)
+        max_cutoff_iso = (
+            now - timedelta(hours=max(0.0, float(max_age_hours)))
+        ).isoformat()
+        min_cutoff_iso = (
+            now - timedelta(hours=max(0.0, float(min_age_hours)))
+        ).isoformat()
+        excluded = tuple(
+            str(mid).strip()
+            for mid in (excluded_market_ids or ())
+            if str(mid or "").strip()
+        )
+        included: tuple[str, ...] | None = None
+        if included_market_ids is not None:
+            included = tuple(
+                str(mid).strip()
+                for mid in included_market_ids
+                if str(mid or "").strip()
+            )
+            if not included:
+                return []
+        effective_limit = max(0, int(limit))
+        fetch_limit = effective_limit
+        if min_priority is not None and effective_limit > 0:
+            fetch_limit = max(effective_limit, effective_limit * 4)
+        where_clauses = [
+            "queued_at >= ?",
+            "queued_at <= ?",
+            "(expires_at IS NULL OR expires_at >= ?)",
+        ]
+        params_list: list[Any] = [
+            max_cutoff_iso,
+            min_cutoff_iso,
+            now.isoformat(),
+        ]
+        if included:
+            placeholders = ",".join("?" * len(included))
+            where_clauses.append(f"market_id IN ({placeholders})")
+            params_list.extend(included)
+        if excluded:
+            placeholders = ",".join("?" * len(excluded))
+            where_clauses.append(f"market_id NOT IN ({placeholders})")
+            params_list.extend(excluded)
+        sql = f"""
+            SELECT market_id, cycle_id, queued_at, gate_name, reason,
+                   threshold_gap, what_to_learn_next, last_seen, expires_at,
+                   last_decision_json, COALESCE(times_seen, 1) AS times_seen
+            FROM research_queue_entries
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY queued_at ASC
+            LIMIT ?
+        """
+        params_list.append(fetch_limit)
+        params: tuple[Any, ...] = tuple(params_list)
+        rows = self._conn.execute(sql, params).fetchall()
+        results = [dict(row) for row in rows]
+        if min_priority is None or not results:
+            return results[:effective_limit] if effective_limit else results
+        cutoff = float(min_priority)
+        filtered: list[dict[str, Any]] = []
+        for entry in results:
+            priority = self.estimate_research_entry_priority(entry)
+            if priority is None or priority >= cutoff:
+                filtered.append(entry)
+            if len(filtered) >= effective_limit:
+                break
+        return filtered
+
+    @staticmethod
+    def estimate_research_entry_priority(entry: dict[str, Any]) -> float | None:
+        """Best-effort priority for a queued research entry.
+
+        Reads ``last_decision_json.audit.pre_analysis_score`` first (most
+        accurate), falls back to ``last_decision_json.pre_analysis_score`` for
+        legacy payloads, then to ``1.0 - threshold_gap`` for entries that have
+        only the gap metadata. Returns ``None`` when no signal is available so
+        callers can treat unknown-priority entries as "skip-worthy" rather than
+        "low-priority".
+        """
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                payload = json.loads(decision_json)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                audit = payload.get("audit")
+                if isinstance(audit, dict):
+                    score = audit.get("pre_analysis_score")
+                    if isinstance(score, (int, float)):
+                        return float(score)
+                score = payload.get("pre_analysis_score")
+                if isinstance(score, (int, float)):
+                    return float(score)
+        threshold_gap = entry.get("threshold_gap")
+        if isinstance(threshold_gap, (int, float)):
+            return max(0.0, 1.0 - float(threshold_gap))
+        return None
+
     @staticmethod
     def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:
-        text = f"{market_id} {question} {category}".upper()
-        if any(token in text for token in ("KXKBOGAME", "KXNPBGAME", "SPORT", "MATCH", "WINNER")):
-            return "sports"
-        if any(token in text for token in ("KXBTC", "KXETH", "KXSOL", "KXXRP", "KXDOGE", "KXBNB", "CRYPTO")):
-            return "crypto"
-        if any(token in text for token in ("MENTION", "SPEECH", "TRANSCRIPT", "LASTWORD", "TRUTHSOCIAL")):
-            return "speech"
-        if any(token in text for token in ("STREAM", "SPOTIFY", "ARTIST", "SONG", "MUSIC", "LUMINATE")):
-            return "music"
-        if any(
-            token in text
-            for token in ("KXHIGH", "KXLOW", "KXTEMP", "KXRAIN", "WEATHER", "TEMPERATURE")
-        ):
-            return "weather"
-        if any(
-            token in text
-            for token in ("KXGOLD", "KXSILVER", "KXNATGAS", "KXBRENT", "KXHOIL", "KXSUGAR", "KXCOFFEE", "KXCORN", "KXSOYBEAN")
-        ):
-            return "commodities"
-        if any(token in text for token in ("KXINX", "KXNASDAQ", "S&P", "NASDAQ", "DOW")):
-            return "index"
-        return "generic"
+        return family_from_text(f"{market_id} {question} {category}")
 
     def record_resolution(
         self,
@@ -1863,6 +1927,11 @@ class MarketStateManager:
         self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "next_eligible_cycle", "INTEGER DEFAULT 0")
         self._ensure_column("decision_receipts", "score_json", "TEXT")
+        self._ensure_column(
+            "research_queue_entries",
+            "times_seen",
+            "INTEGER DEFAULT 1",
+        )
         self._ensure_column(
             "trade_outcomes",
             "resolution_state",

@@ -27,9 +27,19 @@ class DummyKalshi:
     def __init__(self, markets):
         self._markets = markets
         self.submitted = False
+        self.last_fetch_pages = 1
+        self.last_fetch_cap_hit = False
+        self.last_fetch_mve_filter = None
 
-    def get_markets(self, *, close_time_start=None, close_time_end=None):
+    def get_markets(
+        self,
+        *,
+        close_time_start=None,
+        close_time_end=None,
+        mve_filter=None,
+    ):
         _ = close_time_start, close_time_end
+        self.last_fetch_mve_filter = mve_filter
         return self._markets
 
     def reset_session(self):

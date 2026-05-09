@@ -1,14 +1,19 @@
 import unittest
 import inspect
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import main as main_module
 from calibration_gates import PerformanceStats
 from config import Settings
+from participation import ParticipationTier
 from main import (
     _available_orderbook_sell_quantity,
     _analysis_result_rank,
+    _analysis_candidate_attempt_limit,
+    _apply_participation_audit_fields,
     _analyze_market_candidate,
     _apply_runtime_score_receipt,
     _best_orderbook_sell_price,
@@ -50,6 +55,7 @@ from main import (
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
+    _research_queue_last_decision_json,
     _resolve_dynamic_analysis_candidate_cap,
     _resolve_min_bet_floor,
     _score_breakdown_from_execution_audit,
@@ -107,9 +113,17 @@ class TestMainUtils(unittest.TestCase):
             self._responses = list(responses)
             self.calls = []
             self.reset_calls = 0
+            self.last_fetch_pages = 0
+            self.last_fetch_cap_hit = False
+            self.last_fetch_mve_filter = None
 
-        def get_markets(self, close_time_start=None, close_time_end=None):
-            self.calls.append((close_time_start, close_time_end))
+        def get_markets(
+            self,
+            close_time_start=None,
+            close_time_end=None,
+            mve_filter=None,
+        ):
+            self.calls.append((close_time_start, close_time_end, mve_filter))
             response = self._responses.pop(0)
             if isinstance(response, Exception):
                 raise response
@@ -192,8 +206,8 @@ class TestMainUtils(unittest.TestCase):
 
     def test_runtime_score_receipt_overwrites_pre_execution_score_fields(self) -> None:
         market = Market(
-            id="KXMLBGAME-26APR121610TEXLAD-LAD",
-            question="Will the Dodgers beat the Rangers?",
+            id="KXSAMPLEGAME-26APR121610TEAMA-TEAMA",
+            question="Will Team A beat Team B?",
             liquidity_usdc=1000.0,
             outcomes=[
                 MarketOutcome(name="YES", price=0.55),
@@ -209,7 +223,7 @@ class TestMainUtils(unittest.TestCase):
             evidence_quality=0.86,
             edge_source="computed",
             evidence_basis="direct",
-            primary_source_url="https://www.espn.com/mlb/game/_/gameId/test",
+            primary_source_url="https://www.example.com/game/test",
         )
         runtime_score = compute_final_score(
             market,
@@ -304,13 +318,13 @@ class TestMainUtils(unittest.TestCase):
 
     def test_event_ticker_prefix_prefers_event_ticker_field(self) -> None:
         market = Market(
-            id="KXMLBGAME-26APR121610TEXLAD-LAD",
-            event_ticker="KXMLBGAME-26APR121610TEXLAD",
+            id="KXSAMPLEGAME-26APR121610TEAMA-TEAMA",
+            event_ticker="KXSAMPLEGAME-26APR121610TEAMA",
             question="Test",
         )
         self.assertEqual(
             _event_ticker_prefix(market),
-            "KXMLBGAME-26APR121610TEXLAD",
+            "KXSAMPLEGAME-26APR121610TEAMA",
         )
 
     def test_event_ticker_prefix_falls_back_to_market_id_prefix(self) -> None:
@@ -810,38 +824,6 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(reason, "pre_analysis_repeated_non_actionable_bin_market")
         self.assertEqual(metadata["participation_demotion_family"], "generic")
 
-    def test_pre_analysis_demotion_for_zero_action_family(self) -> None:
-        market = Market(
-            id="KXPERSONMENTION-26APR09-TERM",
-            question="Will candidate mention term?",
-            category="politics",
-            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
-            close_time=datetime.now(timezone.utc) + timedelta(hours=8),
-            resolution_criteria="Official transcript source",
-        )
-        state = MarketState(
-            market_id=market.id,
-            analysis_count=6,
-            non_actionable_streak=4,
-            last_terminal_outcome="no_trade_recommended",
-        )
-        settings = Settings(
-            PRE_ANALYSIS_HARD_REJECTION_ENABLED=True,
-            PRE_ANALYSIS_ZERO_ACTION_FAMILY_BLOCK_ENABLED=True,
-            PRE_ANALYSIS_ZERO_ACTION_FAMILY_MIN_SAMPLES=20,
-            PRE_ANALYSIS_HARD_REJECTION_FAMILIES=("speech", "mention"),
-        )
-        rejected, reason, metadata = _pre_analysis_participation_hold(
-            market=market,
-            state=state,
-            settings=settings,
-            traded_before=False,
-            family_action_stats={"sample_size": 25, "action_rate": 0.0},
-        )
-        self.assertTrue(rejected)
-        self.assertEqual(reason, "pre_analysis_zero_action_family")
-        self.assertEqual(metadata["participation_demotion_family"], "speech")
-
     def test_pre_analysis_demotion_for_fallback_edge_high_churn(self) -> None:
         market = Market(
             id="KXBTCD-26APR0917-T70499.99",
@@ -1022,7 +1004,7 @@ class TestMainUtils(unittest.TestCase):
     def test_pre_analysis_opportunity_score_adds_post_event_bonus(self) -> None:
         settings = Settings()
         market_past = Market(
-            id="KXMLBGAME-PAST",
+            id="KXSAMPLEGAME-PAST",
             question="Post-event market",
             category="sports",
             liquidity_usdc=800.0,
@@ -1031,7 +1013,7 @@ class TestMainUtils(unittest.TestCase):
             resolution_criteria="Official box score",
         )
         market_future = market_past.model_copy(
-            update={"id": "KXMLBGAME-FUTURE", "close_time": datetime.now(timezone.utc) + timedelta(hours=3)}
+            update={"id": "KXSAMPLEGAME-FUTURE", "close_time": datetime.now(timezone.utc) + timedelta(hours=3)}
         )
         past_score, past_breakdown = _pre_analysis_opportunity_score(
             market_past,
@@ -1049,52 +1031,20 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(future_breakdown["pre_score_post_event_bonus"], 0.0)
         self.assertGreater(past_score, future_score)
 
-    def test_pre_analysis_opportunity_score_boosts_priority_mlb_markets(self) -> None:
-        settings = Settings()
-        priority_market = Market(
-            id="KXMLBGAME-26APR201335NYYBOS-NYY",
-            question="Will this contract settle above the listed strike?",
-            category="finance",
-            liquidity_usdc=600.0,
-            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
-            close_time=datetime.now(timezone.utc) + timedelta(hours=8),
-            resolution_criteria="Official settlement source",
-        )
-        non_priority_market = priority_market.model_copy(
-            update={"id": "KXGENERIC-26APR201335NYYBOS-P1.5"}
-        )
-        priority_score, priority_breakdown = _pre_analysis_opportunity_score(
-            priority_market,
-            None,
-            settings,
-            traded_before=False,
-        )
-        non_priority_score, non_priority_breakdown = _pre_analysis_opportunity_score(
-            non_priority_market,
-            None,
-            settings,
-            traded_before=False,
-        )
-        self.assertEqual(priority_breakdown["pre_score_mlb_priority_bonus"], 0.05)
-        self.assertEqual(non_priority_breakdown["pre_score_mlb_priority_bonus"], 0.0)
-        self.assertGreater(priority_score, non_priority_score)
-
-    def test_pre_analysis_opportunity_score_applies_mlb_subfamily_and_zero_trade_penalties(self) -> None:
+    def test_pre_analysis_opportunity_score_applies_zero_trade_rate_penalty_from_history(self) -> None:
         settings = Settings(
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=True,
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=0.06,
             PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.04,
             HISTORICAL_TICKER_PREFIX_LEN=12,
             HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
         )
         market = Market(
-            id="KXMLBSPREAD-26APR201335NYYBOS-BOS2",
-            question="MLB spread contract",
-            category="sports",
+            id="KXGENERIC-26APR201335-T1",
+            question="Generic threshold contract",
+            category="finance",
             liquidity_usdc=700.0,
             outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
             close_time=datetime.now(timezone.utc) + timedelta(hours=8),
-            resolution_criteria="Official box score",
+            resolution_criteria="Official settlement source",
         )
         market_prefix = market.id[: settings.HISTORICAL_TICKER_PREFIX_LEN]
         historical_prefix_stats = {
@@ -1113,8 +1063,6 @@ class TestMainUtils(unittest.TestCase):
             historical_prefix_stats=historical_prefix_stats,
         )
         disabled_settings = Settings(
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY_ENABLED=False,
-            PRE_ANALYSIS_MLB_SUBFAMILY_PENALTY=0.06,
             PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.0,
             HISTORICAL_TICKER_PREFIX_LEN=12,
             HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
@@ -1126,9 +1074,7 @@ class TestMainUtils(unittest.TestCase):
             traded_before=False,
             historical_prefix_stats=historical_prefix_stats,
         )
-        self.assertEqual(penalized_breakdown["pre_score_mlb_subfamily_penalty"], 0.06)
         self.assertEqual(penalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.04)
-        self.assertEqual(unpenalized_breakdown["pre_score_mlb_subfamily_penalty"], 0.0)
         self.assertEqual(unpenalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.0)
         self.assertLess(penalized_score, unpenalized_score)
 
@@ -1205,6 +1151,28 @@ class TestMainUtils(unittest.TestCase):
         self.assertTrue(applied)
         self.assertTrue(neg_floor)
 
+    def test_parallel_attempt_limit_does_not_add_failure_buffer(self) -> None:
+        settings = Settings(MAX_MARKETS_PER_CYCLE=6, XAI_CIRCUIT_BREAKER_MAX_FAILURES=3)
+        self.assertEqual(
+            _analysis_candidate_attempt_limit(
+                settings,
+                dynamic_max_markets_per_cycle=6,
+                parallel_analysis_enabled=True,
+            ),
+            6,
+        )
+
+    def test_sequential_attempt_limit_keeps_failure_buffer(self) -> None:
+        settings = Settings(MAX_MARKETS_PER_CYCLE=6, XAI_CIRCUIT_BREAKER_MAX_FAILURES=3)
+        self.assertEqual(
+            _analysis_candidate_attempt_limit(
+                settings,
+                dynamic_max_markets_per_cycle=6,
+                parallel_analysis_enabled=False,
+            ),
+            9,
+        )
+
     def test_pre_analysis_opportunity_score_penalizes_weak_historical_family_performance(self) -> None:
         market = Market(
             id="KXBTCD-26APR0917-T70499.99",
@@ -1273,6 +1241,209 @@ class TestMainUtils(unittest.TestCase):
             breakdown["pre_score_historical_family_pnl_ratio"],
             0.525,
             places=6,
+        )
+
+    def test_generic_family_negative_pnl_penalty_is_capped(self) -> None:
+        market = Market(
+            id="KXJOBLESSCLAIMS-26MAY07-200000",
+            question="Will initial jobless claims be above 200,000?",
+            category="economic",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official Department of Labor release",
+        )
+        settings = Settings(
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=-10.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=0.10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=-15.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=0.15,
+        )
+        _, breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={
+                "sample_size": 40,
+                "win_rate": 0.55,
+                "pnl_total": -40.0,
+            },
+        )
+        self.assertEqual(breakdown["pre_score_market_subfamily"], "generic_macro_release")
+        self.assertAlmostEqual(
+            breakdown["pre_score_historical_family_pnl_penalty"],
+            0.04,
+            places=6,
+        )
+
+    def test_pre_analysis_opportunity_score_caps_stacked_historical_penalties(
+        self,
+    ) -> None:
+        """Stacked historical/family penalties from overlapping data sources
+        (fallback rate + family PnL + severe family PnL + zero-trade-rate
+        + negative-prefix + historical-gate score-penalty) must not be allowed
+        to compound into a 0.5pp+ score collapse. The cap credits any excess
+        back into the score and surfaces the credit in the breakdown so the
+        receipts stay auditable.
+        """
+
+        from market_state import MarketState
+        from calibration_gates import PerformanceStats, GateTier
+
+        market = Market(
+            id="KXBADCRYPTO-1234-T100",
+            question="Will BTC settle above threshold?",
+            category="crypto",
+            liquidity_usdc=800.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.50),
+                MarketOutcome(name="NO", price=0.50),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+            resolution_criteria="Official settlement source",
+        )
+        cap = 0.20
+        settings = Settings(
+            PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD=0.50,
+            PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES=5,
+            PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY=0.20,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=0.45,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=0.18,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES=10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=-5.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=0.12,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=-15.0,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=0.20,
+            PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=0.04,
+            HISTORICAL_TICKER_PREFIX_LEN=12,
+            HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=3,
+            HISTORICAL_TICKER_PREFIX_PNL_CUTOFF=-2.0,
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=cap,
+        )
+        # Build penalty stack from every overlapping source so we can verify
+        # the cap's credit-back behavior.
+        prefix_stats = {
+            "KXBADCRYPTO-": PerformanceStats(
+                sample_size=8,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-20.0,
+            )
+        }
+        historical_gate_metrics = {
+            "historical_gate_tier": GateTier.SOFT_DEMOTE,
+            "historical_gate_sample_weight": 0.8,
+            "historical_gate_score_penalty": 0.10,
+        }
+        score, breakdown = _pre_analysis_opportunity_score(
+            market,
+            MarketState(market_id=market.id, analysis_count=0),
+            settings,
+            traded_before=False,
+            fallback_family_edge_rate=0.95,
+            fallback_family_sample_size=80,
+            historical_family_stats={
+                "sample_size": 30,
+                "win_rate": 0.30,
+                "pnl_total": -25.0,
+            },
+            historical_prefix_stats=prefix_stats,
+            historical_gate_metrics=historical_gate_metrics,
+        )
+        raw_stack = breakdown["pre_score_stacked_historical_penalty_raw"]
+        excess = breakdown["pre_score_stacked_historical_excess_credited"]
+        cap_emitted = breakdown["pre_score_stacked_historical_penalty_cap"]
+        self.assertGreater(
+            raw_stack,
+            cap,
+            "Test setup should produce a raw stacked penalty exceeding the cap",
+        )
+        self.assertAlmostEqual(excess, raw_stack - cap, places=6)
+        self.assertAlmostEqual(cap_emitted, cap, places=6)
+
+        # Recompute the same market with the cap effectively disabled and
+        # verify the score recovers exactly the credited excess. This proves
+        # the cap purely adjusts the score arithmetic without altering the
+        # individual penalty fields the receipts depend on.
+        settings_uncapped = Settings(
+            PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD=settings.PRE_ANALYSIS_FALLBACK_FAMILY_RATE_THRESHOLD,
+            PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES=settings.PRE_ANALYSIS_FALLBACK_FAMILY_MIN_SAMPLES,
+            PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY=settings.PRE_ANALYSIS_FALLBACK_FAMILY_PENALTY,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY,
+            PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY=settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY,
+            HISTORICAL_TICKER_PREFIX_LEN=settings.HISTORICAL_TICKER_PREFIX_LEN,
+            HISTORICAL_TICKER_PREFIX_MIN_SAMPLES=settings.HISTORICAL_TICKER_PREFIX_MIN_SAMPLES,
+            HISTORICAL_TICKER_PREFIX_PNL_CUTOFF=settings.HISTORICAL_TICKER_PREFIX_PNL_CUTOFF,
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=settings.HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.0,
+        )
+        score_uncapped, breakdown_uncapped = _pre_analysis_opportunity_score(
+            market,
+            MarketState(market_id=market.id, analysis_count=0),
+            settings_uncapped,
+            traded_before=False,
+            fallback_family_edge_rate=0.95,
+            fallback_family_sample_size=80,
+            historical_family_stats={
+                "sample_size": 30,
+                "win_rate": 0.30,
+                "pnl_total": -25.0,
+            },
+            historical_prefix_stats=prefix_stats,
+            historical_gate_metrics=historical_gate_metrics,
+        )
+        self.assertAlmostEqual(score_uncapped + excess, score, places=6)
+        self.assertEqual(
+            breakdown_uncapped["pre_score_stacked_historical_excess_credited"],
+            0.0,
+        )
+
+    def test_pre_analysis_opportunity_score_does_not_credit_when_below_cap(
+        self,
+    ) -> None:
+        """When stacked penalties stay under the cap, the cap must be a no-op."""
+        market = Market(
+            id="KXSTABLE-1234-T100",
+            question="Will the index settle above threshold?",
+            category="generic",
+            liquidity_usdc=400.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(
+            PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES=10,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD=0.45,
+            PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.40,
+        )
+        _, breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={
+                "sample_size": 20,
+                "win_rate": 0.40,
+                "pnl_total": -3.0,
+            },
+        )
+        self.assertEqual(
+            breakdown["pre_score_stacked_historical_excess_credited"],
+            0.0,
         )
 
     def test_is_coinflip_signal_detects_low_information_decision(self) -> None:
@@ -1895,6 +2066,221 @@ class TestMainUtils(unittest.TestCase):
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
         self.assertEqual([item["market"].id for item in capped], ["w-high-score", "c1"])
 
+    def test_cap_analysis_candidates_does_not_double_count_historical_gate_penalty(self) -> None:
+        """Fix 5d: when historical_gate_metrics is present (gate ran and
+        surfaced its score penalty into _pre_analysis_opportunity_score),
+        _cap_analysis_candidates must NOT also deduct the legacy 0.12 flat
+        penalty. The score penalty would otherwise be double-counted.
+
+        Markets here use NBA-keyword questions so family_from_text resolves
+        them to sports family (zero source_difficulty_penalty), isolating
+        the historical_gate behavior under test.
+        """
+        market = Market(
+            id="KXSPORTS-METRICS-ATTACHED",
+            question="Will the NBA Lakers win the playoffs?",
+            category="sports",
+        )
+        candidates = [
+            {
+                "market": market,
+                "pre_analysis_score": 0.65,
+                "historical_gate_allowed": False,
+                "historical_gate_metrics": {
+                    "historical_gate_score_penalty": 0.05,
+                },
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.60,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER",
+                    question="Will the NBA Heat win the conference?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        with_metrics = next(
+            item for item in capped if item["market"].id == "KXSPORTS-METRICS-ATTACHED"
+        )
+        components = with_metrics["selection_rank_components"]
+        # Penalty must be exactly the metric-supplied value, NOT 0.12.
+        assert components["historical_gate_penalty"] == 0.05
+        assert components["risk_adjusted_score"] == 0.60  # 0.65 - 0.05
+
+    def test_cap_analysis_candidates_falls_back_to_flat_penalty_without_metrics(self) -> None:
+        """Backward-compat: when historical_gate_allowed is False but metrics
+        are missing entirely, the legacy flat 0.12 penalty still applies so
+        old code paths don't suddenly become more permissive.
+
+        The legacy market is given a high enough base score (0.85) that even
+        with the flat 0.12 penalty it still ranks ahead of the third
+        candidate, so the cap selection actually exercises the legacy path.
+        """
+        candidates = [
+            {
+                "market": Market(
+                    id="KXSPORTS-LEGACY-NO-METRICS",
+                    question="Will the NBA Lakers win the playoffs?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.85,
+                "historical_gate_allowed": False,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.60,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER",
+                    question="Will the NBA Heat win the conference?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        legacy = next(
+            item for item in capped if item["market"].id == "KXSPORTS-LEGACY-NO-METRICS"
+        )
+        components = legacy["selection_rank_components"]
+        assert components["historical_gate_penalty"] == 0.12
+        assert components["risk_adjusted_score"] == 0.73  # 0.85 - 0.12
+
+    def test_cap_analysis_candidates_limits_sports_candidates(self) -> None:
+        """Cycle 4 recovery: sports props were monopolizing all analysis
+        slots even when other families had eligible candidates. The sports
+        cap must reserve room for non-sports markets so the cycle still
+        evaluates direct-evidence opportunities elsewhere."""
+        candidates = [
+            {
+                "market": Market(
+                    id="KXMLBHRR-1",
+                    question="Will the Yankees hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.90,
+            },
+            {
+                "market": Market(
+                    id="KXMLBHRR-2",
+                    question="Will the Red Sox hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.88,
+            },
+            {
+                "market": Market(
+                    id="KXMLBHRR-3",
+                    question="Will the Dodgers hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.86,
+            },
+            {
+                "market": Market(
+                    id="KXMLBHRR-4",
+                    question="Will the Braves hit a home run?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.84,
+            },
+            {
+                "market": Market(
+                    id="KXBTCD-T70K",
+                    question="Will Bitcoin close above $70k?",
+                    category="crypto",
+                ),
+                "pre_analysis_score": 0.70,
+            },
+            {
+                "market": Market(
+                    id="KXHIGHCHI-T50",
+                    question="Will Chicago high be below 50F?",
+                    category="weather",
+                ),
+                "pre_analysis_score": 0.65,
+            },
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=4,
+            max_sports_candidates_per_cycle=2,
+            max_weather_candidates_per_cycle=1,
+            max_crypto_candidates_per_cycle=1,
+        )
+        capped_ids = [item["market"].id for item in capped]
+        sports_ids = [mid for mid in capped_ids if mid.startswith("KXMLBHRR-")]
+        self.assertEqual(len(sports_ids), 2)
+        self.assertIn("KXBTCD-T70K", capped_ids)
+        self.assertIn("KXHIGHCHI-T50", capped_ids)
+
+    def test_cap_analysis_candidates_sports_cap_none_keeps_legacy_behavior(self) -> None:
+        """Backward-compat: with max_sports_candidates_per_cycle=None the
+        previous behavior (no sports-specific cap) must remain so existing
+        operators are not surprised by silent diversification."""
+        candidates = [
+            {
+                "market": Market(
+                    id="KXMLB-1",
+                    question="Will Yankees win?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.90,
+            },
+            {
+                "market": Market(
+                    id="KXMLB-2",
+                    question="Will Red Sox win?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.85,
+            },
+            {
+                "market": Market(
+                    id="KXMLB-3",
+                    question="Will Dodgers win?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.80,
+            },
+            {
+                "market": Market(
+                    id="KXBTCD-T70K",
+                    question="Will Bitcoin close above $70k?",
+                    category="crypto",
+                ),
+                "pre_analysis_score": 0.50,
+            },
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=3,
+            max_sports_candidates_per_cycle=None,
+        )
+        capped_ids = [item["market"].id for item in capped]
+        self.assertEqual(
+            len([mid for mid in capped_ids if mid.startswith("KXMLB-")]),
+            3,
+        )
+
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {
             "sells": [
@@ -2012,7 +2398,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(client.reset_calls, 1)
         self.assertEqual(len(client.calls), 3)
         # last call should be unfiltered fallback
-        self.assertEqual(client.calls[-1], (None, None))
+        self.assertEqual(client.calls[-1], (None, None, None))
 
     def test_cap_effective_confidence_for_market_respects_category_caps(self) -> None:
         settings = Settings(
@@ -2643,10 +3029,10 @@ class TestMainUtils(unittest.TestCase):
     def test_analyze_market_candidate_uses_extended_research_profile(self) -> None:
         market = Market(
             id="m-extended-research",
-            question="Will Team A win?",
+            question="NBA: Will Team A win?",
             outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
             liquidity_usdc=200.0,
-            category="sports",
+            category="nba",
             close_time=datetime.now(timezone.utc) + timedelta(hours=12),
         )
         settings = Settings(
@@ -2680,6 +3066,14 @@ class TestMainUtils(unittest.TestCase):
         self.assertGreater(
             int(client.last_search_config.lookback_hours or 0),
             int(baseline_config.lookback_hours or 0),
+        )
+        self.assertNotEqual(
+            client.last_search_config.allowed_domains,
+            baseline_config.allowed_domains,
+        )
+        self.assertEqual(
+            client.last_search_config.allowed_domains[0],
+            baseline_config.source_domains_pool[settings.EXTENDED_RESEARCH_SOURCE_OFFSET],
         )
 
     def test_analyze_market_candidate_uses_high_confidence_shrinkage_factor(self) -> None:
@@ -2945,6 +3339,76 @@ class TestSyntheticDecisionMarker(unittest.TestCase):
         self.assertFalse(audit.get("synthetic_decision"))
 
 
+class TestParticipationAuditStamping(unittest.TestCase):
+    def test_should_trade_confidence_skip_gets_canonical_participation_fields(self) -> None:
+        audit = _build_execution_audit(
+            final_action="skip",
+            final_reason="confidence_below_min",
+            counterfactual_required_confidence=0.62,
+            evidence_basis_class="direct",
+            edge_source="computed",
+        )
+        inferred = _apply_participation_audit_fields(
+            audit,
+            decision={
+                "should_trade": True,
+                "confidence": 0.58,
+                "evidence_quality": 0.90,
+                "evidence_basis": "direct",
+                "edge_source": "computed",
+            },
+            settings=Settings(MIN_CONFIDENCE=0.62),
+        )
+        self.assertTrue(inferred)
+        self.assertEqual(
+            audit["participation_tier"],
+            str(ParticipationTier.SKIP_FOR_NOW_WITH_REASON),
+        )
+        self.assertEqual(audit["participation_decision"], "confidence_below_min")
+        self.assertTrue(audit["blocked_conviction"])
+        self.assertEqual(audit["skip_due_to"], "weak_edge")
+
+    def test_order_attempt_gets_execution_eligible_tier(self) -> None:
+        audit = _build_execution_audit(
+            final_action="order_attempt",
+            final_reason="order_submitted",
+        )
+        inferred = _apply_participation_audit_fields(
+            audit,
+            decision={"should_trade": True, "confidence": 0.80},
+            settings=Settings(),
+        )
+        self.assertTrue(inferred)
+        self.assertEqual(
+            audit["participation_tier"],
+            str(ParticipationTier.EXECUTION_ELIGIBLE),
+        )
+
+    def test_no_trade_placeholder_is_research_gap(self) -> None:
+        audit = _build_execution_audit(
+            final_action="skip",
+            final_reason="no_trade_recommended",
+        )
+        inferred = _apply_participation_audit_fields(
+            audit,
+            decision={
+                "should_trade": False,
+                "confidence": 0.50,
+                "evidence_quality": 0.0,
+                "evidence_basis": "absence_only",
+                "edge_source": "none",
+            },
+            settings=Settings(),
+        )
+        self.assertTrue(inferred)
+        self.assertEqual(
+            audit["participation_tier"],
+            str(ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE),
+        )
+        self.assertEqual(audit["participation_decision"], "no_trade_research_gap")
+        self.assertEqual(audit["skip_due_to"], "lack_of_evidence")
+
+
 class TestHistoricalFamilyFlattening(unittest.TestCase):
     def test_breakdown_fields_lift_to_top_level(self) -> None:
         audit = _build_execution_audit(
@@ -2970,6 +3434,25 @@ class TestHistoricalFamilyFlattening(unittest.TestCase):
             },
         )
         self.assertEqual(audit.get("historical_family_samples"), 99)
+
+
+class TestHistoricalFamilyStatsRuntimeLoad(unittest.TestCase):
+    def test_confidence_shrink_block_does_not_reset_recent_family_stats(self) -> None:
+        src = inspect.getsource(main_module.main)
+        confidence_block = src.split(
+            "if settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED:",
+            1,
+        )[1].split("recent_research_entries", 1)[0]
+        self.assertNotIn("historical_family_stats_recent = {}", confidence_block)
+
+    def test_emergency_research_drain_keeps_current_market_guard(self) -> None:
+        src = inspect.getsource(main_module.main)
+        emergency_block = src.split(
+            "Emergency second-pass drain:",
+            1,
+        )[1].split("if drainable_research_entries:", 1)[0]
+        self.assertIn("if mid not in current_market_ids:", emergency_block)
+        self.assertNotIn("if mid in current_market_ids:", emergency_block)
 
 
 class TestCounterfactualAuditFields(unittest.TestCase):
@@ -3030,6 +3513,199 @@ class TestCounterfactualAuditFields(unittest.TestCase):
             historical_metrics={"historical_gate_prefix_sample_size": 7},
         )
         self.assertEqual(fields["counterfactual_prefix_samples_short_by"], 13)
+
+    def test_helper_emits_drawdown_counterfactual_for_drawdown_reason(self) -> None:
+        settings = Settings(MAX_DAILY_DRAWDOWN_USDC=25.0)
+        fields = _build_counterfactual_audit_fields(
+            reason="pre_analysis_daily_drawdown_blocked",
+            settings=settings,
+        )
+        self.assertEqual(
+            fields["counterfactual_required_for_drawdown_block"],
+            "drawdown_reset_or_position_close",
+        )
+        self.assertEqual(fields["counterfactual_max_daily_drawdown_usdc"], 25.0)
+
+
+class TestSkipDueToForReason(unittest.TestCase):
+    """Regression tests for the skip-reason categorizer used by audit/receipts."""
+
+    def setUp(self) -> None:
+        from main import _skip_due_to_for_reason
+        self._fn = _skip_due_to_for_reason
+
+    def test_pre_analysis_score_soft_research_returns_weak_pre_analysis_score(self) -> None:
+        """Score-band soft-research must be tagged as a pre-analysis-score
+        weakness, not as 'weak_edge'. Distinguishing these in receipts lets
+        analytics tell apart 'low pre-analysis opportunity score' from 'low
+        runtime edge'."""
+        self.assertEqual(
+            self._fn("pre_analysis_score_soft_research"),
+            "weak_pre_analysis_score",
+        )
+        self.assertEqual(
+            self._fn("pre_analysis_score_below_min"),
+            "weak_pre_analysis_score",
+        )
+        self.assertEqual(
+            self._fn("pre_analysis_score_far_below_min"),
+            "weak_pre_analysis_score",
+        )
+
+    def test_daily_drawdown_blocked_returns_risk_cap(self) -> None:
+        self.assertEqual(
+            self._fn("pre_analysis_daily_drawdown_blocked"),
+            "risk_cap",
+        )
+        self.assertEqual(self._fn("daily_drawdown_limit"), "risk_cap")
+
+    def test_fallback_edge_high_churn_returns_repeated_churn(self) -> None:
+        """High-churn fallback-edge reasons describe repeated non-actionable
+        cycles, not weak-edge market-judgment failures."""
+        self.assertEqual(
+            self._fn("pre_analysis_fallback_edge_high_churn"),
+            "repeated_churn",
+        )
+
+    def test_evidence_reason_returns_lack_of_evidence(self) -> None:
+        self.assertEqual(self._fn("evidence_quality_below_min"), "lack_of_evidence")
+
+    def test_timeout_reason_returns_timeout(self) -> None:
+        self.assertEqual(self._fn("grok_stream_timeout"), "timeout")
+
+
+class TestSyntheticDecisionAuditFields(unittest.TestCase):
+    """Receipts for markets that were never actually analyzed by Grok must
+    explicitly mark themselves so analytics can partition real findings from
+    placeholder triples (eq=0.0/edge_source=none/basis=absence_only)."""
+
+    def test_constant_carries_expected_flags(self) -> None:
+        from main import _SYNTHETIC_DECISION_AUDIT_FIELDS as fields
+        self.assertTrue(fields["analysis_skipped"])
+        self.assertTrue(fields["evidence_quality_unevaluated"])
+        self.assertTrue(fields["edge_source_unevaluated"])
+        self.assertFalse(fields["pre_analysis_hard_reject"])
+
+    def test_synthetic_audit_resolves_hard_reject_naming(self) -> None:
+        """final_action=research_queued must NOT be conflated with hard reject;
+        the explicit pre_analysis_hard_reject=False resolves the legacy
+        naming confusion in receipts."""
+        from main import _SYNTHETIC_DECISION_AUDIT_FIELDS, _build_execution_audit
+        audit = _build_execution_audit(
+            decision_terminal=False,
+            final_action="research_queued",
+            final_reason="pre_analysis_score_soft_research",
+            decision_origin="synthetic_research_queue",
+            **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+        )
+        self.assertEqual(audit["final_action"], "research_queued")
+        self.assertFalse(audit["pre_analysis_hard_reject"])
+        self.assertTrue(audit["analysis_skipped"])
+        self.assertTrue(audit["synthetic_decision"])
+
+    def test_research_queue_payload_embeds_audit_context(self) -> None:
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.50,
+            bet_size_pct=0.0,
+            reasoning="queued",
+            edge_source="none",
+            evidence_basis="absence_only",
+            evidence_quality=0.0,
+            abstain=True,
+        )
+        audit = _build_execution_audit(
+            final_action="research_queued",
+            final_reason="pre_analysis_score_soft_research",
+            decision_origin="synthetic_research_queue",
+            participation_tier=str(ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE),
+            skip_due_to="weak_pre_analysis_score",
+            pre_analysis_score=0.41,
+            pre_analysis_breakdown={"pre_score_market_subfamily": "generic_macro_release"},
+            why_not_execution_eligible="score below threshold",
+            counterfactual_required_pre_analysis_score=0.55,
+        )
+        payload = json.loads(_research_queue_last_decision_json(decision, audit))
+        self.assertEqual(payload["audit"]["pre_analysis_score"], 0.41)
+        self.assertEqual(payload["participation_tier"], audit["participation_tier"])
+        self.assertEqual(payload["skip_due_to"], "weak_pre_analysis_score")
+        self.assertEqual(
+            payload["counterfactual_required_pre_analysis_score"],
+            0.55,
+        )
+
+    def test_no_research_queued_audit_marks_hard_reject(self) -> None:
+        """Invariant: every production path that sets final_action=
+        research_queued routes through the synthetic-audit constant which
+        explicitly stamps pre_analysis_hard_reject=False. This regression
+        test exercises every reason string the audit currently emits with
+        research_queued and asserts the invariant holds."""
+        from main import _SYNTHETIC_DECISION_AUDIT_FIELDS, _build_execution_audit
+        research_queued_reasons = (
+            "pre_analysis_score_soft_research",
+            "pre_analysis_score_far_below_min",
+            "pre_analysis_historical_prefix_pnl_block",
+            "pre_analysis_historical_prefix_small_sample_negative",
+            "pre_analysis_historical_family_pnl_block",
+            "pre_analysis_crypto_historically_unprofitable",
+            "pre_analysis_repeated_non_actionable_market",
+            "pre_analysis_repeated_non_actionable_bin_market",
+            "pre_analysis_repeated_churn_market",
+            "pre_analysis_fallback_edge_high_churn",
+            "repeated_non_actionable_research_only",
+            "evidence_quality_below_min",
+            "confidence_below_min",
+            "edge_above_reasonable_max",
+            "score_gate_blocked",
+            "daily_drawdown_blocked",
+            "grok_stream_timeout",
+        )
+        for reason in research_queued_reasons:
+            audit = _build_execution_audit(
+                decision_terminal=False,
+                final_action="research_queued",
+                final_reason=reason,
+                decision_origin="synthetic_research_queue",
+                **_SYNTHETIC_DECISION_AUDIT_FIELDS,
+            )
+            self.assertEqual(audit["final_action"], "research_queued")
+            self.assertFalse(
+                audit.get("pre_analysis_hard_reject", False),
+                f"Invariant violated for final_reason={reason}: "
+                f"pre_analysis_hard_reject must be False when "
+                f"final_action='research_queued'.",
+            )
+
+    def test_production_source_has_no_hard_reject_true(self) -> None:
+        """Static safety net: scan main.py source for any literal that sets
+        pre_analysis_hard_reject=True. Catches regressions that the runtime
+        invariant test would miss because they wouldn't go through the
+        _SYNTHETIC_DECISION_AUDIT_FIELDS constant."""
+        from pathlib import Path
+        import re
+        main_path = Path(__file__).resolve().parent.parent / "main.py"
+        src = main_path.read_text(encoding="utf-8")
+        # Strip lines that document the invariant (string literals / comments
+        # that mention the field name with True for pedagogical reasons).
+        # Match assignments only: optional quote, key, optional quote, then
+        # `=` or `:` separator, then `True`.
+        offending_lines: list[str] = []
+        pattern = re.compile(
+            r'["\']?pre_analysis_hard_reject["\']?\s*[:=]\s*True\b'
+        )
+        for line_no, line in enumerate(src.splitlines(), start=1):
+            stripped = line.lstrip()
+            # Skip comment-only lines.
+            if stripped.startswith("#"):
+                continue
+            if pattern.search(line):
+                offending_lines.append(f"{line_no}: {line.rstrip()}")
+        self.assertFalse(
+            offending_lines,
+            "Production code must never set pre_analysis_hard_reject=True; "
+            "found:\n" + "\n".join(offending_lines),
+        )
 
 
 class TestPreviousAnalysisAnchorEvidence(unittest.TestCase):
@@ -3124,6 +3800,66 @@ class TestTierBreakdownFormat(unittest.TestCase):
     def test_unknown_tier_falls_back_to_raw_label(self) -> None:
         result = _format_tier_breakdown_for_log({"some_future_tier": 1})
         self.assertIn("some_future_tier:1", result)
+
+
+class TestSummarizeDistribution(unittest.TestCase):
+    """Score-distribution helper used by cycle receipts (5f)."""
+
+    def _fn(self, samples):
+        from main import _summarize_distribution
+        return _summarize_distribution(samples)
+
+    def test_empty_samples_return_count_only(self) -> None:
+        result = self._fn([])
+        self.assertEqual(result, {"count": 0})
+
+    def test_single_sample_returns_collapsed_distribution(self) -> None:
+        result = self._fn([0.42])
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["min"], 0.42)
+        self.assertEqual(result["max"], 0.42)
+        self.assertEqual(result["p50"], 0.42)
+
+    def test_distribution_percentiles_match_linear_interpolation(self) -> None:
+        result = self._fn([0.10, 0.20, 0.30, 0.40, 0.50])
+        self.assertEqual(result["count"], 5)
+        self.assertEqual(result["min"], 0.10)
+        self.assertEqual(result["max"], 0.50)
+        self.assertEqual(result["p50"], 0.30)
+        self.assertAlmostEqual(result["p25"], 0.20)
+        self.assertAlmostEqual(result["p75"], 0.40)
+
+
+class TestResearchQueueCycleLogMaxlenSetting(unittest.TestCase):
+    """Configurable per-cycle research-queue capture log (5g)."""
+
+    def test_default_maxlen_is_200(self) -> None:
+        from config import Settings
+        self.assertEqual(Settings().RESEARCH_QUEUE_CYCLE_LOG_MAXLEN, 200)
+
+    def test_setting_can_be_overridden(self) -> None:
+        from config import Settings
+        custom = Settings(RESEARCH_QUEUE_CYCLE_LOG_MAXLEN=50)
+        self.assertEqual(custom.RESEARCH_QUEUE_CYCLE_LOG_MAXLEN, 50)
+
+
+class TestAdaptiveResearchBandSettings(unittest.TestCase):
+    """Adaptive widening of the soft-research routing band (5e)."""
+
+    def test_default_settings_enable_adaptive_band(self) -> None:
+        from config import Settings
+        s = Settings()
+        self.assertTrue(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED)
+        self.assertEqual(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX, 0.30)
+        self.assertGreaterEqual(
+            s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX,
+            s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND,
+        )
+
+    def test_adaptive_band_can_be_disabled(self) -> None:
+        from config import Settings
+        s = Settings(PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED=False)
+        self.assertFalse(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED)
 
 
 if __name__ == "__main__":

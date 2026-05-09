@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sys
+import argparse
 from collections import Counter
 from pathlib import Path
 
@@ -33,8 +34,19 @@ from participation import (
 _DEFAULT_LOG = "logs/trades.log"
 
 
+def _normalize_participation_tier(raw: object) -> str:
+    text = str(raw or "").strip()
+    if text.startswith("ParticipationTier."):
+        text = text.split(".", 1)[1].lower()
+    return text
+
+
 def main() -> None:
-    log_path = sys.argv[1] if len(sys.argv) > 1 else _DEFAULT_LOG
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("log", nargs="?", default=None, help="Path to trades log")
+    parser.add_argument("--log", dest="log_flag", default=None, help="Path to trades log")
+    args = parser.parse_args()
+    log_path = args.log_flag or args.log or _DEFAULT_LOG
     path = Path(log_path)
     if not path.exists():
         print(f"Log file not found: {path}")
@@ -66,6 +78,23 @@ def main() -> None:
         old_reason_counts[old_reason] += 1
         total += 1
 
+        existing_tier = _normalize_participation_tier(audit.get("participation_tier"))
+        if existing_tier:
+            new_tier = existing_tier
+            new_tier_counts[new_tier] += 1
+            transition_key = f"{old_reason} -> {new_tier}"
+            if old_reason != new_tier:
+                reclassified[transition_key] += 1
+            continue
+
+        if old_action in {"order_attempt", "order_submitted", "dry_run"}:
+            new_tier = str(ParticipationTier.EXECUTION_ELIGIBLE)
+            new_tier_counts[new_tier] += 1
+            transition_key = f"{old_reason} -> {new_tier}"
+            if old_reason != new_tier:
+                reclassified[transition_key] += 1
+            continue
+
         hist_sample = audit.get("historical_gate_prefix_sample_size")
         hist_wr = audit.get("historical_gate_prefix_win_rate")
         hist_wlb = audit.get("historical_gate_wilson_lb")
@@ -87,7 +116,18 @@ def main() -> None:
             decision_evidence_basis=decision.get("evidence_basis"),
             decision_edge_source=decision.get("edge_source"),
             decision_evidence_quality=decision.get("evidence_quality"),
+            confidence_value=decision.get("confidence"),
+            confidence_threshold=audit.get("counterfactual_required_confidence"),
+            edge_value=audit.get("gate_edge_actual") or audit.get("edge_market"),
             evidence_quality_threshold=0.75,
+            score_gate_blocked="score_gate" in old_reason,
+            score_gate_reason=old_reason if "score_gate" in old_reason else None,
+            downstream_gate_reason=(
+                old_reason
+                if old_action in {"skip", "monitor_only"}
+                and decision.get("should_trade") is True
+                else None
+            ),
         )
 
         new_tier = str(result.tier)
@@ -105,6 +145,9 @@ def main() -> None:
             definitive_floor_would_help += 1
 
     print(f"\n=== Replay Cycle Funnel ({total} records from {log_path}) ===\n")
+    if total <= 0:
+        print("No trade-decision records found.")
+        return
 
     print("OLD final_action distribution:")
     for action, count in old_action_counts.most_common():

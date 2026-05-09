@@ -11,6 +11,7 @@ parts:
     Proxy evidence can support research, but should_trade=true requires a larger edge and stronger pricing-in explanation than direct evidence.
     Always classify evidence basis as direct, proxy, or absence-only in your reasoning.
     Use evidence_basis=direct only when a cited source explicitly addresses the market's settlement criteria. If the reasoning uses previews, form, vague forecasts, missing reports, or inference from silence, use proxy or absence_only instead.
+    For non-sports markets, evidence_basis=direct also requires primary_source_url; without that URL, classify the evidence as proxy or absence_only and treat the case as source repair.
     For repeated/noisy bin markets without direct source confirmation, default to no-action.
     If you cannot find external odds, bookmaker lines, or settlement-aligned primary data, reduce evidence_quality and default to should_trade=false unless edge_market clears the configured fallback threshold with source-backed reasoning.
     If you cannot fetch externally verifiable settlement-aligned data, set abstain=true and should_trade=false rather than defaulting to a synthetic high-confidence NO call.
@@ -30,6 +31,7 @@ parts:
     When evidence_basis=direct and primary_source_url is from NWS/NOAA/Kalshi-aligned exchange/Tier-1 wire service, set evidence_quality >= 0.80.
     For sports/MLB markets where the game has already concluded per the cited primary source (AP, Reuters, ESPN), set definitive_outcome_detected=true and evidence_quality>=0.85; do not lower evidence_quality below this floor.
     For non-sports should_trade=true decisions, you MUST populate primary_source_url with the exact URL used or the bot will reject the trade.
+    Missing primary_source_url on a non-sports market is not a no-trade market judgment; it is a research gap to fix with a settlement-aligned source.
     Example primary_source_url values: "https://www.wsj.com/market-data/quotes/bond/BX/TMUBMUSD10Y", "https://www.coindesk.com/price/bitcoin", "https://forecast.weather.gov/MapClick.php?lat=29.76&lon=-95.37".
     Set evidence_basis to one of: direct, proxy, or absence_only.
     For numeric-strike threshold markets (ticker contains -T<number>), if no exchange-feed or official settlement source is cited, cap confidence at 0.70 and set edge_source=fallback.

@@ -6,29 +6,29 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    "analyze": "965a8140f6296556298c0d8cd9ce8cb55c37471fdee544166522153c58bb8887",
+    "analyze": "59dba101d969a58f6512148fb289c76a74855df71f76c2441f532a2ebee0eff4",
     "deep": "d0550226ab14dcc2ec52fff8733f51df5daa8c207e329b685a4b0e07c532dfc6",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    "commodities:deep_false": "42d9e5aebb3c3d08f0e6c9e8733d20326d2b919f7002300a843b83fcde744126",
-    "commodities:deep_true": "586d62780d355c337c66bd2b2640e40962c35071c4d2cefb93491472ba507c3a",
-    "crypto:deep_false": "fd22ee2738f59d695bb106d30a2bdbddd10899b6ae0bfba2e2782bc8d2ae16ce",
-    "crypto:deep_true": "1271f3c348401d8d48fc0e6d757aca966e540339145ced4ffecf92fb046d5bf3",
-    "generic:deep_false": "f760221c069205bc55bb73d0740ceca7cecc49b82019d5abc6cbdee52458723a",
-    "generic:deep_true": "2d90e4a052badf599dd8bf0cb10f157cecb9eee763ba4e3ae70126f918185d4b",
-    "music:deep_false": "d449b6a05834eae11c55a9a6969446f576a380d8f4290e1bcadee3761651e8fc",
-    "music:deep_true": "1d9b1debb4d0b92ab011c8f2274aec504bf25250d3be68eea14feaeca7b3c140",
-    "politics:deep_false": "773c1d3bd5bf7f84e62a0d8be804cb1b7f528d111695d10f9ac487d6d0b8b5a6",
-    "politics:deep_true": "3a5e1cdeb8e26c57bf22f3a72983ed407efbe17b9237468ea724d799c7c281cd",
-    "speech:deep_false": "44004d077b07f695867b9a2608adab8c2ac36219ff4d5b793a1c7f5103361dc5",
-    "speech:deep_true": "902c7cb40d7eb1316f7280654160bd344f9ebe662d5f9085db98b0ec4e0254c2",
-    "speech_mention:deep_false": "5e6d3e65ce329d6f31915dafab60fba664add664b6bb525ca7494883ddec28cf",
-    "speech_mention:deep_true": "c9d6660a2a5a9c6850cc53cd5f45834281f52a20fe140d9a7dc5b4b85f213e45",
-    "sports:deep_false": "39a6bd21f86b13793f4911e1d507c2eed23b7e34a6185ab5e641528c415b9744",
-    "sports:deep_true": "f5d783281897d9d2e1cb73570ff675bcf37ad40a89a484680158faad2cf2b817",
-    "weather:deep_false": "609dfd16b1bacb249d309815aae40ea82c8b99f74f26286f3d77af03ea3e62c5",
-    "weather:deep_true": "0eb16aeae1efccc65a0c8b0bec326f595b72185c65a4be2cfbb8ec9e63be10b9",
+    "commodities:deep_false": "043d8e1ae1e587e97c14ba6e1096787c2356c6f98ba8b7a8a26095672158db3e",
+    "commodities:deep_true": "c7cf0607b4a603448b091b79f2e85b078e571c0e7917bc35d66d38dc4f2000a6",
+    "crypto:deep_false": "3fa0ca87f71435ca1c8434c085065133909ef5ec7fb8690d02f72805994b57b7",
+    "crypto:deep_true": "fd400865be30b4050922e20e382a4e9b8c1672be35963e6f36c96402219db782",
+    "generic:deep_false": "e65daff654c96c570d601aec670aa84c1b7875eb3f949c359b924846d255271c",
+    "generic:deep_true": "aff7076824e76bf3426a8b98b46ec8ad72134eb161d4ff765587cc4585d4139b",
+    "music:deep_false": "c2a5d40116795fd2449215a4f011c29ad2e4711f41807f4b071b0f35c541be98",
+    "music:deep_true": "0f19eb9553c4621a053c6e99f1ef52fcaca5592e0a489877ac006e55d1f7ea5a",
+    "politics:deep_false": "17324635ace631dc33a98aa60ecfbc2d92ef379b485b176e81f483d883937830",
+    "politics:deep_true": "421a4936b9a6e409bdb6bc05d211e5b08c68cc797a2fd32bbca5446f287bf736",
+    "speech:deep_false": "f1228e100eb52a41dba37f0546c6ee27653f864d89e4721c719f40e83c202ac6",
+    "speech:deep_true": "e6b281d33197c76711bbed8f2b024644b6e7610a33ff4f705393929a7b988649",
+    "speech_mention:deep_false": "d9cb905bcba77b47c52f280ed293779b7d433ec2d6d305db0ec52bda45098cb6",
+    "speech_mention:deep_true": "d8d261da18ad5a74bdb4d105379ae10b708ea49af1c02818ca07872a2cacc5ac",
+    "sports:deep_false": "10acbb06d4b428298db0652257487b8797d18884cdb4cb820426ca4975e9c629",
+    "sports:deep_true": "eff61a1498b14eda9cec8c4a9b4ef22f18c8ecfc2d8e9da5423296336791457e",
+    "weather:deep_false": "7d90eda56d83089e7885a47fd2e0d3f20b5144c27e728285701893ea8b2f9923",
+    "weather:deep_true": "239cb2f91bbf8c553a7f2d120ed0b4854eac7df39005332f7c6b571b4347c6a1",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -40,7 +40,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
     "edge_external": "c85f0f881724bd6cb9c2626a4b3497e6540511c9dbbaef1b125b79c484ad16ad",
     "edge_source": "2901c6e3da6168e6b4205bf0660b22475968ecc6b946ebb1a66841b517cd2bce",
-    "evidence_basis": "4b71f131ebb0cf364858c8ccad2d966cf3cd0330e6f6d28d09e64ee3b0c63bf5",
+    "evidence_basis": "ff492060d94fea1e70d1623d7bc0d3c4348302c9d19dda58e233aa703ec71682",
     "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
     "evidence_quality": "6658519042cb5d88eae008c8641d15e4c7bd16eeb7b9929bec12f82cfbc2045f",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",

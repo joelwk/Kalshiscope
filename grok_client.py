@@ -117,6 +117,10 @@ def _default_search_config(settings: Settings | None = None) -> SearchConfig:
         to_date=now,
         allowed_domains=list(resolved.SEARCH_ALLOWED_DOMAINS),
         allowed_x_handles=list(resolved.SEARCH_ALLOWED_X_HANDLES),
+        source_domains_pool=list(resolved.SEARCH_ALLOWED_DOMAINS),
+        source_x_handles_pool=list(resolved.SEARCH_ALLOWED_X_HANDLES),
+        max_allowed_domains=resolved.SEARCH_PROFILE_MAX_DOMAINS,
+        max_allowed_x_handles=resolved.SEARCH_PROFILE_MAX_X_HANDLES,
         multimedia_confidence_range=resolved.MULTIMEDIA_CONFIDENCE_THRESHOLD,
     )
 
@@ -189,12 +193,23 @@ def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
     and transport-layer resets (RST_STREAM / UNAVAILABLE) are always retriable
     regardless of duration, since they indicate an interrupted stream rather
     than a content failure.
+
+    A fast "Empty response from Grok" (sub-_SLOW_FAILURE_THRESHOLD_MS) is
+    treated as transient: a stream that finishes in single-digit seconds with
+    zero content is far more consistent with an upstream blip than a real
+    content failure. Slow empty responses still fall through to the slow-
+    failure short-circuit so we don't burn budget retrying genuine outages.
     """
     if _is_timeout_class_error(exc) or _is_transport_reset_error(exc):
         return True
+    error_text = str(exc).lower()
+    if (
+        "empty response from grok" in error_text
+        and duration_ms < _SLOW_FAILURE_THRESHOLD_MS
+    ):
+        return True
     if duration_ms >= _SLOW_FAILURE_THRESHOLD_MS:
         return False
-    error_text = str(exc).lower()
     retriable_markers = (
         "statuscode.internal",
         "internal server error",
@@ -298,6 +313,8 @@ def _category_research_hint(profile_name: str, market: Market | None = None) -> 
         return load_prompt("user/category_hints/speech_general")
     if profile_name == "music":
         return load_prompt("user/category_hints/music")
+    if profile_name == "entertainment":
+        return load_prompt("user/category_hints/entertainment")
     if market is not None and is_commodity_market(market):
         return load_prompt("user/category_hints/commodities")
     return load_prompt("user/category_hints/generic")
@@ -394,16 +411,28 @@ class GrokClient:
                 to_date=config.to_date or defaults.to_date,
                 allowed_domains=config.allowed_domains or defaults.allowed_domains,
                 allowed_x_handles=config.allowed_x_handles or defaults.allowed_x_handles,
+                source_domains_pool=config.source_domains_pool or defaults.source_domains_pool,
+                source_x_handles_pool=(
+                    config.source_x_handles_pool or defaults.source_x_handles_pool
+                ),
+                max_allowed_domains=(
+                    config.max_allowed_domains or defaults.max_allowed_domains
+                ),
+                max_allowed_x_handles=(
+                    config.max_allowed_x_handles or defaults.max_allowed_x_handles
+                ),
                 enable_multimedia=config.enable_multimedia,
                 multimedia_confidence_range=config.multimedia_confidence_range,
                 profile_name=config.profile_name,
                 lookback_hours=config.lookback_hours,
             )
         # Keep within xAI limits while preserving prioritized order from profile builder.
-        if len(config.allowed_domains) > 5:
-            config.allowed_domains = config.allowed_domains[:5]
-        if len(config.allowed_x_handles) > 10:
-            config.allowed_x_handles = config.allowed_x_handles[:10]
+        max_domains = max(1, int(config.max_allowed_domains or 5))
+        max_handles = max(1, int(config.max_allowed_x_handles or 10))
+        if len(config.allowed_domains) > max_domains:
+            config.allowed_domains = config.allowed_domains[:max_domains]
+        if len(config.allowed_x_handles) > max_handles:
+            config.allowed_x_handles = config.allowed_x_handles[:max_handles]
         return config
 
     def _should_enable_multimedia(
@@ -716,12 +745,20 @@ class GrokClient:
             if market_implied is not None
             else None
         )
+        primary_source_url = str(decision.primary_source_url or "").strip()
+        primary_source_required_for_direct = profile_name != "sports"
+        primary_source_satisfies_direct = (
+            bool(primary_source_url) or not primary_source_required_for_direct
+        )
+        if evidence_basis_class == "direct" and not primary_source_satisfies_direct:
+            evidence_basis_class = "proxy"
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
         verifiable_floor_allowed = (
             has_verifiable_signal
             and not low_information
             and source_match_class == "settlement_aligned"
+            and primary_source_satisfies_direct
         )
         if has_verifiable_signal and not verifiable_floor_allowed:
             if low_information:
@@ -730,6 +767,11 @@ class GrokClient:
                 evidence_floor_suppressed_reason = "preview_or_proxy_source"
             elif no_external_odds and source_match_class == "missing_or_absence_only":
                 evidence_floor_suppressed_reason = "no_external_odds"
+            elif (
+                source_match_class == "settlement_aligned"
+                and not primary_source_satisfies_direct
+            ):
+                evidence_floor_suppressed_reason = "missing_primary_source_url"
             else:
                 evidence_floor_suppressed_reason = "source_not_settlement_aligned"
         if verifiable_floor_allowed:
@@ -762,6 +804,7 @@ class GrokClient:
             profile_name == "weather"
             and (decision.raw_confidence or decision.confidence) >= _WEATHER_OBS_CONFIDENCE_FLOOR
             and _RE_WEATHER_OBS_LOCKED.search(decision.reasoning or "")
+            and primary_source_satisfies_direct
         ):
             if evidence_quality < _WEATHER_OBS_EVIDENCE_FLOOR:
                 evidence_quality = _WEATHER_OBS_EVIDENCE_FLOOR
@@ -772,6 +815,7 @@ class GrokClient:
             and decision.likelihood_ratio is not None
             and decision.likelihood_ratio >= 10.0
             and not low_information
+            and primary_source_satisfies_direct
         )
         if (
             definitive_outcome_detected
@@ -1191,12 +1235,14 @@ class GrokClient:
     ) -> float:
         """Per-attempt stream deadline, clamped to the remaining analysis budget.
 
-        When *search_profile* is ``"crypto"`` the per-profile timeout from
-        settings (``GROK_STREAM_TIMEOUT_SECONDS_CRYPTO``) is preferred over
-        the generic default, giving crypto markets a longer window to avoid
-        frequent timeouts. When *deep* is True we use
-        ``GROK_STREAM_TIMEOUT_SECONDS_DEEP`` (defaults to a higher value than
-        the initial-pass timeout) since deep refinement runs richer prompts.
+        Profile-aware overrides (when set to a positive value) raise the
+        per-attempt cap above the generic ``GROK_STREAM_TIMEOUT_SECONDS``:
+
+        - ``deep=True`` → ``GROK_STREAM_TIMEOUT_SECONDS_DEEP``
+        - ``search_profile == "crypto"`` → ``GROK_STREAM_TIMEOUT_SECONDS_CRYPTO``
+        - ``search_profile == "weather"`` → ``GROK_STREAM_TIMEOUT_SECONDS_WEATHER``
+          (added after cycle 1 review observed weather analyses timing out at
+          exactly the legacy 100s ceiling on data-heavy NWS observation prompts)
         """
         base_timeout = float(self.stream_timeout_seconds)
         if (
@@ -1219,6 +1265,16 @@ class GrokClient:
             )
             if crypto_timeout is not None and int(crypto_timeout) > 0:
                 base_timeout = max(base_timeout, float(crypto_timeout))
+        if (
+            search_profile == "weather"
+            and hasattr(self, "settings")
+            and self.settings is not None
+        ):
+            weather_timeout = getattr(
+                self.settings, "GROK_STREAM_TIMEOUT_SECONDS_WEATHER", None
+            )
+            if weather_timeout is not None and int(weather_timeout) > 0:
+                base_timeout = max(base_timeout, float(weather_timeout))
         if budget_remaining_ms is None or budget_remaining_ms <= 0:
             return base_timeout
         budget_seconds = max(

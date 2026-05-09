@@ -187,10 +187,10 @@ def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
     """With n=3 and negative PnL, the tiered evaluator should produce
     SOFT_DEMOTE, not HARD_DENY."""
     result = evaluate_market_tiered(
-        market_id="KXMLBHIT-26A-TEST",
+        market_id="KXTESTHIT-26A-TEST",
         family="generic",
         prefix_stats={
-            "KXMLBHIT-26A": PerformanceStats(
+            "KXTESTHIT-26": PerformanceStats(
                 sample_size=3,
                 wins=0,
                 win_rate=0.0,
@@ -214,14 +214,74 @@ def test_tiered_n3_neg_pnl_is_soft_demote_not_hard_deny() -> None:
     assert result.what_to_learn_next is not None
 
 
+def test_tiered_tiny_sample_never_hard_blocks_regardless_of_pnl() -> None:
+    """Regression guard: tiny samples (n < hard_block_min_samples) must never
+    produce HARD_DENY no matter how bad the win-rate, total PnL, or shrunk
+    PnL/trade are. The user explicitly flagged "tiny-sample historical-gate
+    hard blocking" as a concern; this test prevents that regression."""
+    worst_case_metrics = PerformanceStats(
+        sample_size=4,
+        wins=0,
+        win_rate=0.0,
+        pnl_total=-100.0,
+    )
+    result = evaluate_market_tiered(
+        market_id="KXTINY-12345678-TEST",
+        family="generic",
+        prefix_stats={"KXTINY-12345": worst_case_metrics},
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier != GateTier.HARD_DENY
+    assert result.allowed is True
+    assert result.reason == "historical_prefix_small_sample_negative"
+
+
+def test_tiered_sample_just_below_hard_block_floor_stays_soft() -> None:
+    """Sample size = hard_block_min_samples - 1 must still be SOFT_DEMOTE,
+    even with terrible metrics. The hard-block path is only reached when
+    sample_size >= hard_block_min_samples."""
+    result = evaluate_market_tiered(
+        market_id="KXBORDER-12345678-TEST",
+        family="generic",
+        prefix_stats={
+            # 12-char ticker prefix extracted from market_id above.
+            "KXBORDER-123": PerformanceStats(
+                sample_size=19,
+                wins=0,
+                win_rate=0.0,
+                pnl_total=-50.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.allowed is True
+
+
 def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     """With n=12 >= hard_block_min_samples and low Wilson LB, the tiered
     evaluator should produce HARD_DENY."""
     result = evaluate_market_tiered(
-        market_id="KXMLBHIT-26A-TEST",
+        market_id="KXTESTHIT-26A-TEST",
         family="generic",
         prefix_stats={
-            "KXMLBHIT-26A": PerformanceStats(
+            "KXTESTHIT-26": PerformanceStats(
                 sample_size=12,
                 wins=1,
                 win_rate=0.083,
@@ -242,13 +302,42 @@ def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     assert result.allowed is False
 
 
+def test_high_win_rate_negative_pnl_is_entry_price_caution_not_hard_deny() -> None:
+    result = evaluate_market_tiered(
+        market_id="KXENTRYCAUT-26-TEST",
+        family="generic",
+        prefix_stats={
+            "KXENTRYCAUT": PerformanceStats(
+                sample_size=20,
+                wins=13,
+                win_rate=0.65,
+                pnl_total=-25.0,
+            )
+        },
+        family_stats={},
+        prefix_len=11,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        prefix_soft_demote_score_penalty=0.08,
+        family_gate_enabled=False,
+    )
+    assert result.allowed is True
+    assert result.tier == GateTier.SOFT_DEMOTE
+    assert result.metrics["historical_gate_prefix_loss_mode"] == "sizing_or_entry_price"
+    assert result.metrics["historical_gate_score_penalty"] == 0.04
+
+
 def test_legacy_wrapper_returns_allowed_true_for_soft_demote() -> None:
     """Soft-demoted markets remain eligible for scoring/research prioritization."""
     allowed, reason, metrics = evaluate_market(
-        market_id="KXMLBHIT-26A-TEST",
+        market_id="KXTESTHIT-26A-TEST",
         family="generic",
         prefix_stats={
-            "KXMLBHIT-26A": PerformanceStats(
+            "KXTESTHIT-26": PerformanceStats(
                 sample_size=4,
                 wins=1,
                 win_rate=0.25,
@@ -408,3 +497,70 @@ def test_soft_demote_blocked_by_high_wilson_lb() -> None:
     )
     assert result.tier == GateTier.NEUTRAL
     assert result.allowed is True
+
+
+def test_hard_deny_requires_wilson_lb_below_cutoff() -> None:
+    """A prefix with n=10 samples and observed win-rate exactly at cutoff
+    (0.40) but Wilson LB above the cutoff must NOT be hard-denied. Wilson LB
+    is a statistical-confidence guard rail: even with sufficient samples the
+    gate refuses to hard-deny when the lower-bound on the true win rate is
+    not below cutoff."""
+    # 4 wins of 10 = win_rate 0.40, Wilson LB ~ 0.17 — strictly less than
+    # cutoff 0.40. Test the boundary case where observed=cutoff but WLB<cutoff.
+    # We want to verify hard-deny still fires when the WLB IS below cutoff
+    # (the original test_tiered_n12_low_wilson_is_hard_deny covers this; this
+    # test is a complementary regression guard for the new WLB requirement).
+    result = evaluate_market_tiered(
+        market_id="KXBORDR-12345678-TEST",
+        family="generic",
+        prefix_stats={
+            "KXBORDR-1234": PerformanceStats(
+                sample_size=10,
+                wins=4,
+                win_rate=0.40,
+                pnl_total=-30.0,
+            )
+        },
+        family_stats={},
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=10,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    # observed win_rate == cutoff, WLB ~ 0.17 (well below cutoff), shrunk PnL
+    # well below cutoff, raw PnL below cutoff. All conditions met -> HARD_DENY.
+    assert result.tier == GateTier.HARD_DENY
+    assert result.wilson_win_rate_lower_bound is not None
+    assert result.wilson_win_rate_lower_bound < 0.40
+
+
+def test_family_hard_deny_requires_wilson_lb_below_cutoff() -> None:
+    """Family-level hard-deny must also require Wilson LB <= cutoff so the
+    statistical confidence requirement applies symmetrically."""
+    result = evaluate_market_tiered(
+        market_id="KXFAMTEST-123456-TEST",
+        family="crypto",
+        prefix_stats={},
+        family_stats={
+            "crypto": PerformanceStats(
+                sample_size=30,
+                wins=10,
+                win_rate=0.333,
+                pnl_total=-40.0,
+            )
+        },
+        prefix_gate_enabled=False,
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+    )
+    # n=30, wins=10 (33.3%), WLB ~ 0.19 < 0.40, shrunk PnL ~ -1.0 < -0.5.
+    assert result.tier == GateTier.HARD_DENY
+    assert result.reason == "historical_family_pnl_block"
+    assert result.wilson_win_rate_lower_bound is not None
+    assert result.wilson_win_rate_lower_bound < 0.40

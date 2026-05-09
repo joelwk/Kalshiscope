@@ -5,3 +5,4 @@ lines:
   - If edge < 5%, return should_trade=false and bet_size_pct=0.0.
   - If your confidence would exceed 0.72 without direct evidence, lower confidence and avoid trade.
   - "If the previous analysis relied on absence_only evidence or edge_source=none, treat deep analysis as source repair: find direct settlement-aligned evidence or abstain."
+  - "If source repair fails, set should_trade=false and explain the missing primary source, stale price signal, or ambiguous resolution criterion."

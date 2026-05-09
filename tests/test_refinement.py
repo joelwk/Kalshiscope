@@ -254,3 +254,121 @@ def test_flip_accepted_when_evidence_basis_direct_and_primary_source_url() -> No
     result = refinement.perform_refinement(grok, market, initial)
     assert result.outcome == "NO", "Flip should be accepted with direct evidence + URL"
     assert result.confidence >= 0.70
+
+
+def _sports_market(market_id: str = "KXMLBF5-26MAY041840TORTB-TB") -> Market:
+    """Sports family fixture (MLB ticker prefix triggers _SPORTS_TICKER_PATTERN)."""
+    return Market(
+        id=market_id,
+        question="Toronto vs Tampa Bay first 5 innings winner?",
+        category="sports",
+        outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+    )
+
+
+def _weather_market(market_id: str = "KXLOWTLV-26MAY03-B61.5") -> Market:
+    """Weather family fixture (weather keyword triggers family detection)."""
+    return Market(
+        id=market_id,
+        question="Will the minimum temperature be 61-62 on May 3?",
+        category="weather",
+        outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+    )
+
+
+def test_skip_borderline_families_suppresses_borderline_trade_trigger() -> None:
+    """When the market's family is in skip_borderline_families, the
+    borderline_trade_confidence trigger must NOT fire even though confidence
+    is in the [0.60, 0.78] window. This protects fast-moving sports markets
+    from the deep-refinement edge-erosion failure mode (TORTB F5 case)."""
+    market = _sports_market()
+    refinement = RefinementStrategy(
+        market=market,
+        skip_borderline_families=("sports",),
+    )
+    decision = _decision(0.62)
+    reasons = refinement.get_refinement_reasons(decision, None)
+    assert "borderline_trade_confidence" not in reasons
+
+
+def test_skip_borderline_families_does_not_affect_non_listed_families() -> None:
+    """Weather markets must still trigger borderline_trade_confidence
+    refinement when sports is the only entry in skip_borderline_families."""
+    market = _weather_market()
+    refinement = RefinementStrategy(
+        market=market,
+        skip_borderline_families=("sports",),
+    )
+    decision = _decision(0.62)
+    reasons = refinement.get_refinement_reasons(decision, None)
+    assert "borderline_trade_confidence" in reasons
+
+
+def test_skip_borderline_families_default_empty_preserves_existing_behavior() -> None:
+    """Backward-compat: when skip_borderline_families is empty (default),
+    sports markets still get the borderline_trade_confidence trigger.
+    Operators must opt in via the env setting."""
+    market = _sports_market()
+    refinement = RefinementStrategy(market=market)
+    decision = _decision(0.62)
+    reasons = refinement.get_refinement_reasons(decision, None)
+    assert "borderline_trade_confidence" in reasons
+
+
+def test_skip_borderline_families_case_insensitive() -> None:
+    """The skip list normalizes input so 'Sports', 'SPORTS', and 'sports'
+    all suppress the trigger \u2014 operators may write any case in .env."""
+    market = _sports_market()
+    for variant in ("Sports", "SPORTS", "sports", "  sports  "):
+        refinement = RefinementStrategy(
+            market=market,
+            skip_borderline_families=(variant,),
+        )
+        decision = _decision(0.62)
+        reasons = refinement.get_refinement_reasons(decision, None)
+        assert "borderline_trade_confidence" not in reasons, (
+            f"Variant {variant!r} should suppress trigger"
+        )
+
+
+def test_skip_borderline_families_does_not_block_other_triggers() -> None:
+    """The skip only affects borderline_trade_confidence. Other triggers
+    (low_evidence_quality, high_conf_small_edge) must still fire on sports
+    markets so genuine evidence/edge problems are not masked."""
+    market = _sports_market()
+    refinement = RefinementStrategy(
+        market=market,
+        skip_borderline_families=("sports",),
+    )
+    low_evidence_decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.62,
+        bet_size_pct=0.5,
+        reasoning="low evidence",
+        evidence_quality=0.30,
+    )
+    reasons = refinement.get_refinement_reasons(low_evidence_decision, None)
+    assert "low_evidence_quality" in reasons
+    assert "borderline_trade_confidence" not in reasons
+
+
+def test_skip_borderline_families_handles_missing_market() -> None:
+    """When self.market is None the helper must not crash; treat as
+    'do not skip' so refinement runs normally."""
+    refinement = RefinementStrategy(
+        market=None,
+        skip_borderline_families=("sports",),
+    )
+    decision = _decision(0.62)
+    reasons = refinement.get_refinement_reasons(decision, None)
+    assert "borderline_trade_confidence" in reasons
+
+
+def test_settings_default_skip_borderline_families_includes_sports() -> None:
+    """Sports is the canonical skip target after the post-7-cycle audit."""
+    from config import Settings
+    s = Settings()
+    assert "sports" in s.REFINEMENT_SKIP_BORDERLINE_FAMILIES

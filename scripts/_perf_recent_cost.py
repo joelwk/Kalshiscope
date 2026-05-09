@@ -1,7 +1,13 @@
 """Recent cost trend report (read-only)."""
 import json
 import sqlite3
+import sys
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from research_profiles import family_from_text
 
 conn = sqlite3.connect('data/market_state.db')
 conn.row_factory = sqlite3.Row
@@ -49,20 +55,7 @@ rows = conn.execute(
 
 
 def family(mid: str) -> str:
-    n = (mid or "").upper()
-    if "BTC" in n or "ETH" in n:
-        return "crypto"
-    if "MLB" in n or "NBA" in n or "NFL" in n or "NHL" in n:
-        return "sports"
-    if any(t in n for t in ("LOWT", "HIGHT", "TEMPNYC", "HIGH", "LOW")):
-        return "weather"
-    if any(t in n for t in ("BRENT", "WTI", "GOLD", "SILVER", "COPPER", "NATGAS", "HOIL", "LCATTLE", "CORN", "SOY", "WHEAT")):
-        return "commodity"
-    if n.startswith(("KXNASDAQ100U-", "KXINXU-", "KXINX-")):
-        return "index"
-    if "MENTION" in n or "LASTWORDCOUNT" in n:
-        return "speech"
-    return "generic"
+    return family_from_text(mid)
 
 
 totals = {}
@@ -147,26 +140,26 @@ print(f"\nTotal high-conf (>=0.85) trades: wins={win_count} losses={loss_count} 
       f"win_rate={(win_count/(win_count+loss_count) if (win_count+loss_count) else 0):.4f}")
 
 print()
-print("=== Sports breakout: MLB submarkets (MLB GAME, MLB SPREAD, MLB RFI, etc.) ===")
+print("=== Submarket breakout by event-prefix (top 25 by sample size) ===")
 rows = conn.execute(
     """
     SELECT market_id, confidence, won, pnl_estimate
     FROM trade_outcomes
     WHERE won IS NOT NULL
-      AND market_id LIKE 'KXMLB%'
     """
 ).fetchall()
 sub_totals = {}
 for r in rows:
     mid = r['market_id'] or ''
     parts = mid.split('-')
-    sub = parts[0] if parts else 'KXMLB'
+    sub = parts[0] if parts else mid
     sub_totals.setdefault(sub, {"n": 0, "wins": 0, "pnl": 0.0})
     sub_totals[sub]["n"] += 1
     sub_totals[sub]["wins"] += 1 if int(r['won'] or 0) == 1 else 0
     sub_totals[sub]["pnl"] += float(r['pnl_estimate'] or 0)
 
-for sub, t in sorted(sub_totals.items(), key=lambda x: x[1]['pnl']):
+ranked = sorted(sub_totals.items(), key=lambda x: x[1]['n'], reverse=True)[:25]
+for sub, t in sorted(ranked, key=lambda x: x[1]['pnl']):
     n = t['n']
     wr = (t['wins'] / n) if n else 0
     print(f"  {sub:<24} n={n:>3} wr={wr:.4f} pnl=${t['pnl']:+.2f}")

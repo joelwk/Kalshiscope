@@ -284,6 +284,81 @@ def test_compute_final_score_applies_hallucinated_edge_penalty_when_not_definiti
     assert "hallucinated_edge" in score.rejection_reasons
 
 
+def test_suppress_hallucinated_edge_also_suppresses_high_edge_calibration_penalty() -> None:
+    """Cycle 1 review: when high-quality settled evidence trips
+    ``suppress_hallucinated_edge_penalty=True``, the matching
+    ``high_edge_calibration_penalty`` (which fires on the same edge magnitude
+    range) should also be suppressed so the score gate sees the unstacked
+    score. Otherwise the trade still loses ~0.18 from the score and gets
+    routed to the research queue."""
+    market = Market(
+        id="m-suppress-both-penalties",
+        question="Kehlani-style settlement-aligned chart edge",
+        outcomes=[MarketOutcome(name="YES", price=0.66), MarketOutcome(name="NO", price=0.34)],
+        liquidity_usdc=1500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+        resolution_criteria="Hits Daily Double chart for the week",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.90,
+        bet_size_pct=0.5,
+        reasoning="Settlement-aligned chart numerics",
+        edge_external=0.56,
+        edge_source="computed",
+        evidence_quality=1.0,
+        primary_source_url="https://www.hitsdailydouble.com/charts/hits-top-50",
+        source_match_class="settlement_aligned",
+    )
+    score = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.34,
+        max_reasonable_edge=0.40,
+        evidence_basis_class="direct",
+        suppress_hallucinated_edge_penalty=True,
+    )
+    assert score.hallucinated_edge_penalty == pytest.approx(0.0, abs=1e-9)
+    assert score.high_edge_calibration_penalty == pytest.approx(0.0, abs=1e-9)
+    assert score.extreme_edge_learning_queue is False
+    assert "hallucinated_edge" not in score.rejection_reasons
+    assert "high_edge_calibration_penalty" not in score.rejection_reasons
+    assert "extreme_edge_learning_queue" not in score.rejection_reasons
+
+
+def test_high_edge_calibration_penalty_fires_when_not_suppressed() -> None:
+    """Regression check: without the suppression flag, the penalty still
+    fires for non-definitive high-edge cases (the old cycle 1 behavior)."""
+    market = Market(
+        id="m-suppress-flag-off",
+        question="Test",
+        outcomes=[MarketOutcome(name="YES", price=0.66), MarketOutcome(name="NO", price=0.34)],
+        liquidity_usdc=1500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.90,
+        bet_size_pct=0.5,
+        reasoning="High edge, no suppression",
+        edge_external=0.56,
+        edge_source="computed",
+        evidence_quality=0.70,
+    )
+    score = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.34,
+        max_reasonable_edge=0.40,
+        evidence_basis_class="proxy",
+        suppress_hallucinated_edge_penalty=False,
+    )
+    assert score.high_edge_calibration_penalty > 0
+    assert score.extreme_edge_learning_queue is True
+
+
 def test_compute_final_score_adds_high_edge_calibration_penalty() -> None:
     market = Market(
         id="m-high-edge-cal",
@@ -1461,7 +1536,7 @@ def test_compute_final_score_applies_historical_family_bonus_for_profitable_fami
     assert with_bonus.final_score == pytest.approx(without_bonus.final_score + 0.04)
 
 
-def _make_market(market_id: str = "KXMLBGAME-26APR191420NYMCHC-CHC", **kw):
+def _make_market(market_id: str = "KXSAMPLEGAME-26APR191420TEAMATEAMB-TEAMA", **kw):
     defaults = dict(
         id=market_id,
         question="Test",
@@ -1488,7 +1563,7 @@ def _make_decision(**kw):
 
 
 def test_historical_prefix_bonus_credits_proven_winners() -> None:
-    market = _make_market("KXMLBGAME-26APR191420NYMCHC-CHC")
+    market = _make_market("KXSAMPLEGAME-26APR191420TEAMATEAMB-TEAMA")
     decision = _make_decision(confidence=0.75)
     result = compute_final_score(
         market, decision, implied_prob_market=0.55,
@@ -1666,9 +1741,9 @@ def test_coinflip_sports_penalty_triggers() -> None:
     assert non_sports.coinflip_sports_penalty == pytest.approx(0.0, abs=1e-9)
 
 
-def test_kxmlbgame_positive_prefix_lifts_rank() -> None:
-    game_market = _make_market("KXMLBGAME-26APR191420NYMCHC-CHC")
-    hit_market = _make_market("KXMLBHIT-26APR271940SEAMIN-SEARAROZARENA56-1")
+def test_positive_prefix_lifts_rank() -> None:
+    game_market = _make_market("KXSAMPLEGAME-26APR191420TEAMATEAMB-TEAMA")
+    hit_market = _make_market("KXSAMPLEHIT-26APR271940TEAMCTEAMD-PROP56-1")
     decision = _make_decision(confidence=0.80, evidence_quality=0.80)
     game_result = compute_final_score(
         game_market, decision, implied_prob_market=0.55,
@@ -1685,7 +1760,7 @@ def test_kxmlbgame_positive_prefix_lifts_rank() -> None:
 
 
 def test_historical_prefix_amplified_penalty() -> None:
-    market = _make_market("KXMLBHIT-26APR271940SEAMIN-SEARAROZARENA56-1")
+    market = _make_market("KXSAMPLEHIT-26APR271940TEAMCTEAMD-PROP56-1")
     decision = _make_decision(confidence=0.75, evidence_quality=0.70)
     result = compute_final_score(
         market, decision, implied_prob_market=0.55,
@@ -1741,8 +1816,8 @@ def test_high_edge_calibration_penalty_fires_on_extreme_edge() -> None:
     even when suppress_hallucinated_edge_penalty=True (the fix for the
     biggest realized PnL leak: 22 trades at 22.7% WR, -$90.12)."""
     market = Market(
-        id="KXMLBGAME-test",
-        question="Test MLB game",
+        id="KXSAMPLEGAME-test",
+        question="Test sports game",
         outcomes=[MarketOutcome(name="YES", price=0.30)],
         liquidity_usdc=500.0,
         close_time=datetime.now(timezone.utc) + timedelta(hours=2),
@@ -1774,7 +1849,7 @@ def test_high_edge_calibration_penalty_fires_on_extreme_edge() -> None:
 def test_high_edge_calibration_penalty_escalates_at_055() -> None:
     """Edge >= 0.55 forces the maximum penalty of 0.18."""
     market = Market(
-        id="KXMLBSPREAD-test",
+        id="KXSAMPLESPREAD-test",
         question="Test spread",
         outcomes=[MarketOutcome(name="YES", price=0.20)],
         liquidity_usdc=500.0,
@@ -1805,7 +1880,7 @@ def test_high_edge_calibration_penalty_exempts_direct_definitive() -> None:
     """Direct evidence + definitive_outcome_eligible should exempt from
     the high-edge calibration penalty."""
     market = Market(
-        id="KXMLBGAME-exempt",
+        id="KXSAMPLEGAME-exempt",
         question="Test settled game",
         outcomes=[MarketOutcome(name="NO", price=0.40)],
         liquidity_usdc=500.0,

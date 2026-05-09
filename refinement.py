@@ -6,6 +6,7 @@ from logging_config import get_logger
 from grok_client import GrokClient
 from config import SearchConfig
 from models import Market, MarketState, TradeDecision
+from research_profiles import market_family
 
 logger = get_logger(__name__)
 
@@ -31,10 +32,18 @@ class RefinementStrategy:
         market: Market | None = None,
         urgent_days_before_close: int = 2,
         high_confidence_threshold: float = HIGH_CONFIDENCE_THRESHOLD,
+        skip_borderline_families: tuple[str, ...] = (),
     ) -> None:
         self.market = market
         self.urgent_days_before_close = urgent_days_before_close
         self.high_confidence_threshold = high_confidence_threshold
+        # Normalize to lowercase for case-insensitive comparison; settings
+        # accept user-provided values like "Sports" or "SPORTS".
+        self.skip_borderline_families = tuple(
+            family.strip().lower()
+            for family in skip_borderline_families
+            if family and family.strip()
+        )
 
     def should_refine(
         self,
@@ -77,7 +86,17 @@ class RefinementStrategy:
             return reasons
 
         if decision.should_trade and 0.60 <= decision.confidence <= 0.78:
-            reasons.append("borderline_trade_confidence")
+            # Skip the borderline-trade-confidence trigger for families that
+            # move too fast for refinement to add value (e.g. sports player
+            # props, F5, RFI). The 1.5-2 minute deep refinement window
+            # erodes edge through market movement faster than the deep pass
+            # can add new information; previous live runs showed
+            # KXMLBF5-...-TORTB-TB initial trade=True (conf=0.62, edge>=0.08)
+            # downgraded to trade=False (conf=0.50, edge=0.04) by deep
+            # refinement after 2 minutes of market movement. Other refine
+            # triggers below still fire for these families.
+            if not self._family_skipped_for_borderline_trade():
+                reasons.append("borderline_trade_confidence")
         if implied_prob is None and (decision.should_trade or quality < LOW_EVIDENCE_REFINE_THRESHOLD):
             reasons.append("missing_implied_probability")
         if quality < LOW_EVIDENCE_REFINE_THRESHOLD and (
@@ -316,3 +335,16 @@ class RefinementStrategy:
         now = datetime.now(timezone.utc)
         urgent_cutoff = now + timedelta(days=self.urgent_days_before_close)
         return close_time <= urgent_cutoff
+
+    def _family_skipped_for_borderline_trade(self) -> bool:
+        """Return True when the market's family is in the skip list.
+
+        Used to suppress the borderline_trade_confidence refinement trigger
+        for families where deep refinement consistently erodes edge through
+        market movement (e.g. sports). When the market is unavailable we
+        fall back to "do not skip" so refinement runs normally.
+        """
+        if not self.skip_borderline_families or self.market is None:
+            return False
+        family = market_family(self.market).strip().lower()
+        return family in self.skip_borderline_families

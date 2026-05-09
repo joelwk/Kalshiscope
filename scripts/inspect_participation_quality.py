@@ -28,6 +28,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from research_profiles import family_from_text  # noqa: E402
+
 DEFAULT_DB_PATH = "data/market_state.db"
 DEFAULT_WINDOW_DAYS = 7
 DEFAULT_LOG_FILES = ("logs/predictbot.log", "logs/predictbot.log.1")
@@ -105,24 +107,7 @@ def _coerce_dt(text: object) -> datetime | None:
 
 
 def _market_family_from_id(market_id: str) -> str:
-    normalized = (market_id or "").upper()
-    if "BTC" in normalized or "ETH" in normalized:
-        return "crypto"
-    if normalized.startswith(("KXNASDAQ100U-", "KXINXU-")):
-        return "index"
-    if "MENTION" in normalized or "LASTWORDCOUNT" in normalized:
-        return "speech"
-    if any(
-        token in normalized
-        for token in (
-            "GOLD", "SILVER", "WTI", "NATGAS", "COPPER", "CORN",
-            "SOY", "WHEAT", "AAA",
-        )
-    ):
-        return "commodity"
-    if any(token in normalized for token in ("LOWT", "HIGHT", "TEMPNYC")):
-        return "weather"
-    return "generic"
+    return family_from_text(market_id)
 
 
 def _safe_json_loads(raw: object) -> dict[str, Any] | None:
@@ -135,6 +120,13 @@ def _safe_json_loads(raw: object) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_participation_tier(raw: object) -> str:
+    text = str(raw or "").strip()
+    if text.startswith("ParticipationTier."):
+        text = text.split(".", 1)[1].lower()
+    return text or "unknown"
 
 
 def section_decision_outcome_mix(
@@ -309,6 +301,8 @@ def section_participation_demotions(
                 """
                 SELECT
                   COUNT(*) AS n,
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_tier') IS NOT NULL
+                           THEN 1 ELSE 0 END) AS tier_total,
                   SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
                             AND COALESCE(final_action,'') = 'research_queued'
                            THEN 1 ELSE 0 END) AS demoted_to_research,
@@ -329,6 +323,8 @@ def section_participation_demotions(
                 """
                 SELECT
                   COUNT(*) AS n,
+                  SUM(CASE WHEN json_extract(audit_json,'$.participation_tier') IS NOT NULL
+                           THEN 1 ELSE 0 END) AS tier_total,
                   SUM(CASE WHEN json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
                             AND COALESCE(final_action,'') = 'research_queued'
                            THEN 1 ELSE 0 END) AS demoted_to_research,
@@ -343,12 +339,17 @@ def section_participation_demotions(
                 """,
             ).fetchone()
         total = int(row["n"] or 0)
+        tier_total = int(row["tier_total"] or 0)
         demoted_total = int(row["demoted_total"] or 0)
         demoted_to_research = int(row["demoted_to_research"] or 0)
         demoted_to_skip = int(row["demoted_to_skip"] or 0)
         terminal_rejects = int(row["terminal_rejects"] or 0)
         print(f"{label}")
         print(f"  decisions seen:                         {total}")
+        print(
+            f"  participation_tier set:                 {tier_total} "
+            f"({_fmt_pct(tier_total, total)})"
+        )
         print(f"  participation_demotion_reason set:      {demoted_total}")
         print(
             f"    -> routed to research_queued:         {demoted_to_research} "
@@ -379,6 +380,29 @@ def section_participation_demotions(
         print(f"{'reason':<48} {'n':>8}")
         for row in rows:
             print(f"{str(row['reason']):<48} {int(row['n']):>8}")
+
+    tier_rows = conn.execute(
+        """
+        SELECT
+          COALESCE(json_extract(audit_json,'$.participation_tier'),'unknown') AS tier,
+          COALESCE(final_action,'unknown') AS final_action,
+          COUNT(*) AS n
+        FROM decision_receipts
+        WHERE json_extract(audit_json,'$.participation_tier') IS NOT NULL
+        GROUP BY tier, final_action
+        ORDER BY n DESC
+        LIMIT 30
+        """,
+    ).fetchall()
+    if tier_rows:
+        _print_subheader("Canonical participation tier by final_action (all-time)")
+        print(f"{'tier':<36} {'final_action':<18} {'n':>8}")
+        for row in tier_rows:
+            tier_label = _normalize_participation_tier(row["tier"])
+            print(
+                f"{tier_label:<36} {str(row['final_action']):<18} "
+                f"{int(row['n']):>8}"
+            )
 
 
 def section_decision_field_distribution(
@@ -801,11 +825,17 @@ def section_cycle_funnel(
     fields = [
         "fetched", "filtered", "analyzed", "decisions_made",
         "execution_candidates", "research_queue_size",
+        "research_queue_drained_count",
+        "research_queue_drain_skipped_stale_count",
+        "research_queue_drain_skipped_low_priority_count",
+        "research_queue_emergency_probes_count",
+        "timeout_routed_to_monitor_only_count",
         "order_attempts", "api_tokens_consumed", "api_cost_estimate_usd",
     ]
     series: dict[str, list[float]] = {field: [] for field in fields}
     rejection_total = Counter()
     evidence_total = Counter()
+    participation_tier_total = Counter()
     cycles_analyzed_pos_exec_zero_with_research_pos = 0
     cycles_analyzed_pos = 0
     cycles_total = 0
@@ -842,6 +872,14 @@ def section_cycle_funnel(
             for key, val in evidence.items():
                 try:
                     evidence_total[str(key)] += int(val)
+                except (TypeError, ValueError):
+                    continue
+
+        participation_tiers = payload.get("participation_tier_breakdown")
+        if isinstance(participation_tiers, dict):
+            for key, val in participation_tiers.items():
+                try:
+                    participation_tier_total[_normalize_participation_tier(key)] += int(val)
                 except (TypeError, ValueError):
                     continue
 
@@ -911,6 +949,12 @@ def section_cycle_funnel(
         total_evidence = sum(evidence_total.values())
         for key, n in evidence_total.most_common():
             print(f"  {key:<24} n={n:>6} ({_fmt_pct(n, total_evidence)})")
+
+    if participation_tier_total:
+        _print_subheader("participation_tier_breakdown totals")
+        total_tiers = sum(participation_tier_total.values())
+        for key, n in participation_tier_total.most_common():
+            print(f"  {key:<36} n={n:>6} ({_fmt_pct(n, total_tiers)})")
 
 
 _GROK_TIMEOUT_PATTERNS = (

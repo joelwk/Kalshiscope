@@ -290,13 +290,21 @@ def compute_final_score(
     extreme_edge_learning_queue = False
     edge_abs_max = max(abs(edge_market), abs(edge_external))
     high_edge_threshold = min(normalized_max_reasonable_edge, 0.32)
-    if (
-        edge_abs_max > high_edge_threshold
-        and not (
-            normalized_evidence_basis == "direct"
-            and definitive_outcome_eligible
-        )
-    ):
+    # The penalty is suppressed when:
+    # - evidence_basis=direct AND definitive_outcome_eligible (legacy exemption
+    #   for definitive-outcome trades), OR
+    # - evidence_basis=direct AND suppress_hallucinated_edge_penalty=True
+    #   (the high-quality settlement-aligned path added in the cycle 1
+    #   review: same conditions that suppress hallucinated_edge should
+    #   suppress this matching penalty so the score gate sees the unstacked
+    #   score).
+    # Suppression requires direct evidence in both cases — proxy/fallback
+    # high edges still receive the penalty as a safety net for the largest
+    # realized PnL leak class.
+    high_edge_exempt_via_direct = normalized_evidence_basis == "direct" and (
+        definitive_outcome_eligible or suppress_hallucinated_edge_penalty
+    )
+    if edge_abs_max > high_edge_threshold and not high_edge_exempt_via_direct:
         high_edge_calibration_penalty = min(
             0.18,
             max(0.0, edge_abs_max - high_edge_threshold) * 0.50,

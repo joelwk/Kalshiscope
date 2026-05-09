@@ -6,6 +6,8 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
+from research_profiles import family_from_text
+
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute(
@@ -22,21 +24,7 @@ def _bucket(confidence: float) -> str:
 
 
 def _market_family_from_id(market_id: str) -> str:
-    normalized = (market_id or "").upper()
-    if "BTC" in normalized or "ETH" in normalized:
-        return "crypto"
-    if normalized.startswith(("KXNASDAQ100U-", "KXINXU-")):
-        return "index"
-    if "MENTION" in normalized or "LASTWORDCOUNT" in normalized:
-        return "speech"
-    if any(
-        token in normalized
-        for token in ("GOLD", "SILVER", "WTI", "NATGAS", "COPPER", "CORN", "SOY", "WHEAT", "AAA")
-    ):
-        return "commodity"
-    if any(token in normalized for token in ("LOWT", "HIGHT", "TEMPNYC")):
-        return "weather"
-    return "generic"
+    return family_from_text(market_id)
 
 
 def run(db_path: str) -> None:
@@ -442,6 +430,8 @@ def run(db_path: str) -> None:
                         COALESCE(CAST(json_extract(decision_json, '$.confidence') AS REAL), 0.0) AS confidence
                     FROM decision_receipts
                     WHERE COALESCE(final_action, '') IN ('order_submitted', 'dry_run')
+                      AND COALESCE(json_extract(audit_json, '$.analysis_skipped'), 0) = 0
+                      AND COALESCE(json_extract(audit_json, '$.synthetic_decision'), 0) = 0
                     """
                 ).fetchall()
                 if retrospective_rows:

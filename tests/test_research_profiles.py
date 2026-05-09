@@ -18,6 +18,111 @@ def test_market_family_sports() -> None:
     assert market_family(market) == "sports"
 
 
+def test_market_family_mlb_player_prop_via_ticker_prefix() -> None:
+    """Regression: KXMLBTB-* (player-prop questions) must classify as sports
+    even when the natural-language question never names "MLB". The 7-cycle
+    follow-up audit found a settled-game trade (KXMLBTB-26MAY031605CLEATH-
+    CLEJRAMREZ11-2) was misrouted to "generic" and skipped because the
+    keyword regex `\\bmlb\\b` could not match the leading "KXMLB" without a
+    word boundary. Ticker-prefix detection in family_from_text now anchors
+    on `\\bKXMLB`."""
+    market = Market(
+        id="KXMLBTB-26MAY031605CLEATH-CLEJRAMREZ11-2",
+        question="Jose Ramirez: 2+ total bases?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_mlb_first_5_innings_via_ticker_prefix() -> None:
+    """KXMLBF5-* (cycle-14 success fixture) classifies as sports."""
+    market = Market(
+        id="KXMLBF5-26MAY031920TEXDET-DET",
+        question="Will Detroit win first 5 innings vs Texas?",
+        category="sports",
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_nba_player_prop_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNBA-PLAYER-PROP-XYZ",
+        question="Will player score 20+ points?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_nfl_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNFL-26WK1-PHI-DAL",
+        question="Will the home team win?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_nhl_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNHL-26FEB14-RANGERS-BRUINS",
+        question="Will the road team win?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_ncaa_via_ticker_prefix() -> None:
+    market = Market(
+        id="KXNCAAB-MARMAD2026-WIN",
+        question="Will the favored team advance?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_ticker_prefix_takes_precedence_over_keywords() -> None:
+    """Even if the question text contains a non-sports keyword, the sports
+    ticker prefix wins. Guards against accidental misclassification when
+    a sports market question references e.g. weather conditions."""
+    market = Market(
+        id="KXMLB-26AUG-RAINOUT",
+        question="Will the game be a rain-out (weather affecting play)?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+
+
+def test_market_family_no_false_positive_on_non_sports_kx_ticker() -> None:
+    """Tickers like KXBTC, KXHIGHCHI, KXLOWTLAX must not be miscategorized
+    as sports just because they share the KX prefix. This guards against
+    the sports-ticker pattern accidentally matching everything starting
+    with KX. Family-specific classification (crypto/weather/etc) is
+    asserted in the dedicated tests above; here we only verify that the
+    sports-ticker pattern doesn't fire on non-sports prefixes."""
+    crypto = Market(
+        id="KXBTCD-26MAY0317-T78649.99",
+        question="Bitcoin range bin?",
+        category="crypto",
+    )
+    weather_temp = Market(
+        id="KXHIGHCHI-26MAY03-T70",
+        question="Will the high temperature in Chicago be above 70F?",
+        category=None,
+    )
+    music = Market(
+        id="KXBBCHARTPOSITIONSONG-26MAY09SOE-3",
+        question="Will Ordinary be on the Billboard Hot 100?",
+        category=None,
+    )
+    assert market_family(crypto) != "sports"
+    assert market_family(weather_temp) != "sports"
+    assert market_family(music) != "sports"
+    # And the keyword-based detection still works for these too.
+    assert market_family(crypto) == "crypto"
+    assert market_family(weather_temp) == "weather"
+    assert market_family(music) == "music"
+
+
 def test_market_family_olympics_hockey_question() -> None:
     market = Market(
         id="1b",
@@ -48,6 +153,45 @@ def test_market_family_champions_league() -> None:
 def test_market_family_crypto() -> None:
     market = Market(id="2", question="Will $BTC close above 120k?", category="crypto")
     assert market_family(market) == "crypto"
+
+
+def test_market_family_crypto_15m_ticker_prefixes() -> None:
+    """15-minute crypto tickers must not fall into the generic family.
+
+    The cycle-7 logs showed KXSOL15M/KXXRP15M/KXBNB15M decisions using the
+    generic search profile, which gives them generic-family PnL penalties and
+    non-crypto source domains.
+    """
+    for ticker in (
+        "KXSOL15M-26MAY051345-45",
+        "KXXRP15M-26MAY051345-45",
+        "KXBNB15M-26MAY051345-45",
+        "KXDOGE15M-26MAY051345-45",
+    ):
+        market = Market(id=ticker, question="Price up in next 15 mins?", category=None)
+        assert market_family(market) == "crypto"
+
+
+def test_profile_for_crypto_15m_ticker_uses_crypto_profile() -> None:
+    settings = Settings()
+    market = Market(
+        id="KXSOL15M-26MAY051345-45",
+        question="SOL price up in next 15 mins?",
+        category=None,
+    )
+    profile = profile_for_market(settings, market)
+    assert profile.name == "crypto"
+    assert "coinbase.com" in profile.domains
+
+
+def test_market_family_crypto_daily_alt_tickers_from_logs() -> None:
+    """KXSOLE/KXSHIBA were showing up as generic in recent participation logs."""
+    for ticker in (
+        "KXSOLE-26MAY0817-B88",
+        "KXSHIBA-26MAY0717-B0.0000062",
+    ):
+        market = Market(id=ticker, question="Crypto spot price range?", category=None)
+        assert market_family(market) == "crypto"
 
 
 def test_market_family_politics() -> None:
@@ -100,6 +244,15 @@ def test_market_family_music_detected_from_streaming_keywords() -> None:
     assert market_family(market) == "music"
 
 
+def test_market_family_entertainment_ticker_precedes_streaming_keyword() -> None:
+    market = Market(
+        id="KXNETFLIXTOPVIEWSMOVIE-26MAY11-21",
+        question="Will this streaming movie be #1 on Netflix?",
+        category="entertainment",
+    )
+    assert market_family(market) == "entertainment"
+
+
 def test_profile_for_market_returns_music_profile() -> None:
     settings = Settings()
     market = Market(
@@ -111,6 +264,53 @@ def test_profile_for_market_returns_music_profile() -> None:
     assert profile.name == "music"
     assert "billboard.com" in profile.domains
     assert "SpotifyCharts" in profile.x_handles
+
+
+def test_profile_for_market_returns_entertainment_profile() -> None:
+    settings = Settings()
+    market = Market(
+        id="KXNETFLIXTOPVIEWSMOVIE-26MAY11-21",
+        question="Will the #1 Movie on Netflix have at least 21 million views?",
+        category=None,
+    )
+    profile = profile_for_market(settings, market)
+    assert profile.name == "entertainment"
+    assert "netflix.com" in profile.domains
+    assert "flixpatrol.com" in profile.domains
+
+
+def test_build_search_config_keeps_full_source_pool_for_extended_research() -> None:
+    now = datetime.now(timezone.utc)
+    settings = Settings(
+        ENTERTAINMENT_ALLOWED_DOMAINS=(
+            "netflix.com",
+            "top10.netflix.com",
+            "flixpatrol.com",
+            "boxofficemojo.com",
+            "the-numbers.com",
+            "variety.com",
+        ),
+        SEARCH_PROFILE_MAX_DOMAINS=3,
+    )
+    market = Market(
+        id="KXNETFLIXRANKMOVIE-26MAY11-REM",
+        question="Will this movie rank #1 on Netflix?",
+        close_time=now + timedelta(hours=12),
+    )
+    search_config = build_market_search_config(settings, market, now=now)
+    assert search_config.allowed_domains == [
+        "netflix.com",
+        "top10.netflix.com",
+        "flixpatrol.com",
+    ]
+    assert search_config.source_domains_pool == [
+        "netflix.com",
+        "top10.netflix.com",
+        "flixpatrol.com",
+        "boxofficemojo.com",
+        "the-numbers.com",
+        "variety.com",
+    ]
 
 
 def test_profile_for_market_returns_speech_profile() -> None:

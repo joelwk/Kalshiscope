@@ -93,6 +93,23 @@ class TestGrokClient(unittest.TestCase):
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=20_000.0))
 
+    def test_fast_empty_response_from_grok_is_retriable(self) -> None:
+        """A sub-_SLOW_FAILURE_THRESHOLD_MS empty response is treated as
+        upstream blip and retried (fix 5b). The 4707ms duration in the
+        recent error log is the canonical case."""
+        err = ValueError("Empty response from Grok")
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=4707.46))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=14_999.0))
+
+    def test_slow_empty_response_from_grok_stays_non_retriable(self) -> None:
+        """A slow empty response (>= _SLOW_FAILURE_THRESHOLD_MS) still falls
+        through to the slow-failure short-circuit so we don't burn budget on
+        genuine outages masquerading as empty streams."""
+        err = ValueError("Empty response from Grok")
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=15_000.0))
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
     def test_grpc_deadline_exceeded_is_retriable_regardless_of_duration(self) -> None:
         err = RuntimeError(
             'StatusCode.DEADLINE_EXCEEDED\ndetails = "Deadline Exceeded"'
@@ -136,6 +153,63 @@ class TestGrokClient(unittest.TestCase):
         self.assertLess(clamped, 20.0)
         self.assertGreater(clamped, 18.0)
         self.assertEqual(uncapped, 90.0)
+
+    def test_stream_deadline_uses_weather_profile_override(self) -> None:
+        """Cycle 1 review: weather analyses timed out at the legacy 100s
+        ceiling; the new ``GROK_STREAM_TIMEOUT_SECONDS_WEATHER`` setting
+        raises the per-attempt cap to 120s for the weather profile."""
+        settings = Settings(
+            GROK_STREAM_TIMEOUT_SECONDS=100,
+            GROK_STREAM_TIMEOUT_SECONDS_WEATHER=120,
+            GROK_STREAM_TIMEOUT_SECONDS_CRYPTO=120,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        client.stream_timeout_seconds = 100
+
+        weather_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile="weather"
+        )
+        crypto_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile="crypto"
+        )
+        generic_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile=None
+        )
+        self.assertEqual(weather_deadline, 120.0)
+        self.assertEqual(crypto_deadline, 120.0)
+        self.assertEqual(generic_deadline, 100.0)
+
+    def test_stream_deadline_weather_override_clamped_to_budget(self) -> None:
+        """Even with a weather override, the remaining analysis budget
+        still clamps the per-attempt deadline so a near-exhausted budget
+        doesn't pretend it has 120s left."""
+        settings = Settings(
+            GROK_STREAM_TIMEOUT_SECONDS=100,
+            GROK_STREAM_TIMEOUT_SECONDS_WEATHER=120,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        client.stream_timeout_seconds = 100
+
+        deadline = client._resolve_stream_deadline_seconds(
+            30_000.0, search_profile="weather"
+        )
+        self.assertLess(deadline, 30.0)
+        self.assertGreater(deadline, 28.0)
+
+    def test_stream_deadline_weather_override_disabled_when_zero(self) -> None:
+        """Setting GROK_STREAM_TIMEOUT_SECONDS_WEATHER=0 falls back to the
+        global stream timeout."""
+        settings = Settings(
+            GROK_STREAM_TIMEOUT_SECONDS=100,
+            GROK_STREAM_TIMEOUT_SECONDS_WEATHER=0,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        client.stream_timeout_seconds = 100
+
+        weather_deadline = client._resolve_stream_deadline_seconds(
+            None, search_profile="weather"
+        )
+        self.assertEqual(weather_deadline, 100.0)
 
     def test_rpc_timeout_is_capped_to_stream_deadline(self) -> None:
         client = GrokClient(
@@ -367,6 +441,48 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(captured["x"]["allowed_x_handles"], ["Foo"])
         self.assertFalse(captured["x"]["enable_image_understanding"])
         self.assertFalse(captured["x"]["enable_video_understanding"])
+
+    def test_tools_respect_search_config_source_caps(self) -> None:
+        market = Market(
+            id="m2-cap",
+            question="Will BTC be above $50k tomorrow?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+            liquidity_usdc=200.0,
+        )
+        content = """
+        {"should_trade": false, "outcome": "NO", "confidence": 0.6, "bet_size_pct": 0.0, "reasoning": "test"}
+        """
+        search_config = SearchConfig(
+            from_date=datetime(2026, 1, 13, 0, 0, tzinfo=timezone.utc),
+            to_date=datetime(2026, 1, 13, 12, 0, tzinfo=timezone.utc),
+            allowed_domains=["a.com", "b.com", "c.com", "d.com"],
+            allowed_x_handles=["A", "B", "C", "D", "E"],
+            max_allowed_domains=3,
+            max_allowed_x_handles=4,
+        )
+        client = GrokClient(api_key="x", search_config=search_config)
+        client.client = DummyClient(content)
+
+        captured = {}
+
+        def fake_web_search(*args, **kwargs):
+            captured["web"] = kwargs
+            return {"tool": "web"}
+
+        def fake_x_search(*args, **kwargs):
+            captured["x"] = kwargs
+            return {"tool": "x"}
+
+        with patch("xai_provider.web_search", side_effect=fake_web_search), patch(
+            "xai_provider.x_search", side_effect=fake_x_search
+        ):
+            client.analyze_market(market)
+
+        self.assertEqual(
+            captured["web"]["allowed_domains"],
+            ["a.com", "b.com", "c.com"],
+        )
+        self.assertEqual(captured["x"]["allowed_x_handles"], ["A", "B", "C", "D"])
 
     def test_analyze_market_deep_enables_multimedia_for_borderline(self) -> None:
         market = Market(
@@ -922,6 +1038,7 @@ class TestGrokClient(unittest.TestCase):
             edge_source="fallback",
             likelihood_ratio=25.0,
             evidence_quality=0.10,
+            primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -934,6 +1051,38 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.source_match_class, "settlement_aligned")
         self.assertEqual(validated.evidence_basis, "direct")
+
+    def test_validate_and_enrich_suppresses_non_sports_direct_floor_without_primary_url(self) -> None:
+        market = Market(
+            id="m-definitive-missing-source",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap from Reuters confirms settlement outcome."
+            ),
+            implied_prob_external=None,
+            my_prob=0.85,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertFalse(validated.definitive_outcome_detected)
+        self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+        self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
+        self.assertEqual(validated.evidence_basis, "proxy")
 
     def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
         market = Market(
@@ -955,6 +1104,7 @@ class TestGrokClient(unittest.TestCase):
             edge_source="fallback",
             likelihood_ratio=25.0,
             evidence_quality=0.10,
+            primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(
             api_key="x",
@@ -989,6 +1139,7 @@ class TestGrokClient(unittest.TestCase):
             my_prob=None,
             edge_external=0.22,
             evidence_quality=0.0,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=39.1&lon=-94.6",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -1017,6 +1168,7 @@ class TestGrokClient(unittest.TestCase):
             my_prob=None,
             edge_external=0.23,
             evidence_quality=0.0,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=39.1&lon=-94.6",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -1046,6 +1198,7 @@ class TestGrokClient(unittest.TestCase):
             edge_external=0.20,
             edge_source="fallback",
             evidence_quality=0.1,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=39.1&lon=-94.6",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(

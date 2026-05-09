@@ -34,6 +34,24 @@ class EvaluateMarketResult:
     what_to_learn_next: str | None = None
 
 
+def _loss_mode(
+    *,
+    sample_size: int,
+    win_rate: float,
+    pnl_total: float,
+    win_rate_cutoff: float,
+    hard_block_min_samples: int,
+) -> str:
+    """Classify whether negative history is selection risk or sizing/entry risk."""
+    if pnl_total >= 0.0:
+        return "neutral"
+    if sample_size < max(1, hard_block_min_samples):
+        return "small_sample_uncertain"
+    if win_rate > float(win_rate_cutoff):
+        return "sizing_or_entry_price"
+    return "low_hit_rate"
+
+
 def _cutoff_iso(lookback_days: int) -> str:
     days = max(1, int(lookback_days))
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -209,6 +227,11 @@ def evaluate_market_tiered(
     metrics: dict[str, Any] = {
         "historical_gate_market_prefix": market_prefix,
         "historical_gate_market_family": normalized_family,
+        "historical_gate_prefix_len": normalized_prefix_len,
+        "historical_gate_prefix_specificity": (
+            "event_prefix" if normalized_prefix_len >= 12 else "short_family_prefix"
+        ),
+        "historical_gate_loss_source_uncertain": True,
     }
 
     if prefix_gate_enabled and prefix_stats:
@@ -224,6 +247,15 @@ def evaluate_market_tiered(
             ) if prefix_shrinkage_enabled else (
                 prefix_snapshot.pnl_total / n if n > 0 else 0.0
             )
+            soft_min = max(1, int(prefix_min_samples))
+            hard_block_min = max(soft_min, int(prefix_hard_block_min_samples))
+            prefix_loss_mode = _loss_mode(
+                sample_size=n,
+                win_rate=prefix_snapshot.win_rate,
+                pnl_total=prefix_snapshot.pnl_total,
+                win_rate_cutoff=float(prefix_win_rate_cutoff),
+                hard_block_min_samples=hard_block_min,
+            )
             metrics.update(
                 {
                     "historical_gate_prefix_sample_size": n,
@@ -231,13 +263,18 @@ def evaluate_market_tiered(
                     "historical_gate_prefix_pnl_total": prefix_snapshot.pnl_total,
                     "historical_gate_prefix_wilson_lb": round(wlb, 4),
                     "historical_gate_prefix_shrunk_pnl_per_trade": round(shrunk_pnl, 4),
+                    "historical_gate_prefix_loss_mode": prefix_loss_mode,
+                    "historical_gate_loss_mode": prefix_loss_mode,
+                    "historical_gate_loss_source_uncertain": (
+                        prefix_loss_mode != "low_hit_rate"
+                    ),
                 }
             )
 
-            soft_min = max(1, int(prefix_min_samples))
-            hard_block_min = max(soft_min, int(prefix_hard_block_min_samples))
             sample_weight = min(1.0, n / hard_block_min) if hard_block_min > 0 else 1.0
             score_penalty = max(0.0, float(prefix_soft_demote_score_penalty)) * sample_weight
+            if prefix_loss_mode == "sizing_or_entry_price":
+                score_penalty *= 0.5
             metrics.update(
                 {
                     "historical_gate_sample_weight": round(sample_weight, 4),
@@ -245,9 +282,15 @@ def evaluate_market_tiered(
                 }
             )
 
+            # Hard-deny requires both observed and Wilson-LB win rates to be
+            # below the cutoff. Adding the Wilson-LB requirement enforces
+            # statistical confidence on top of observed win-rate / PnL signals
+            # so even a sufficient-sample prefix is not hard-blocked unless
+            # the lower bound on its true win rate is below cutoff.
             if (
                 n >= hard_block_min
                 and prefix_snapshot.win_rate <= float(prefix_win_rate_cutoff)
+                and wlb <= float(prefix_win_rate_cutoff)
                 and shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
                 and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
             ):
@@ -306,6 +349,13 @@ def evaluate_market_tiered(
             ) if prefix_shrinkage_enabled else (
                 family_snapshot.pnl_total / n_fam if n_fam > 0 else 0.0
             )
+            family_loss_mode = _loss_mode(
+                sample_size=n_fam,
+                win_rate=family_snapshot.win_rate,
+                pnl_total=family_snapshot.pnl_total,
+                win_rate_cutoff=float(family_win_rate_cutoff),
+                hard_block_min_samples=max(1, int(family_min_samples)),
+            )
             metrics.update(
                 {
                     "historical_gate_family_sample_size": n_fam,
@@ -315,12 +365,21 @@ def evaluate_market_tiered(
                     "historical_family_pnl_total": family_snapshot.pnl_total,
                     "historical_gate_family_wilson_lb": round(wlb_fam, 4),
                     "historical_gate_family_shrunk_pnl_per_trade": round(shrunk_pnl_fam, 4),
+                    "historical_gate_family_loss_mode": family_loss_mode,
+                    "historical_gate_loss_mode": (
+                        metrics.get("historical_gate_loss_mode") or family_loss_mode
+                    ),
+                    "historical_gate_loss_source_uncertain": (
+                        bool(metrics.get("historical_gate_loss_source_uncertain"))
+                        or family_loss_mode != "low_hit_rate"
+                    ),
                 }
             )
             if (
                 n_fam >= max(1, int(family_min_samples))
                 and family_snapshot.pnl_total <= float(family_pnl_cutoff)
                 and family_snapshot.win_rate <= float(family_win_rate_cutoff)
+                and wlb_fam <= float(family_win_rate_cutoff)
                 and shrunk_pnl_fam <= float(prefix_shrunk_pnl_cutoff)
             ):
                 return EvaluateMarketResult(
@@ -333,7 +392,9 @@ def evaluate_market_tiered(
                     sample_size=n_fam,
                     what_to_learn_next=(
                         f"Family '{normalized_family}' has {n_fam} samples, "
-                        f"Wilson LB={wlb_fam:.2f}; monitor for recovery."
+                        f"Wilson LB={wlb_fam:.2f}, shrunk PnL/trade={shrunk_pnl_fam:.2f}; "
+                        "execution requires direct settlement-aligned evidence and "
+                        "recovery in the family before this gate clears."
                     ),
                 )
 
