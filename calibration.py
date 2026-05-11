@@ -148,7 +148,8 @@ def historical_confidence_shrink(
         )
 
     confidence_gap = bounded_confidence - observed_win_rate
-    calibrated_confidence = bounded_confidence - (confidence_gap * 0.60)
+    shrink_factor = 0.75 if sample_size < 30 else 0.60
+    calibrated_confidence = bounded_confidence - (confidence_gap * shrink_factor)
     calibrated_confidence = _clamp(calibrated_confidence, 0.0, bounded_confidence)
     return HistoricalConfidenceShrinkResult(
         calibrated_confidence=calibrated_confidence,

@@ -179,6 +179,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.18)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_THRESHOLD, 0.25)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.28)
+        self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE_MULTIPLIER, 0.85)
+        self.assertEqual(config.Settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER, 0.70)
+        self.assertEqual(config.Settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER, 0.85)
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
 
@@ -189,8 +192,10 @@ class TestConfig(unittest.TestCase):
             "SPORTS_MIN_EVIDENCE_QUALITY=0.60",
             "LOW_PRICE_MIN_EDGE=0.18",
             "VERY_LOW_PRICE_MIN_EDGE=0.28",
+            "LOW_PRICE_MIN_EDGE_MULTIPLIER=0.85",
             "FALLBACK_EDGE_MIN_EDGE=0.25",
-            "MAX_REASONABLE_EDGE=0.35",
+            "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=0.90",
+            "MAX_REASONABLE_EDGE=0.40",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
             "SCORE_GATE_THRESHOLD=0.42",
@@ -201,6 +206,8 @@ class TestConfig(unittest.TestCase):
             "KALSHI_MVE_FILTER=exclude",
             "KALSHI_ELIGIBLE_FLOOR=100",
             "KALSHI_FETCH_TOPUP_ENABLED=false",
+            "KELLY_DYNAMIC_ENABLED=true",
+            "KELLY_FRACTION_DEFAULT=0.45",
             "SEARCH_PROFILE_MAX_DOMAINS=5",
             "EXTENDED_RESEARCH_SOURCE_OFFSET=5",
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS=0.60",
@@ -353,6 +360,7 @@ class TestConfig(unittest.TestCase):
             "LMSR_LIQUIDITY_PARAM_B": "120000",
             "LMSR_MIN_INEFFICIENCY": "0.04",
             "KELLY_SIZING_ENABLED": "true",
+            "KELLY_DYNAMIC_ENABLED": "false",
             "KELLY_FRACTION_DEFAULT": "0.2",
             "KELLY_FRACTION_SHORT_HORIZON_HOURS": "2",
             "KELLY_FRACTION_SHORT_HORIZON": "0.1",
@@ -361,6 +369,8 @@ class TestConfig(unittest.TestCase):
             "COINFLIP_PRICE_LOWER": "0.46",
             "COINFLIP_PRICE_UPPER": "0.54",
             "FALLBACK_EDGE_MIN_EDGE": "0.09",
+            "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER": "0.8",
+            "MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER": "0.6",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -374,6 +384,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.LMSR_LIQUIDITY_PARAM_B, 120000.0)
         self.assertEqual(settings.LMSR_MIN_INEFFICIENCY, 0.04)
         self.assertTrue(settings.KELLY_SIZING_ENABLED)
+        self.assertFalse(settings.KELLY_DYNAMIC_ENABLED)
         self.assertEqual(settings.KELLY_FRACTION_DEFAULT, 0.2)
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON_HOURS, 2)
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON, 0.1)
@@ -382,6 +393,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.COINFLIP_PRICE_LOWER, 0.46)
         self.assertEqual(settings.COINFLIP_PRICE_UPPER, 0.54)
         self.assertEqual(settings.FALLBACK_EDGE_MIN_EDGE, 0.09)
+        self.assertEqual(settings.FALLBACK_EDGE_MIN_EDGE_MULTIPLIER, 0.8)
+        self.assertEqual(settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER, 0.6)
 
     def test_profit_guardrail_defaults(self) -> None:
         settings = config.Settings()
@@ -419,11 +432,12 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
         self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 40.0)
-        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.25)
+        self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.025)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
-        self.assertEqual(settings.SCORE_GENERIC_BIN_PENALTY_BASE, 0.04)
+        self.assertEqual(settings.SCORE_GENERIC_BIN_PENALTY_BASE, 0.015)
         self.assertEqual(settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE, 0.08)
-        self.assertEqual(settings.SCORE_OVERCONFIDENCE_PENALTY_BASE, 0.11)
+        self.assertEqual(settings.SCORE_OVERCONFIDENCE_PENALTY_BASE, 0.05)
+        self.assertTrue(settings.SCORE_VOLUME_AMPLIFIER_ENABLED)
         self.assertEqual(settings.MENTION_MARKET_SCORE_PENALTY, 0.10)
         self.assertTrue(settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED)
         self.assertEqual(settings.PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY, 0.25)
@@ -449,7 +463,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_FAMILY_MIN_SAMPLES, 12)
         self.assertEqual(settings.HISTORICAL_FAMILY_PNL_CUTOFF, -12.0)
         self.assertEqual(settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF, 0.40)
-        self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.22)
+        self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE, 0.12)
         self.assertEqual(settings.MAX_SPEECH_CONFIDENCE, 0.65)

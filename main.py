@@ -978,20 +978,33 @@ def _edge_threshold_for_market(
     source has ground-truth pricing semantics.
     """
     min_edge = settings.MIN_EDGE
+    if market is not None and not definitive_outcome_eligible:
+        liquidity = float(market.liquidity_usdc or 0.0)
+        high_liquidity_threshold = max(0.0, float(settings.MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD))
+        medium_liquidity_threshold = max(0.0, float(settings.MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD))
+        if high_liquidity_threshold > 0 and liquidity > high_liquidity_threshold:
+            min_edge *= max(0.0, float(settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER))
+        elif medium_liquidity_threshold > 0 and liquidity > medium_liquidity_threshold:
+            min_edge *= max(0.0, float(settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER))
     is_weather_market = market is not None and market_family(market) == "weather"
     if is_weather_market and not definitive_outcome_eligible:
         min_edge = max(min_edge, settings.WEATHER_MIN_EDGE)
     if not definitive_outcome_eligible:
+        low_price_multiplier = max(0.0, float(settings.LOW_PRICE_MIN_EDGE_MULTIPLIER))
         if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
-            min_edge = max(min_edge, settings.VERY_LOW_PRICE_MIN_EDGE)
+            min_edge = max(min_edge, settings.VERY_LOW_PRICE_MIN_EDGE * low_price_multiplier)
         if implied_prob < settings.LOW_PRICE_THRESHOLD:
-            min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
+            min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE * low_price_multiplier)
         if settings.COINFLIP_PRICE_LOWER <= implied_prob <= settings.COINFLIP_PRICE_UPPER:
-            min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE)
+            min_edge = max(min_edge, settings.LOW_PRICE_MIN_EDGE * low_price_multiplier)
     if (edge_source or "").lower() == "fallback" and not definitive_outcome_eligible:
-        min_edge = max(min_edge, settings.FALLBACK_EDGE_MIN_EDGE)
+        fallback_multiplier = max(0.0, float(settings.FALLBACK_EDGE_MIN_EDGE_MULTIPLIER))
+        min_edge = max(min_edge, settings.FALLBACK_EDGE_MIN_EDGE * fallback_multiplier)
         if is_weather_market:
-            min_edge = max(min_edge, settings.WEATHER_FALLBACK_EDGE_MIN_EDGE)
+            min_edge = max(
+                min_edge,
+                settings.WEATHER_FALLBACK_EDGE_MIN_EDGE * fallback_multiplier,
+            )
     return min_edge
 
 
@@ -2286,6 +2299,7 @@ def _log_settings_summary(settings) -> None:
             "score_computed_edge_bonus": settings.SCORE_COMPUTED_EDGE_BONUS,
             "score_repeated_analysis_penalty_base": settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE,
             "score_repeated_analysis_penalty_start_count": settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT,
+            "score_volume_amplifier_enabled": settings.SCORE_VOLUME_AMPLIFIER_ENABLED,
             "score_confidence_calibration_floor": settings.SCORE_CONFIDENCE_CALIBRATION_FLOOR,
             "score_confidence_calibration_penalty_scale": settings.SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE,
             "mention_market_score_penalty": settings.MENTION_MARKET_SCORE_PENALTY,
@@ -2299,6 +2313,7 @@ def _log_settings_summary(settings) -> None:
             "bayesian_max_confidence_boost": settings.BAYESIAN_MAX_CONFIDENCE_BOOST,
             "lmsr_enabled": settings.LMSR_ENABLED,
             "kelly_sizing_enabled": settings.KELLY_SIZING_ENABLED,
+            "kelly_dynamic_enabled": settings.KELLY_DYNAMIC_ENABLED,
             "kelly_fraction_default": settings.KELLY_FRACTION_DEFAULT,
             "kelly_fraction_short_horizon_hours": settings.KELLY_FRACTION_SHORT_HORIZON_HOURS,
             "kelly_fraction_short_horizon": settings.KELLY_FRACTION_SHORT_HORIZON,
@@ -3726,6 +3741,9 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         "score_numeric_strike_computed_overconfidence_penalty": float(
             getattr(score_result, "numeric_strike_computed_overconfidence_penalty", 0.0) or 0.0
         ),
+        "score_volume_amplifier_discount": float(
+            getattr(score_result, "volume_amplifier_discount", 0.0) or 0.0
+        ),
         "score_coinflip_sports_penalty": float(
             getattr(score_result, "coinflip_sports_penalty", 0.0) or 0.0
         ),
@@ -3874,6 +3892,7 @@ def _score_kwargs(
         "ambiguous_resolution_penalty_base": settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE,
         "max_reasonable_edge": settings.MAX_REASONABLE_EDGE,
         "hallucinated_edge_penalty_base": settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE,
+        "volume_amplifier_enabled": settings.SCORE_VOLUME_AMPLIFIER_ENABLED,
         "extreme_market_edge_penalty_base": settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE,
         "late_stage_overconfidence_penalty_base": settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE,
         "extreme_confidence_threshold": settings.SCORE_EXTREME_CONFIDENCE_THRESHOLD,
@@ -9814,6 +9833,8 @@ def main(max_cycles: int | None = None) -> None:
                         market_price=implied_prob,
                         fraction=kelly_fraction_value,
                         min_edge=min_edge_for_kelly,
+                        edge=edge_value,
+                        dynamic_enabled=settings.KELLY_DYNAMIC_ENABLED,
                     )
                 else:
                     adjusted_bet_pct = edge_scaling_bet_pct

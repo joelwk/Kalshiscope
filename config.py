@@ -32,16 +32,22 @@ class Settings:
 
     # Edge gating / sizing
     MIN_EDGE: float = 0.12
+    MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD: float = 300.0
+    MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER: float = 0.70
+    MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD: float = 100.0
+    MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER: float = 0.85
     LOW_PRICE_THRESHOLD: float = 0.50
     VERY_LOW_PRICE_THRESHOLD: float = 0.25
     HIGH_PRICE_THRESHOLD: float = 0.65
     LOW_PRICE_MIN_EDGE: float = 0.18
     VERY_LOW_PRICE_MIN_EDGE: float = 0.28
+    LOW_PRICE_MIN_EDGE_MULTIPLIER: float = 0.85
     COINFLIP_PRICE_LOWER: float = 0.48
     COINFLIP_PRICE_UPPER: float = 0.52
     EDGE_SCALING_RANGE: float = 0.15
     LOW_PRICE_BET_PENALTY: float = 0.50
     FALLBACK_EDGE_MIN_EDGE: float = 0.30
+    FALLBACK_EDGE_MIN_EDGE_MULTIPLIER: float = 0.90
     WEATHER_MIN_EDGE: float = 0.14
     WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.34
     REQUIRE_IMPLIED_PRICE: bool = True
@@ -459,17 +465,18 @@ class Settings:
     SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY: float = 0.30
     SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.60
     SCORE_LOW_INFO_PENALTY_BASE: float = 0.08
-    SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.25
+    SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.025
     SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT: int = 1
     SCORE_CONFIDENCE_CALIBRATION_FLOOR: float = 0.55
     SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE: float = 0.10
     SCORE_FALLBACK_EDGE_PENALTY_BASE: float = 0.12
-    SCORE_OVERCONFIDENCE_PENALTY_BASE: float = 0.11
+    SCORE_OVERCONFIDENCE_PENALTY_BASE: float = 0.05
     SCORE_COMPUTED_EDGE_BONUS: float = 0.03
     SCORE_PROXY_EVIDENCE_PENALTY_BASE: float = 0.11
-    SCORE_GENERIC_BIN_PENALTY_BASE: float = 0.04
+    SCORE_GENERIC_BIN_PENALTY_BASE: float = 0.015
     SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE: float = 0.08
-    SCORE_HALLUCINATED_EDGE_PENALTY_BASE: float = 0.22
+    SCORE_HALLUCINATED_EDGE_PENALTY_BASE: float = 0.08
+    SCORE_VOLUME_AMPLIFIER_ENABLED: bool = True
     SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE: float = 0.08
     SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE: float = 0.12
     SCORE_EXTREME_CONFIDENCE_THRESHOLD: float = 0.90
@@ -656,7 +663,8 @@ class Settings:
     LMSR_LIQUIDITY_PARAM_B: float = 100000.0
     LMSR_MIN_INEFFICIENCY: float = 0.05
     KELLY_SIZING_ENABLED: bool = False
-    KELLY_FRACTION_DEFAULT: float = 0.25
+    KELLY_DYNAMIC_ENABLED: bool = True
+    KELLY_FRACTION_DEFAULT: float = 0.45
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
@@ -808,6 +816,22 @@ def load_settings() -> Settings:
             Settings.SPORTS_MIN_EVIDENCE_QUALITY,
         ),
         MIN_EDGE=_read_env_float("MIN_EDGE", Settings.MIN_EDGE),
+        MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD=_read_env_float(
+            "MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD",
+            Settings.MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD,
+        ),
+        MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER=_read_env_float(
+            "MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER",
+            Settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER,
+        ),
+        MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD=_read_env_float(
+            "MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD",
+            Settings.MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD,
+        ),
+        MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER=_read_env_float(
+            "MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER",
+            Settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER,
+        ),
         LOW_PRICE_THRESHOLD=_read_env_float(
             "LOW_PRICE_THRESHOLD", Settings.LOW_PRICE_THRESHOLD
         ),
@@ -823,6 +847,10 @@ def load_settings() -> Settings:
         VERY_LOW_PRICE_MIN_EDGE=_read_env_float(
             "VERY_LOW_PRICE_MIN_EDGE", Settings.VERY_LOW_PRICE_MIN_EDGE
         ),
+        LOW_PRICE_MIN_EDGE_MULTIPLIER=_read_env_float(
+            "LOW_PRICE_MIN_EDGE_MULTIPLIER",
+            Settings.LOW_PRICE_MIN_EDGE_MULTIPLIER,
+        ),
         COINFLIP_PRICE_LOWER=_read_env_float(
             "COINFLIP_PRICE_LOWER", Settings.COINFLIP_PRICE_LOWER
         ),
@@ -837,6 +865,10 @@ def load_settings() -> Settings:
         ),
         FALLBACK_EDGE_MIN_EDGE=_read_env_float(
             "FALLBACK_EDGE_MIN_EDGE", Settings.FALLBACK_EDGE_MIN_EDGE
+        ),
+        FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=_read_env_float(
+            "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER",
+            Settings.FALLBACK_EDGE_MIN_EDGE_MULTIPLIER,
         ),
         WEATHER_MIN_EDGE=_read_env_float(
             "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
@@ -1364,6 +1396,10 @@ def load_settings() -> Settings:
             "SCORE_HALLUCINATED_EDGE_PENALTY_BASE",
             Settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE,
         ),
+        SCORE_VOLUME_AMPLIFIER_ENABLED=_read_env_bool(
+            "SCORE_VOLUME_AMPLIFIER_ENABLED",
+            Settings.SCORE_VOLUME_AMPLIFIER_ENABLED,
+        ),
         SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE=_read_env_float(
             "SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE",
             Settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE,
@@ -1862,6 +1898,10 @@ def load_settings() -> Settings:
         KELLY_SIZING_ENABLED=_read_env_bool(
             "KELLY_SIZING_ENABLED",
             Settings.KELLY_SIZING_ENABLED,
+        ),
+        KELLY_DYNAMIC_ENABLED=_read_env_bool(
+            "KELLY_DYNAMIC_ENABLED",
+            Settings.KELLY_DYNAMIC_ENABLED,
         ),
         KELLY_FRACTION_DEFAULT=_read_env_float(
             "KELLY_FRACTION_DEFAULT",

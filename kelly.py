@@ -39,10 +39,19 @@ def kelly_bet_pct(
     market_price: float,
     fraction: float,
     min_edge: float,
+    edge: float | None = None,
+    dynamic_enabled: bool = True,
 ) -> float:
     """Compute final bet size percentage from edge and fractional Kelly."""
     posterior_prob = _validate_probability(posterior)
     market_prob = _validate_probability(market_price)
-    if posterior_prob - market_prob < float(min_edge):
+    raw_edge = posterior_prob - market_prob
+    if raw_edge < float(min_edge):
         return 0.0
+    if dynamic_enabled:
+        sizing_edge = raw_edge if edge is None else float(edge)
+        if sizing_edge >= 0.18:
+            fraction = min(0.65, max(0.40, fraction))
+        else:
+            fraction = min(0.50, max(0.35, fraction))
     return max(0.0, min(1.0, fractional_kelly(posterior_prob, market_prob, fraction)))

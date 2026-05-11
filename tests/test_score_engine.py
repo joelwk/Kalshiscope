@@ -214,7 +214,7 @@ def test_compute_final_score_adds_hallucinated_edge_penalty() -> None:
         implied_prob_market=0.20,
         max_reasonable_edge=0.45,
     )
-    assert score.hallucinated_edge_penalty == pytest.approx(0.15, rel=1e-9)
+    assert score.hallucinated_edge_penalty == pytest.approx(0.08, rel=1e-9)
     assert "hallucinated_edge" in score.rejection_reasons
 
 
@@ -279,7 +279,7 @@ def test_compute_final_score_applies_hallucinated_edge_penalty_when_not_definiti
         evidence_basis_class="direct",
         suppress_hallucinated_edge_penalty=False,
     )
-    assert score.hallucinated_edge_penalty == pytest.approx(0.15, rel=1e-9)
+    assert score.hallucinated_edge_penalty == pytest.approx(0.08, rel=1e-9)
     assert score.hallucinated_edge_penalty_suppressed is False
     assert "hallucinated_edge" in score.rejection_reasons
 
@@ -650,7 +650,7 @@ def test_compute_final_score_applies_repeated_analysis_penalty() -> None:
         implied_prob_market=0.52,
         repeated_analysis_count=5,
     )
-    assert score.repeated_analysis_penalty == 0.20
+    assert score.repeated_analysis_penalty == pytest.approx(0.10)
     assert "repeated_analysis_penalty" in score.rejection_reasons
 
 
@@ -681,6 +681,43 @@ def test_compute_final_score_applies_strengthened_repeated_analysis_penalty() ->
     )
     assert score.repeated_analysis_penalty == pytest.approx(0.30)
     assert "repeated_analysis_penalty" in score.rejection_reasons
+
+
+def test_compute_final_score_applies_volume_amplifier_discount() -> None:
+    market = Market(
+        id="m-volume-amplifier",
+        question="High liquidity market",
+        outcomes=[MarketOutcome(name="YES", price=0.52), MarketOutcome(name="NO", price=0.48)],
+        liquidity_usdc=750.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.66,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_external=0.07,
+        evidence_quality=0.7,
+    )
+    baseline = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.52,
+        repeated_analysis_count=5,
+        volume_amplifier_enabled=False,
+    )
+    amplified = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.52,
+        repeated_analysis_count=5,
+    )
+    assert amplified.volume_amplifier_discount > 0.0
+    assert amplified.final_score == pytest.approx(
+        baseline.final_score + amplified.volume_amplifier_discount
+    )
+    assert "repeated_analysis_penalty" in amplified.rejection_reasons
 
 
 def test_compute_final_score_applies_fallback_edge_penalty() -> None:
@@ -896,7 +933,7 @@ def test_compute_final_score_applies_weather_bin_penalty_for_narrow_bins() -> No
         weather_score_penalty=0.10,
         now=now,
     )
-    assert bin_adjusted.weather_bin_penalty == 0.03
+    assert bin_adjusted.weather_bin_penalty == 0.015
     assert no_bin_adjusted.weather_bin_penalty == 0.0
     assert bin_adjusted.final_score < no_bin_adjusted.final_score
 
@@ -1356,6 +1393,7 @@ def test_compute_final_score_applies_short_prefix_penalty() -> None:
         decision,
         implied_prob_market=0.60,
         evidence_basis_class="direct",
+        volume_amplifier_enabled=False,
     )
     penalized = compute_final_score(
         market,
@@ -1363,6 +1401,7 @@ def test_compute_final_score_applies_short_prefix_penalty() -> None:
         implied_prob_market=0.60,
         evidence_basis_class="direct",
         short_prefix_penalty=0.10,
+        volume_amplifier_enabled=False,
     )
     assert penalized.short_prefix_penalty == pytest.approx(0.10)
     assert penalized.final_score == pytest.approx(baseline.final_score - 0.10)

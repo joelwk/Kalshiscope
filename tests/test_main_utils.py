@@ -2443,9 +2443,9 @@ class TestMainUtils(unittest.TestCase):
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         self.assertEqual(_edge_threshold_for_market(0.60, settings, "computed"), 0.05)
-        self.assertEqual(_edge_threshold_for_market(0.20, settings, "computed"), 0.25)
-        self.assertEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.08)
-        self.assertEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.08)
+        self.assertAlmostEqual(_edge_threshold_for_market(0.20, settings, "computed"), 0.2125)
+        self.assertAlmostEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.068)
+        self.assertAlmostEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.072)
         weather_market = Market(
             id="w-edge",
             question="Will rainfall exceed 1 inch in Miami tomorrow?",
@@ -2457,7 +2457,32 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(
             _edge_threshold_for_market(0.60, settings, "fallback", market=weather_market),
-            0.15,
+            0.135,
+        )
+        liquid_market = Market(
+            id="liq-edge",
+            question="Liquid sports market",
+            category="sports",
+            liquidity_usdc=200.0,
+        )
+        very_liquid_market = liquid_market.model_copy(update={"liquidity_usdc": 501.0})
+        self.assertAlmostEqual(
+            _edge_threshold_for_market(0.60, settings, "computed", market=liquid_market),
+            0.05 * settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER,
+        )
+        self.assertAlmostEqual(
+            _edge_threshold_for_market(0.60, settings, "computed", market=very_liquid_market),
+            0.05 * settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER,
+        )
+        self.assertEqual(
+            _edge_threshold_for_market(
+                0.20,
+                settings,
+                "fallback",
+                market=very_liquid_market,
+                definitive_outcome_eligible=True,
+            ),
+            0.05,
         )
 
     def test_passes_edge_threshold_blocks_very_low_price_without_extreme_edge(self) -> None:
@@ -2483,7 +2508,7 @@ class TestMainUtils(unittest.TestCase):
         passed, edge, reason = _passes_edge_threshold(0.14, decision, settings)
         self.assertFalse(passed)
         self.assertAlmostEqual(edge or 0.0, 0.20, places=6)
-        self.assertIn("below min 0.25", reason)
+        self.assertIn("below min 0.2125", reason)
 
     def test_min_evidence_quality_for_weather_market_uses_weather_floor(self) -> None:
         settings = Settings(

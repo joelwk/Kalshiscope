@@ -18,7 +18,7 @@ parts:
     Historical calibration rule (April 2026): confidence 0.90+ won 43.5% (n=46, -$23.99), while 0.80-0.89 won 59.8% (n=107, +$36.52). Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
     Use confidence >0.89 only for direct definitive evidence with a primary_source_url explicitly relevant to settlement criteria.
     Confidence must not exceed evidence_quality + 0.05. If it does, lower confidence.
-    If your edge versus market implied probability exceeds 32 percentage points, treat it as a hallucination risk and set should_trade=false.
+    If your edge versus market implied probability exceeds 40 percentage points, treat it as a hallucination risk and set should_trade=false unless direct settlement-aligned evidence supports the edge.
     Exception: when definitive_outcome_detected=true with a Tier-1 primary source URL, edges up to 65 percentage points are legitimate; do not flag as hallucination.
     Do not claim definitive_outcome_detected for MLB sub-line items (spreads, totals, first-5, props) unless the cited primary source explicitly resolves that exact line item; an inning-by-inning recap alone is insufficient unless it confirms the specific bet settlement criterion (e.g., F5 lead by N runs, team total under threshold).
     For entry prices below 0.20 implied probability, require extraordinary direct evidence tied to settlement criteria.
@@ -43,6 +43,8 @@ parts:
     For crypto threshold markets, include current spot price, threshold, and buffer_to_threshold_pct in reasoning. When the buffer is large relative to typical volatility, this is a strong trading signal.
     If buffer_to_threshold_pct exceeds 0.50% with less than 2 hours to close, default to should_trade=false; explain expected vs actual volatility.
     Pricing-in check: before recommending should_trade=true, briefly state why the market has NOT already priced in your evidence (e.g., evidence is fresh / source is non-public / market is illiquid). If you cannot articulate this, set should_trade=false.
+    Base-rate check: explicitly compare your probability to a 2024-2026 relevant base rate, prior market/odds rate, or recent resolved-event frequency before setting confidence.
+    Self-consistency check: after estimating probability, ask what base rate, source conflict, or recent news would lower it by 10-15 percentage points; revise confidence if the critique is persuasive.
     For numeric-strike markets (-T<number> in ticker) where edge_source=computed, lower confidence by 10pp regardless of how confident the computation feels — historically these have the worst calibration.
     Default to should_trade=false. Favor fewer, higher-quality opportunities; no-trade is expected about 85% of cycles.
     Set should_trade=true only when edge_market is positive, source-backed, and the reasoning explains why the market has not priced it in.
@@ -51,5 +53,5 @@ parts:
     If analysis does not produce a clear directional advantage, set should_trade=false and keep no-trade reasoning concise (under 100 words).
     When holding for research/no-action, state the missing direct source, market data, or settlement evidence that would make the market worth reconsidering later.
     If your only evidence is absence of information with no directional signal, set should_trade=false.
-    Provide concise reasoning that includes implied probability, your probability, and edge.
+    Provide concise reasoning that includes implied probability, your probability, edge, 2-3 key sources with dates, the base rate considered, and uncertainty factors under 40 words.
     Include likelihood_ratio as a positive decimal equal to P(evidence|predicted_outcome)/P(evidence|alternative_outcome). Use likelihood_ratio=1.0 when evidence is neutral.

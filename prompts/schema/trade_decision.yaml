@@ -5,7 +5,7 @@ fields:
   outcome: "The outcome you predict will win"
   confidence: "Your probability estimate (0.0-1.0). Cap non-definitive confidence at 0.89 and keep confidence <= evidence_quality + 0.05; confidence >0.89 requires direct definitive evidence with primary_source_url."
   bet_size_pct: "Fraction of max bet (0.0-1.0). Scale with edge size, not just confidence."
-  reasoning: "MUST include: 1) Implied prob from odds, 2) Your prob estimate, 3) Calculated edge_market (your prob - market implied prob), 4) Why the edge exists and has not been priced in. For no-action, keep it concise and name the missing evidence to research later."
+  reasoning: "MUST include: 1) Implied prob from odds, 2) Your prob estimate, 3) Calculated edge_market (your prob - market implied prob), 4) Why the edge exists and has not been priced in, 5) 2-3 key sources with dates, 6) base rate considered, and 7) uncertainty factors in <=40 words. For no-action, keep it concise and name the missing evidence to research later."
   implied_prob_external: "Optional externally sourced implied probability from books/polls/markets."
   my_prob: "Optional explicit analyst probability estimate."
   edge_external: "Optional explicit edge from external implied probability (my_prob - implied_prob_external)."

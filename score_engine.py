@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from models import Market, TradeDecision
 
 _WEATHER_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
-_NARROW_WEATHER_BIN_PENALTY = 0.03
+_NARROW_WEATHER_BIN_PENALTY = 0.015
 _MENTION_MARKET_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
 _GENERIC_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
 _NUMERIC_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+$", re.IGNORECASE)
@@ -66,6 +66,7 @@ class ScoreResult:
     historical_prefix_penalty: float = 0.0
     extreme_confidence_band_penalty: float = 0.0
     numeric_strike_computed_overconfidence_penalty: float = 0.0
+    volume_amplifier_discount: float = 0.0
     rejection_reasons: tuple[str, ...] = ()
     bayesian_posterior: float | None = None
     lmsr_price: float | None = None
@@ -87,7 +88,7 @@ def compute_final_score(
     low_info_penalty_base: float = 0.05,
     repeated_analysis_count: int = 0,
     non_actionable_streak: int = 0,
-    repeated_analysis_penalty_base: float = 0.05,
+    repeated_analysis_penalty_base: float = 0.025,
     repeated_analysis_penalty_start_count: int = 1,
     mention_market_penalty_base: float = 0.0,
     confidence_calibration_floor: float = 0.50,
@@ -95,11 +96,11 @@ def compute_final_score(
     fallback_edge_penalty_base: float = 0.04,
     computed_edge_bonus_base: float = 0.03,
     proxy_evidence_penalty_base: float = 0.05,
-    overconfidence_penalty_base: float = 0.08,
-    generic_bin_penalty_base: float = 0.03,
+    overconfidence_penalty_base: float = 0.05,
+    generic_bin_penalty_base: float = 0.015,
     ambiguous_resolution_penalty_base: float = 0.06,
     max_reasonable_edge: float = 0.45,
-    hallucinated_edge_penalty_base: float = 0.15,
+    hallucinated_edge_penalty_base: float = 0.08,
     extreme_market_edge_penalty_base: float = 0.08,
     late_stage_overconfidence_penalty_base: float = 0.08,
     extreme_confidence_threshold: float = 0.90,
@@ -120,6 +121,7 @@ def compute_final_score(
     coinflip_price_upper: float = 0.55,
     historical_prefix_pnl_per_trade: float | None = None,
     historical_prefix_sample_size: int = 0,
+    volume_amplifier_enabled: bool = True,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -435,7 +437,7 @@ def compute_final_score(
     if not (getattr(market, "resolution_criteria", "") or "").strip():
         ambiguous_resolution_penalty = max(0.0, ambiguous_resolution_penalty_base)
 
-    final_score = (
+    positive_score = (
         (evidence_multiplier * weighted_edge)
         + evidence_component
         + bayesian_component
@@ -448,33 +450,39 @@ def compute_final_score(
         + observed_data_bonus
         + historical_family_bonus
         + historical_prefix_bonus
-        - historical_prefix_penalty
-        - extreme_confidence_band_penalty
-        - numeric_strike_computed_overconfidence_penalty
-        - low_information_penalty
-        - no_external_odds_penalty
-        - repeated_analysis_penalty
-        - mention_market_penalty
-        - confidence_calibration_penalty
-        - overconfidence_penalty
-        - extreme_confidence_penalty
-        - late_stage_overconfidence_penalty
-        - fallback_high_confidence_penalty
-        - extreme_market_edge_penalty
-        - hallucinated_edge_penalty
-        - high_edge_calibration_penalty
-        - fallback_edge_penalty
-        - proxy_evidence_penalty
-        - liquidity_penalty
-        - staleness_penalty
-        - weather_uncertainty_penalty
-        - weather_bin_penalty
-        - generic_bin_penalty
-        - numeric_strike_bin_penalty
-        - short_prefix_penalty
-        - ambiguous_resolution_penalty
-        - coinflip_sports_penalty
     )
+    total_penalty = (
+        historical_prefix_penalty
+        + extreme_confidence_band_penalty
+        + numeric_strike_computed_overconfidence_penalty
+        + low_information_penalty
+        + no_external_odds_penalty
+        + repeated_analysis_penalty
+        + mention_market_penalty
+        + confidence_calibration_penalty
+        + overconfidence_penalty
+        + extreme_confidence_penalty
+        + late_stage_overconfidence_penalty
+        + fallback_high_confidence_penalty
+        + extreme_market_edge_penalty
+        + hallucinated_edge_penalty
+        + high_edge_calibration_penalty
+        + fallback_edge_penalty
+        + proxy_evidence_penalty
+        + liquidity_penalty
+        + staleness_penalty
+        + weather_uncertainty_penalty
+        + weather_bin_penalty
+        + generic_bin_penalty
+        + numeric_strike_bin_penalty
+        + short_prefix_penalty
+        + ambiguous_resolution_penalty
+        + coinflip_sports_penalty
+    )
+    volume_amplifier_discount = 0.0
+    if volume_amplifier_enabled and total_penalty > 0 and (liquidity > 500.0 or evidence_quality > 0.80):
+        volume_amplifier_discount = total_penalty * 0.20
+    final_score = positive_score - total_penalty + volume_amplifier_discount
 
     rejection_reasons: list[str] = []
     if edge_market <= 0:
@@ -576,6 +584,7 @@ def compute_final_score(
         historical_prefix_penalty=historical_prefix_penalty,
         extreme_confidence_band_penalty=extreme_confidence_band_penalty,
         numeric_strike_computed_overconfidence_penalty=numeric_strike_computed_overconfidence_penalty,
+        volume_amplifier_discount=volume_amplifier_discount,
         weather_uncertainty_penalty=weather_uncertainty_penalty,
         weather_bin_penalty=weather_bin_penalty,
         generic_bin_penalty=generic_bin_penalty,
@@ -641,6 +650,7 @@ def score_breakdown_explanation(result: ScoreResult) -> str:
         ("observed_data", result.observed_data_bonus),
         ("hist_family", result.historical_family_bonus),
         ("hist_prefix", result.historical_prefix_bonus),
+        ("volume_amp", result.volume_amplifier_discount),
     ]
     penalty_fields = [
         ("low_info", result.low_information_penalty),
