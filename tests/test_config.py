@@ -208,6 +208,12 @@ class TestConfig(unittest.TestCase):
             "KALSHI_FETCH_TOPUP_ENABLED=false",
             "KELLY_DYNAMIC_ENABLED=true",
             "KELLY_FRACTION_DEFAULT=0.45",
+            "GROK_SELF_CONSISTENCY_ENABLED=true",
+            "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD=300",
+            "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD=0.15",
+            "CALIBRATION_ONLINE_UPDATE_ENABLED=true",
+            "CALIBRATION_ONLINE_ALPHA=0.15",
+            "CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET=500",
             "SEARCH_PROFILE_MAX_DOMAINS=5",
             "EXTENDED_RESEARCH_SOURCE_OFFSET=5",
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS=0.60",
@@ -312,6 +318,11 @@ class TestConfig(unittest.TestCase):
             "XAI_CLIENT_TIMEOUT_SECONDS": "75",
             "GROK_STREAM_TIMEOUT_SECONDS": "80",
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS": "55",
+            "GROK_SELF_CONSISTENCY_ENABLED": "false",
+            "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD": "425",
+            "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD": "0.18",
+            "GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE": "0.25",
+            "GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE": "0.85",
             "PRE_ORDER_MARKET_REFRESH": "true",
             "ORDERBOOK_PRECHECK_ENABLED": "true",
             "ORDERBOOK_PRECHECK_MIN_CONFIDENCE": "0.8",
@@ -322,6 +333,9 @@ class TestConfig(unittest.TestCase):
             "EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE": "false",
             "CALIBRATION_MODE_ENABLED": "true",
             "CALIBRATION_MIN_SAMPLES": "25",
+            "CALIBRATION_ONLINE_UPDATE_ENABLED": "false",
+            "CALIBRATION_ONLINE_ALPHA": "0.2",
+            "CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET": "250",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -338,6 +352,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 75)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 80)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 55)
+        self.assertFalse(settings.GROK_SELF_CONSISTENCY_ENABLED)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD, 425.0)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD, 0.18)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE, 0.25)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.85)
         self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
         self.assertTrue(settings.ORDERBOOK_PRECHECK_ENABLED)
         self.assertEqual(settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE, 0.8)
@@ -348,6 +367,9 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertTrue(settings.CALIBRATION_MODE_ENABLED)
         self.assertEqual(settings.CALIBRATION_MIN_SAMPLES, 25)
+        self.assertFalse(settings.CALIBRATION_ONLINE_UPDATE_ENABLED)
+        self.assertEqual(settings.CALIBRATION_ONLINE_ALPHA, 0.2)
+        self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 250)
 
     def test_bayesian_lmsr_kelly_settings_overrides(self) -> None:
         env = {
@@ -429,6 +451,14 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 240)
+        self.assertTrue(settings.GROK_SELF_CONSISTENCY_ENABLED)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD, 300.0)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD, 0.15)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE, 0.3)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.7)
+        self.assertTrue(settings.CALIBRATION_ONLINE_UPDATE_ENABLED)
+        self.assertEqual(settings.CALIBRATION_ONLINE_ALPHA, 0.15)
+        self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 500)
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
         self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 40.0)

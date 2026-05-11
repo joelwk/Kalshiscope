@@ -1001,6 +1001,36 @@ class TestMainUtils(unittest.TestCase):
             places=6,
         )
 
+    def test_pre_analysis_opportunity_score_adds_small_positive_family_volume_bonus(self) -> None:
+        market = Market(
+            id="KXBTCD-26APR0917-T70499.99",
+            question="Bitcoin threshold",
+            category="crypto",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings()
+        baseline_score, baseline_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 7, "win_rate": 0.50, "pnl_total": 2.0},
+        )
+        boosted_score, boosted_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 8, "win_rate": 0.50, "pnl_total": 2.0},
+        )
+
+        self.assertEqual(baseline_breakdown["pre_score_historical_family_volume_bonus"], 0.0)
+        self.assertGreater(boosted_breakdown["pre_score_historical_family_volume_bonus"], 0.0)
+        self.assertGreater(boosted_score, baseline_score)
+
     def test_pre_analysis_opportunity_score_adds_post_event_bonus(self) -> None:
         settings = Settings()
         market_past = Market(

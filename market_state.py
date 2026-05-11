@@ -186,6 +186,18 @@ class MarketStateManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS confidence_calibration_online (
+                    family TEXT NOT NULL,
+                    bucket REAL NOT NULL,
+                    win_rate REAL NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (family, bucket)
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS decision_receipts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     cycle_id TEXT,
@@ -223,6 +235,9 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_exchange_settlements_market_id ON exchange_settlements (market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_confidence_calibration_online_family ON confidence_calibration_online (family)"
             )
             self._conn.execute(
                 """
@@ -1206,7 +1221,158 @@ class MarketStateManager:
                         else 0.0
                     ),
                 }
+        online_rows = self._conn.execute(
+            """
+            SELECT family, bucket, win_rate, sample_size
+            FROM confidence_calibration_online
+            WHERE sample_size > 0
+            """
+        ).fetchall()
+        for row in online_rows:
+            family_key = str(row["family"] or "all")
+            bucket = float(row["bucket"] or 0.0)
+            online_sample_size = int(row["sample_size"] or 0)
+            if online_sample_size <= 0:
+                continue
+            online_win_rate = max(0.0, min(1.0, float(row["win_rate"] or 0.0)))
+            family_snapshot = snapshot.setdefault(family_key, {})
+            existing = family_snapshot.get(bucket)
+            if existing is None:
+                family_snapshot[bucket] = {
+                    "sample_size": online_sample_size,
+                    "wins": online_win_rate * online_sample_size,
+                    "win_rate": online_win_rate,
+                    "mean_confidence": bucket,
+                }
+                continue
+            existing_sample_size = int(existing.get("sample_size", 0) or 0)
+            combined_sample_size = existing_sample_size + online_sample_size
+            if combined_sample_size <= 0:
+                continue
+            existing_win_rate = max(
+                0.0,
+                min(1.0, float(existing.get("win_rate", 0.0) or 0.0)),
+            )
+            combined_win_rate = (
+                (existing_win_rate * existing_sample_size)
+                + (online_win_rate * online_sample_size)
+            ) / combined_sample_size
+            existing_mean = float(existing.get("mean_confidence", bucket) or bucket)
+            combined_mean = (
+                (existing_mean * existing_sample_size) + (bucket * online_sample_size)
+            ) / combined_sample_size
+            family_snapshot[bucket] = {
+                "sample_size": combined_sample_size,
+                "wins": combined_win_rate * combined_sample_size,
+                "win_rate": combined_win_rate,
+                "mean_confidence": combined_mean,
+            }
         return snapshot
+
+    def record_online_confidence_calibration(
+        self,
+        *,
+        market_id: str,
+        confidence: float | None,
+        won: bool | int | None,
+        question: str = "",
+        category: str = "",
+        alpha: float = 0.15,
+        max_samples_per_bucket: int = 500,
+        updated_at: datetime | None = None,
+    ) -> bool:
+        if confidence is None or won is None:
+            return False
+        try:
+            bounded_confidence = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            return False
+        sample_value = 1.0 if int(won) == 1 else 0.0
+        bucket = int(bounded_confidence * 10.0) / 10.0
+        family = self._infer_family_from_state_row(
+            market_id=str(market_id or ""),
+            question=str(question or ""),
+            category=str(category or ""),
+        )
+        normalized_alpha = max(0.0, min(1.0, float(alpha or 0.15)))
+        sample_cap = max(1, int(max_samples_per_bucket or 500))
+        timestamp = (updated_at or datetime.now(timezone.utc)).isoformat()
+        changed = False
+        with self._conn:
+            for family_key in ("all", family):
+                row = self._conn.execute(
+                    """
+                    SELECT win_rate, sample_size
+                    FROM confidence_calibration_online
+                    WHERE family = ? AND bucket = ?
+                    """,
+                    (family_key, bucket),
+                ).fetchone()
+                if row is None:
+                    next_win_rate = sample_value
+                    next_sample_size = 1
+                else:
+                    old_win_rate = max(0.0, min(1.0, float(row["win_rate"] or 0.0)))
+                    old_sample_size = max(0, int(row["sample_size"] or 0))
+                    next_win_rate = (
+                        normalized_alpha * sample_value
+                        + (1.0 - normalized_alpha) * old_win_rate
+                    )
+                    next_sample_size = min(sample_cap, old_sample_size + 1)
+                self._conn.execute(
+                    """
+                    INSERT INTO confidence_calibration_online (
+                        family, bucket, win_rate, sample_size, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(family, bucket) DO UPDATE SET
+                        win_rate = excluded.win_rate,
+                        sample_size = excluded.sample_size,
+                        updated_at = excluded.updated_at
+                    """,
+                    (family_key, bucket, next_win_rate, next_sample_size, timestamp),
+                )
+                changed = True
+        return changed
+
+    def record_online_confidence_calibration_from_trade(
+        self,
+        market_id: str,
+        *,
+        alpha: float = 0.15,
+        max_samples_per_bucket: int = 500,
+    ) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT
+                t.confidence AS confidence,
+                t.won AS won,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category,
+                COALESCE(t.resolved_at, t.last_updated, '') AS updated_at
+            FROM trade_outcomes t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE t.market_id = ?
+              AND t.won IS NOT NULL
+            """,
+            (market_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        confidence = row["confidence"]
+        if confidence is None:
+            confidence = self._get_latest_confidence(market_id)
+        updated_at = _parse_timestamp(row["updated_at"]) or datetime.now(timezone.utc)
+        return self.record_online_confidence_calibration(
+            market_id=market_id,
+            confidence=confidence,
+            won=row["won"],
+            question=str(row["question"] or ""),
+            category=str(row["category"] or ""),
+            alpha=alpha,
+            max_samples_per_bucket=max_samples_per_bucket,
+            updated_at=updated_at,
+        )
 
     def get_exchange_realized_pnl_total(self) -> float:
         row = self._conn.execute(
@@ -1475,6 +1641,10 @@ class MarketStateManager:
         market_id: str,
         winning_outcome: str,
         resolved_at: datetime | None,
+        *,
+        online_calibration_enabled: bool = False,
+        online_calibration_alpha: float = 0.15,
+        online_calibration_max_samples_per_bucket: int = 500,
     ) -> bool:
         resolved_ts = resolved_at or datetime.now(timezone.utc)
         row = self._conn.execute(
@@ -1536,6 +1706,12 @@ class MarketStateManager:
             won,
             pnl_estimate if pnl_estimate is not None else 0.0,
         )
+        if online_calibration_enabled:
+            self.record_online_confidence_calibration_from_trade(
+                market_id,
+                alpha=online_calibration_alpha,
+                max_samples_per_bucket=online_calibration_max_samples_per_bucket,
+            )
         return True
 
     def record_exchange_settlement(
@@ -1550,6 +1726,9 @@ class MarketStateManager:
         avg_price: float | None,
         settled_at: datetime | None,
         raw: dict[str, Any],
+        online_calibration_enabled: bool = False,
+        online_calibration_alpha: float = 0.15,
+        online_calibration_max_samples_per_bucket: int = 500,
     ) -> None:
         normalized_settlement_id = str(settlement_id or "").strip()
         normalized_market_id = str(market_id or "").strip()
@@ -1649,6 +1828,12 @@ class MarketStateManager:
                     datetime.now(timezone.utc).isoformat(),
                     resolution_state,
                 ),
+            )
+        if online_calibration_enabled:
+            self.record_online_confidence_calibration_from_trade(
+                normalized_market_id,
+                alpha=online_calibration_alpha,
+                max_samples_per_bucket=online_calibration_max_samples_per_bucket,
             )
 
     def _upsert_trade_outcome_entry(

@@ -198,6 +198,7 @@ _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES = {
 }
 _PRE_ANALYSIS_AMBIGUOUS_MARKET_PENALTY = 0.08
 _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS = 0.06
+_PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS = 0.03
 _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
 _AMBIGUOUS_MARKET_TOKENS = (
     "attend",
@@ -1959,6 +1960,7 @@ def _update_resolved_markets(
     markets: list[Market],
     state_manager: MarketStateManager,
     kalshi_client: KalshiClient,
+    settings: Settings | None = None,
 ) -> None:
     traded_ids = state_manager.get_unresolved_traded_market_ids()
     if not traded_ids:
@@ -1987,6 +1989,21 @@ def _update_resolved_markets(
             market_id=market_id,
             winning_outcome=winning_outcome,
             resolved_at=market.close_time,
+            online_calibration_enabled=(
+                bool(getattr(settings, "CALIBRATION_ONLINE_UPDATE_ENABLED", False))
+                if settings is not None
+                else False
+            ),
+            online_calibration_alpha=(
+                float(getattr(settings, "CALIBRATION_ONLINE_ALPHA", 0.15))
+                if settings is not None
+                else 0.15
+            ),
+            online_calibration_max_samples_per_bucket=(
+                int(getattr(settings, "CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET", 500))
+                if settings is not None
+                else 500
+            ),
         )
         if updated:
             state_manager.reset_bayesian_state(market_id)
@@ -2276,6 +2293,9 @@ def _log_settings_summary(settings) -> None:
             "market_min_close_days": settings.MARKET_MIN_CLOSE_DAYS,
             "market_max_close_days": settings.MARKET_MAX_CLOSE_DAYS,
             "grok_model": settings.GROK_MODEL,
+            "grok_self_consistency_enabled": settings.GROK_SELF_CONSISTENCY_ENABLED,
+            "grok_self_consistency_liquidity_threshold": settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD,
+            "grok_self_consistency_edge_threshold": settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD,
             "categories_allowlist": settings.MARKET_CATEGORIES_ALLOWLIST,
             "categories_blocklist": settings.MARKET_CATEGORIES_BLOCKLIST,
             "ticker_prefix_blocklist": settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
@@ -2302,6 +2322,8 @@ def _log_settings_summary(settings) -> None:
             "score_volume_amplifier_enabled": settings.SCORE_VOLUME_AMPLIFIER_ENABLED,
             "score_confidence_calibration_floor": settings.SCORE_CONFIDENCE_CALIBRATION_FLOOR,
             "score_confidence_calibration_penalty_scale": settings.SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE,
+            "calibration_online_update_enabled": settings.CALIBRATION_ONLINE_UPDATE_ENABLED,
+            "calibration_online_alpha": settings.CALIBRATION_ONLINE_ALPHA,
             "mention_market_score_penalty": settings.MENTION_MARKET_SCORE_PENALTY,
             "pre_analysis_opportunity_enabled": settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED,
             "pre_analysis_opportunity_min_score": settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE,
@@ -2824,6 +2846,7 @@ def _sync_settlements_from_exchange(
     *,
     state_manager: MarketStateManager,
     kalshi_client: KalshiClient,
+    settings: Settings | None = None,
     limit: int = 200,
 ) -> int:
     payload = kalshi_client.get_settlements(limit=limit)
@@ -2833,7 +2856,24 @@ def _sync_settlements_from_exchange(
         parsed = _parse_exchange_settlement_row(row)
         if parsed is None:
             continue
-        state_manager.record_exchange_settlement(**parsed)
+        state_manager.record_exchange_settlement(
+            **parsed,
+            online_calibration_enabled=(
+                bool(getattr(settings, "CALIBRATION_ONLINE_UPDATE_ENABLED", False))
+                if settings is not None
+                else False
+            ),
+            online_calibration_alpha=(
+                float(getattr(settings, "CALIBRATION_ONLINE_ALPHA", 0.15))
+                if settings is not None
+                else 0.15
+            ),
+            online_calibration_max_samples_per_bucket=(
+                int(getattr(settings, "CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET", 500))
+                if settings is not None
+                else 500
+            ),
+        )
         imported += 1
     return imported
 
@@ -4469,6 +4509,9 @@ def _pre_analysis_opportunity_score(
         fallback_family_penalty *= 0.5
         fallback_family_penalty_scale = 0.5
     historical_profit_bonus = 0.0
+    historical_family_volume_bonus = 0.0
+    if historical_family_sample_size >= 8 and historical_family_pnl > 0.0:
+        historical_family_volume_bonus = _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS
     if (
         historical_family_sample_size >= max(1, settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES)
         and historical_family_pnl > abs(float(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD))
@@ -4570,6 +4613,7 @@ def _pre_analysis_opportunity_score(
         + (0.25 * horizon_score)
         + post_event_bonus
         + historical_profit_bonus
+        + historical_family_volume_bonus
         - repeated_analysis_penalty
         - non_actionable_penalty
         - family_penalty
@@ -4609,6 +4653,7 @@ def _pre_analysis_opportunity_score(
         "pre_score_historical_family_samples": float(historical_family_sample_size),
         "pre_score_historical_family_pnl_total": historical_family_pnl,
         "pre_score_historical_profit_bonus": historical_profit_bonus,
+        "pre_score_historical_family_volume_bonus": historical_family_volume_bonus,
         "pre_score_source_difficulty_penalty": source_difficulty_penalty,
         "pre_score_ambiguous_resolution_penalty": ambiguous_resolution_penalty,
         "pre_score_ambiguous_market_penalty": ambiguous_market_penalty,
@@ -5547,7 +5592,12 @@ def main(max_cycles: int | None = None) -> None:
             if settings.RESOLUTION_SYNC_INTERVAL_CYCLES > 0:
                 if cycle_count % settings.RESOLUTION_SYNC_INTERVAL_CYCLES == 0:
                     try:
-                        _update_resolved_markets(markets, state_manager, kalshi_client)
+                        _update_resolved_markets(
+                            markets,
+                            state_manager,
+                            kalshi_client,
+                            settings=settings,
+                        )
                     except Exception as exc:
                         logger.warning(
                             "Resolution sync failed: %s",
@@ -5558,6 +5608,7 @@ def main(max_cycles: int | None = None) -> None:
                         synced_settlements = _sync_settlements_from_exchange(
                             state_manager=state_manager,
                             kalshi_client=kalshi_client,
+                            settings=settings,
                         )
                         if synced_settlements > 0:
                             logger.info(
@@ -9204,6 +9255,19 @@ def main(max_cycles: int | None = None) -> None:
                     settings,
                     market=market,
                 )
+                baseline_edge_threshold = _edge_threshold_for_market(
+                    implied_prob,
+                    settings,
+                    decision_for_edge.edge_source,
+                    market=None,
+                    definitive_outcome_eligible=_is_definitive_outcome_eligible(
+                        decision_for_edge, settings
+                    ),
+                )
+                edge_threshold_reduction = max(
+                    0.0,
+                    float(baseline_edge_threshold - required_edge_threshold),
+                )
                 edge_ok, edge_value, edge_reason = _passes_edge_threshold(
                     implied_prob,
                     decision_for_edge,
@@ -9212,6 +9276,11 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
+                audit_context["gate_edge_required_baseline"] = baseline_edge_threshold
+                audit_context["gate_edge_dynamic_reduction"] = edge_threshold_reduction
+                audit_context["gate_edge_dynamic_reduction_applied"] = (
+                    edge_threshold_reduction > 1e-9
+                )
                 _def_validated = _is_definitive_validated(decision_for_edge, settings)
                 if _def_validated:
                     audit_context["definitive_edge_bypass_validated"] = True
@@ -9227,6 +9296,8 @@ def main(max_cycles: int | None = None) -> None:
                     "edge_gate_pass": edge_ok,
                     "gate_edge_required": required_edge_threshold,
                     "gate_edge_actual": edge_value,
+                    "gate_edge_required_baseline": baseline_edge_threshold,
+                    "gate_edge_dynamic_reduction": edge_threshold_reduction,
                 }
                 calibration_payload.update(build_counterfactual_flags(edge_value))
                 calibration_samples.append(calibration_payload)
@@ -9608,6 +9679,9 @@ def main(max_cycles: int | None = None) -> None:
                         "bayesian_component": score_result.bayesian_component,
                         "inefficiency_component": score_result.inefficiency_component,
                         "kelly_component": score_result.kelly_component,
+                        "score_volume_amplifier_discount": (
+                            score_result.volume_amplifier_discount
+                        ),
                         "confidence_alignment_bonus": score_result.confidence_alignment_bonus,
                         "evidence_basis_bonus": score_result.evidence_basis_bonus,
                         "observed_data_bonus": score_result.observed_data_bonus,
@@ -9838,6 +9912,19 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 else:
                     adjusted_bet_pct = edge_scaling_bet_pct
+                if (
+                    kelly_path_active
+                    and kelly_raw_value is not None
+                    and float(kelly_raw_value) > 0.0
+                ):
+                    effective_kelly_fraction = max(
+                        0.0,
+                        float(adjusted_bet_pct) / float(kelly_raw_value),
+                    )
+                    audit_context["kelly_effective_fraction"] = effective_kelly_fraction
+                    audit_context["kelly_dynamic_fraction_gt_0_50"] = (
+                        effective_kelly_fraction > 0.50
+                    )
                 kelly_posterior_edge_below_min = False
                 if kelly_path_active and adjusted_bet_pct <= 0:
                     kelly_posterior_edge_below_min = True
@@ -10267,6 +10354,12 @@ def main(max_cycles: int | None = None) -> None:
                             "bet_amount_usdc": bet_amount,
                             "min_bet_floor_applied": min_bet_floor_applied,
                             "kelly_sub_floor_skipped": kelly_sub_floor_skipped,
+                            "kelly_effective_fraction": audit_context.get(
+                                "kelly_effective_fraction"
+                            ),
+                            "kelly_dynamic_fraction_gt_0_50": audit_context.get(
+                                "kelly_dynamic_fraction_gt_0_50"
+                            ),
                         },
                     )
                     trades_skipped_balance += 1

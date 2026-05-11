@@ -56,6 +56,7 @@ class XAIProvider:
         config: SearchConfig,
         enable_multimedia: bool,
         timeout_seconds: float | None = None,
+        temperature: float | None = None,
     ):
         client = self._client_for_timeout(timeout_seconds)
         for attempt in range(1, self.create_chat_max_attempts + 1):
@@ -63,6 +64,7 @@ class XAIProvider:
                 return client.chat.create(
                     model=model,
                     response_format=response_format,
+                    temperature=temperature,
                     tools=[
                         web_search(
                             allowed_domains=config.allowed_domains,

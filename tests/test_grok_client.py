@@ -65,9 +65,11 @@ class SequencedChatClient:
     def __init__(self, responses: list[Exception | str]) -> None:
         self.responses = responses
         self.create_calls = 0
+        self.create_kwargs: list[dict] = []
 
     def create(self, **kwargs):
         self.create_calls += 1
+        self.create_kwargs.append(kwargs)
         response = self.responses[min(self.create_calls - 1, len(self.responses) - 1)]
         if isinstance(response, Exception):
             return FailingChatSession(response)
@@ -400,6 +402,71 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(last_kwargs["model"], client.model)
         self.assertEqual(len(last_kwargs["tools"]), 2)
         self.assertIs(last_kwargs["response_format"], TradeDecision)
+        self.assertEqual(last_kwargs["temperature"], 0.7)
+
+    def test_self_consistency_runs_second_pass_and_averages_yes_probability(self) -> None:
+        market = Market(
+            id="m-self-consistency",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.75, '
+            '"probability_yes": 0.75, "bet_size_pct": 0.5, '
+            '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
+            '"evidence_quality": 0.8, "key_sources": ["source A"], '
+            '"base_rate_used": true}'
+        )
+        second = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.65, '
+            '"probability_yes": 0.65, "bet_size_pct": 0.5, '
+            '"reasoning": "Counter-evidence lowers this.", '
+            '"evidence_quality": 0.8, "key_sources": ["source B"], '
+            '"self_critique": "Recent base rate lowers probability."}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, second])
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["temperature"], 0.3)
+        self.assertEqual(sequenced.chat.create_kwargs[1]["temperature"], 0.7)
+        self.assertAlmostEqual(decision.probability_yes or 0.0, 0.70)
+        self.assertAlmostEqual(decision.confidence, 0.70)
+        self.assertIn("source A", decision.key_sources)
+        self.assertIn("source B", decision.key_sources)
+        self.assertIn("Recent base rate", decision.self_critique or "")
+
+    def test_self_consistency_skips_second_pass_below_thresholds(self) -> None:
+        market = Market(
+            id="m-no-self-consistency",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=100.0,
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.60, '
+            '"probability_yes": 0.60, "bet_size_pct": 0.0, '
+            '"reasoning": "Implied prob: 55%, My prob: 60%, Edge: 5%", '
+            '"evidence_quality": 0.7}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([content])
+        client.client = sequenced
+
+        client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 1)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["temperature"], 0.3)
 
     def test_tools_use_search_config(self) -> None:
         market = Market(

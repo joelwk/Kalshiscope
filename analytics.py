@@ -395,22 +395,47 @@ def run(db_path: str) -> None:
                     AVG(COALESCE(CAST(json_extract(audit_json, '$.score_proxy_evidence_penalty') AS REAL), 0.0)) AS proxy_evidence_penalty_avg,
                     AVG(COALESCE(CAST(json_extract(audit_json, '$.score_repeated_penalty') AS REAL), 0.0)) AS repeated_penalty_avg,
                     AVG(COALESCE(CAST(json_extract(audit_json, '$.score_generic_bin_penalty') AS REAL), 0.0)) AS generic_bin_penalty_avg,
-                    AVG(COALESCE(CAST(json_extract(audit_json, '$.score_ambiguous_resolution_penalty') AS REAL), 0.0)) AS ambiguous_resolution_penalty_avg
+                    AVG(COALESCE(CAST(json_extract(audit_json, '$.score_ambiguous_resolution_penalty') AS REAL), 0.0)) AS ambiguous_resolution_penalty_avg,
+                    AVG(COALESCE(CAST(json_extract(audit_json, '$.score_volume_amplifier_discount') AS REAL), 0.0)) AS volume_amplifier_discount_avg
                 FROM decision_receipts
                 """
             ).fetchone()
             if penalty_avg_row:
                 print("\nAverage score penalties (decision receipts):")
                 print(
-                    "  liquidity={:.4f} weather={:.4f} proxy_evidence={:.4f} repeated={:.4f} generic_bin={:.4f} ambiguous_resolution={:.4f}".format(
+                    "  liquidity={:.4f} weather={:.4f} proxy_evidence={:.4f} repeated={:.4f} generic_bin={:.4f} ambiguous_resolution={:.4f} volume_amplifier_discount={:.4f}".format(
                         float(penalty_avg_row["liquidity_penalty_avg"] or 0.0),
                         float(penalty_avg_row["weather_penalty_avg"] or 0.0),
                         float(penalty_avg_row["proxy_evidence_penalty_avg"] or 0.0),
                         float(penalty_avg_row["repeated_penalty_avg"] or 0.0),
                         float(penalty_avg_row["generic_bin_penalty_avg"] or 0.0),
                         float(penalty_avg_row["ambiguous_resolution_penalty_avg"] or 0.0),
+                        float(penalty_avg_row["volume_amplifier_discount_avg"] or 0.0),
                     )
                 )
+
+            kelly_distribution_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS kelly_trades,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(CAST(json_extract(audit_json, '$.kelly_effective_fraction') AS REAL), 0.0) > 0.50
+                            THEN 1 ELSE 0
+                        END
+                    ) AS kelly_gt_half
+                FROM decision_receipts
+                WHERE json_extract(audit_json, '$.kelly_effective_fraction') IS NOT NULL
+                """
+            ).fetchone()
+            if kelly_distribution_row:
+                kelly_trades = int(kelly_distribution_row["kelly_trades"] or 0)
+                if kelly_trades > 0:
+                    kelly_gt_half = int(kelly_distribution_row["kelly_gt_half"] or 0)
+                    print(
+                        "Kelly dynamic fraction >0.50: "
+                        f"{kelly_gt_half}/{kelly_trades} ({(kelly_gt_half / kelly_trades) * 100:.1f}%)"
+                    )
 
             decision_receipt_columns = {
                 str(column["name"])

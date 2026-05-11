@@ -63,6 +63,12 @@ class TradeDecision(BaseModel):
         le=1.0,
         description=_TRADE_DECISION_DESCRIPTIONS["confidence"],
     )
+    probability_yes: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=_TRADE_DECISION_DESCRIPTIONS["probability_yes"],
+    )
     bet_size_pct: float = Field(
         ge=0.0,
         le=1.0,
@@ -70,6 +76,22 @@ class TradeDecision(BaseModel):
     )
     reasoning: str = Field(
         description=_TRADE_DECISION_DESCRIPTIONS["reasoning"],
+    )
+    key_sources: list[str] = Field(
+        default_factory=list,
+        description=_TRADE_DECISION_DESCRIPTIONS["key_sources"],
+    )
+    base_rate_used: bool | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["base_rate_used"],
+    )
+    uncertainty_note: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["uncertainty_note"],
+    )
+    self_critique: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["self_critique"],
     )
     implied_prob_external: float | None = Field(
         default=None,
