@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 # Using override=True avoids stale exported shell vars shadowing updated .env values.
 load_dotenv(override=True)
 
+XAI_WEB_SEARCH_ALLOWED_DOMAINS_LIMIT = 5
+XAI_X_SEARCH_ALLOWED_HANDLES_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -22,6 +25,7 @@ class Settings:
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
     CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
     MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.75
+    SPORTS_MIN_EVIDENCE_QUALITY: float = 0.70
     MIN_LIQUIDITY_USDC: float = 15.0
     POLL_INTERVAL_SEC: int = 300
     DRY_STREAK_SLEEP_ENABLED: bool = True
@@ -93,6 +97,10 @@ class Settings:
         "espn.com",
         "cbssports.com",
         "nba.com",
+        "espncricinfo.com",
+        "cricbuzz.com",
+        "iplt20.com",
+        "koreabaseball.com",
         "covers.com",
         "sportsbookreview.com",
         "theathletic.com",
@@ -107,6 +115,10 @@ class Settings:
         "ESPN",
         "CBSSports",
         "NBA",
+        "ESPNcricinfo",
+        "cricbuzz",
+        "IPL",
+        "KBO_ENG",
         "SportsCenter",
         "ShamsCharania",
         "wojespn",
@@ -149,6 +161,10 @@ class Settings:
         "espn.com",
         "cbssports.com",
         "nba.com",
+        "espncricinfo.com",
+        "cricbuzz.com",
+        "iplt20.com",
+        "koreabaseball.com",
         "covers.com",
         "sportsbookreview.com",
         "theathletic.com",
@@ -163,6 +179,10 @@ class Settings:
         "ESPN",
         "CBSSports",
         "NBA",
+        "ESPNcricinfo",
+        "cricbuzz",
+        "IPL",
+        "KBO_ENG",
         "SportsCenter",
         "ShamsCharania",
         "wojespn",
@@ -458,6 +478,7 @@ class Settings:
     WEATHER_SCORE_PENALTY: float = 0.12
     WEATHER_MIN_EVIDENCE_QUALITY: float = 0.80
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER: float = 0.72
+    DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS: float = 0.65
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT: float = 0.75
     DIRECT_SOURCE_WHITELIST: tuple[str, ...] = (
         "weather.gov",
@@ -471,6 +492,10 @@ class Settings:
         "zerohedge.com",
         "apnews.com",
         "espn.com",
+        "espncricinfo.com",
+        "cricbuzz.com",
+        "iplt20.com",
+        "koreabaseball.com",
         "mlb.com",
         "nfl.com",
         "nba.com",
@@ -590,6 +615,7 @@ class Settings:
     RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
     RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
     RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.55
+    RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
     EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
     DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR: float = 0.80
@@ -777,6 +803,10 @@ def load_settings() -> Settings:
             "MIN_EVIDENCE_QUALITY_FOR_TRADE",
             Settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
         ),
+        SPORTS_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "SPORTS_MIN_EVIDENCE_QUALITY",
+            Settings.SPORTS_MIN_EVIDENCE_QUALITY,
+        ),
         MIN_EDGE=_read_env_float("MIN_EDGE", Settings.MIN_EDGE),
         LOW_PRICE_THRESHOLD=_read_env_float(
             "LOW_PRICE_THRESHOLD", Settings.LOW_PRICE_THRESHOLD
@@ -946,13 +976,25 @@ def load_settings() -> Settings:
             "MULTIMEDIA_CONFIDENCE_THRESHOLD",
             Settings.MULTIMEDIA_CONFIDENCE_THRESHOLD,
         ),
-        SEARCH_PROFILE_MAX_DOMAINS=_read_env_int(
-            "SEARCH_PROFILE_MAX_DOMAINS",
-            Settings.SEARCH_PROFILE_MAX_DOMAINS,
+        SEARCH_PROFILE_MAX_DOMAINS=min(
+            XAI_WEB_SEARCH_ALLOWED_DOMAINS_LIMIT,
+            max(
+                1,
+                _read_env_int(
+                    "SEARCH_PROFILE_MAX_DOMAINS",
+                    Settings.SEARCH_PROFILE_MAX_DOMAINS,
+                ),
+            ),
         ),
-        SEARCH_PROFILE_MAX_X_HANDLES=_read_env_int(
-            "SEARCH_PROFILE_MAX_X_HANDLES",
-            Settings.SEARCH_PROFILE_MAX_X_HANDLES,
+        SEARCH_PROFILE_MAX_X_HANDLES=min(
+            XAI_X_SEARCH_ALLOWED_HANDLES_LIMIT,
+            max(
+                1,
+                _read_env_int(
+                    "SEARCH_PROFILE_MAX_X_HANDLES",
+                    Settings.SEARCH_PROFILE_MAX_X_HANDLES,
+                ),
+            ),
         ),
         EXTENDED_RESEARCH_SOURCE_OFFSET=_read_env_int(
             "EXTENDED_RESEARCH_SOURCE_OFFSET",
@@ -1354,6 +1396,10 @@ def load_settings() -> Settings:
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER",
             Settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER,
         ),
+        DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS=_read_env_float(
+            "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS",
+            Settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS,
+        ),
         DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT=_read_env_float(
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT",
             Settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT,
@@ -1713,6 +1759,10 @@ def load_settings() -> Settings:
         RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=_read_env_float(
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY",
             Settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY,
+        ),
+        RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=_read_env_bool(
+            "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH",
+            Settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH,
         ),
         EXTENDED_RESEARCH_AFTER_STREAK=_read_env_int(
             "EXTENDED_RESEARCH_AFTER_STREAK",

@@ -122,6 +122,18 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.EXTENDED_RESEARCH_SOURCE_OFFSET, 4)
         self.assertEqual(settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET, 8)
 
+    def test_search_profile_limits_clamp_to_xai_provider_caps(self) -> None:
+        env = {
+            **self._required_env(),
+            "SEARCH_PROFILE_MAX_DOMAINS": "8",
+            "SEARCH_PROFILE_MAX_X_HANDLES": "14",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+
+        self.assertEqual(settings.SEARCH_PROFILE_MAX_DOMAINS, 5)
+        self.assertEqual(settings.SEARCH_PROFILE_MAX_X_HANDLES, 10)
+
     def test_weather_profile_settings_overrides(self) -> None:
         env = {
             **self._required_env(),
@@ -132,7 +144,9 @@ class TestConfig(unittest.TestCase):
             "WEATHER_MIN_EDGE": "0.09",
             "WEATHER_SCORE_PENALTY": "0.04",
             "WEATHER_MIN_EVIDENCE_QUALITY": "0.72",
+            "SPORTS_MIN_EVIDENCE_QUALITY": "0.61",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE": "0.18",
+            "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS": "0.59",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE": "2",
             "KELLY_FRACTION_WEATHER": "0.45",
         }
@@ -145,7 +159,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.WEATHER_MIN_EDGE, 0.09)
         self.assertEqual(settings.WEATHER_SCORE_PENALTY, 0.04)
         self.assertEqual(settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.72)
+        self.assertEqual(settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.61)
         self.assertEqual(settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.18)
+        self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS, 0.59)
         self.assertEqual(settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.KELLY_FRACTION_WEATHER, 0.45)
 
@@ -153,6 +169,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.65)
         self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
         self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.80)
+        self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.70)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
         self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.12)
@@ -169,6 +186,7 @@ class TestConfig(unittest.TestCase):
         env_example = Path(".env.example").read_text(encoding="utf-8")
         expected_lines = {
             "MIN_EDGE=0.12",
+            "SPORTS_MIN_EVIDENCE_QUALITY=0.60",
             "LOW_PRICE_MIN_EDGE=0.18",
             "VERY_LOW_PRICE_MIN_EDGE=0.28",
             "FALLBACK_EDGE_MIN_EDGE=0.25",
@@ -185,6 +203,8 @@ class TestConfig(unittest.TestCase):
             "KALSHI_FETCH_TOPUP_ENABLED=false",
             "SEARCH_PROFILE_MAX_DOMAINS=5",
             "EXTENDED_RESEARCH_SOURCE_OFFSET=5",
+            "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS=0.60",
+            "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
         }
         for expected_line in expected_lines:
             self.assertIn(expected_line, env_example)
@@ -367,6 +387,7 @@ class TestConfig(unittest.TestCase):
         settings = config.Settings()
         self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.75)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER, 0.72)
+        self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS, 0.65)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
         self.assertIn("weather.gov", settings.DIRECT_SOURCE_WHITELIST)
         self.assertEqual(settings.SCORE_GATE_MODE, "active")
@@ -458,10 +479,13 @@ class TestConfig(unittest.TestCase):
 
     def test_tennis_sources_present_in_sports_profile_defaults(self) -> None:
         self.assertIn("atptour.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
+        self.assertIn("espncricinfo.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
+        self.assertIn("cricbuzz.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
         self.assertIn("wtatennis.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
         self.assertIn("tennisexplorer.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
         self.assertIn("flashscore.com", config.Settings.SPORTS_ALLOWED_DOMAINS)
         self.assertIn("atptour", config.Settings.SPORTS_ALLOWED_X_HANDLES)
+        self.assertIn("ESPNcricinfo", config.Settings.SPORTS_ALLOWED_X_HANDLES)
         self.assertIn("WTA", config.Settings.SPORTS_ALLOWED_X_HANDLES)
 
     def test_profit_leak_fix_defaults(self) -> None:
@@ -584,6 +608,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+        self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
 
     def test_research_queue_drain_settings_env_override(self) -> None:
         env = {
@@ -593,6 +618,7 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS": "0.25",
             "RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS": "24.0",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY": "0.65",
+            "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH": "false",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -601,6 +627,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 0.25)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 24.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.65)
+        self.assertFalse(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
 
     def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
         """Cycle 4 recovery: a growing research queue (127+ entries) needs

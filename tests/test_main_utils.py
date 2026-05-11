@@ -2489,6 +2489,7 @@ class TestMainUtils(unittest.TestCase):
         settings = Settings(
             MIN_EVIDENCE_QUALITY_FOR_TRADE=0.5,
             WEATHER_MIN_EVIDENCE_QUALITY=0.7,
+            SPORTS_MIN_EVIDENCE_QUALITY=0.6,
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -2503,16 +2504,24 @@ class TestMainUtils(unittest.TestCase):
             question="Will BTC close above threshold?",
             category="crypto",
         )
+        sports_market = Market(
+            id="KXIPLSIX-26MAY11DCPBKS-20",
+            question="Will there be over 19.5 total match sixes?",
+            category=None,
+        )
         self.assertEqual(_min_evidence_quality_for_market(weather_market, settings), 0.7)
+        self.assertEqual(_min_evidence_quality_for_market(sports_market, settings), 0.6)
         self.assertEqual(_min_evidence_quality_for_market(generic_market, settings), 0.5)
 
     def test_min_evidence_quality_relaxes_for_whitelisted_direct_sources(self) -> None:
         settings = Settings(
             MIN_EVIDENCE_QUALITY_FOR_TRADE=0.75,
             WEATHER_MIN_EVIDENCE_QUALITY=0.80,
+            SPORTS_MIN_EVIDENCE_QUALITY=0.70,
             DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT=0.68,
             DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER=0.72,
-            DIRECT_SOURCE_WHITELIST=("weather.gov", "coindesk.com"),
+            DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS=0.60,
+            DIRECT_SOURCE_WHITELIST=("weather.gov", "coindesk.com", "espncricinfo.com"),
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -2539,6 +2548,14 @@ class TestMainUtils(unittest.TestCase):
         generic_decision = weather_decision.model_copy(
             update={"primary_source_url": "https://www.coindesk.com/price/bitcoin"}
         )
+        sports_market = Market(
+            id="KXT20MATCH-26MAY10COOPNG-COO",
+            question="Will the T20 cricket match winner be COO?",
+            category=None,
+        )
+        sports_decision = weather_decision.model_copy(
+            update={"primary_source_url": "https://www.espncricinfo.com/series/test"}
+        )
         proxy_decision = weather_decision.model_copy(update={"evidence_basis": "proxy"})
         self.assertEqual(
             _min_evidence_quality_for_market(weather_market, settings, weather_decision),
@@ -2547,6 +2564,10 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(
             _min_evidence_quality_for_market(generic_market, settings, generic_decision),
             0.68,
+        )
+        self.assertEqual(
+            _min_evidence_quality_for_market(sports_market, settings, sports_decision),
+            0.60,
         )
         self.assertEqual(
             _min_evidence_quality_for_market(generic_market, settings, proxy_decision),

@@ -150,6 +150,19 @@ def test_market_family_champions_league() -> None:
     assert market_family(market) == "sports"
 
 
+def test_market_family_cricket_kbo_and_isl_tickers_from_logs() -> None:
+    """Recent participation logs showed these sports tickers using generic
+    search profiles and generic-family penalties."""
+    for ticker in (
+        "KXIPLSIX-26MAY11DCPBKS-20",
+        "KXT20MATCH-26MAY10COOPNG-COO",
+        "KXKBOGAME-26MAY100100KIALOT-KIA",
+        "KXISLGAME-26APR291230HAHHGE-HGE",
+    ):
+        market = Market(id=ticker, question="Will the home team win?", category=None)
+        assert market_family(market) == "sports"
+
+
 def test_market_family_crypto() -> None:
     market = Market(id="2", question="Will $BTC close above 120k?", category="crypto")
     assert market_family(market) == "crypto"

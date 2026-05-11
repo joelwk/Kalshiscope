@@ -484,6 +484,63 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertEqual(captured["x"]["allowed_x_handles"], ["A", "B", "C", "D"])
 
+    def test_tools_clamp_search_sources_to_xai_caps(self) -> None:
+        market = Market(
+            id="m2-provider-cap",
+            question="Will BTC be above $50k tomorrow?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+            liquidity_usdc=200.0,
+        )
+        content = """
+        {"should_trade": false, "outcome": "NO", "confidence": 0.6, "bet_size_pct": 0.0, "reasoning": "test"}
+        """
+        search_config = SearchConfig(
+            from_date=datetime(2026, 1, 13, 0, 0, tzinfo=timezone.utc),
+            to_date=datetime(2026, 1, 13, 12, 0, tzinfo=timezone.utc),
+            allowed_domains=["a.com", "b.com", "c.com", "d.com", "e.com", "f.com"],
+            allowed_x_handles=[
+                "A",
+                "B",
+                "C",
+                "D",
+                "E",
+                "F",
+                "G",
+                "H",
+                "I",
+                "J",
+                "K",
+            ],
+            max_allowed_domains=8,
+            max_allowed_x_handles=14,
+        )
+        client = GrokClient(api_key="x", search_config=search_config)
+        client.client = DummyClient(content)
+
+        captured = {}
+
+        def fake_web_search(*args, **kwargs):
+            captured["web"] = kwargs
+            return {"tool": "web"}
+
+        def fake_x_search(*args, **kwargs):
+            captured["x"] = kwargs
+            return {"tool": "x"}
+
+        with patch("xai_provider.web_search", side_effect=fake_web_search), patch(
+            "xai_provider.x_search", side_effect=fake_x_search
+        ):
+            client.analyze_market(market)
+
+        self.assertEqual(
+            captured["web"]["allowed_domains"],
+            ["a.com", "b.com", "c.com", "d.com", "e.com"],
+        )
+        self.assertEqual(
+            captured["x"]["allowed_x_handles"],
+            ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
+        )
+
     def test_analyze_market_deep_enables_multimedia_for_borderline(self) -> None:
         market = Market(
             id="m3",
