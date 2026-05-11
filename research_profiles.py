@@ -40,6 +40,8 @@ _SPORTS_KEYWORDS = (
     "copa",
     "cricket",
     "ipl",
+    "t20",
+    "kbo",
     "rugby",
     "f1",
     "formula 1",
@@ -167,7 +169,7 @@ _ENTERTAINMENT_TICKER_PATTERN = re.compile(
 # `f"{category} {question} {market_id}"`, so the ticker is at end-of-text
 # preceded by a space \u2014 the boundary fires correctly.
 _SPORTS_TICKER_PATTERN = re.compile(
-    r"\bKX(?:MLB|NBA|NFL|NHL|NCAA|EPL|UCL|UEFA|MLS|WNBA|AFL|ATP|WTA|UFC|MMA|BOX|F1)",
+    r"\bKX(?:MLB|NBA|NFL|NHL|NCAA|EPL|UCL|UEFA|MLS|WNBA|AFL|ATP|WTA|UFC|MMA|BOX|F1|IPL|T20|KBO|ISL)",
     re.IGNORECASE,
 )
 _CRYPTO_TICKER_PATTERN = re.compile(

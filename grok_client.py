@@ -7,7 +7,12 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from config import SearchConfig, Settings
+from config import (
+    SearchConfig,
+    Settings,
+    XAI_WEB_SEARCH_ALLOWED_DOMAINS_LIMIT,
+    XAI_X_SEARCH_ALLOWED_HANDLES_LIMIT,
+)
 from logging_config import get_logger
 from models import Market, TradeDecision
 from prompts.loader import load_lines, load_prompt, render
@@ -426,9 +431,15 @@ class GrokClient:
                 profile_name=config.profile_name,
                 lookback_hours=config.lookback_hours,
             )
-        # Keep within xAI limits while preserving prioritized order from profile builder.
-        max_domains = max(1, int(config.max_allowed_domains or 5))
-        max_handles = max(1, int(config.max_allowed_x_handles or 10))
+        # Keep within xAI server-side limits while preserving prioritized profile order.
+        max_domains = min(
+            XAI_WEB_SEARCH_ALLOWED_DOMAINS_LIMIT,
+            max(1, int(config.max_allowed_domains or 5)),
+        )
+        max_handles = min(
+            XAI_X_SEARCH_ALLOWED_HANDLES_LIMIT,
+            max(1, int(config.max_allowed_x_handles or 10)),
+        )
         if len(config.allowed_domains) > max_domains:
             config.allowed_domains = config.allowed_domains[:max_domains]
         if len(config.allowed_x_handles) > max_handles:

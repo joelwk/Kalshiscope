@@ -1340,11 +1340,13 @@ def _min_evidence_quality_for_market(
     settings: Settings,
     decision: TradeDecision | None = None,
 ) -> float:
-    base_minimum = (
-        settings.WEATHER_MIN_EVIDENCE_QUALITY
-        if market_family(market) == "weather"
-        else settings.MIN_EVIDENCE_QUALITY_FOR_TRADE
-    )
+    family = market_family(market)
+    if family == "weather":
+        base_minimum = settings.WEATHER_MIN_EVIDENCE_QUALITY
+    elif family == "sports":
+        base_minimum = settings.SPORTS_MIN_EVIDENCE_QUALITY
+    else:
+        base_minimum = settings.MIN_EVIDENCE_QUALITY_FOR_TRADE
     if decision is None:
         return base_minimum
     evidence_basis = _decision_evidence_basis(decision)
@@ -1353,11 +1355,12 @@ def _min_evidence_quality_for_market(
         return base_minimum
     if not _is_whitelisted_primary_source_url(primary_source_url, settings):
         return base_minimum
-    direct_source_minimum = (
-        settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER
-        if market_family(market) == "weather"
-        else settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT
-    )
+    if family == "weather":
+        direct_source_minimum = settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER
+    elif family == "sports":
+        direct_source_minimum = settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS
+    else:
+        direct_source_minimum = settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT
     return min(base_minimum, max(0.0, min(1.0, float(direct_source_minimum))))
 
 
@@ -2250,6 +2253,7 @@ def _log_settings_summary(settings) -> None:
             "confidence_gate_min_evidence_quality": settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY,
             "confidence_gate_override_min_confidence": settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE,
             "min_evidence_quality_for_trade": settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
+            "sports_min_evidence_quality": settings.SPORTS_MIN_EVIDENCE_QUALITY,
             "min_liquidity_usdc": settings.MIN_LIQUIDITY_USDC,
             "min_volume_24h": settings.MIN_VOLUME_24H,
             "min_open_interest": settings.MIN_OPEN_INTEREST,
@@ -2270,6 +2274,7 @@ def _log_settings_summary(settings) -> None:
             "max_music_candidates_per_cycle": settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
             "max_sports_candidates_per_cycle": settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
             "weather_min_evidence_quality": settings.WEATHER_MIN_EVIDENCE_QUALITY,
+            "direct_source_min_evidence_quality_sports": settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS,
             "weather_fallback_edge_min_edge": settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
             "kalshi_server_side_filters_enabled": settings.KALSHI_SERVER_SIDE_FILTERS_ENABLED,
             "kalshi_max_fetch_pages": settings.KALSHI_MAX_FETCH_PAGES,
@@ -7234,7 +7239,11 @@ def main(max_cycles: int | None = None) -> None:
                         "short_prefix_score_penalty": short_prefix_score_penalty,
                         "short_prefix_metrics": short_prefix_metrics,
                         "force_extended_research": (
-                            int(state.non_actionable_streak if state else 0)
+                            (
+                                is_drain_probe
+                                and settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH
+                            )
+                            or int(state.non_actionable_streak if state else 0)
                             >= settings.EXTENDED_RESEARCH_AFTER_STREAK
                         ),
                         "market_snapshot_monotonic": time.monotonic(),
