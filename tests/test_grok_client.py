@@ -272,6 +272,40 @@ class TestGrokClient(unittest.TestCase):
             client.analyze_market_deep(market)
         self.assertEqual(failing.chat.create_calls, 1)
 
+    def test_unimplemented_deep_model_falls_back_to_fast_reasoning_model(self) -> None:
+        market = Market(
+            id="m-deep-unimplemented",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "No durable edge.", '
+            '"evidence_quality": 0.5}'
+        )
+        client = GrokClient(
+            api_key="x",
+            model="grok-4-1-fast-reasoning",
+            model_deep="grok-4.3-latest",
+        )
+        sequenced = SequencedClient(
+            [
+                RuntimeError("StatusCode.UNIMPLEMENTED 404 model unavailable"),
+                content,
+            ]
+        )
+        client.client = sequenced
+
+        decision = client.analyze_market_deep(market)
+
+        self.assertFalse(decision.should_trade)
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["model"], "grok-4.3-latest")
+        self.assertEqual(
+            sequenced.chat.create_kwargs[1]["model"],
+            "grok-4-1-fast-reasoning",
+        )
+
     def test_initial_analysis_still_retries_on_retriable_error(self) -> None:
         market = Market(
             id="m-initial-retry",

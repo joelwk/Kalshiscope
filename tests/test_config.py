@@ -169,7 +169,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.65)
         self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
         self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.80)
-        self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.70)
+        self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
         self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.12)
@@ -189,7 +189,7 @@ class TestConfig(unittest.TestCase):
         env_example = Path(".env.example").read_text(encoding="utf-8")
         expected_lines = {
             "MIN_EDGE=0.12",
-            "SPORTS_MIN_EVIDENCE_QUALITY=0.60",
+            "SPORTS_MIN_EVIDENCE_QUALITY=0.55",
             "LOW_PRICE_MIN_EDGE=0.18",
             "VERY_LOW_PRICE_MIN_EDGE=0.28",
             "LOW_PRICE_MIN_EDGE_MULTIPLIER=0.85",
@@ -198,18 +198,21 @@ class TestConfig(unittest.TestCase):
             "MAX_REASONABLE_EDGE=0.40",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
-            "SCORE_GATE_THRESHOLD=0.42",
-            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25",
-            "MAX_MARKETS_PER_CYCLE=16",
-            "MAX_TRADES_PER_CYCLE=3",
-            "MAX_TRADES_PER_DAY=12",
+            "CONFIDENCE_GATE_MIN_EDGE=0.08",
+            "MIN_EVIDENCE_QUALITY_FOR_TRADE=0.55",
+            "SCORE_GATE_THRESHOLD=0.48",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.40",
+            "MAX_MARKETS_PER_CYCLE=20",
+            "MAX_TRADES_PER_CYCLE=4",
+            "MAX_TRADES_PER_DAY=8",
             "KALSHI_MVE_FILTER=exclude",
             "KALSHI_ELIGIBLE_FLOOR=100",
             "KALSHI_FETCH_TOPUP_ENABLED=false",
             "KELLY_DYNAMIC_ENABLED=true",
             "KELLY_FRACTION_DEFAULT=0.45",
             "GROK_SELF_CONSISTENCY_ENABLED=true",
-            "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD=300",
+            "GROK_ANALYSIS_MAX_BUDGET_SECONDS=420",
+            "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD=400",
             "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD=0.15",
             "CALIBRATION_ONLINE_UPDATE_ENABLED=true",
             "CALIBRATION_ONLINE_ALPHA=0.15",
@@ -217,6 +220,11 @@ class TestConfig(unittest.TestCase):
             "SEARCH_PROFILE_MAX_DOMAINS=5",
             "EXTENDED_RESEARCH_SOURCE_OFFSET=5",
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS=0.60",
+            "PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.28",
+            "PRE_ANALYSIS_ADAPTIVE_BOOST=0.03",
+            "PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=8",
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=8",
+            "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=0.40",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
         }
         for expected_line in expected_lines:
@@ -228,12 +236,14 @@ class TestConfig(unittest.TestCase):
             "PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES": "12",
             "PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD": "0.40",
             "PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY": "0.15",
+            "PRE_ANALYSIS_ADAPTIVE_BOOST": "0.05",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_MIN_SAMPLES, 12)
         self.assertEqual(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_WIN_RATE_THRESHOLD, 0.40)
         self.assertEqual(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PENALTY, 0.15)
+        self.assertEqual(settings.PRE_ANALYSIS_ADAPTIVE_BOOST, 0.05)
 
     def test_weather_profile_defaults_include_official_sources(self) -> None:
         self.assertIn("weather.gov", config.Settings.WEATHER_ALLOWED_DOMAINS)
@@ -420,7 +430,9 @@ class TestConfig(unittest.TestCase):
 
     def test_profit_guardrail_defaults(self) -> None:
         settings = config.Settings()
-        self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.75)
+        self.assertEqual(settings.CONFIDENCE_GATE_MIN_EDGE, 0.08)
+        self.assertEqual(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE, 0.55)
+        self.assertEqual(settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER, 0.72)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS, 0.65)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT, 0.75)
@@ -429,12 +441,14 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_THRESHOLD, 0.60)
         self.assertEqual(settings.SCORE_LOW_INFO_PENALTY_BASE, 0.08)
-        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.55)
-        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 3)
+        self.assertEqual(settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE, 0.28)
+        self.assertEqual(settings.PRE_ANALYSIS_REDUCED_MAX_CANDIDATES, 8)
+        self.assertEqual(settings.PRE_ANALYSIS_ADAPTIVE_BOOST, 0.03)
+        self.assertEqual(settings.MAX_MARKETS_PER_CYCLE, 20)
         self.assertEqual(settings.MAX_CRYPTO_CANDIDATES_PER_CYCLE, 1)
         self.assertEqual(settings.MAX_SPEECH_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.MAX_MUSIC_CANDIDATES_PER_CYCLE, 2)
-        self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 2)
+        self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 4)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
         self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
@@ -450,9 +464,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
-        self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 240)
+        self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 420)
         self.assertTrue(settings.GROK_SELF_CONSISTENCY_ENABLED)
-        self.assertEqual(settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD, 300.0)
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD, 400.0)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD, 0.15)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE, 0.3)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.7)
@@ -648,10 +662,10 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
-        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 1)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 8)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
-        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
 
     def test_research_queue_drain_settings_env_override(self) -> None:
@@ -687,7 +701,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 2)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
-        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.55)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
 
     def test_max_sports_candidates_per_cycle_default_unset(self) -> None:
         """Cycle 4 recovery: the new sports cap defaults to 0 (no cap) so

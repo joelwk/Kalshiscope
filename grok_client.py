@@ -101,6 +101,7 @@ _ANALYSIS_MAX_ATTEMPTS = 3
 _DEEP_ANALYSIS_MAX_ATTEMPTS = 1
 _ANALYSIS_RETRY_WAIT_SECONDS = 2
 _DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 240
+_FAST_REASONING_FALLBACK_MODEL = "grok-4-1-fast-reasoning"
 _SLOW_FAILURE_THRESHOLD_MS = 15_000
 # Reserve a small cushion inside the per-attempt deadline so post-stream work
 # (JSON parse, validation, logging) still fits within the overall budget.
@@ -236,6 +237,15 @@ def _is_quota_exhausted_grok_error(exc: Exception) -> bool:
     """Detect xAI account quota/credit exhaustion (non-retriable, non-transient)."""
     error_text = str(exc).lower()
     return any(marker in error_text for marker in _QUOTA_EXHAUSTED_MARKERS)
+
+
+def _is_model_unimplemented_grok_error(exc: Exception) -> bool:
+    """Detect model/tooling 404s that should fall back to the fast model once."""
+    error_text = str(exc).lower()
+    return (
+        "unimplemented" in error_text
+        and ("404" in error_text or "statuscode.unimplemented" in error_text)
+    )
 
 
 def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
@@ -1653,11 +1663,13 @@ class GrokClient:
         max_attempts: int,
         temperature: float | None = None,
         self_consistency_variant: bool = False,
+        model_override: str | None = None,
+        allow_model_fallback: bool = True,
     ) -> TradeDecision:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
-        model = self.model_deep if deep else self.model
+        model = model_override or (self.model_deep if deep else self.model)
         phase_label = "deep market analysis" if deep else "market analysis"
         logger.debug(
             "Starting %s: id=%s",
@@ -1833,6 +1845,40 @@ class GrokClient:
             duration = (time.monotonic() - start_time) * 1000
             retriable = _is_retriable_grok_error(exc, duration)
             budget_after_error_ms = max(0.0, budget_remaining_ms - duration)
+            if (
+                allow_model_fallback
+                and _is_model_unimplemented_grok_error(exc)
+                and model != _FAST_REASONING_FALLBACK_MODEL
+                and budget_after_error_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0
+            ):
+                logger.warning(
+                    "Grok model unimplemented; retrying with fast model: market=%s model=%s fallback_model=%s",
+                    market.id,
+                    model,
+                    _FAST_REASONING_FALLBACK_MODEL,
+                    data={
+                        "market_id": market.id,
+                        "model": model,
+                        "fallback_model": _FAST_REASONING_FALLBACK_MODEL,
+                        "deep": deep,
+                        "self_consistency_variant": self_consistency_variant,
+                        "budget_remaining_ms": round(budget_after_error_ms, 2),
+                        "error": str(exc),
+                    },
+                )
+                return self._run_analysis_once(
+                    market=market,
+                    search_config=search_config,
+                    previous_analysis=previous_analysis,
+                    deep=False,
+                    retry_attempt=1,
+                    budget_remaining_ms=budget_after_error_ms,
+                    max_attempts=1,
+                    temperature=temperature,
+                    self_consistency_variant=self_consistency_variant,
+                    model_override=_FAST_REASONING_FALLBACK_MODEL,
+                    allow_model_fallback=False,
+                )
             will_retry = (
                 retriable
                 and retry_attempt < max_attempts
@@ -1868,6 +1914,7 @@ class GrokClient:
                     "budget_remaining_ms": round(budget_after_error_ms, 2),
                     "previous_analysis": previous_summary if deep else None,
                     "search_profile": active_config.profile_name,
+                    "model": model,
                 },
             )
             setattr(exc, "_grok_duration_ms", duration)

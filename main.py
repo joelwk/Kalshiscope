@@ -199,6 +199,7 @@ _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES = {
 _PRE_ANALYSIS_AMBIGUOUS_MARKET_PENALTY = 0.08
 _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS = 0.06
 _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS = 0.03
+_PRE_ANALYSIS_POSITIVE_FAMILY_PNL_BONUS = 0.02
 _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
 _AMBIGUOUS_MARKET_TOKENS = (
     "attend",
@@ -4510,8 +4511,20 @@ def _pre_analysis_opportunity_score(
         fallback_family_penalty_scale = 0.5
     historical_profit_bonus = 0.0
     historical_family_volume_bonus = 0.0
-    if historical_family_sample_size >= 8 and historical_family_pnl > 0.0:
-        historical_family_volume_bonus = _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS
+    positive_family_pnl_bonus = 0.0
+    if historical_family_sample_size >= 8 and (
+        historical_family_win_rate > 0.55 or historical_family_pnl > 0.0
+    ):
+        historical_family_volume_bonus = max(
+            0.0,
+            float(
+                getattr(
+                    settings,
+                    "PRE_ANALYSIS_ADAPTIVE_BOOST",
+                    _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS,
+                )
+            ),
+        )
     if (
         historical_family_sample_size >= max(1, settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_MIN_SAMPLES)
         and historical_family_pnl > abs(float(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD))
@@ -4632,6 +4645,9 @@ def _pre_analysis_opportunity_score(
         - coinflip_penalty
         + stacked_historical_excess_credited
     )
+    if historical_family_pnl > 0.0:
+        positive_family_pnl_bonus = _PRE_ANALYSIS_POSITIVE_FAMILY_PNL_BONUS
+        score += positive_family_pnl_bonus
     return score, {
         "pre_score_price_center": price_center_score,
         "pre_score_liquidity": liquidity_score,
@@ -4654,6 +4670,7 @@ def _pre_analysis_opportunity_score(
         "pre_score_historical_family_pnl_total": historical_family_pnl,
         "pre_score_historical_profit_bonus": historical_profit_bonus,
         "pre_score_historical_family_volume_bonus": historical_family_volume_bonus,
+        "pre_score_positive_family_pnl_bonus": positive_family_pnl_bonus,
         "pre_score_source_difficulty_penalty": source_difficulty_penalty,
         "pre_score_ambiguous_resolution_penalty": ambiguous_resolution_penalty,
         "pre_score_ambiguous_market_penalty": ambiguous_market_penalty,
@@ -4979,6 +4996,20 @@ def _resolve_dynamic_analysis_candidate_cap(
         )
         reduced_candidate_cap_applied = True
     return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied, negative_score_floor_applied
+
+
+def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, str, str]:
+    """Prioritize near-threshold research entries before older weak entries."""
+    raw_gap = entry.get("threshold_gap")
+    try:
+        threshold_gap = max(0.0, float(raw_gap))
+    except (TypeError, ValueError):
+        threshold_gap = float("inf")
+    return (
+        threshold_gap,
+        str(entry.get("queued_at") or ""),
+        str(entry.get("market_id") or ""),
+    )
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -6300,6 +6331,10 @@ def main(max_cycles: int | None = None) -> None:
                         excluded_market_ids=excluded_ids,
                         included_market_ids=tuple(current_market_ids),
                     )
+                    drain_rows = sorted(
+                        drain_rows,
+                        key=_research_queue_drain_sort_key,
+                    )
                     selected = 0
                     for entry in drain_rows:
                         mid = str(entry.get("market_id") or "").strip()
@@ -6362,6 +6397,10 @@ def main(max_cycles: int | None = None) -> None:
                             limit=drain_pool_limit,
                             excluded_market_ids=excluded_ids,
                             included_market_ids=tuple(current_market_ids),
+                        )
+                        emergency_rows = sorted(
+                            emergency_rows,
+                            key=_research_queue_drain_sort_key,
                         )
                         emergency_selected = 0
                         for entry in emergency_rows:

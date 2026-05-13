@@ -56,6 +56,7 @@ from main import (
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
     _research_queue_last_decision_json,
+    _research_queue_drain_sort_key,
     _resolve_dynamic_analysis_candidate_cap,
     _resolve_min_bet_floor,
     _score_breakdown_from_execution_audit,
@@ -1029,7 +1030,38 @@ class TestMainUtils(unittest.TestCase):
 
         self.assertEqual(baseline_breakdown["pre_score_historical_family_volume_bonus"], 0.0)
         self.assertGreater(boosted_breakdown["pre_score_historical_family_volume_bonus"], 0.0)
+        self.assertEqual(boosted_breakdown["pre_score_positive_family_pnl_bonus"], 0.02)
         self.assertGreater(boosted_score, baseline_score)
+
+    def test_pre_analysis_opportunity_score_boosts_profitable_family_pnl(self) -> None:
+        market = Market(
+            id="KXMLBF5-26APR0917-TEST",
+            question="MLB First 5 Innings threshold",
+            category="sports",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(PRE_ANALYSIS_ADAPTIVE_BOOST=0.03)
+        baseline_score, baseline_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 0, "win_rate": 0.0, "pnl_total": 0.0},
+        )
+        boosted_score, boosted_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 1, "win_rate": 1.0, "pnl_total": 1.0},
+        )
+
+        self.assertEqual(baseline_breakdown["pre_score_positive_family_pnl_bonus"], 0.0)
+        self.assertEqual(boosted_breakdown["pre_score_positive_family_pnl_bonus"], 0.02)
+        self.assertAlmostEqual(boosted_score - baseline_score, 0.02, places=6)
 
     def test_pre_analysis_opportunity_score_adds_post_event_bonus(self) -> None:
         settings = Settings()
@@ -1180,6 +1212,17 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(cap, 1)
         self.assertTrue(applied)
         self.assertTrue(neg_floor)
+
+    def test_research_queue_drain_sort_key_prioritizes_small_threshold_gap(self) -> None:
+        entries = [
+            {"market_id": "KXWIDE", "threshold_gap": 0.11, "queued_at": "2026-05-13T00:01:00+00:00"},
+            {"market_id": "KXCLOSE", "threshold_gap": 0.01, "queued_at": "2026-05-13T00:02:00+00:00"},
+            {"market_id": "KXUNKNOWN", "threshold_gap": None, "queued_at": "2026-05-13T00:00:00+00:00"},
+        ]
+
+        ordered = sorted(entries, key=_research_queue_drain_sort_key)
+
+        self.assertEqual([entry["market_id"] for entry in ordered], ["KXCLOSE", "KXWIDE", "KXUNKNOWN"])
 
     def test_parallel_attempt_limit_does_not_add_failure_buffer(self) -> None:
         settings = Settings(MAX_MARKETS_PER_CYCLE=6, XAI_CIRCUIT_BREAKER_MAX_FAILURES=3)

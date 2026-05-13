@@ -21,11 +21,11 @@ class Settings:
     MAX_BET_USDC: float = 50.0
     MIN_CONFIDENCE: float = 0.62  # Raised to avoid low-confidence churn and improve calibration
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
-    CONFIDENCE_GATE_MIN_EDGE: float = 0.10
+    CONFIDENCE_GATE_MIN_EDGE: float = 0.08
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
     CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
-    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.75
-    SPORTS_MIN_EVIDENCE_QUALITY: float = 0.70
+    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.55
+    SPORTS_MIN_EVIDENCE_QUALITY: float = 0.55
     MIN_LIQUIDITY_USDC: float = 15.0
     POLL_INTERVAL_SEC: int = 300
     DRY_STREAK_SLEEP_ENABLED: bool = True
@@ -408,7 +408,7 @@ class Settings:
     REFINEMENT_SKIP_BORDERLINE_FAMILIES: tuple[str, ...] = ("sports",)
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 2
-    MAX_MARKETS_PER_CYCLE: int = 3
+    MAX_MARKETS_PER_CYCLE: int = 20
     MAX_WEATHER_CANDIDATES_PER_CYCLE: int = 1
     MAX_CRYPTO_CANDIDATES_PER_CYCLE: int = 1
     # Music/speech candidates per cycle were raised from 1 to 2 after the
@@ -427,7 +427,7 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
-    MAX_TRADES_PER_CYCLE: int = 2
+    MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
     MAX_DAILY_DRAWDOWN_USDC: float = 30.0
@@ -445,9 +445,9 @@ class Settings:
     # initial pass; keep its per-attempt deadline at the pre-fix value of 90s
     # so legitimate refinements (e.g. KXINXU at ~75s) don't timeout.
     GROK_STREAM_TIMEOUT_SECONDS_DEEP: int = 90
-    GROK_ANALYSIS_MAX_BUDGET_SECONDS: int = 240
+    GROK_ANALYSIS_MAX_BUDGET_SECONDS: int = 420
     GROK_SELF_CONSISTENCY_ENABLED: bool = True
-    GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD: float = 300.0
+    GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD: float = 400.0
     GROK_SELF_CONSISTENCY_EDGE_THRESHOLD: float = 0.15
     GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE: float = 0.3
     GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE: float = 0.7
@@ -519,7 +519,7 @@ class Settings:
         "the-numbers.com",
     )
     PRE_ANALYSIS_OPPORTUNITY_ENABLED: bool = True
-    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.55
+    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.28
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND: float = 0.20
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED: bool = True
     # Adaptive widening of the soft-research band when sustained zero-execution
@@ -531,7 +531,7 @@ class Settings:
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED: bool = True
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX: float = 0.30
     PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD: float = 0.50
-    PRE_ANALYSIS_REDUCED_MAX_CANDIDATES: int = 3
+    PRE_ANALYSIS_REDUCED_MAX_CANDIDATES: int = 8
     PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY: float = 0.25
     PRE_ANALYSIS_NON_ACTIONABLE_STREAK_CAP: int = 8
     PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY: float = 0.15
@@ -554,6 +554,7 @@ class Settings:
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY: float = 0.10
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD: float = -15.0
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY: float = 0.15
+    PRE_ANALYSIS_ADAPTIVE_BOOST: float = 0.03
     # Cap on the combined "stacked historical-family penalty" set in
     # _pre_analysis_opportunity_score. The fallback-family, historical-family
     # win-rate, historical-family PnL, zero-trade-rate, negative-prefix and
@@ -626,10 +627,10 @@ class Settings:
     # the queue is not a write-only black hole. Conservative defaults: at most one
     # forced probe per cycle, only after the entry has aged at least an hour.
     RESEARCH_QUEUE_DRAIN_ENABLED: bool = True
-    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 1
+    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 8
     RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
     RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
-    RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.55
+    RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
     RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
     EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
@@ -1591,6 +1592,10 @@ def load_settings() -> Settings:
         PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY=_read_env_float(
             "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY",
             Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY,
+        ),
+        PRE_ANALYSIS_ADAPTIVE_BOOST=_read_env_float(
+            "PRE_ANALYSIS_ADAPTIVE_BOOST",
+            Settings.PRE_ANALYSIS_ADAPTIVE_BOOST,
         ),
         PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=_read_env_float(
             "PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP",

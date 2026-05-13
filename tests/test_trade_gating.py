@@ -266,10 +266,10 @@ def test_zero_bet_skip_message_is_mode_aware() -> None:
     assert "edge scaling" in _zero_bet_skip_message("edge_scaling")
 
 
-def test_min_evidence_quality_floor_default_is_raised() -> None:
+def test_min_evidence_quality_floor_default_allows_crypto_volume_tuning() -> None:
     settings = Settings()
     generic_market = Market(id="m-eq-floor", question="Will BTC close above threshold?", category="crypto")
-    assert _min_evidence_quality_for_market(generic_market, settings) == 0.75
+    assert _min_evidence_quality_for_market(generic_market, settings) == 0.55
 
 
 def test_edge_gate_blocks_below_tightened_global_min_edge() -> None:
