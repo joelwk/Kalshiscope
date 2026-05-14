@@ -533,6 +533,16 @@ class GrokClient:
             value = value / 100.0
         return max(-1.0, min(1.0, value))
 
+    @staticmethod
+    def _near_binary_probability(value: float | None) -> bool:
+        if value is None:
+            return False
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            return False
+        return normalized >= 0.95 or normalized <= 0.05
+
     def _derive_edge(
         self,
         implied: float | None,
@@ -746,6 +756,12 @@ class GrokClient:
             0.0,
             min(1.0, active_settings.GROK_ABSTAIN_EVIDENCE_THRESHOLD),
         )
+        definitive_raw_evidence_floor = max(
+            0.0,
+            min(1.0, active_settings.DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR),
+        )
+        definitive_raw_evidence_ok = raw_evidence_quality >= definitive_raw_evidence_floor
+        definitive_probability_ok = self._near_binary_probability(decision.my_prob)
         validated_confidence = float(max(0.0, min(1.0, decision.confidence)))
         if (
             decision.should_trade
@@ -801,6 +817,8 @@ class GrokClient:
                 has_definitive_outcome_signal
                 and decision.likelihood_ratio is not None
                 and decision.likelihood_ratio >= 10.0
+                and definitive_raw_evidence_ok
+                and definitive_probability_ok
             ):
                 evidence_floor = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
             if market_edge is None or abs(market_edge) < _LOW_QUALITY_EDGE_BUFFER:
@@ -835,6 +853,8 @@ class GrokClient:
             and has_definitive_outcome_signal
             and decision.likelihood_ratio is not None
             and decision.likelihood_ratio >= 10.0
+            and definitive_raw_evidence_ok
+            and definitive_probability_ok
             and not low_information
             and primary_source_satisfies_direct
         )
@@ -1895,7 +1915,7 @@ class GrokClient:
                         "response_preview": _response_preview(content),
                     },
                 )
-            log_fn = logger.warning if will_retry else logger.error
+            log_fn = logger.warning if (will_retry or self_consistency_variant) else logger.error
             log_fn(
                 "%s failed: id=%s, error=%s, duration=%.2fms",
                 phase_label.capitalize(),
@@ -1911,10 +1931,12 @@ class GrokClient:
                     "will_retry": will_retry,
                     "quota_exhausted": _is_quota_exhausted_grok_error(exc),
                     "retry_attempt": retry_attempt,
+                    "max_attempts": max_attempts,
                     "budget_remaining_ms": round(budget_after_error_ms, 2),
                     "previous_analysis": previous_summary if deep else None,
                     "search_profile": active_config.profile_name,
                     "model": model,
+                    "self_consistency_variant": self_consistency_variant,
                 },
             )
             setattr(exc, "_grok_duration_ms", duration)

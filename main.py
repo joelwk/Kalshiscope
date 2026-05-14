@@ -115,6 +115,38 @@ _COMMODITY_MARKET_TOKENS = (
     "WHEAT",
     "AAA",
 )
+_SPORTS_ENTITY_STOPWORDS = frozenset(
+    {
+        "above",
+        "after",
+        "against",
+        "base",
+        "bases",
+        "below",
+        "first",
+        "game",
+        "have",
+        "hits",
+        "home",
+        "inning",
+        "innings",
+        "matchup",
+        "over",
+        "period",
+        "player",
+        "points",
+        "prop",
+        "runs",
+        "score",
+        "sports",
+        "team",
+        "than",
+        "total",
+        "under",
+        "will",
+        "with",
+    }
+)
 _HISTORICAL_WIN_RATE_BY_BUCKET = {
     0.7: 0.43,
     0.8: 0.50,
@@ -1026,8 +1058,21 @@ def _passes_edge_threshold(
         else decision.confidence
     )
     edge = effective_confidence - implied_prob
-    is_definitive = _is_definitive_outcome_eligible(decision, settings)
-    is_definitive_validated = _is_definitive_validated(decision, settings)
+    if (
+        str(getattr(decision, "edge_source", "") or "").strip().lower() == "none"
+        and getattr(decision, "my_prob", None) is None
+    ):
+        return False, edge, "missing_structured_probability"
+    is_definitive = _is_definitive_outcome_eligible(
+        decision,
+        settings,
+        market=market,
+    )
+    is_definitive_validated = _is_definitive_validated(
+        decision,
+        settings,
+        market=market,
+    )
     max_reasonable_edge = (
         max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX)))
         if is_definitive_validated
@@ -1157,6 +1202,7 @@ def _max_confidence_for_market(market: Market | None, settings: Settings) -> flo
 def _non_definitive_confidence_ceiling(
     decision: TradeDecision,
     settings: Settings,
+    market: Market | None = None,
 ) -> float:
     """Hard ceiling for non-definitive trades per historical calibration data.
 
@@ -1164,7 +1210,7 @@ def _non_definitive_confidence_ceiling(
     Allow definitive-outcome-eligible decisions to bypass this cap since they
     are backed by settlement-aligned primary sources.
     """
-    if _is_definitive_outcome_eligible(decision, settings):
+    if _is_definitive_outcome_eligible(decision, settings, market=market):
         return 1.0
     evidence_basis = str(getattr(decision, "evidence_basis", "") or "").strip().lower()
     if evidence_basis == "direct":
@@ -1194,9 +1240,84 @@ def _is_whitelisted_primary_source_url(url: str, settings: Settings) -> bool:
     return False
 
 
+def _decision_raw_evidence_quality(decision: TradeDecision) -> float:
+    raw_value = getattr(decision, "raw_evidence_quality", None)
+    if raw_value is None:
+        raw_value = getattr(decision, "evidence_quality", 0.0)
+    try:
+        return max(0.0, min(1.0, float(raw_value or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _decision_has_near_binary_my_prob(decision: TradeDecision) -> bool:
+    my_prob = getattr(decision, "my_prob", None)
+    if my_prob is None:
+        return False
+    try:
+        my_prob_value = float(my_prob)
+    except (TypeError, ValueError):
+        return False
+    return my_prob_value >= 0.95 or my_prob_value <= 0.05
+
+
+def _significant_market_tokens(text: str) -> set[str]:
+    tokens = set()
+    for token in re.findall(r"[a-zA-Z][a-zA-Z']{3,}", text or ""):
+        normalized = token.strip("'").lower()
+        if normalized and normalized not in _SPORTS_ENTITY_STOPWORDS:
+            tokens.add(normalized)
+    return tokens
+
+
+def _decision_source_text(decision: TradeDecision) -> str:
+    parts = [
+        str(getattr(decision, "reasoning", "") or ""),
+        str(getattr(decision, "primary_source_url", "") or ""),
+    ]
+    key_sources = getattr(decision, "key_sources", None)
+    if isinstance(key_sources, (list, tuple)):
+        parts.extend(str(item) for item in key_sources)
+    elif key_sources:
+        parts.append(str(key_sources))
+    return " ".join(parts).lower()
+
+
+def _sports_settlement_source_matches_market(
+    decision: TradeDecision,
+    market: Market | None,
+) -> bool:
+    if market is None or market_family(market) != "sports":
+        return True
+    source_match = str(getattr(decision, "source_match_class", "") or "").strip().lower()
+    if source_match != "settlement_aligned":
+        return True
+
+    tokens = _significant_market_tokens(
+        " ".join(
+            (
+                str(getattr(market, "question", "") or ""),
+                str(getattr(market, "resolution_criteria", "") or ""),
+            )
+        )
+    )
+    if not tokens:
+        return True
+
+    decision_text = _decision_source_text(decision)
+    matched_tokens = {
+        token
+        for token in tokens
+        if re.search(rf"\b{re.escape(token)}\b", decision_text)
+    }
+    required_matches = 2 if len(tokens) >= 2 else 1
+    return len(matched_tokens) >= required_matches
+
+
 def _is_high_quality_settled_evidence(
     decision: TradeDecision,
     settings: Settings,
+    market: Market | None = None,
 ) -> bool:
     """Recognize concrete settlement-aligned chart/observation evidence.
 
@@ -1238,7 +1359,9 @@ def _is_high_quality_settled_evidence(
     primary_source_url = str(getattr(decision, "primary_source_url", "") or "").strip()
     if not primary_source_url:
         return False
-    return _is_whitelisted_primary_source_url(primary_source_url, settings)
+    if not _is_whitelisted_primary_source_url(primary_source_url, settings):
+        return False
+    return _sports_settlement_source_matches_market(decision, market)
 
 
 def _should_suppress_hallucinated_edge_penalty(
@@ -1246,6 +1369,7 @@ def _should_suppress_hallucinated_edge_penalty(
     decision: TradeDecision,
     evidence_basis: str,
     settings: Settings,
+    market: Market | None = None,
 ) -> bool:
     if str(evidence_basis or "").strip().lower() != "direct":
         return False
@@ -1255,23 +1379,23 @@ def _should_suppress_hallucinated_edge_penalty(
     if not _is_whitelisted_primary_source_url(primary_source_url, settings):
         return False
     if bool(getattr(decision, "definitive_outcome_detected", False)):
-        return True
-    return _is_high_quality_settled_evidence(decision, settings)
+        return _is_definitive_outcome_eligible(decision, settings, market=market)
+    return _is_high_quality_settled_evidence(decision, settings, market=market)
 
 
 def _is_definitive_outcome_eligible(
     decision: TradeDecision,
     settings: Settings,
+    market: Market | None = None,
 ) -> bool:
     """Check whether a decision qualifies for definitive-outcome floor overrides.
 
-    A decision is eligible when EITHER:
-    - The model explicitly set ``definitive_outcome_detected=True`` AND has a
-      whitelisted primary_source_url + direct evidence_basis, OR
-    - The decision cites a whitelisted primary source URL with direct
-      evidence basis AND ``my_prob`` is in the near-binary range
-      ``[0.95, 1.0]`` or ``[0.0, 0.05]`` (auto-detect for cases where the
-      model forgot to flag a clearly-resolved outcome).
+    Definitive overrides are intentionally strict because they bypass several
+    normal uncertainty penalties. A candidate needs direct, whitelisted,
+    settlement-aligned evidence, high raw evidence quality, and a structured
+    near-binary ``my_prob``. Sports settlement sources also need to mention
+    the market's own entity tokens so an unrelated boxscore cannot unlock
+    definitive handling.
     """
     evidence_basis = _decision_evidence_basis(decision)
     if evidence_basis != "direct":
@@ -1281,21 +1405,26 @@ def _is_definitive_outcome_eligible(
         return False
     if not _is_whitelisted_primary_source_url(primary_source_url, settings):
         return False
-    if bool(getattr(decision, "definitive_outcome_detected", False)):
-        return True
-    my_prob = getattr(decision, "my_prob", None)
-    if my_prob is None:
+    source_match = str(getattr(decision, "source_match_class", "") or "").strip().lower()
+    if source_match != "settlement_aligned":
         return False
-    try:
-        my_prob_value = float(my_prob)
-    except (TypeError, ValueError):
+    if not _sports_settlement_source_matches_market(decision, market):
         return False
-    return my_prob_value >= 0.95 or my_prob_value <= 0.05
+    if not _decision_has_near_binary_my_prob(decision):
+        return False
+    raw_eq_floor = max(
+        0.0,
+        min(1.0, float(settings.DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR)),
+    )
+    if _decision_raw_evidence_quality(decision) < raw_eq_floor:
+        return False
+    return True
 
 
 def _is_definitive_validated(
     decision: TradeDecision,
     settings: Settings,
+    market: Market | None = None,
 ) -> bool:
     """Strict validation that gates the higher ``DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX`` cap.
 
@@ -1309,7 +1438,7 @@ def _is_definitive_validated(
       compensates for the relaxed ``definitive_outcome_detected`` requirement.
     """
     legacy_validated = (
-        _is_definitive_outcome_eligible(decision, settings)
+        _is_definitive_outcome_eligible(decision, settings, market=market)
         and bool(getattr(decision, "definitive_outcome_detected", False))
         and float(getattr(decision, "evidence_quality", 0.0) or 0.0) >= 0.80
         and _decision_evidence_basis(decision) == "direct"
@@ -1318,7 +1447,7 @@ def _is_definitive_validated(
     )
     if legacy_validated:
         return True
-    return _is_high_quality_settled_evidence(decision, settings)
+    return _is_high_quality_settled_evidence(decision, settings, market=market)
 
 
 def _apply_definitive_outcome_floors(
@@ -1334,7 +1463,7 @@ def _apply_definitive_outcome_floors(
     ``definitive_outcome_detected`` set to True so downstream consumers
     pick up the auto-detection.
     """
-    if not _is_definitive_outcome_eligible(decision, settings):
+    if not _is_definitive_outcome_eligible(decision, settings, market=market):
         return decision, False
     floor = max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR)))
     current_eq = float(decision.evidence_quality or 0.0)
@@ -1406,7 +1535,10 @@ def _should_queue_research_for_blocked_trade(
     if gate_name == "evidence":
         return normalized_gap <= _RESEARCH_QUEUE_EVIDENCE_GAP_MAX
     if gate_name == "edge":
-        if str(edge_reason or "") == "edge_above_reasonable_max":
+        if str(edge_reason or "") in {
+            "edge_above_reasonable_max",
+            "missing_structured_probability",
+        }:
             return True
         return normalized_gap <= _RESEARCH_QUEUE_EDGE_GAP_MAX
     if gate_name in {"hallucinated_edge", "extreme_market_edge"}:
@@ -5261,8 +5393,10 @@ def _analyze_market_candidate(
     decision = _cap_confidence_for_category(decision, market, settings)
     confidence_before_calibration = decision.confidence
     evidence_basis_for_calibration = _decision_evidence_basis(decision)
-    definitive_outcome_for_calibration = bool(
-        getattr(decision, "definitive_outcome_detected", False)
+    definitive_outcome_for_calibration = _is_definitive_outcome_eligible(
+        decision,
+        settings,
+        market=market,
     )
     stage_one_confidence = calibrate_confidence(
         decision.confidence,
@@ -5318,7 +5452,11 @@ def _analyze_market_candidate(
                 ),
             }
         )
-    _nd_ceiling = _non_definitive_confidence_ceiling(decision, settings)
+    _nd_ceiling = _non_definitive_confidence_ceiling(
+        decision,
+        settings,
+        market=market,
+    )
     if decision.confidence > _nd_ceiling:
         _nd_original = decision.confidence
         _nd_scaled_bet = decision.bet_size_pct
@@ -8133,8 +8271,13 @@ def main(max_cycles: int | None = None) -> None:
                     decision=decision,
                     evidence_basis=evidence_basis_for_rank,
                     settings=settings,
+                    market=market,
                 )
-                definitive_eligible_for_rank = _is_definitive_outcome_eligible(decision, settings)
+                definitive_eligible_for_rank = _is_definitive_outcome_eligible(
+                    decision,
+                    settings,
+                    market=market,
+                )
                 implied_prob_for_rank = _get_implied_probability(market, decision.outcome)
                 short_prefix_penalty_for_rank = float(
                     candidate.get("short_prefix_score_penalty", 0.0) or 0.0
@@ -8893,7 +9036,9 @@ def main(max_cycles: int | None = None) -> None:
                         override_edge=override_edge,
                     )
                     if not confidence_override_allowed and _is_definitive_outcome_eligible(
-                        decision, settings
+                        decision,
+                        settings,
+                        market=market,
                     ):
                         confidence_override_allowed = True
                         override_min_confidence = settings.MIN_CONFIDENCE
@@ -9300,7 +9445,9 @@ def main(max_cycles: int | None = None) -> None:
                     decision_for_edge.edge_source,
                     market=None,
                     definitive_outcome_eligible=_is_definitive_outcome_eligible(
-                        decision_for_edge, settings
+                        decision_for_edge,
+                        settings,
+                        market=market,
                     ),
                 )
                 edge_threshold_reduction = max(
@@ -9320,7 +9467,11 @@ def main(max_cycles: int | None = None) -> None:
                 audit_context["gate_edge_dynamic_reduction_applied"] = (
                     edge_threshold_reduction > 1e-9
                 )
-                _def_validated = _is_definitive_validated(decision_for_edge, settings)
+                _def_validated = _is_definitive_validated(
+                    decision_for_edge,
+                    settings,
+                    market=market,
+                )
                 if _def_validated:
                     audit_context["definitive_edge_bypass_validated"] = True
                 calibration_payload = {
@@ -9366,6 +9517,11 @@ def main(max_cycles: int | None = None) -> None:
                             rejection_breakdown,
                             "edge_below_min",
                         )
+                    elif edge_reason == "missing_structured_probability":
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "missing_structured_probability",
+                        )
                     edge_shortfall = max(
                         0.0,
                         float(required_edge_threshold - float(edge_value or 0.0)),
@@ -9380,7 +9536,12 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     research_reason = (
                         edge_reason
-                        if queue_for_research and str(edge_reason or "") == "edge_above_reasonable_max"
+                        if queue_for_research
+                        and str(edge_reason or "")
+                        in {
+                            "edge_above_reasonable_max",
+                            "missing_structured_probability",
+                        }
                         else "edge_gate_blocked"
                     )
                     final_action = "research_queued" if queue_for_research else "skip"
@@ -9615,6 +9776,7 @@ def main(max_cycles: int | None = None) -> None:
                         decision=decision_for_edge,
                         evidence_basis=evidence_basis,
                         settings=settings,
+                        market=market,
                     )
                 )
                 exec_pfx_stats = _get_prefix_pnl(market.id or "")
@@ -9646,7 +9808,9 @@ def main(max_cycles: int | None = None) -> None:
                         short_prefix_penalty=short_prefix_score_penalty,
                         suppress_hallucinated_edge_penalty=suppress_hallucinated_edge_penalty,
                         definitive_outcome_eligible=_is_definitive_outcome_eligible(
-                            decision_for_edge, settings
+                            decision_for_edge,
+                            settings,
+                            market=market,
                         ),
                         historical_family_pnl_total=float(
                             candidate.get("historical_family_pnl_total", 0.0) or 0.0
@@ -9681,7 +9845,9 @@ def main(max_cycles: int | None = None) -> None:
                     evidence_basis_class=evidence_basis,
                     edge_source=decision_for_edge.edge_source,
                     definitive_outcome_eligible=_is_definitive_outcome_eligible(
-                        decision_for_edge, settings
+                        decision_for_edge,
+                        settings,
+                        market=market,
                     ),
                 )
                 score_receipt_fields = _apply_runtime_score_receipt(
@@ -10898,7 +11064,9 @@ def main(max_cycles: int | None = None) -> None:
                         decision=decision_for_edge,
                         evidence_basis=evidence_basis,
                         primary_source_whitelisted=_is_definitive_outcome_eligible(
-                            decision_for_edge, settings
+                            decision_for_edge,
+                            settings,
+                            market=market,
                         ),
                         cycle_overrides_applied=cycle_definitive_overrides_applied,
                         max_overrides_per_cycle=settings.MAX_DEFINITIVE_OVERRIDES_PER_CYCLE,
@@ -11967,16 +12135,16 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     "participation_tier_breakdown": participation_tier_breakdown,
                 }
-                # Escalate to ERROR once sustained selection failure exceeds the
-                # configured threshold so predictbot_errors.log captures it.
-                # First-time alerts stay at WARN to avoid noise.
+                # Sustained zero-execution yield is a calibration signal, not a
+                # thrown runtime error. Keep it out of predictbot_errors.log
+                # while still tagging sustained alerts for dashboards.
                 escalate_to_error = (
                     settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
                     and consecutive_zero_execution_yield_cycles
                     >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
                 )
                 if escalate_to_error:
-                    logger.error(
+                    logger.warning(
                         "Cycle yield alert (sustained, %d cycles): 0 execution candidates "
                         "with %d research-queued; top tiers: %s — investigate gate calibration",
                         consecutive_zero_execution_yield_cycles,

@@ -502,6 +502,43 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(sequenced.chat.create_calls, 1)
         self.assertEqual(sequenced.chat.create_kwargs[0]["temperature"], 0.3)
 
+    def test_self_consistency_second_pass_timeout_is_not_logged_as_error(self) -> None:
+        market = Market(
+            id="m-self-consistency-timeout",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.75, '
+            '"probability_yes": 0.75, "bet_size_pct": 0.5, '
+            '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
+            '"evidence_quality": 0.8}'
+        )
+        timeout = RuntimeError('StatusCode.DEADLINE_EXCEEDED details = "Deadline Exceeded"')
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, timeout])
+        client.client = sequenced
+
+        with patch("grok_client.logger.error") as error_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertTrue(decision.should_trade)
+        error_mock.assert_not_called()
+        self.assertTrue(
+            any(
+                call.kwargs.get("data", {}).get("self_consistency_variant") is True
+                and call.kwargs.get("data", {}).get("will_retry") is False
+                for call in warning_mock.call_args_list
+            )
+        )
+
     def test_tools_use_search_config(self) -> None:
         market = Market(
             id="m2",
@@ -1191,11 +1228,11 @@ class TestGrokClient(unittest.TestCase):
                 "Final score in official recap from Reuters confirms settlement outcome."
             ),
             implied_prob_external=None,
-            my_prob=0.85,
+            my_prob=0.97,
             edge_external=0.35,
             edge_source="fallback",
             likelihood_ratio=25.0,
-            evidence_quality=0.10,
+            evidence_quality=0.80,
             primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(api_key="x")
@@ -1209,6 +1246,39 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.source_match_class, "settlement_aligned")
         self.assertEqual(validated.evidence_basis, "direct")
+
+    def test_validate_and_enrich_definitive_outcome_requires_structured_probability(self) -> None:
+        market = Market(
+            id="m-definitive-no-my-prob",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap from Reuters confirms settlement outcome. "
+                "My probability: 97%."
+            ),
+            implied_prob_external=None,
+            my_prob=None,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.90,
+            primary_source_url="https://www.reuters.com/sports/example",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertFalse(validated.definitive_outcome_detected)
+        self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
 
     def test_validate_and_enrich_suppresses_non_sports_direct_floor_without_primary_url(self) -> None:
         market = Market(
@@ -1257,11 +1327,11 @@ class TestGrokClient(unittest.TestCase):
                 "Final score in official recap from Reuters confirms settlement outcome."
             ),
             implied_prob_external=None,
-            my_prob=0.85,
+            my_prob=0.97,
             edge_external=0.35,
             edge_source="fallback",
             likelihood_ratio=25.0,
-            evidence_quality=0.10,
+            evidence_quality=0.80,
             primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(

@@ -94,11 +94,12 @@ def test_log_trade_decision_includes_terminal_audit_fields() -> None:
 
 
 def test_predictbot_errors_log_captures_error_level_events(fresh_logging: Path) -> None:
-    """Cycle 2 emitted a ``logger.error("Cycle yield alert (sustained...)")``
-    that needs to land in ``predictbot_errors.log`` so operators can see
-    sustained selection-failure escalations without scanning the full debug
-    log. This regression test exercises the root-attached error handler so
-    we know the routing works end-to-end."""
+    """ERROR-level events should land in ``predictbot_errors.log``.
+
+    This regression test exercises the root-attached error handler so we know
+    true runtime errors route correctly without depending on a specific bot
+    alert type.
+    """
     setup_logging(
         level="DEBUG",
         file_level="DEBUG",
@@ -110,9 +111,9 @@ def test_predictbot_errors_log_captures_error_level_events(fresh_logging: Path) 
     set_correlation_id("test_cid")
     logger = get_logger("predictbot")
     logger.error(
-        "Cycle yield alert (sustained, %d cycles)",
-        2,
-        data={"cycle_yield_alert": True, "research_queue_size": 168},
+        "Synthetic runtime error: %s",
+        "boom",
+        data={"synthetic_runtime_error": True},
     )
     for handler in logging.getLogger().handlers:
         handler.flush()
@@ -123,9 +124,9 @@ def test_predictbot_errors_log_captures_error_level_events(fresh_logging: Path) 
     assert content, "predictbot_errors.log is empty after ERROR event"
     record = json.loads(content.splitlines()[-1])
     assert record["level"] == "ERROR"
-    assert "Cycle yield alert" in record["message"]
+    assert "Synthetic runtime error" in record["message"]
     assert record["correlation_id"] == "test_cid"
-    assert record.get("data", {}).get("cycle_yield_alert") is True
+    assert record.get("data", {}).get("synthetic_runtime_error") is True
 
 
 def test_predictbot_errors_log_ignores_warning_level(fresh_logging: Path) -> None:

@@ -3367,8 +3367,12 @@ class TestNonDefinitiveConfidenceCeiling(unittest.TestCase):
         decision = self._make_decision(
             confidence=0.95,
             evidence_basis="direct",
+            evidence_quality=0.90,
+            raw_evidence_quality=0.90,
             definitive_outcome_detected=True,
             primary_source_url="https://apnews.com/article/example",
+            source_match_class="settlement_aligned",
+            my_prob=0.97,
         )
         settings = Settings()
         ceiling = _non_definitive_confidence_ceiling(decision, settings)

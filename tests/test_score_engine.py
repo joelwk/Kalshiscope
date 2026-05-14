@@ -1841,9 +1841,12 @@ def test_non_definitive_confidence_ceiling_allows_definitive() -> None:
         bet_size_pct=0.5,
         reasoning="test",
         evidence_quality=0.90,
+        raw_evidence_quality=0.90,
         evidence_basis="direct",
         definitive_outcome_detected=True,
         primary_source_url="https://apnews.com/article/example",
+        source_match_class="settlement_aligned",
+        my_prob=0.97,
     )
     settings = Settings(MAX_GLOBAL_CONFIDENCE_DIRECT=0.89)
     ceiling = _non_definitive_confidence_ceiling(decision, settings)
