@@ -342,6 +342,11 @@ class TestConfig(unittest.TestCase):
             "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD": "0.18",
             "GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE": "0.25",
             "GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE": "0.85",
+            "EDGE_REPAIR_ENABLED": "false",
+            "EDGE_BAND_CALIBRATION_ENABLED": "false",
+            "DAILY_EXPECTANCY_ENABLED": "false",
+            "DAILY_EXPECTANCY_PRIMARY_TARGETS": "3",
+            "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT": "0.15",
             "PRE_ORDER_MARKET_REFRESH": "true",
             "ORDERBOOK_PRECHECK_ENABLED": "true",
             "ORDERBOOK_PRECHECK_MIN_CONFIDENCE": "0.8",
@@ -376,6 +381,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD, 0.18)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE, 0.25)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.85)
+        self.assertFalse(settings.EDGE_REPAIR_ENABLED)
+        self.assertFalse(settings.EDGE_BAND_CALIBRATION_ENABLED)
+        self.assertFalse(settings.DAILY_EXPECTANCY_ENABLED)
+        self.assertEqual(settings.DAILY_EXPECTANCY_PRIMARY_TARGETS, 3)
+        self.assertEqual(settings.DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT, 0.15)
         self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
         self.assertTrue(settings.ORDERBOOK_PRECHECK_ENABLED)
         self.assertEqual(settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE, 0.8)
@@ -479,6 +489,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD, 0.15)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE, 0.3)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.7)
+        self.assertTrue(settings.EDGE_REPAIR_ENABLED)
+        self.assertTrue(settings.EDGE_BAND_CALIBRATION_ENABLED)
+        self.assertTrue(settings.DAILY_EXPECTANCY_ENABLED)
+        self.assertEqual(settings.DAILY_EXPECTANCY_PRIMARY_TARGETS, 2)
+        self.assertEqual(settings.DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT, 0.25)
         self.assertTrue(settings.CALIBRATION_ONLINE_UPDATE_ENABLED)
         self.assertEqual(settings.CALIBRATION_ONLINE_ALPHA, 0.15)
         self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 500)
@@ -676,6 +691,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
+        self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 2)
 
     def test_research_queue_drain_settings_env_override(self) -> None:
         env = {
@@ -686,6 +702,7 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS": "24.0",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY": "0.65",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH": "false",
+            "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS": "5",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -695,6 +712,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 24.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.65)
         self.assertFalse(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
+        self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 5)
 
     def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
         """Cycle 4 recovery: a growing research queue (127+ entries) needs

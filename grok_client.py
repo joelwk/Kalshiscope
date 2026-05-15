@@ -1340,6 +1340,26 @@ class GrokClient:
             return first
 
         averaged_yes = max(0.0, min(1.0, (first_yes + second_yes) / 2.0))
+        first_outcome = (
+            self._canonical_outcome_for_market(market, first.outcome) or first.outcome
+        )
+        second_outcome = (
+            self._canonical_outcome_for_market(market, second.outcome) or second.outcome
+        )
+        first_side = self._normalize_outcome_label(first_outcome)
+        second_side = self._normalize_outcome_label(second_outcome)
+        side_disagree = (
+            first_side in {"yes", "true", "1", "no", "false", "0"}
+            and second_side in {"yes", "true", "1", "no", "false", "0"}
+            and (first_side in {"yes", "true", "1"}) != (second_side in {"yes", "true", "1"})
+        )
+        trade_disagree = bool(first.should_trade) != bool(second.should_trade)
+        probability_gap = abs(first_yes - second_yes)
+        material_probability_gap = max(
+            0.12,
+            float(getattr(self.settings, "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD", 0.15)),
+        )
+        probability_disagree = probability_gap >= material_probability_gap
         yes_outcome = self._canonical_outcome_for_market(market, "YES")
         no_outcome = self._canonical_outcome_for_market(market, "NO")
         if yes_outcome and no_outcome:
@@ -1352,12 +1372,64 @@ class GrokClient:
 
         merged_sources = list(dict.fromkeys([*(first.key_sources or []), *(second.key_sources or [])]))[:4]
         critique = second.self_critique or second.uncertainty_note or second.reasoning
+        if trade_disagree or side_disagree or probability_disagree:
+            repair_critique = (
+                "self_consistency_disagreement: "
+                f"trade_disagree={trade_disagree}, side_disagree={side_disagree}, "
+                f"probability_gap={probability_gap:.4f}; deep repair required before execution. "
+                f"second-pass critique: {str(critique or '').strip()}"
+            )
+            conservative_confidence = min(
+                value
+                for value in (
+                    self._bounded_probability(first.confidence),
+                    self._bounded_probability(second.confidence),
+                    self._bounded_probability(merged_confidence),
+                )
+                if value is not None
+            )
+            return first.model_copy(
+                update={
+                    "should_trade": False,
+                    "abstain": True,
+                    "bet_size_pct": 0.0,
+                    "outcome": merged_outcome,
+                    "confidence": conservative_confidence,
+                    "probability_yes": averaged_yes,
+                    "my_prob": conservative_confidence,
+                    "implied_prob_external": self._market_implied_probability(
+                        market,
+                        merged_outcome,
+                    ),
+                    "key_sources": merged_sources,
+                    "uncertainty_note": second.uncertainty_note or first.uncertainty_note,
+                    "self_critique": repair_critique[:800],
+                    "raw_confidence": conservative_confidence,
+                    "raw_outcome": merged_outcome,
+                    "prompt_tokens": (first.prompt_tokens or 0) + (second.prompt_tokens or 0),
+                    "completion_tokens": (first.completion_tokens or 0) + (second.completion_tokens or 0),
+                    "reasoning_tokens": (first.reasoning_tokens or 0) + (second.reasoning_tokens or 0),
+                    "cached_tokens": (first.cached_tokens or 0) + (second.cached_tokens or 0),
+                    "reasoning": (
+                        f"{first.reasoning}\n"
+                        f"[self_consistency_disagreement] average YES={averaged_yes:.4f}; "
+                        f"trade_disagree={trade_disagree}; side_disagree={side_disagree}; "
+                        f"probability_gap={probability_gap:.4f}; "
+                        f"second-pass critique: {str(critique or '').strip()}"
+                    ).strip(),
+                }
+            )
         merged = first.model_copy(
             update={
-                "should_trade": bool(first.should_trade or second.should_trade),
+                "should_trade": bool(first.should_trade and second.should_trade),
                 "outcome": merged_outcome,
                 "confidence": max(0.0, min(1.0, merged_confidence)),
                 "probability_yes": averaged_yes,
+                "my_prob": max(0.0, min(1.0, merged_confidence)),
+                "implied_prob_external": self._market_implied_probability(
+                    market,
+                    merged_outcome,
+                ),
                 "key_sources": merged_sources,
                 "base_rate_used": (
                     first.base_rate_used if first.base_rate_used is not None else second.base_rate_used

@@ -472,10 +472,43 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(sequenced.chat.create_kwargs[0]["temperature"], 0.3)
         self.assertEqual(sequenced.chat.create_kwargs[1]["temperature"], 0.7)
         self.assertAlmostEqual(decision.probability_yes or 0.0, 0.70)
-        self.assertAlmostEqual(decision.confidence, 0.70)
+        self.assertLessEqual(decision.confidence, 0.70)
         self.assertIn("source A", decision.key_sources)
         self.assertIn("source B", decision.key_sources)
         self.assertIn("Recent base rate", decision.self_critique or "")
+
+    def test_self_consistency_disagreement_marks_deep_repair_required(self) -> None:
+        market = Market(
+            id="m-self-consistency-disagree",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.78, '
+            '"probability_yes": 0.78, "bet_size_pct": 0.5, '
+            '"reasoning": "YES edge", "evidence_quality": 0.8}'
+        )
+        second = (
+            '{"should_trade": false, "outcome": "NO", "confidence": 0.62, '
+            '"probability_yes": 0.38, "bet_size_pct": 0.0, '
+            '"reasoning": "Counter-evidence favors NO.", '
+            '"evidence_quality": 0.8, "self_critique": "Sources conflict."}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, second])
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertFalse(decision.should_trade)
+        self.assertTrue(decision.abstain)
+        self.assertIn("self_consistency_disagreement", decision.reasoning)
+        self.assertIn("deep repair required", decision.self_critique or "")
 
     def test_self_consistency_skips_second_pass_below_thresholds(self) -> None:
         market = Market(
