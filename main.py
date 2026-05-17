@@ -1061,6 +1061,188 @@ def _edge_repair_reason(
     return None
 
 
+def _decision_positive_edge(
+    *,
+    decision: TradeDecision,
+    market: Market,
+) -> tuple[float | None, float | None]:
+    implied_prob = _get_implied_probability(market, decision.outcome)
+    market_edge = (
+        decision.confidence - implied_prob if implied_prob is not None else None
+    )
+    edge_candidates = [
+        float(value)
+        for value in (market_edge, decision.edge_external)
+        if value is not None
+    ]
+    if not edge_candidates:
+        return None, market_edge
+    return max(edge_candidates), market_edge
+
+
+def _conviction_repair_reason(
+    *,
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+    score_result: Any | None = None,
+    score_threshold: float | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> str | None:
+    """Detect strong evidence/edge contradictions before final participation skip."""
+    diag = diagnostics if isinstance(diagnostics, dict) else None
+
+    def _record_diag(extra: dict[str, Any]) -> None:
+        if diag is not None:
+            diag.update(extra)
+
+    def _miss(reason: str) -> None:
+        _record_diag(
+            {
+                "conviction_repair_triggerable": False,
+                "conviction_repair_missed_reason": reason,
+            }
+        )
+
+    if not getattr(settings, "CONVICTION_REPAIR_ENABLED", True):
+        _miss("conviction_repair_disabled")
+        return None
+    evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
+    positive_edge, _market_edge = _decision_positive_edge(
+        decision=decision,
+        market=market,
+    )
+    evidence_basis = _decision_evidence_basis(decision)
+    edge_source = str(decision.edge_source or "").strip().lower()
+    source_match = str(getattr(decision, "source_match_class", "") or "").strip().lower()
+    has_primary_source = bool(
+        str(getattr(decision, "primary_source_url", "") or "").strip()
+    )
+    final_score = (
+        float(getattr(score_result, "final_score", 0.0) or 0.0)
+        if score_result is not None
+        else None
+    )
+    score_gap: float | None = None
+    if final_score is not None and score_threshold is not None:
+        score_gap = max(0.0, float(score_threshold) - final_score)
+    raw_confidence = (
+        float(decision.raw_confidence)
+        if decision.raw_confidence is not None
+        else float(decision.confidence or 0.0)
+    )
+    calibrated_confidence = float(decision.confidence or 0.0)
+    confidence_gap = float(settings.MIN_CONFIDENCE) - calibrated_confidence
+    calibration_delta = raw_confidence - calibrated_confidence
+    min_edge = float(settings.CONVICTION_REPAIR_MIN_EDGE)
+    min_evidence = float(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY)
+    score_gap_max = float(settings.CONVICTION_REPAIR_SCORE_GAP_MAX)
+    raw_should_trade = getattr(decision, "raw_should_trade", None)
+    candidate_like = bool(
+        raw_should_trade is True
+        or (positive_edge is not None and positive_edge >= min_edge)
+        or evidence_quality >= max(0.0, min_evidence - 0.05)
+    )
+    _record_diag(
+        {
+            "conviction_repair_evaluated": True,
+            "conviction_repair_candidate_like": candidate_like,
+            "conviction_repair_evidence_quality": evidence_quality,
+            "conviction_repair_positive_edge": positive_edge,
+            "conviction_repair_market_edge": _market_edge,
+            "conviction_repair_evidence_basis": evidence_basis,
+            "conviction_repair_edge_source": edge_source,
+            "conviction_repair_source_match_class": source_match,
+            "conviction_repair_primary_source_url_present": has_primary_source,
+            "conviction_repair_score": final_score,
+            "conviction_repair_score_threshold": score_threshold,
+            "conviction_repair_score_gap": score_gap,
+            "conviction_repair_raw_confidence": raw_confidence,
+            "conviction_repair_confidence": calibrated_confidence,
+            "conviction_repair_confidence_gap": confidence_gap,
+            "conviction_repair_calibration_delta": calibration_delta,
+            "conviction_repair_raw_should_trade": raw_should_trade,
+        }
+    )
+    if evidence_quality < min_evidence:
+        _miss("evidence_quality_below_repair_min")
+        return None
+    if positive_edge is None or positive_edge < min_edge:
+        _miss("edge_below_repair_min")
+        return None
+    if evidence_basis == "absence_only":
+        _miss("absence_only_evidence")
+        return None
+    if edge_source in {"", "none"}:
+        _miss("missing_edge_source")
+        return None
+    if not (
+        evidence_basis == "direct"
+        or (source_match == "settlement_aligned" and has_primary_source)
+    ):
+        _miss("insufficient_source_alignment")
+        return None
+    if market_family(market) != "sports" and not has_primary_source:
+        _miss("non_sports_missing_primary_source")
+        return None
+    if not decision.should_trade and not decision.abstain:
+        if score_gap is not None and score_gap > score_gap_max:
+            _miss("score_gap_above_repair_max")
+            return None
+        reason = (
+            "conviction_repair_raw_trade_demotion"
+            if raw_should_trade is True
+            else "conviction_repair_no_trade_contradiction"
+        )
+        _record_diag(
+            {
+                "conviction_repair_triggerable": True,
+                "conviction_repair_reason": reason,
+            }
+        )
+        return reason
+    if decision.abstain:
+        _miss("decision_abstained")
+        return None
+    if decision.should_trade:
+        confidence_score_floor = float(
+            getattr(settings, "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR", 0.0)
+            or 0.0
+        )
+        if final_score is not None and final_score < confidence_score_floor:
+            _miss("score_below_confidence_repair_floor")
+            return None
+        if 0.0 < confidence_gap <= score_gap_max:
+            reason = "conviction_repair_confidence_near_min"
+            _record_diag(
+                {
+                    "conviction_repair_triggerable": True,
+                    "conviction_repair_reason": reason,
+                }
+            )
+            return reason
+        if (
+            confidence_gap > 0.0
+            and raw_confidence >= float(settings.MIN_CONFIDENCE)
+            and calibration_delta > 0.05
+        ):
+            reason = "conviction_repair_confidence_calibration_block"
+            _record_diag(
+                {
+                    "conviction_repair_triggerable": True,
+                    "conviction_repair_reason": reason,
+                }
+            )
+            return reason
+        if confidence_gap > 0.0:
+            _miss("confidence_gap_above_repair_max")
+            return None
+        _miss("decision_already_above_confidence_min")
+        return None
+    _miss("no_repairable_decision_state")
+    return None
+
+
 def _research_queue_context_text(context: dict[str, Any] | None) -> str | None:
     if not isinstance(context, dict):
         return None
@@ -4003,8 +4185,23 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         "score_evidence_basis_bonus": float(
             getattr(score_result, "evidence_basis_bonus", 0.0) or 0.0
         ),
+        "score_source_alignment_bonus": float(
+            getattr(score_result, "source_alignment_bonus", 0.0) or 0.0
+        ),
+        "score_proxy_penalty_reduced": bool(
+            getattr(score_result, "proxy_penalty_reduced", False)
+        ),
         "score_computed_edge_bonus": float(
             getattr(score_result, "computed_edge_bonus", 0.0) or 0.0
+        ),
+        "score_source_confirmed_edge_bonus": float(
+            getattr(score_result, "source_confirmed_edge_bonus", 0.0) or 0.0
+        ),
+        "score_source_confirmed_edge": bool(
+            getattr(score_result, "source_confirmed_edge", False)
+        ),
+        "score_source_confirmed_edge_value": float(
+            getattr(score_result, "source_confirmed_edge_value", 0.0) or 0.0
         ),
         "score_bayesian_component": float(
             getattr(score_result, "bayesian_component", 0.0) or 0.0
@@ -4086,6 +4283,15 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         ),
         "score_historical_family_bonus": float(
             getattr(score_result, "historical_family_bonus", 0.0) or 0.0
+        ),
+        "score_historical_family_signal": float(
+            getattr(score_result, "historical_family_signal", 0.0) or 0.0
+        ),
+        "score_historical_family_score_adjustment": float(
+            getattr(score_result, "historical_family_score_adjustment", 0.0) or 0.0
+        ),
+        "score_historical_family_size_multiplier": float(
+            getattr(score_result, "historical_family_size_multiplier", 1.0) or 1.0
         ),
         "score_ambiguous_resolution_penalty": float(
             getattr(score_result, "ambiguous_resolution_penalty", 0.0) or 0.0
@@ -4230,8 +4436,13 @@ def _score_kwargs(
     definitive_outcome_eligible: bool = False,
     historical_family_pnl_total: float | None = None,
     historical_family_sample_size: int = 0,
+    historical_family_win_rate: float | None = None,
+    historical_family_deployed_usdc: float | None = None,
+    historical_family_high_conf_losses: int = 0,
     historical_prefix_pnl_per_trade: float | None = None,
     historical_prefix_sample_size: int = 0,
+    source_match_class: str = "",
+    primary_source_url_present: bool = False,
 ) -> dict[str, Any]:
     return {
         "is_weather_market": is_weather_market,
@@ -4248,6 +4459,13 @@ def _score_kwargs(
         "fallback_edge_penalty_base": settings.SCORE_FALLBACK_EDGE_PENALTY_BASE,
         "overconfidence_penalty_base": settings.SCORE_OVERCONFIDENCE_PENALTY_BASE,
         "computed_edge_bonus_base": settings.SCORE_COMPUTED_EDGE_BONUS,
+        "source_confirmed_edge_min": settings.CONVICTION_REPAIR_MIN_EDGE,
+        "source_confirmed_edge_min_evidence_quality": (
+            settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY
+        ),
+        "source_confirmed_edge_bonus_base": (
+            settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS
+        ),
         "proxy_evidence_penalty_base": settings.SCORE_PROXY_EVIDENCE_PENALTY_BASE,
         "generic_bin_penalty_base": settings.SCORE_GENERIC_BIN_PENALTY_BASE,
         "ambiguous_resolution_penalty_base": settings.SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE,
@@ -4268,8 +4486,16 @@ def _score_kwargs(
         "definitive_outcome_eligible": definitive_outcome_eligible,
         "historical_family_pnl_total": historical_family_pnl_total,
         "historical_family_sample_size": historical_family_sample_size,
+        "historical_family_win_rate": historical_family_win_rate,
+        "historical_family_deployed_usdc": historical_family_deployed_usdc,
+        "historical_family_high_conf_losses": historical_family_high_conf_losses,
+        "historical_family_signal_enabled": settings.HISTORICAL_FAMILY_SIGNAL_ENABLED,
+        "historical_family_signal_score_scale": settings.HISTORICAL_FAMILY_SCORE_SCALE,
+        "historical_family_size_scale_max": settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX,
         "historical_prefix_pnl_per_trade": historical_prefix_pnl_per_trade,
         "historical_prefix_sample_size": historical_prefix_sample_size,
+        "source_match_class": source_match_class,
+        "primary_source_url_present": primary_source_url_present,
     }
 
 
@@ -5222,9 +5448,15 @@ def _cap_analysis_candidates(
         }
         candidate["selection_rank_score"] = round(risk_adjusted_score, 4)
         candidate["selection_rank_components"] = selection_components
-        # Research-queue drain probes always rank ahead of normal candidates so
-        # the cap doesn't silently drop the longest-waiting research entries.
-        drain_probe_priority = 0 if candidate.get("is_research_queue_drain_probe") else 1
+        # Research-queue drain probes and score-promoted near-misses rank ahead
+        # of normal candidates so queue work that has improved is not dropped by
+        # the per-cycle cap after it finally becomes actionable.
+        if candidate.get("is_research_queue_drain_probe"):
+            drain_probe_priority = 0
+        elif candidate.get("is_research_queue_score_promotion"):
+            drain_probe_priority = 1
+        else:
+            drain_probe_priority = 2
         ranked_candidates.append(
             (
                 (
@@ -5322,22 +5554,29 @@ def _resolve_dynamic_analysis_candidate_cap(
     return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied, negative_score_floor_applied
 
 
-def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, str, str]:
-    """Prioritize near-threshold research entries before older weak entries."""
+def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, str, str]:
+    """Prioritize persisted queue quality, then near-threshold older entries."""
+    priority = MarketStateManager.estimate_research_entry_priority(entry)
     raw_gap = entry.get("threshold_gap")
     try:
         threshold_gap = max(0.0, float(raw_gap))
     except (TypeError, ValueError):
         threshold_gap = float("inf")
+    drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
+        entry
+    )
     return (
+        -float(priority or 0.0),
         threshold_gap,
+        drain_attempts,
         str(entry.get("queued_at") or ""),
         str(entry.get("market_id") or ""),
     )
 
 
-def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, int, str, str]:
+def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, int, str, str]:
     """Promotion ranking when zero-yield cycles show the queue needs active repair."""
+    priority = MarketStateManager.estimate_research_entry_priority(entry)
     raw_gap = entry.get("threshold_gap")
     try:
         threshold_gap = max(0.0, float(raw_gap))
@@ -5347,12 +5586,40 @@ def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, i
         times_seen = max(0, int(entry.get("times_seen") or 0))
     except (TypeError, ValueError):
         times_seen = 0
+    drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
+        entry
+    )
     return (
+        -float(priority or 0.0),
         threshold_gap,
+        drain_attempts,
         -times_seen,
         str(entry.get("queued_at") or ""),
         str(entry.get("market_id") or ""),
     )
+
+
+def _research_queue_recent_drain_attempt(
+    entry: dict[str, Any],
+    *,
+    cooldown_minutes: float,
+    now: datetime | None = None,
+) -> bool:
+    """True when a queue entry was already selected for drain too recently."""
+    if cooldown_minutes <= 0:
+        return False
+    _attempts, last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
+        entry
+    )
+    if last_attempt is None:
+        return False
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    if last_attempt.tzinfo is None:
+        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+    age_minutes = (now_dt - last_attempt).total_seconds() / 60.0
+    return 0.0 <= age_minutes < cooldown_minutes
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -6169,6 +6436,7 @@ def main(max_cycles: int | None = None) -> None:
             pre_vs_runtime_score_deltas: list[float] = []
             runtime_score_below_threshold_order_count = 0
             runtime_score_evaluation_count = 0
+            source_confirmed_edge_count = 0
             score_gate_score_source_counts: dict[str, int] = {}
             rejection_funnel_summary: list[dict[str, Any]] = []
             pre_analysis_rejection_breakdown: dict[str, int] = {}
@@ -6232,6 +6500,8 @@ def main(max_cycles: int | None = None) -> None:
             evidence_floor_suppressed_count = 0
             timeout_routed_to_monitor_only_count = 0
             negative_best_score_skipped_count = 0
+            research_queue_score_promotion_count = 0
+            research_queue_low_yield_placeholder_skipped_count = 0
             should_trade_blocked_breakdown: dict[str, int] = {}
             cycle_prompt_tokens = 0
             cycle_completion_tokens = 0
@@ -6634,6 +6904,7 @@ def main(max_cycles: int | None = None) -> None:
             analysis_candidates: list[dict[str, Any]] = []
             fallback_family_rate_cache: dict[str, tuple[float, int]] = {}
             historical_family_outcome_snapshot: dict[str, dict[str, float | int]] = {}
+            historical_family_signal_snapshot: dict[str, dict[str, float | int]] = {}
             historical_prefix_stats: dict[str, Any] = {}
             historical_short_prefix_stats: dict[str, Any] = {}
             historical_family_stats_recent: dict[str, Any] = {}
@@ -6650,6 +6921,17 @@ def main(max_cycles: int | None = None) -> None:
                     data={"error": str(exc)},
                 )
                 historical_family_outcome_snapshot = {}
+            try:
+                historical_family_signal_snapshot = state_manager.get_family_signal_snapshot(
+                    lookback=max(100, settings.HISTORICAL_FAMILY_MIN_SAMPLES * 20),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Historical family signal snapshot lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
+                historical_family_signal_snapshot = {}
             try:
                 historical_prefix_stats = load_ticker_prefix_stats(
                     state_manager,
@@ -6729,8 +7011,10 @@ def main(max_cycles: int | None = None) -> None:
             research_queue_drained_count = 0
             research_queue_drain_skipped_stale_count = 0
             research_queue_drain_skipped_low_priority_count = 0
+            research_queue_drain_skipped_recent_attempt_count = 0
             research_queue_emergency_probes_count = 0
             research_queue_zero_yield_promotions_count = 0
+            research_queue_drain_attempts_marked_count = 0
             if (
                 settings.RESEARCH_QUEUE_ENABLED
                 and settings.RESEARCH_QUEUE_PERSIST_TO_DB
@@ -6753,9 +7037,10 @@ def main(max_cycles: int | None = None) -> None:
                     if isinstance(m, Market)
                 }
                 # Over-fetch beyond the per-cycle drain limit so the priority
-                # filter and stale-market filter don't starve the per-cycle quota.
+                # filter, stale-market filter, and recent-attempt rotation don't
+                # starve the per-cycle quota.
                 drain_pool_limit = max(
-                    1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE * 5
+                    1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE * 12
                 )
                 _drain_min_priority = max(
                     0.0, float(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY)
@@ -6763,6 +7048,36 @@ def main(max_cycles: int | None = None) -> None:
                 drain_per_cycle_quota = max(
                     1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE
                 )
+                zero_yield_eligible = (
+                    settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+                    and consecutive_zero_execution_yield_cycles
+                    >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                )
+                zero_yield_target = max(
+                    0,
+                    int(getattr(settings, "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS", 0) or 0),
+                )
+                zero_yield_reserved_slots = (
+                    min(zero_yield_target, drain_per_cycle_quota)
+                    if zero_yield_eligible
+                    else 0
+                )
+                normal_drain_quota = max(
+                    0,
+                    drain_per_cycle_quota - zero_yield_reserved_slots,
+                )
+                drain_retry_cooldown_minutes = max(
+                    0.0,
+                    float(
+                        getattr(
+                            settings,
+                            "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES",
+                            0.0,
+                        )
+                        or 0.0
+                    ),
+                )
+                drain_selection_now = datetime.now(timezone.utc)
                 try:
                     drain_rows = state_manager.get_drainable_research_entries(
                         min_age_hours=settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS,
@@ -6777,11 +7092,20 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     selected = 0
                     for entry in drain_rows:
+                        if selected >= normal_drain_quota:
+                            break
                         mid = str(entry.get("market_id") or "").strip()
                         if not mid:
                             continue
                         if mid not in current_market_ids:
                             research_queue_drain_skipped_stale_count += 1
+                            continue
+                        if _research_queue_recent_drain_attempt(
+                            entry,
+                            cooldown_minutes=drain_retry_cooldown_minutes,
+                            now=drain_selection_now,
+                        ):
+                            research_queue_drain_skipped_recent_attempt_count += 1
                             continue
                         # Apply the operator-tuned priority floor here (not in
                         # the SQL helper) so we can count low-priority skips
@@ -6802,8 +7126,6 @@ def main(max_cycles: int | None = None) -> None:
                                 continue
                         drainable_research_entries[mid] = entry
                         selected += 1
-                        if selected >= drain_per_cycle_quota:
-                            break
                 except Exception as exc:
                     logger.debug(
                         "Research queue drain lookup failed: %s",
@@ -6819,11 +7141,6 @@ def main(max_cycles: int | None = None) -> None:
                 # outside this cycle's filtered market list cannot be marked as
                 # probes by the per-market loop and would produce misleading
                 # "selected" telemetry without any actual analysis.
-                zero_yield_eligible = (
-                    settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
-                    and consecutive_zero_execution_yield_cycles
-                    >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
-                )
                 emergency_eligible = (
                     not drainable_research_entries
                     and zero_yield_eligible
@@ -6846,6 +7163,7 @@ def main(max_cycles: int | None = None) -> None:
                             key=_research_queue_drain_sort_key,
                         )
                         emergency_selected = 0
+                        emergency_quota = max(1, normal_drain_quota or drain_per_cycle_quota)
                         for entry in emergency_rows:
                             mid = str(entry.get("market_id") or "").strip()
                             if not mid:
@@ -6854,6 +7172,13 @@ def main(max_cycles: int | None = None) -> None:
                                 continue
                             if mid not in current_market_ids:
                                 research_queue_drain_skipped_stale_count += 1
+                                continue
+                            if _research_queue_recent_drain_attempt(
+                                entry,
+                                cooldown_minutes=drain_retry_cooldown_minutes,
+                                now=drain_selection_now,
+                            ):
+                                research_queue_drain_skipped_recent_attempt_count += 1
                                 continue
                             if _drain_min_priority > 0.0:
                                 entry_priority = (
@@ -6870,7 +7195,7 @@ def main(max_cycles: int | None = None) -> None:
                             entry["is_drain_emergency_probe"] = True
                             drainable_research_entries[mid] = entry
                             emergency_selected += 1
-                            if emergency_selected >= drain_per_cycle_quota:
+                            if emergency_selected >= emergency_quota:
                                 break
                         research_queue_emergency_probes_count = emergency_selected
                     except Exception as exc:
@@ -6879,11 +7204,11 @@ def main(max_cycles: int | None = None) -> None:
                             exc,
                             data={"error": str(exc)},
                         )
-                zero_yield_target = max(
-                    0,
-                    int(getattr(settings, "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS", 0) or 0),
-                )
-                if zero_yield_eligible and zero_yield_target > len(drainable_research_entries):
+                if (
+                    zero_yield_eligible
+                    and zero_yield_target > 0
+                    and len(drainable_research_entries) < drain_per_cycle_quota
+                ):
                     try:
                         promotion_min_age = max(
                             0.0,
@@ -6900,8 +7225,12 @@ def main(max_cycles: int | None = None) -> None:
                             promotion_rows,
                             key=_research_queue_zero_yield_sort_key,
                         )
+                        promotion_quota = min(
+                            zero_yield_target,
+                            max(0, drain_per_cycle_quota - len(drainable_research_entries)),
+                        )
                         for entry in promotion_rows:
-                            if len(drainable_research_entries) >= zero_yield_target:
+                            if research_queue_zero_yield_promotions_count >= promotion_quota:
                                 break
                             mid = str(entry.get("market_id") or "").strip()
                             if not mid:
@@ -6910,6 +7239,13 @@ def main(max_cycles: int | None = None) -> None:
                                 continue
                             if mid not in current_market_ids:
                                 research_queue_drain_skipped_stale_count += 1
+                                continue
+                            if _research_queue_recent_drain_attempt(
+                                entry,
+                                cooldown_minutes=drain_retry_cooldown_minutes,
+                                now=drain_selection_now,
+                            ):
+                                research_queue_drain_skipped_recent_attempt_count += 1
                                 continue
                             entry["is_zero_yield_promotion"] = True
                             entry["zero_yield_promotion_bypassed_priority_floor"] = True
@@ -6921,6 +7257,35 @@ def main(max_cycles: int | None = None) -> None:
                             exc,
                             data={"error": str(exc)},
                         )
+                if drainable_research_entries:
+                    drain_attempt_marked_at = datetime.now(timezone.utc)
+                    for mid, entry in list(drainable_research_entries.items()):
+                        attempts, last_attempt = (
+                            MarketStateManager.research_queue_drain_attempt_metadata(
+                                entry
+                            )
+                        )
+                        entry["research_queue_drain_attempts_before_selection"] = attempts
+                        entry["research_queue_last_drain_attempt_at_before_selection"] = (
+                            last_attempt.isoformat() if last_attempt else None
+                        )
+                        entry["research_queue_drain_attempts"] = attempts + 1
+                        entry["research_queue_last_drain_attempt_at"] = (
+                            drain_attempt_marked_at.isoformat()
+                        )
+                        try:
+                            state_manager.mark_research_queue_drain_attempt(
+                                mid,
+                                cycle_id=cycle_id,
+                                attempted_at=drain_attempt_marked_at,
+                            )
+                            research_queue_drain_attempts_marked_count += 1
+                        except Exception as exc:
+                            logger.debug(
+                                "Research queue drain attempt metadata update failed: %s",
+                                exc,
+                                data={"market_id": mid, "error": str(exc)},
+                            )
                 if drainable_research_entries:
                     logger.info(
                         "Research queue drain selected %d candidate(s) for forced re-analysis",
@@ -6940,6 +7305,12 @@ def main(max_cycles: int | None = None) -> None:
                                     "is_zero_yield_promotion": bool(
                                         entry.get("is_zero_yield_promotion")
                                     ),
+                                    "research_queue_drain_attempts": entry.get(
+                                        "research_queue_drain_attempts"
+                                    ),
+                                    "research_queue_last_drain_attempt_at": entry.get(
+                                        "research_queue_last_drain_attempt_at"
+                                    ),
                                 }
                                 for mid, entry in drainable_research_entries.items()
                             ],
@@ -6949,7 +7320,19 @@ def main(max_cycles: int | None = None) -> None:
                             "research_queue_drain_skipped_low_priority_count": (
                                 research_queue_drain_skipped_low_priority_count
                             ),
+                            "research_queue_drain_skipped_recent_attempt_count": (
+                                research_queue_drain_skipped_recent_attempt_count
+                            ),
                             "research_queue_drain_min_priority": _drain_min_priority,
+                            "research_queue_drain_retry_cooldown_minutes": (
+                                drain_retry_cooldown_minutes
+                            ),
+                            "research_queue_drain_attempts_marked_count": (
+                                research_queue_drain_attempts_marked_count
+                            ),
+                            "research_queue_zero_yield_reserved_slots": (
+                                zero_yield_reserved_slots
+                            ),
                             "research_queue_emergency_probes_count": (
                                 research_queue_emergency_probes_count
                             ),
@@ -6964,12 +7347,14 @@ def main(max_cycles: int | None = None) -> None:
                 elif (
                     research_queue_drain_skipped_stale_count > 0
                     or research_queue_drain_skipped_low_priority_count > 0
+                    or research_queue_drain_skipped_recent_attempt_count > 0
                 ):
                     logger.debug(
-                        "Research queue drain skipped %d stale + %d low-priority "
+                        "Research queue drain skipped %d stale + %d low-priority + %d recent-attempt "
                         "entries; no candidates promoted",
                         research_queue_drain_skipped_stale_count,
                         research_queue_drain_skipped_low_priority_count,
+                        research_queue_drain_skipped_recent_attempt_count,
                         data={
                             "research_queue_drain_skipped_stale_count": (
                                 research_queue_drain_skipped_stale_count
@@ -6977,7 +7362,13 @@ def main(max_cycles: int | None = None) -> None:
                             "research_queue_drain_skipped_low_priority_count": (
                                 research_queue_drain_skipped_low_priority_count
                             ),
+                            "research_queue_drain_skipped_recent_attempt_count": (
+                                research_queue_drain_skipped_recent_attempt_count
+                            ),
                             "research_queue_drain_min_priority": _drain_min_priority,
+                            "research_queue_drain_retry_cooldown_minutes": (
+                                drain_retry_cooldown_minutes
+                            ),
                             "consecutive_zero_execution_yield_cycles": (
                                 consecutive_zero_execution_yield_cycles
                             ),
@@ -7014,6 +7405,14 @@ def main(max_cycles: int | None = None) -> None:
                 if not normalized_family:
                     return {}
                 return dict(historical_family_outcome_snapshot.get(normalized_family, {}))
+
+            def _get_historical_family_signal_stats(
+                family_name: str,
+            ) -> dict[str, float | int]:
+                normalized_family = str(family_name or "").strip().lower()
+                if not normalized_family:
+                    return {}
+                return dict(historical_family_signal_snapshot.get(normalized_family, {}))
 
             def _evaluate_historical_gate(
                 *,
@@ -7202,15 +7601,36 @@ def main(max_cycles: int | None = None) -> None:
                     family_name
                 )
                 historical_family_stats = _get_historical_family_stats(family_name)
+                historical_family_signal_stats = _get_historical_family_signal_stats(
+                    family_name
+                )
                 recent_family_stats = historical_family_stats_recent.get(family_name)
                 historical_family_pnl_total = float(
-                    getattr(recent_family_stats, "pnl_total", 0.0) or 0.0
+                    historical_family_signal_stats.get(
+                        "pnl_total",
+                        getattr(recent_family_stats, "pnl_total", 0.0),
+                    )
+                    or 0.0
                 )
                 historical_family_sample_size = int(
-                    getattr(recent_family_stats, "sample_size", 0) or 0
+                    historical_family_signal_stats.get(
+                        "sample_size",
+                        getattr(recent_family_stats, "sample_size", 0),
+                    )
+                    or 0
                 )
                 historical_family_win_rate = float(
-                    getattr(recent_family_stats, "win_rate", 0.0) or 0.0
+                    historical_family_signal_stats.get(
+                        "win_rate",
+                        getattr(recent_family_stats, "win_rate", 0.0),
+                    )
+                    or 0.0
+                )
+                historical_family_deployed_usdc = float(
+                    historical_family_signal_stats.get("deployed_usdc", 0.0) or 0.0
+                )
+                historical_family_high_conf_losses = int(
+                    historical_family_signal_stats.get("high_conf_losses", 0) or 0
                 )
                 historical_gate_allowed, historical_gate_reason, historical_gate_metrics = (
                     _evaluate_historical_gate(
@@ -7525,6 +7945,11 @@ def main(max_cycles: int | None = None) -> None:
                     continue
                 pre_analysis_score = None
                 pre_analysis_breakdown: dict[str, Any] | None = None
+                drain_entry = None
+                is_drain_probe = False
+                is_research_queue_score_promotion = False
+                research_queue_low_yield_placeholder = False
+                research_queue_score_promotion_gap = None
                 if settings.PRE_ANALYSIS_OPPORTUNITY_ENABLED:
                     pre_analysis_score, pre_analysis_breakdown = _pre_analysis_opportunity_score(
                         market,
@@ -7538,14 +7963,56 @@ def main(max_cycles: int | None = None) -> None:
                         historical_gate_metrics=historical_gate_metrics,
                     )
                     research_entry = recent_research_entries.get(market.id)
+                    is_research_queue_score_promotion = False
+                    research_queue_low_yield_placeholder = False
+                    research_queue_score_promotion_gap = None
                     if research_entry is not None:
-                        pre_analysis_score += _RESEARCH_QUEUE_SCORE_BUMP
                         if pre_analysis_breakdown is None:
                             pre_analysis_breakdown = {}
-                        pre_analysis_breakdown["research_queue_bump"] = _RESEARCH_QUEUE_SCORE_BUMP
+                        research_queue_low_yield_placeholder = (
+                            MarketStateManager.is_repeated_low_yield_research_entry(
+                                research_entry,
+                                min_attempts=(
+                                    settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS
+                                ),
+                                min_times_seen=(
+                                    settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN
+                                ),
+                            )
+                        )
+                        if research_queue_low_yield_placeholder:
+                            research_queue_low_yield_placeholder_skipped_count += 1
+                            pre_analysis_breakdown[
+                                "research_queue_low_yield_placeholder_skipped"
+                            ] = True
+                        else:
+                            pre_analysis_score += _RESEARCH_QUEUE_SCORE_BUMP
+                            pre_analysis_breakdown["research_queue_bump"] = (
+                                _RESEARCH_QUEUE_SCORE_BUMP
+                            )
                         pre_analysis_breakdown["previous_research_reason"] = str(
                             research_entry.get("reason") or ""
                         )
+                        research_queue_score_promotion_gap = float(
+                            settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                            - pre_analysis_score
+                        )
+                        if (
+                            not research_queue_low_yield_placeholder
+                            and research_queue_score_promotion_gap
+                            <= max(
+                                0.0,
+                                float(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP),
+                            )
+                        ):
+                            is_research_queue_score_promotion = True
+                            research_queue_score_promotion_count += 1
+                            pre_analysis_breakdown[
+                                "research_queue_score_promotion"
+                            ] = True
+                            pre_analysis_breakdown[
+                                "research_queue_score_promotion_gap"
+                            ] = round(research_queue_score_promotion_gap, 4)
                     # Record the post-bump score for cycle-level distribution
                     # telemetry. Includes drain probes so the receipt reflects
                     # the actual score landscape across all scored markets.
@@ -7568,6 +8035,12 @@ def main(max_cycles: int | None = None) -> None:
                         pre_analysis_breakdown["research_queue_drain_reason"] = str(
                             drain_entry.get("reason") or ""
                         )
+                        pre_analysis_breakdown["research_queue_drain_attempts"] = (
+                            drain_entry.get("research_queue_drain_attempts")
+                        )
+                        pre_analysis_breakdown[
+                            "research_queue_last_drain_attempt_at"
+                        ] = drain_entry.get("research_queue_last_drain_attempt_at")
                         pre_analysis_breakdown["research_queue_zero_yield_promotion"] = bool(
                             drain_entry.get("is_zero_yield_promotion")
                         )
@@ -7579,7 +8052,11 @@ def main(max_cycles: int | None = None) -> None:
                             )
                         )
                         research_queue_drained_count += 1
-                    if not is_drain_probe and pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE:
+                    if (
+                        not is_drain_probe
+                        and not is_research_queue_score_promotion
+                        and pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
+                    ):
                         _research_floor = (
                             settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
                             - effective_research_band
@@ -7846,11 +8323,17 @@ def main(max_cycles: int | None = None) -> None:
                         "historical_family_pnl_total": historical_family_pnl_total,
                         "historical_family_sample_size": historical_family_sample_size,
                         "historical_family_win_rate": historical_family_win_rate,
+                        "historical_family_deployed_usdc": historical_family_deployed_usdc,
+                        "historical_family_high_conf_losses": historical_family_high_conf_losses,
                         "short_prefix_score_penalty": short_prefix_score_penalty,
                         "short_prefix_metrics": short_prefix_metrics,
                         "force_extended_research": (
                             (
                                 is_drain_probe
+                                and settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH
+                            )
+                            or (
+                                is_research_queue_score_promotion
                                 and settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH
                             )
                             or int(state.non_actionable_streak if state else 0)
@@ -7866,6 +8349,15 @@ def main(max_cycles: int | None = None) -> None:
                             if _research_context else None
                         ),
                         "is_research_queue_drain_probe": is_drain_probe,
+                        "is_research_queue_score_promotion": (
+                            is_research_queue_score_promotion
+                        ),
+                        "research_queue_low_yield_placeholder": (
+                            research_queue_low_yield_placeholder
+                        ),
+                        "research_queue_score_promotion_gap": (
+                            research_queue_score_promotion_gap
+                        ),
                         "research_queue_drain_entry": (
                             drain_entry if is_drain_probe else None
                         ),
@@ -8679,8 +9171,23 @@ def main(max_cycles: int | None = None) -> None:
                         historical_family_sample_size=int(
                             candidate.get("historical_family_sample_size", 0) or 0
                         ),
+                        historical_family_win_rate=float(
+                            candidate.get("historical_family_win_rate", 0.0) or 0.0
+                        ),
+                        historical_family_deployed_usdc=float(
+                            candidate.get("historical_family_deployed_usdc", 0.0) or 0.0
+                        ),
+                        historical_family_high_conf_losses=int(
+                            candidate.get("historical_family_high_conf_losses", 0) or 0
+                        ),
                         historical_prefix_pnl_per_trade=pfx_shrunk,
                         historical_prefix_sample_size=pfx_n,
+                        source_match_class=str(
+                            getattr(decision, "source_match_class", "") or ""
+                        ),
+                        primary_source_url_present=bool(
+                            str(getattr(decision, "primary_source_url", "") or "").strip()
+                        ),
                     ),
                 )
                 analysis_result["historical_family_win_rate"] = float(
@@ -8709,11 +9216,24 @@ def main(max_cycles: int | None = None) -> None:
                     "liquidity_penalty": rank_score.liquidity_penalty,
                     "staleness_penalty": rank_score.staleness_penalty,
                     "evidence_basis_bonus": rank_score.evidence_basis_bonus,
+                    "source_confirmed_edge_bonus": (
+                        rank_score.source_confirmed_edge_bonus
+                    ),
+                    "source_confirmed_edge": rank_score.source_confirmed_edge,
+                    "source_confirmed_edge_value": (
+                        rank_score.source_confirmed_edge_value
+                    ),
                     "generic_bin_penalty": rank_score.generic_bin_penalty,
                     "numeric_strike_bin_penalty": rank_score.numeric_strike_bin_penalty,
                     "extreme_confidence_penalty": rank_score.extreme_confidence_penalty,
                     "short_prefix_penalty": rank_score.short_prefix_penalty,
                     "historical_family_bonus": rank_score.historical_family_bonus,
+                    "historical_family_signal": rank_score.historical_family_signal,
+                    "historical_family_score_adjustment": (
+                        rank_score.historical_family_score_adjustment
+                    ),
+                    "source_alignment_bonus": rank_score.source_alignment_bonus,
+                    "proxy_penalty_reduced": rank_score.proxy_penalty_reduced,
                     "ambiguous_resolution_penalty": rank_score.ambiguous_resolution_penalty,
                 }
 
@@ -9057,6 +9577,12 @@ def main(max_cycles: int | None = None) -> None:
                     "historical_family_win_rate": candidate.get(
                         "historical_family_win_rate"
                     ),
+                    "historical_family_deployed_usdc": candidate.get(
+                        "historical_family_deployed_usdc"
+                    ),
+                    "historical_family_high_conf_losses": candidate.get(
+                        "historical_family_high_conf_losses"
+                    ),
                     "pre_execution_final_score": pre_execution_final_score,
                     "score_breakdown": analysis_result.get("pre_execution_score_breakdown"),
                     "evidence_basis_class": evidence_basis,
@@ -9147,6 +9673,12 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     audit_context["research_queue_drain_reason"] = (
                         drain_meta.get("reason")
+                    )
+                    audit_context["research_queue_drain_attempts"] = (
+                        drain_meta.get("research_queue_drain_attempts")
+                    )
+                    audit_context["research_queue_last_drain_attempt_at"] = (
+                        drain_meta.get("research_queue_last_drain_attempt_at")
                     )
                 audit_context.update(score_receipt_fields)
                 compact_pre_execution_score = _compact_score_breakdown(score_receipt_fields)
@@ -9272,50 +9804,421 @@ def main(max_cycles: int | None = None) -> None:
                         },
                     )
 
+                conviction_score_threshold = _effective_score_gate_threshold(
+                    settings=settings,
+                    market=market,
+                    evidence_basis_class=evidence_basis,
+                    evidence_quality=decision.evidence_quality,
+                )
+                conviction_repair_diagnostics: dict[str, Any] = {}
+                conviction_repair_reason = _conviction_repair_reason(
+                    decision=decision,
+                    market=market,
+                    settings=settings,
+                    score_result=pre_execution_score_result,
+                    score_threshold=conviction_score_threshold,
+                    diagnostics=conviction_repair_diagnostics,
+                )
+                if conviction_repair_diagnostics.get(
+                    "conviction_repair_candidate_like"
+                ) or conviction_repair_diagnostics.get("conviction_repair_triggerable"):
+                    audit_context.update(conviction_repair_diagnostics)
+                if conviction_repair_reason is not None:
+                    positive_edge_for_repair, market_edge_for_repair = _decision_positive_edge(
+                        decision=decision,
+                        market=market,
+                    )
+                    audit_context.update(
+                        {
+                            "conviction_repair_triggered": True,
+                            "conviction_repair_reason": conviction_repair_reason,
+                            "conviction_repair_original_should_trade": bool(
+                                decision.should_trade
+                            ),
+                            "conviction_repair_original_confidence": decision.confidence,
+                            "conviction_repair_positive_edge": positive_edge_for_repair,
+                            "conviction_repair_market_edge": market_edge_for_repair,
+                            "conviction_repair_score_threshold": conviction_score_threshold,
+                        }
+                    )
+                    repair_market = _market_with_research_queue_context(
+                        market,
+                        candidate.get("research_queue_drain_entry"),
+                    )
+                    repair_search_config = _build_extended_reanalysis_search_config(
+                        build_market_search_config(settings, repair_market),
+                        settings,
+                    )
+                    repair_previous = decision.model_copy(
+                        update={
+                            "reasoning": (
+                                f"[ConvictionRepairRequired reason={conviction_repair_reason}] "
+                                "Strong edge/evidence conflicted with the final participation path. "
+                                "Reconcile exact settlement criteria, current market price, source alignment, "
+                                "counter-evidence, and explain whether this is executable or not. "
+                                f"{decision.reasoning}"
+                            )
+                        }
+                    )
+                    try:
+                        repaired_decision = grok_client.analyze_market_deep(
+                            repair_market,
+                            previous_analysis=repair_previous,
+                            search_config=repair_search_config,
+                        )
+                        cycle_prompt_tokens += int(repaired_decision.prompt_tokens or 0)
+                        cycle_completion_tokens += int(
+                            repaired_decision.completion_tokens or 0
+                        )
+                        cycle_reasoning_tokens += int(
+                            repaired_decision.reasoning_tokens or 0
+                        )
+                        cycle_cached_tokens += int(repaired_decision.cached_tokens or 0)
+                        repaired_decision = _cap_confidence_for_category(
+                            repaired_decision,
+                            market,
+                            settings,
+                        )
+                        repair_ceiling = _non_definitive_confidence_ceiling(
+                            repaired_decision,
+                            settings,
+                            market=market,
+                        )
+                        if repaired_decision.confidence > repair_ceiling:
+                            repaired_decision = repaired_decision.model_copy(
+                                update={
+                                    "confidence": repair_ceiling,
+                                    "bet_size_pct": max(
+                                        0.0,
+                                        min(
+                                            1.0,
+                                            repaired_decision.bet_size_pct
+                                            * (
+                                                repair_ceiling
+                                                / max(
+                                                    repaired_decision.confidence,
+                                                    1e-9,
+                                                )
+                                            ),
+                                        ),
+                                    ),
+                                    "reasoning": (
+                                        f"[ConvictionRepair confidence capped to {repair_ceiling:.2f}] "
+                                        f"{repaired_decision.reasoning}"
+                                    ),
+                                }
+                            )
+                        decision = repaired_decision
+                        analysis_result["decision"] = decision
+                        analysis_result["conviction_repair_triggered"] = True
+                        analysis_result["conviction_repair_reason"] = (
+                            conviction_repair_reason
+                        )
+                        used_extended_research = True
+                        audit_context["extended_research_used"] = True
+                        evidence_basis = _decision_evidence_basis(decision)
+                        pfx_stats = _get_prefix_pnl(market.id or "")
+                        pfx_n = int(pfx_stats.get("n", 0))
+                        pfx_pnl = float(pfx_stats.get("total_pnl", 0.0))
+                        pfx_shrunk = (
+                            bayesian_shrunk_pnl(pfx_pnl, pfx_n)
+                            if pfx_n > 0
+                            else None
+                        )
+                        pre_execution_score_result = compute_final_score(
+                            market=market,
+                            decision=decision,
+                            implied_prob_market=_get_implied_probability(
+                                market,
+                                decision.outcome,
+                            ),
+                            **_score_kwargs(
+                                settings=settings,
+                                repeated_analysis_count=analysis_count_for_market,
+                                non_actionable_streak=non_actionable_streak_for_market,
+                                is_weather_market=(market_family(market) == "weather"),
+                                evidence_basis_class=evidence_basis,
+                                edge_source=decision.edge_source or "",
+                                market_family=market_family_name,
+                                short_prefix_penalty=short_prefix_score_penalty,
+                                suppress_hallucinated_edge_penalty=(
+                                    _should_suppress_hallucinated_edge_penalty(
+                                        decision=decision,
+                                        evidence_basis=evidence_basis,
+                                        settings=settings,
+                                        market=market,
+                                    )
+                                ),
+                                definitive_outcome_eligible=(
+                                    _is_definitive_outcome_eligible(
+                                        decision,
+                                        settings,
+                                        market=market,
+                                    )
+                                ),
+                                historical_family_pnl_total=float(
+                                    candidate.get("historical_family_pnl_total", 0.0)
+                                    or 0.0
+                                ),
+                                historical_family_sample_size=int(
+                                    candidate.get("historical_family_sample_size", 0)
+                                    or 0
+                                ),
+                                historical_family_win_rate=float(
+                                    candidate.get("historical_family_win_rate", 0.0)
+                                    or 0.0
+                                ),
+                                historical_family_deployed_usdc=float(
+                                    candidate.get("historical_family_deployed_usdc", 0.0)
+                                    or 0.0
+                                ),
+                                historical_family_high_conf_losses=int(
+                                    candidate.get("historical_family_high_conf_losses", 0)
+                                    or 0
+                                ),
+                                historical_prefix_pnl_per_trade=pfx_shrunk,
+                                historical_prefix_sample_size=pfx_n,
+                                source_match_class=str(
+                                    getattr(decision, "source_match_class", "") or ""
+                                ),
+                                primary_source_url_present=bool(
+                                    str(
+                                        getattr(decision, "primary_source_url", "") or ""
+                                    ).strip()
+                                ),
+                            ),
+                        )
+                        pre_execution_final_score = (
+                            pre_execution_score_result.final_score
+                        )
+                        analysis_result["pre_execution_final_score"] = (
+                            pre_execution_final_score
+                        )
+                        analysis_result["pre_execution_score_result"] = (
+                            pre_execution_score_result
+                        )
+                        analysis_result["pre_execution_rejection_reasons"] = list(
+                            pre_execution_score_result.rejection_reasons
+                        )
+                        score_receipt_fields = _score_receipt_fields(
+                            pre_execution_score_result
+                        )
+                        audit_context.update(
+                            {
+                                "conviction_repair_result_should_trade": bool(
+                                    decision.should_trade
+                                ),
+                                "conviction_repair_result_abstain": bool(
+                                    decision.abstain
+                                ),
+                                "conviction_repair_result_confidence": (
+                                    decision.confidence
+                                ),
+                                "pre_execution_final_score": (
+                                    pre_execution_final_score
+                                ),
+                                "evidence_basis_class": evidence_basis,
+                                "gated_should_trade": bool(decision.should_trade),
+                                "primary_source_url_present": bool(
+                                    str(
+                                        getattr(decision, "primary_source_url", "") or ""
+                                    ).strip()
+                                ),
+                                "source_match_class": getattr(
+                                    decision,
+                                    "source_match_class",
+                                    None,
+                                ),
+                            }
+                        )
+                        audit_context.update(score_receipt_fields)
+                        compact_repair_score = _compact_score_breakdown(
+                            score_receipt_fields
+                        )
+                        if compact_repair_score:
+                            audit_context["score_breakdown"] = compact_repair_score
+                    except Exception as exc:
+                        audit_context.update(
+                            {
+                                "conviction_repair_error": str(exc),
+                                "conviction_repair_error_type": type(exc).__name__,
+                            }
+                        )
+                        logger.warning(
+                            "Conviction repair failed; preserving first-pass decision: market=%s reason=%s error=%s",
+                            market.id,
+                            conviction_repair_reason,
+                            exc,
+                            data={
+                                "market_id": market.id,
+                                "conviction_repair_reason": conviction_repair_reason,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+
                 if decision.abstain:
                     trades_skipped_no_trade += 1
-                    _record_rejection_reason(rejection_breakdown, "abstain_low_evidence")
+                    abstain_reason = (
+                        "conviction_repair_no_trade"
+                        if audit_context.get("conviction_repair_triggered")
+                        else "abstain_low_evidence"
+                    )
+                    _record_rejection_reason(rejection_breakdown, abstain_reason)
+                    repair_queue_position: int | None = None
+                    queue_repair_abstain = bool(
+                        settings.RESEARCH_QUEUE_ENABLED
+                        and abstain_reason == "conviction_repair_no_trade"
+                    )
+                    if queue_repair_abstain:
+                        repair_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=decision,
+                            reason=abstain_reason,
+                            gate_name="conviction_repair",
+                            threshold_gap=0.0,
+                            edge_market=audit_context.get(
+                                "conviction_repair_market_edge"
+                            ),
+                            participation_tier="research_only",
+                            what_to_learn_next=(
+                                "Repair pass abstained despite strong edge/evidence; "
+                                "monitor for a direct source or pricing change before re-entry."
+                            ),
+                        )
+                        audit_context["research_queue_position"] = repair_queue_position
+                        audit_context["research_gate_name"] = "conviction_repair"
+                        if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                            try:
+                                state_manager.record_research_queue_entry(
+                                    market_id=market.id,
+                                    cycle_id=cycle_id,
+                                    gate_name="conviction_repair",
+                                    reason=abstain_reason,
+                                    threshold_gap=0.0,
+                                    what_to_learn_next=(
+                                        "Repair pass abstained despite strong edge/evidence; "
+                                        "monitor for direct source or pricing change."
+                                    ),
+                                    last_decision_json=_research_queue_last_decision_json(
+                                        decision,
+                                        _build_execution_audit(
+                                            decision_terminal=False,
+                                            final_action="research_queued",
+                                            final_reason=abstain_reason,
+                                            learning_hold_reason=abstain_reason,
+                                            **audit_context,
+                                        ),
+                                    ),
+                                )
+                            except Exception:
+                                pass
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=decision.model_dump(),
                         execution_audit=_build_execution_audit(
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="abstain_low_evidence",
+                            decision_terminal=not queue_repair_abstain,
+                            final_action=(
+                                "research_queued" if queue_repair_abstain else "skip"
+                            ),
+                            final_reason=abstain_reason,
+                            learning_hold_reason=abstain_reason,
                             **audit_context,
                         ),
                     )
-                    _record_terminal_outcome(state_manager, market.id, "abstain_low_evidence")
+                    if not queue_repair_abstain:
+                        _record_terminal_outcome(state_manager, market.id, abstain_reason)
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     logger.info(
-                        "SKIP [%s] '%s' -> abstain (low evidence quality %.2f)",
+                        "%s [%s] '%s' -> %s (evidence quality %.2f)",
+                        "RESEARCH" if queue_repair_abstain else "SKIP",
                         market.id,
                         question_short,
+                        abstain_reason,
                         decision.evidence_quality,
                     )
                     continue
 
                 if not decision.should_trade:
                     trades_skipped_no_trade += 1
-                    _record_rejection_reason(rejection_breakdown, "no_trade_recommended")
+                    no_trade_reason = (
+                        "conviction_repair_no_trade"
+                        if audit_context.get("conviction_repair_triggered")
+                        else "no_trade_recommended"
+                    )
+                    _record_rejection_reason(rejection_breakdown, no_trade_reason)
+                    repair_queue_position: int | None = None
+                    queue_repair_no_trade = bool(
+                        settings.RESEARCH_QUEUE_ENABLED
+                        and no_trade_reason == "conviction_repair_no_trade"
+                    )
+                    if queue_repair_no_trade:
+                        repair_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=decision,
+                            reason=no_trade_reason,
+                            gate_name="conviction_repair",
+                            threshold_gap=0.0,
+                            edge_market=audit_context.get(
+                                "conviction_repair_market_edge"
+                            ),
+                            participation_tier="research_only",
+                            what_to_learn_next=(
+                                "Repair pass found strong edge/evidence but no executable decision; "
+                                "monitor for a source, price, or settlement-criteria change that resolves the contradiction."
+                            ),
+                        )
+                        audit_context["research_queue_position"] = repair_queue_position
+                        audit_context["research_gate_name"] = "conviction_repair"
+                        if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                            try:
+                                state_manager.record_research_queue_entry(
+                                    market_id=market.id,
+                                    cycle_id=cycle_id,
+                                    gate_name="conviction_repair",
+                                    reason=no_trade_reason,
+                                    threshold_gap=0.0,
+                                    what_to_learn_next=(
+                                        "Repair pass found strong edge/evidence but no executable decision; "
+                                        "monitor for source, price, or settlement-criteria change."
+                                    ),
+                                    last_decision_json=_research_queue_last_decision_json(
+                                        decision,
+                                        _build_execution_audit(
+                                            decision_terminal=False,
+                                            final_action="research_queued",
+                                            final_reason=no_trade_reason,
+                                            learning_hold_reason=no_trade_reason,
+                                            **audit_context,
+                                        ),
+                                    ),
+                                )
+                            except Exception:
+                                pass
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=decision.model_dump(),
                         execution_audit=_build_execution_audit(
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="no_trade_recommended",
+                            decision_terminal=not queue_repair_no_trade,
+                            final_action=(
+                                "research_queued" if queue_repair_no_trade else "skip"
+                            ),
+                            final_reason=no_trade_reason,
+                            learning_hold_reason=no_trade_reason,
                             **audit_context,
                         ),
                     )
-                    _record_terminal_outcome(state_manager, market.id, "no_trade_recommended")
+                    if not queue_repair_no_trade:
+                        _record_terminal_outcome(state_manager, market.id, no_trade_reason)
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     logger.info(
-                        "SKIP [%s] '%s' -> no trade recommended",
+                        "%s [%s] '%s' -> %s",
+                        "RESEARCH" if queue_repair_no_trade else "SKIP",
                         market.id,
                         question_short,
+                        no_trade_reason,
                     )
                     continue
                 if (
@@ -10192,11 +11095,30 @@ def main(max_cycles: int | None = None) -> None:
                         historical_family_sample_size=int(
                             candidate.get("historical_family_sample_size", 0) or 0
                         ),
+                        historical_family_win_rate=float(
+                            candidate.get("historical_family_win_rate", 0.0) or 0.0
+                        ),
+                        historical_family_deployed_usdc=float(
+                            candidate.get("historical_family_deployed_usdc", 0.0) or 0.0
+                        ),
+                        historical_family_high_conf_losses=int(
+                            candidate.get("historical_family_high_conf_losses", 0) or 0
+                        ),
                         historical_prefix_pnl_per_trade=exec_pfx_shrunk,
                         historical_prefix_sample_size=exec_pfx_n,
+                        source_match_class=str(
+                            getattr(decision_for_edge, "source_match_class", "") or ""
+                        ),
+                        primary_source_url_present=bool(
+                            str(
+                                getattr(decision_for_edge, "primary_source_url", "") or ""
+                            ).strip()
+                        ),
                     ),
                 )
                 runtime_score_evaluation_count += 1
+                if bool(getattr(score_result, "source_confirmed_edge", False)):
+                    source_confirmed_edge_count += 1
                 score_gate_score_source_counts[score_gate_score_source] = (
                     score_gate_score_source_counts.get(score_gate_score_source, 0) + 1
                 )
@@ -10206,6 +11128,12 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 audit_context["historical_family_bonus_applied"] = bool(
                     float(getattr(score_result, "historical_family_bonus", 0.0) or 0.0) > 0.0
+                )
+                audit_context["source_confirmed_edge"] = bool(
+                    getattr(score_result, "source_confirmed_edge", False)
+                )
+                audit_context["source_confirmed_edge_bonus"] = float(
+                    getattr(score_result, "source_confirmed_edge_bonus", 0.0) or 0.0
                 )
                 score_mode = settings.SCORE_GATE_MODE
                 score_threshold_effective = _effective_score_gate_threshold(
@@ -10262,7 +11190,16 @@ def main(max_cycles: int | None = None) -> None:
                             score_result.volume_amplifier_discount
                         ),
                         "confidence_alignment_bonus": score_result.confidence_alignment_bonus,
+                        "source_confirmed_edge_bonus": (
+                            score_result.source_confirmed_edge_bonus
+                        ),
+                        "source_confirmed_edge": score_result.source_confirmed_edge,
+                        "source_confirmed_edge_value": (
+                            score_result.source_confirmed_edge_value
+                        ),
                         "evidence_basis_bonus": score_result.evidence_basis_bonus,
+                        "source_alignment_bonus": score_result.source_alignment_bonus,
+                        "proxy_penalty_reduced": score_result.proxy_penalty_reduced,
                         "observed_data_bonus": score_result.observed_data_bonus,
                         "low_information_penalty": score_result.low_information_penalty,
                         "no_external_odds_penalty": score_result.no_external_odds_penalty,
@@ -10295,6 +11232,13 @@ def main(max_cycles: int | None = None) -> None:
                         "numeric_strike_bin_penalty": score_result.numeric_strike_bin_penalty,
                         "short_prefix_penalty": score_result.short_prefix_penalty,
                         "historical_family_bonus": score_result.historical_family_bonus,
+                        "historical_family_signal": score_result.historical_family_signal,
+                        "historical_family_score_adjustment": (
+                            score_result.historical_family_score_adjustment
+                        ),
+                        "historical_family_size_multiplier": (
+                            score_result.historical_family_size_multiplier
+                        ),
                         "ambiguous_resolution_penalty": score_result.ambiguous_resolution_penalty,
                         "bayesian_posterior": bayesian_posterior_applied,
                         "lmsr_price": lmsr_execution_price,
@@ -10365,6 +11309,9 @@ def main(max_cycles: int | None = None) -> None:
                                 "score_gap": score_gap,
                                 "rejection_reasons": list(score_result.rejection_reasons),
                                 "critical_rejection_reasons": list(score_gate_critical_reasons),
+                                "source_confirmed_edge": bool(
+                                    getattr(score_result, "source_confirmed_edge", False)
+                                ),
                                 "score_gate_score_source": score_gate_score_source,
                             }
                         )
@@ -10491,6 +11438,25 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 else:
                     adjusted_bet_pct = edge_scaling_bet_pct
+                family_size_multiplier = float(
+                    getattr(score_result, "historical_family_size_multiplier", 1.0)
+                    or 1.0
+                )
+                if abs(family_size_multiplier - 1.0) > 1e-9:
+                    original_bet_pct = adjusted_bet_pct
+                    adjusted_bet_pct = max(
+                        0.0,
+                        min(1.0, adjusted_bet_pct * family_size_multiplier),
+                    )
+                    audit_context["historical_family_size_multiplier"] = (
+                        family_size_multiplier
+                    )
+                    audit_context["historical_family_size_original_bet_pct"] = (
+                        original_bet_pct
+                    )
+                    audit_context["historical_family_size_adjusted_bet_pct"] = (
+                        adjusted_bet_pct
+                    )
                 if (
                     kelly_path_active
                     and kelly_raw_value is not None
@@ -12361,11 +13327,23 @@ def main(max_cycles: int | None = None) -> None:
                 "research_queue_drain_skipped_low_priority_count": (
                     research_queue_drain_skipped_low_priority_count
                 ),
+                "research_queue_drain_skipped_recent_attempt_count": (
+                    research_queue_drain_skipped_recent_attempt_count
+                ),
+                "research_queue_drain_attempts_marked_count": (
+                    research_queue_drain_attempts_marked_count
+                ),
                 "research_queue_emergency_probes_count": (
                     research_queue_emergency_probes_count
                 ),
                 "research_queue_zero_yield_promotions_count": (
                     research_queue_zero_yield_promotions_count
+                ),
+                "research_queue_score_promotion_count": (
+                    research_queue_score_promotion_count
+                ),
+                "research_queue_low_yield_placeholder_skipped_count": (
+                    research_queue_low_yield_placeholder_skipped_count
                 ),
                 "no_grok_research_routed": (
                     pre_analysis_research_routed_count + research_only_emissions
@@ -12465,6 +13443,7 @@ def main(max_cycles: int | None = None) -> None:
                 "confidence_calibration_applied": confidence_calibration_applied_count,
                 "calibration_samples": calibration_samples,
                 "runtime_score_evaluation_count": runtime_score_evaluation_count,
+                "source_confirmed_edge_count": source_confirmed_edge_count,
                 "score_gate_score_source_counts": dict(
                     sorted(score_gate_score_source_counts.items())
                 ),
@@ -12630,6 +13609,13 @@ def main(max_cycles: int | None = None) -> None:
                         settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
                     ),
                     "participation_tier_breakdown": participation_tier_breakdown,
+                    "research_queue_score_promotion_count": (
+                        research_queue_score_promotion_count
+                    ),
+                    "research_queue_low_yield_placeholder_skipped_count": (
+                        research_queue_low_yield_placeholder_skipped_count
+                    ),
+                    "source_confirmed_edge_count": source_confirmed_edge_count,
                 }
                 # Sustained zero-execution yield is a calibration signal, not a
                 # thrown runtime error. Keep it out of predictbot_errors.log
@@ -12732,11 +13718,23 @@ def main(max_cycles: int | None = None) -> None:
                     "research_queue_drain_skipped_low_priority_count": (
                         research_queue_drain_skipped_low_priority_count
                     ),
+                    "research_queue_drain_skipped_recent_attempt_count": (
+                        research_queue_drain_skipped_recent_attempt_count
+                    ),
+                    "research_queue_drain_attempts_marked_count": (
+                        research_queue_drain_attempts_marked_count
+                    ),
                     "research_queue_emergency_probes_count": (
                         research_queue_emergency_probes_count
                     ),
                     "research_queue_zero_yield_promotions_count": (
                         research_queue_zero_yield_promotions_count
+                    ),
+                    "research_queue_score_promotion_count": (
+                        research_queue_score_promotion_count
+                    ),
+                    "research_queue_low_yield_placeholder_skipped_count": (
+                        research_queue_low_yield_placeholder_skipped_count
                     ),
                     "effective_research_band": round(effective_research_band, 4),
                     "research_band_widened_by": round(research_band_widened_by, 4),
@@ -12752,6 +13750,7 @@ def main(max_cycles: int | None = None) -> None:
                     "should_trade_but_blocked": should_trade_but_blocked,
                     "should_trade_blocked_breakdown": should_trade_blocked_breakdown,
                     "blocked_direct_evidence_count": blocked_direct_evidence_count,
+                    "source_confirmed_edge_count": source_confirmed_edge_count,
                     "order_attempts": trades_attempted,
                     "orders_filled": trades_filled,
                     "orders_canceled_unfilled": trades_canceled_unfilled,

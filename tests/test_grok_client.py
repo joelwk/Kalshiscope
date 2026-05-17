@@ -259,18 +259,73 @@ class TestGrokClient(unittest.TestCase):
             )
         )
 
-    def test_deep_analysis_does_not_retry_on_failure(self) -> None:
+    def test_deep_analysis_retries_retriable_failure_and_attempts_fast_fallback(self) -> None:
         market = Market(
             id="m-deep-noretry",
             question="Will it rain?",
             outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
         )
         client = GrokClient(api_key="x")
-        failing = FailingClient(TimeoutError("Grok stream exceeded 90.0s for market m-deep-noretry"))
+        failing = FailingClient(
+            RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"')
+        )
         client.client = failing
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(RuntimeError):
             client.analyze_market_deep(market)
-        self.assertEqual(failing.chat.create_calls, 1)
+        self.assertEqual(failing.chat.create_calls, 3)
+
+    def test_deep_analysis_fast_fallback_can_recover_without_previous_analysis(self) -> None:
+        market = Market(
+            id="m-deep-fast-fallback",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "Fast fallback found no edge.", '
+            '"evidence_quality": 0.5}'
+        )
+        client = GrokClient(api_key="x", settings=Settings(GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2))
+        sequenced = SequencedClient(
+            [
+                RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"'),
+                RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"'),
+                content,
+            ]
+        )
+        client.client = sequenced
+
+        decision = client.analyze_market_deep(market)
+
+        self.assertFalse(decision.should_trade)
+        self.assertIn("retriable_fast_fallback", decision.reasoning)
+        self.assertEqual(sequenced.chat.create_calls, 3)
+
+    def test_deep_analysis_preserves_previous_on_retriable_retry_exhaustion(self) -> None:
+        market = Market(
+            id="m-deep-fallback",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        previous = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.52,
+            bet_size_pct=0.0,
+            reasoning="First pass found no executable edge.",
+            evidence_quality=0.8,
+        )
+        client = GrokClient(api_key="x", settings=Settings(GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2))
+        failing = FailingClient(
+            RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"')
+        )
+        client.client = failing
+
+        decision = client.analyze_market_deep(market, previous_analysis=previous)
+
+        self.assertFalse(decision.should_trade)
+        self.assertIn("DeepAnalysisFallback", decision.reasoning)
+        self.assertEqual(failing.chat.create_calls, 2)
 
     def test_unimplemented_deep_model_falls_back_to_fast_reasoning_model(self) -> None:
         market = Market(
@@ -458,7 +513,7 @@ class TestGrokClient(unittest.TestCase):
         second = (
             '{"should_trade": true, "outcome": "YES", "confidence": 0.65, '
             '"probability_yes": 0.65, "bet_size_pct": 0.5, '
-            '"reasoning": "Counter-evidence lowers this.", '
+            '"reasoning": "Implied prob: 55%, My prob: 65%, Edge: 10%. Counter-evidence lowers this.", '
             '"evidence_quality": 0.8, "key_sources": ["source B"], '
             '"self_critique": "Recent base rate lowers probability."}'
         )
@@ -475,6 +530,7 @@ class TestGrokClient(unittest.TestCase):
         self.assertLessEqual(decision.confidence, 0.70)
         self.assertIn("source A", decision.key_sources)
         self.assertIn("source B", decision.key_sources)
+        self.assertIn("self_consistency_agreement", decision.reasoning)
         self.assertIn("Recent base rate", decision.self_critique or "")
 
     def test_self_consistency_disagreement_marks_deep_repair_required(self) -> None:
@@ -1344,6 +1400,42 @@ class TestGrokClient(unittest.TestCase):
         self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
         self.assertEqual(validated.evidence_basis, "proxy")
+
+    def test_validate_and_enrich_extracts_primary_url_from_key_sources(self) -> None:
+        market = Market(
+            id="m-definitive-key-source",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap confirms settlement outcome."
+            ),
+            key_sources=["Reuters recap https://www.reuters.com/sports/example."],
+            implied_prob_external=None,
+            my_prob=0.97,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.80,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+
+        self.assertEqual(
+            validated.primary_source_url,
+            "https://www.reuters.com/sports/example",
+        )
+        self.assertTrue(validated.definitive_outcome_detected)
+        self.assertEqual(validated.evidence_basis, "direct")
 
     def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
         market = Market(

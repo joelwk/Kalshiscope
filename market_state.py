@@ -1056,6 +1056,84 @@ class MarketStateManager:
             }
         return snapshot
 
+    def get_family_signal_snapshot(
+        self,
+        *,
+        lookback: int = 400,
+    ) -> dict[str, dict[str, float | int]]:
+        """Return family PnL efficiency and high-confidence loss signals.
+
+        This is intentionally read-only and uses existing trade_outcomes rows;
+        no schema migration is needed for the execution score/sizing signal.
+        """
+        window = max(1, int(lookback))
+        rows = self._conn.execute(
+            """
+            SELECT
+                t.market_id AS market_id,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category,
+                t.won AS won,
+                t.pnl_estimate AS pnl_estimate,
+                t.amount_usdc AS amount_usdc,
+                t.confidence AS confidence
+            FROM trade_outcomes t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE COALESCE(t.resolution_state, '') LIKE 'resolved%'
+              AND t.won IS NOT NULL
+            ORDER BY COALESCE(t.resolved_at, t.last_updated, '') DESC
+            LIMIT ?
+            """,
+            (window,),
+        ).fetchall()
+        grouped: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {
+                "sample_size": 0,
+                "wins": 0,
+                "pnl_total": 0.0,
+                "deployed_usdc": 0.0,
+                "high_conf_losses": 0,
+            }
+        )
+        for row in rows:
+            family = self._infer_family_from_state_row(
+                market_id=str(row["market_id"] or ""),
+                question=str(row["question"] or ""),
+                category=str(row["category"] or ""),
+            )
+            bucket = grouped[family]
+            won = int(row["won"] or 0)
+            confidence = float(row["confidence"] or 0.0)
+            bucket["sample_size"] = int(bucket["sample_size"]) + 1
+            if won == 1:
+                bucket["wins"] = int(bucket["wins"]) + 1
+            elif confidence >= 0.90:
+                bucket["high_conf_losses"] = int(bucket["high_conf_losses"]) + 1
+            bucket["pnl_total"] = float(bucket["pnl_total"]) + float(
+                row["pnl_estimate"] or 0.0
+            )
+            bucket["deployed_usdc"] = float(bucket["deployed_usdc"]) + abs(
+                float(row["amount_usdc"] or 0.0)
+            )
+        snapshot: dict[str, dict[str, float | int]] = {}
+        for family, values in grouped.items():
+            sample_size = int(values["sample_size"])
+            wins = int(values["wins"])
+            pnl_total = float(values["pnl_total"])
+            deployed_usdc = float(values["deployed_usdc"])
+            snapshot[family] = {
+                "sample_size": sample_size,
+                "wins": wins,
+                "win_rate": (wins / sample_size) if sample_size > 0 else 0.0,
+                "pnl_total": pnl_total,
+                "deployed_usdc": deployed_usdc,
+                "pnl_per_deployed_usdc": (
+                    pnl_total / deployed_usdc if deployed_usdc > 0.0 else 0.0
+                ),
+                "high_conf_losses": int(values["high_conf_losses"]),
+            }
+        return snapshot
+
     def get_confidence_tier_outcomes(self) -> list[dict[str, float | int | str]]:
         rows = self._conn.execute(
             """
@@ -1468,6 +1546,193 @@ class MarketStateManager:
         )
         self._conn.commit()
 
+    def mark_research_queue_drain_attempt(
+        self,
+        market_id: str,
+        *,
+        cycle_id: str | None = None,
+        attempted_at: datetime | None = None,
+    ) -> None:
+        """Record a queue-drain probe in the existing JSON audit payload."""
+        row = self._conn.execute(
+            """
+            SELECT last_decision_json
+            FROM research_queue_entries
+            WHERE market_id = ?
+            """,
+            (market_id,),
+        ).fetchone()
+        if not row:
+            return
+        payload: dict[str, Any]
+        raw_payload = row["last_decision_json"]
+        if raw_payload:
+            try:
+                loaded = json.loads(raw_payload)
+            except (TypeError, ValueError):
+                loaded = {}
+            payload = loaded if isinstance(loaded, dict) else {}
+        else:
+            payload = {}
+        raw_audit = payload.get("audit")
+        audit: dict[str, Any] = raw_audit if isinstance(raw_audit, dict) else {}
+        try:
+            attempts = int(audit.get("research_queue_drain_attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        timestamp = attempted_at or datetime.now(timezone.utc)
+        audit["research_queue_drain_attempts"] = attempts + 1
+        audit["research_queue_last_drain_attempt_at"] = timestamp.isoformat()
+        if cycle_id:
+            audit["research_queue_last_drain_cycle_id"] = cycle_id
+        payload["audit"] = audit
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE research_queue_entries
+                SET last_decision_json = ?
+                WHERE market_id = ?
+                """,
+                (json.dumps(payload, sort_keys=True), market_id),
+            )
+
+    @staticmethod
+    def research_queue_drain_attempt_metadata(
+        entry: dict[str, Any],
+    ) -> tuple[int, datetime | None]:
+        """Return persisted drain attempts and most recent attempt timestamp."""
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                loaded = json.loads(decision_json)
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                payload = loaded
+                raw_audit = loaded.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        attempts_raw = audit.get("research_queue_drain_attempts")
+        if attempts_raw is None and isinstance(payload, dict):
+            attempts_raw = payload.get("research_queue_drain_attempts")
+        try:
+            attempts = max(0, int(attempts_raw or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        last_raw = audit.get("research_queue_last_drain_attempt_at")
+        if last_raw is None and isinstance(payload, dict):
+            last_raw = payload.get("research_queue_last_drain_attempt_at")
+        last_attempt: datetime | None = None
+        if isinstance(last_raw, str) and last_raw.strip():
+            try:
+                parsed = datetime.fromisoformat(last_raw.strip().replace("Z", "+00:00"))
+                last_attempt = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                last_attempt = None
+        return attempts, last_attempt
+
+    @staticmethod
+    def is_repeated_low_yield_research_entry(
+        entry: dict[str, Any],
+        *,
+        min_attempts: int = 4,
+        min_times_seen: int = 8,
+        min_gap: float = 0.08,
+    ) -> bool:
+        """Detect stale synthetic queue placeholders without hard-blocking families."""
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                loaded = json.loads(decision_json)
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                payload = loaded
+                raw_audit = loaded.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(entry)
+        try:
+            times_seen = max(0, int(entry.get("times_seen") or 0))
+        except (TypeError, ValueError):
+            times_seen = 0
+        if attempts < max(1, int(min_attempts)) and times_seen < max(1, int(min_times_seen)):
+            return False
+
+        threshold_gap = entry.get("threshold_gap")
+        if threshold_gap is None:
+            threshold_gap = audit.get("threshold_gap")
+        try:
+            gap = float(threshold_gap) if threshold_gap is not None else None
+        except (TypeError, ValueError):
+            gap = None
+        if gap is not None and gap <= max(0.0, float(min_gap)):
+            return False
+
+        source_match = str(
+            audit.get("source_match_class")
+            or (payload or {}).get("source_match_class")
+            or ""
+        ).strip().lower()
+        evidence_basis = str(
+            audit.get("evidence_basis")
+            or audit.get("evidence_basis_class")
+            or (payload or {}).get("evidence_basis")
+            or ""
+        ).strip().lower()
+        primary_source_url = str(
+            audit.get("primary_source_url")
+            or (payload or {}).get("primary_source_url")
+            or ""
+        ).strip()
+        evidence_quality = 0.0
+        for source in (audit, payload or {}, entry):
+            raw_eq = source.get("evidence_quality") if isinstance(source, dict) else None
+            if isinstance(raw_eq, (int, float)):
+                evidence_quality = max(0.0, min(1.0, float(raw_eq)))
+                break
+        if (
+            evidence_quality >= 0.65
+            or evidence_basis == "direct"
+            or source_match == "settlement_aligned"
+            or primary_source_url
+        ):
+            return False
+
+        decision_origin = str(
+            audit.get("decision_origin") or (payload or {}).get("decision_origin") or ""
+        ).strip().lower()
+        synthetic = bool(audit.get("synthetic_decision")) or decision_origin.startswith(
+            "synthetic_"
+        )
+        confidence = None
+        for source in (payload or {}, audit):
+            raw_conf = source.get("confidence") if isinstance(source, dict) else None
+            if isinstance(raw_conf, (int, float)):
+                confidence = float(raw_conf)
+                break
+        placeholder_confidence = confidence is None or abs(confidence - 0.50) <= 0.05
+        edge_source = str(
+            audit.get("edge_source") or (payload or {}).get("edge_source") or ""
+        ).strip().lower()
+        reason = str(entry.get("reason") or audit.get("final_reason") or "").lower()
+        placeholder_reason = (
+            "pre_analysis" in reason
+            or "soft_research" in reason
+            or "analysis_cap" in reason
+            or "lifetime" in reason
+        )
+        return bool(
+            (synthetic or placeholder_reason)
+            and placeholder_confidence
+            and evidence_quality <= 0.05
+            and edge_source in {"", "none", "fallback"}
+        )
+
     def get_active_research_entries(
         self,
         lookback_hours: int = 6,
@@ -1605,13 +1870,14 @@ class MarketStateManager:
     def estimate_research_entry_priority(entry: dict[str, Any]) -> float | None:
         """Best-effort priority for a queued research entry.
 
-        Reads ``last_decision_json.audit.pre_analysis_score`` first (most
-        accurate), falls back to ``last_decision_json.pre_analysis_score`` for
-        legacy payloads, then to ``1.0 - threshold_gap`` for entries that have
-        only the gap metadata. Returns ``None`` when no signal is available so
-        callers can treat unknown-priority entries as "skip-worthy" rather than
-        "low-priority".
+        Prefer explicit persisted ``research_priority`` first, then enrich it
+        with near-miss, repeated-sighting, source-alignment, evidence, and
+        family-performance signals. Returns ``None`` when no signal is
+        available so callers can treat unknown-priority entries as admissible
+        rather than low-priority.
         """
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
         decision_json = entry.get("last_decision_json")
         if decision_json:
             try:
@@ -1619,18 +1885,88 @@ class MarketStateManager:
             except (TypeError, ValueError):
                 payload = None
             if isinstance(payload, dict):
-                audit = payload.get("audit")
-                if isinstance(audit, dict):
-                    score = audit.get("pre_analysis_score")
-                    if isinstance(score, (int, float)):
-                        return float(score)
-                score = payload.get("pre_analysis_score")
+                raw_audit = payload.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        signals_present = False
+        priority: float | None = None
+        for source in (entry, audit, payload or {}):
+            score = source.get("research_priority") if isinstance(source, dict) else None
+            if isinstance(score, (int, float)):
+                priority = float(score)
+                signals_present = True
+                break
+        if priority is None:
+            for source in (audit, payload or {}):
+                score = source.get("pre_analysis_score") if isinstance(source, dict) else None
                 if isinstance(score, (int, float)):
-                    return float(score)
+                    priority = float(score)
+                    signals_present = True
+                    break
         threshold_gap = entry.get("threshold_gap")
+        if threshold_gap is None and isinstance(audit, dict):
+            threshold_gap = audit.get("threshold_gap")
         if isinstance(threshold_gap, (int, float)):
-            return max(0.0, 1.0 - float(threshold_gap))
-        return None
+            gap = max(0.0, float(threshold_gap))
+            if priority is None:
+                priority = max(0.0, 1.0 - gap)
+            if gap <= 0.03:
+                priority += 0.10
+            elif gap <= 0.08:
+                priority += 0.05
+            signals_present = True
+        try:
+            times_seen = max(0, int(entry.get("times_seen") or 0))
+        except (TypeError, ValueError):
+            times_seen = 0
+        if times_seen > 1:
+            priority = (priority if priority is not None else 0.0) + min(
+                0.10,
+                float(times_seen - 1) * 0.01,
+            )
+            signals_present = True
+        source_match = str(
+            (audit or {}).get("source_match_class")
+            or (payload or {}).get("source_match_class")
+            or ""
+        ).strip().lower()
+        if source_match == "settlement_aligned":
+            priority = (priority if priority is not None else 0.0) + 0.08
+            signals_present = True
+        evidence_quality = None
+        for source in (audit, payload or {}, entry):
+            raw_eq = source.get("evidence_quality") if isinstance(source, dict) else None
+            if isinstance(raw_eq, (int, float)):
+                evidence_quality = float(raw_eq)
+                break
+        if evidence_quality is not None and evidence_quality >= 0.90:
+            priority = (priority if priority is not None else 0.0) + 0.05
+            signals_present = True
+        family_pnl = (audit or {}).get("historical_family_pnl_total")
+        family_samples = (
+            (audit or {}).get("historical_family_samples")
+            or (audit or {}).get("historical_family_sample_size")
+        )
+        if isinstance(family_pnl, (int, float)) and isinstance(family_samples, (int, float)):
+            if float(family_pnl) > 0.0 and int(family_samples) >= 10:
+                priority = (priority if priority is not None else 0.0) + 0.05
+                signals_present = True
+        reason_text = str(entry.get("reason") or (audit or {}).get("final_reason") or "").lower()
+        if "extended_research_cooldown" in reason_text and (
+            (isinstance(threshold_gap, (int, float)) and float(threshold_gap) <= 0.08)
+            or times_seen >= 3
+            or source_match == "settlement_aligned"
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.08
+            signals_present = True
+        if MarketStateManager.is_repeated_low_yield_research_entry(entry):
+            if priority is None:
+                return 0.20
+            priority = min(float(priority), 0.25)
+            signals_present = True
+        if not signals_present or priority is None:
+            return None
+        return max(0.0, min(1.0, float(priority)))
 
     @staticmethod
     def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:

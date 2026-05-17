@@ -6,6 +6,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from config import (
     SearchConfig,
@@ -29,6 +30,7 @@ _RE_NO_EXTERNAL_ODDS = re.compile(
     r"(no (?:external )?(?:betting )?odds found|implied[_ ]prob(?:ability)?\s*[:=]\s*(?:unknown|n/?a|null))",
     re.IGNORECASE,
 )
+_RE_URL = re.compile(r"https?://[^\s,\])}>\"']+", re.IGNORECASE)
 _RE_LOW_INFORMATION = re.compile(
     r"(no (?:search )?results|zero mentions|no mentions of|no evidence(?: found)?|"
     r"no information(?: found)?|no data(?: available)?|could not find (?:any )?"
@@ -94,11 +96,9 @@ _VERIFIABLE_EVIDENCE_KEYWORDS = (
 )
 _MAX_MODEL_RESPONSE_LOG_CHARS = 500
 _ANALYSIS_MAX_ATTEMPTS = 3
-# Deep refinement always has `previous_analysis` as a safe fallback in the
-# caller, so a single failed attempt should short-circuit rather than burn
-# budget that other candidates could use. Initial analyses (no fallback)
-# still use the full attempt count.
-_DEEP_ANALYSIS_MAX_ATTEMPTS = 1
+# May 16 logs showed retriable deep RST_STREAM failures with max_attempts=1.
+# Keep the deep budget bounded, but allow one retry by default.
+_DEEP_ANALYSIS_MAX_ATTEMPTS = 2
 _ANALYSIS_RETRY_WAIT_SECONDS = 2
 _DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 240
 _FAST_REASONING_FALLBACK_MODEL = "grok-4-1-fast-reasoning"
@@ -162,6 +162,22 @@ def _response_preview(text: str, max_chars: int = _MAX_MODEL_RESPONSE_LOG_CHARS)
     if len(preview) <= max_chars:
         return preview
     return preview[:max_chars] + "..."
+
+
+def _clean_extracted_url(value: str) -> str | None:
+    candidate = str(value or "").strip().rstrip(".,;:!?)]}>\"'")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return candidate
+
+
+def _extract_first_url_from_text(text: str) -> str | None:
+    for match in _RE_URL.finditer(text or ""):
+        cleaned = _clean_extracted_url(match.group(0))
+        if cleaned:
+            return cleaned
+    return None
 
 
 _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
@@ -628,6 +644,23 @@ class GrokClient:
             return "direct"
         return "proxy"
 
+    @staticmethod
+    def _extract_primary_source_url(decision: TradeDecision) -> str | None:
+        existing = _clean_extracted_url(str(decision.primary_source_url or ""))
+        if existing:
+            return existing
+        key_sources = decision.key_sources or []
+        if isinstance(key_sources, (list, tuple)):
+            for source in key_sources:
+                extracted = _extract_first_url_from_text(str(source or ""))
+                if extracted:
+                    return extracted
+        elif key_sources:
+            extracted = _extract_first_url_from_text(str(key_sources))
+            if extracted:
+                return extracted
+        return _extract_first_url_from_text(decision.reasoning or "")
+
     def _validate_and_enrich_decision(
         self,
         market: Market,
@@ -678,14 +711,24 @@ class GrokClient:
             prob_consistency_ok = False
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
+        primary_source_url = self._extract_primary_source_url(decision)
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
         low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
-        has_verifiable_signal = self._has_verifiable_source_signal(decision.reasoning)
+        source_text_for_validation = " ".join(
+            part
+            for part in (
+                decision.reasoning or "",
+                " ".join(str(source) for source in (decision.key_sources or [])),
+                primary_source_url or "",
+            )
+            if part
+        )
+        has_verifiable_signal = self._has_verifiable_source_signal(source_text_for_validation)
         has_definitive_outcome_signal = bool(
-            _RE_DEFINITIVE_OUTCOME_SIGNAL.search(decision.reasoning or "")
+            _RE_DEFINITIVE_OUTCOME_SIGNAL.search(source_text_for_validation)
         )
         source_match_class = self._source_match_class(
-            decision.reasoning or "",
+            source_text_for_validation,
             has_verifiable_signal=has_verifiable_signal,
             has_definitive_outcome_signal=has_definitive_outcome_signal,
             no_external_odds=no_external_odds,
@@ -782,7 +825,6 @@ class GrokClient:
             if market_implied is not None
             else None
         )
-        primary_source_url = str(decision.primary_source_url or "").strip()
         primary_source_required_for_direct = profile_name != "sports"
         primary_source_satisfies_direct = (
             bool(primary_source_url) or not primary_source_required_for_direct
@@ -980,6 +1022,7 @@ class GrokClient:
                 "evidence_quality_floor_applied": evidence_quality_floor_applied,
                 "source_match_class": source_match_class,
                 "evidence_floor_suppressed_reason": evidence_floor_suppressed_reason,
+                "primary_source_url": primary_source_url,
                 "reasoning": (
                     f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
                     f"basis={evidence_basis_class} "
@@ -1435,7 +1478,10 @@ class GrokClient:
                     first.base_rate_used if first.base_rate_used is not None else second.base_rate_used
                 ),
                 "uncertainty_note": second.uncertainty_note or first.uncertainty_note,
-                "self_critique": str(critique or "")[:800] or None,
+                "self_critique": (
+                    f"self_consistency_agreement: probability_gap={probability_gap:.4f}; "
+                    f"second-pass critique: {str(critique or '').strip()}"
+                )[:800],
                 "raw_confidence": max(0.0, min(1.0, merged_confidence)),
                 "raw_outcome": merged_outcome,
                 "prompt_tokens": (first.prompt_tokens or 0) + (second.prompt_tokens or 0),
@@ -1443,7 +1489,9 @@ class GrokClient:
                 "reasoning_tokens": (first.reasoning_tokens or 0) + (second.reasoning_tokens or 0),
                 "cached_tokens": (first.cached_tokens or 0) + (second.cached_tokens or 0),
                 "reasoning": (
-                    f"{first.reasoning}\nSelf-consistency average YES={averaged_yes:.4f}; "
+                    f"{first.reasoning}\n"
+                    f"[self_consistency_agreement probability_gap={probability_gap:.4f}] "
+                    f"average YES={averaged_yes:.4f}; "
                     f"second-pass critique: {str(critique or '').strip()}"
                 ).strip(),
             }
@@ -1591,7 +1639,19 @@ class GrokClient:
     ) -> TradeDecision:
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
         last_error: Exception | None = None
-        max_attempts = _DEEP_ANALYSIS_MAX_ATTEMPTS if deep else _ANALYSIS_MAX_ATTEMPTS
+        max_attempts = _ANALYSIS_MAX_ATTEMPTS
+        if deep:
+            max_attempts = max(
+                1,
+                int(
+                    getattr(
+                        self.settings,
+                        "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS",
+                        _DEEP_ANALYSIS_MAX_ATTEMPTS,
+                    )
+                    or _DEEP_ANALYSIS_MAX_ATTEMPTS
+                ),
+            )
         first_decision: TradeDecision | None = None
         active_config_for_merge: SearchConfig | None = None
         for attempt in range(1, max_attempts + 1):
@@ -1650,6 +1710,8 @@ class GrokClient:
                     or attempt >= max_attempts
                     or budget_remaining_ms <= 0
                 ):
+                    if deep and retriable:
+                        break
                     raise
                 sleep_seconds = min(
                     _ANALYSIS_RETRY_WAIT_SECONDS,
@@ -1673,6 +1735,71 @@ class GrokClient:
                 if sleep_seconds > 0:
                     time.sleep(sleep_seconds)
         if first_decision is None:
+            if deep and previous_analysis is not None and last_error is not None:
+                duration_ms = float(getattr(last_error, "_grok_duration_ms", 0.0))
+                if _is_retriable_grok_error(last_error, duration_ms):
+                    logger.warning(
+                        "Deep market analysis exhausted retries; preserving previous analysis: market=%s error=%s",
+                        market.id,
+                        last_error,
+                        data={
+                            "market_id": market.id,
+                            "deep_analysis_failed_retriable": True,
+                            "error": str(last_error),
+                            "error_type": type(last_error).__name__,
+                            "max_attempts": max_attempts,
+                        },
+                    )
+                    return previous_analysis.model_copy(
+                        update={
+                            "reasoning": (
+                                "[DeepAnalysisFallback reason=retriable_failure] "
+                                f"{previous_analysis.reasoning}"
+                            )
+                        }
+                    )
+            if deep and previous_analysis is None and last_error is not None:
+                duration_ms = float(getattr(last_error, "_grok_duration_ms", 0.0))
+                budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
+                if (
+                    _is_retriable_grok_error(last_error, duration_ms)
+                    and budget_remaining_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0
+                ):
+                    logger.warning(
+                        "Deep market analysis exhausted retries; attempting fast fallback: market=%s error=%s",
+                        market.id,
+                        last_error,
+                        data={
+                            "market_id": market.id,
+                            "deep_analysis_failed_retriable": True,
+                            "deep_analysis_fast_fallback_attempted": True,
+                            "fallback_model": _FAST_REASONING_FALLBACK_MODEL,
+                            "budget_remaining_ms": round(budget_remaining_ms, 2),
+                            "error": str(last_error),
+                            "error_type": type(last_error).__name__,
+                            "max_attempts": max_attempts,
+                        },
+                    )
+                    fallback_decision = self._run_analysis_once(
+                        market=market,
+                        search_config=search_config,
+                        previous_analysis=None,
+                        deep=False,
+                        retry_attempt=1,
+                        budget_remaining_ms=budget_remaining_ms,
+                        max_attempts=1,
+                        temperature=None,
+                        model_override=_FAST_REASONING_FALLBACK_MODEL,
+                        allow_model_fallback=False,
+                    )
+                    return fallback_decision.model_copy(
+                        update={
+                            "reasoning": (
+                                "[DeepAnalysisFallback reason=retriable_fast_fallback] "
+                                f"{fallback_decision.reasoning}"
+                            )
+                        }
+                    )
             raise TimeoutError(
                 f"Grok analysis budget exhausted for market {market.id}"
             ) from last_error
@@ -1724,6 +1851,22 @@ class GrokClient:
                             "second_confidence": second_decision.confidence,
                             "merged_confidence": merged.confidence,
                             "merged_probability_yes": merged.probability_yes,
+                            "self_consistency_agreement": (
+                                "self_consistency_disagreement"
+                                not in (merged.reasoning or "")
+                            ),
+                            "self_consistency_probability_gap": abs(
+                                (
+                                    first_decision.probability_yes
+                                    if first_decision.probability_yes is not None
+                                    else first_decision.confidence
+                                )
+                                - (
+                                    second_decision.probability_yes
+                                    if second_decision.probability_yes is not None
+                                    else second_decision.confidence
+                                )
+                            ),
                             "liquidity_usdc": market.liquidity_usdc,
                             "first_edge_market": self._decision_market_edge(
                                 market, first_decision

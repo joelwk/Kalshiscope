@@ -220,6 +220,7 @@ class TestConfig(unittest.TestCase):
             "KELLY_DYNAMIC_ENABLED=true",
             "KELLY_FRACTION_DEFAULT=0.30",
             "GROK_SELF_CONSISTENCY_ENABLED=true",
+            "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2",
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS=420",
             "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD=400",
             "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD=0.15",
@@ -235,6 +236,17 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_PER_CYCLE=8",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=0.40",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
+            "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",
+            "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
+            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.03",
+            "CONVICTION_REPAIR_ENABLED=true",
+            "CONVICTION_REPAIR_MIN_EDGE=0.20",
+            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
+            "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
+            "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
+            "HISTORICAL_FAMILY_SIGNAL_ENABLED=true",
+            "HISTORICAL_FAMILY_SCORE_SCALE=0.06",
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX=0.25",
         }
         for expected_line in expected_lines:
             self.assertIn(expected_line, env_example)
@@ -336,6 +348,8 @@ class TestConfig(unittest.TestCase):
             "KALSHI_MAX_FETCH_PAGES": "12",
             "XAI_CLIENT_TIMEOUT_SECONDS": "75",
             "GROK_STREAM_TIMEOUT_SECONDS": "80",
+            "GROK_STREAM_TIMEOUT_SECONDS_DEEP": "95",
+            "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS": "3",
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS": "55",
             "GROK_SELF_CONSISTENCY_ENABLED": "false",
             "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD": "425",
@@ -344,6 +358,15 @@ class TestConfig(unittest.TestCase):
             "GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE": "0.85",
             "EDGE_REPAIR_ENABLED": "false",
             "EDGE_BAND_CALIBRATION_ENABLED": "false",
+            "CONVICTION_REPAIR_ENABLED": "false",
+            "CONVICTION_REPAIR_MIN_EDGE": "0.24",
+            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY": "0.93",
+            "CONVICTION_REPAIR_SCORE_GAP_MAX": "0.05",
+            "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR": "0.02",
+            "SCORE_SOURCE_CONFIRMED_EDGE_BONUS": "0.08",
+            "HISTORICAL_FAMILY_SIGNAL_ENABLED": "false",
+            "HISTORICAL_FAMILY_SCORE_SCALE": "0.04",
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX": "0.18",
             "DAILY_EXPECTANCY_ENABLED": "false",
             "DAILY_EXPECTANCY_PRIMARY_TARGETS": "3",
             "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT": "0.15",
@@ -375,6 +398,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 12)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 75)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 80)
+        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS_DEEP, 95)
+        self.assertEqual(settings.GROK_DEEP_ANALYSIS_MAX_ATTEMPTS, 3)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 55)
         self.assertFalse(settings.GROK_SELF_CONSISTENCY_ENABLED)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD, 425.0)
@@ -383,6 +408,15 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.85)
         self.assertFalse(settings.EDGE_REPAIR_ENABLED)
         self.assertFalse(settings.EDGE_BAND_CALIBRATION_ENABLED)
+        self.assertFalse(settings.CONVICTION_REPAIR_ENABLED)
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.24)
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.93)
+        self.assertEqual(settings.CONVICTION_REPAIR_SCORE_GAP_MAX, 0.05)
+        self.assertEqual(settings.CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR, 0.02)
+        self.assertEqual(settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS, 0.08)
+        self.assertFalse(settings.HISTORICAL_FAMILY_SIGNAL_ENABLED)
+        self.assertEqual(settings.HISTORICAL_FAMILY_SCORE_SCALE, 0.04)
+        self.assertEqual(settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX, 0.18)
         self.assertFalse(settings.DAILY_EXPECTANCY_ENABLED)
         self.assertEqual(settings.DAILY_EXPECTANCY_PRIMARY_TARGETS, 3)
         self.assertEqual(settings.DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT, 0.15)
@@ -483,6 +517,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 3)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 120)
         self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS, 75)
+        self.assertEqual(settings.GROK_STREAM_TIMEOUT_SECONDS_DEEP, 90)
+        self.assertEqual(settings.GROK_DEEP_ANALYSIS_MAX_ATTEMPTS, 2)
         self.assertEqual(settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS, 420)
         self.assertTrue(settings.GROK_SELF_CONSISTENCY_ENABLED)
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD, 400.0)
@@ -491,6 +527,15 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE, 0.7)
         self.assertTrue(settings.EDGE_REPAIR_ENABLED)
         self.assertTrue(settings.EDGE_BAND_CALIBRATION_ENABLED)
+        self.assertTrue(settings.CONVICTION_REPAIR_ENABLED)
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.20)
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.90)
+        self.assertEqual(settings.CONVICTION_REPAIR_SCORE_GAP_MAX, 0.08)
+        self.assertEqual(settings.CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR, 0.0)
+        self.assertEqual(settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS, 0.06)
+        self.assertTrue(settings.HISTORICAL_FAMILY_SIGNAL_ENABLED)
+        self.assertEqual(settings.HISTORICAL_FAMILY_SCORE_SCALE, 0.06)
+        self.assertEqual(settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX, 0.25)
         self.assertTrue(settings.DAILY_EXPECTANCY_ENABLED)
         self.assertEqual(settings.DAILY_EXPECTANCY_PRIMARY_TARGETS, 2)
         self.assertEqual(settings.DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT, 0.25)
@@ -691,7 +736,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES, 45.0)
         self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 2)
+        self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.03)
+        self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 4)
+        self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 8)
 
     def test_research_queue_drain_settings_env_override(self) -> None:
         env = {
@@ -702,7 +751,11 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS": "24.0",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY": "0.65",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH": "false",
+            "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES": "12.5",
             "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS": "5",
+            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP": "0.015",
+            "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS": "6",
+            "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN": "11",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -712,7 +765,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 24.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.65)
         self.assertFalse(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES, 12.5)
         self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 5)
+        self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.015)
+        self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 6)
+        self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 11)
 
     def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
         """Cycle 4 recovery: a growing research queue (127+ entries) needs
@@ -729,6 +786,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES, 45.0)
 
     def test_max_sports_candidates_per_cycle_default_unset(self) -> None:
         """Cycle 4 recovery: the new sports cap defaults to 0 (no cap) so

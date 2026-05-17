@@ -523,6 +523,8 @@ def test_compute_final_score_defaults_new_optional_fields() -> None:
     assert score.low_information_penalty == 0.0
     assert score.observed_data_bonus == 0.0
     assert score.no_external_odds_penalty == 0.0
+    assert score.source_confirmed_edge is False
+    assert score.source_confirmed_edge_bonus == 0.0
     assert score.repeated_analysis_penalty == 0.0
     assert isinstance(score.rejection_reasons, tuple)
 
@@ -1573,6 +1575,189 @@ def test_compute_final_score_applies_historical_family_bonus_for_profitable_fami
     assert with_bonus.historical_family_bonus == pytest.approx(0.04)
     assert without_bonus.historical_family_bonus == pytest.approx(0.0, abs=1e-9)
     assert with_bonus.final_score == pytest.approx(without_bonus.final_score + 0.04)
+
+
+def test_settlement_aligned_proxy_gets_source_bonus_and_reduced_penalty() -> None:
+    market = Market(
+        id="KXNETFLIX-B1",
+        question="Will this settlement-aligned proxy resolve yes?",
+        outcomes=[MarketOutcome(name="YES", price=0.48), MarketOutcome(name="NO", price=0.52)],
+        liquidity_usdc=700.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=6),
+        resolution_criteria="Official settlement source",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.76,
+        bet_size_pct=0.25,
+        reasoning="High-quality settlement-aligned proxy evidence.",
+        edge_external=0.22,
+        edge_source="fallback",
+        evidence_basis="proxy",
+        evidence_quality=0.94,
+        primary_source_url="https://example.com/source",
+        source_match_class="settlement_aligned",
+    )
+
+    aligned = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.52,
+        evidence_basis_class="proxy",
+        edge_source="fallback",
+        source_match_class="settlement_aligned",
+        primary_source_url_present=True,
+    )
+    unaligned = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.52,
+        evidence_basis_class="proxy",
+        edge_source="fallback",
+        source_match_class="preview_or_proxy",
+        primary_source_url_present=True,
+    )
+
+    assert aligned.source_alignment_bonus == pytest.approx(0.03)
+    assert aligned.proxy_penalty_reduced is True
+    assert aligned.proxy_evidence_penalty < unaligned.proxy_evidence_penalty
+    assert aligned.final_score > unaligned.final_score
+
+
+def test_source_confirmed_edge_suppresses_calibrated_negative_market_rejection() -> None:
+    market = Market(
+        id="KXSPORTS-26MAY171900TEAMATEAMB",
+        question="Will Team A win?",
+        outcomes=[MarketOutcome(name="YES", price=0.72), MarketOutcome(name="NO", price=0.28)],
+        liquidity_usdc=1000.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=3),
+        resolution_criteria="Official box score",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        raw_confidence=0.86,
+        bet_size_pct=0.20,
+        reasoning="Official box score and computed external probability support YES.",
+        implied_prob_external=0.48,
+        my_prob=0.72,
+        edge_external=0.24,
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=0.95,
+        primary_source_url="https://www.espn.com/game/example",
+        source_match_class="settlement_aligned",
+    )
+
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.72,
+        evidence_basis_class="direct",
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url_present=True,
+        source_confirmed_edge_min=0.20,
+        source_confirmed_edge_min_evidence_quality=0.90,
+    )
+
+    assert result.edge_market < 0.0
+    assert result.source_confirmed_edge is True
+    assert result.source_confirmed_edge_bonus > 0.0
+    assert "non_positive_market_edge" not in result.rejection_reasons
+
+
+def test_source_confirmed_edge_requires_source_backing() -> None:
+    market = Market(
+        id="KXGENERIC-B1",
+        question="Will a generic threshold resolve yes?",
+        outcomes=[MarketOutcome(name="YES", price=0.72), MarketOutcome(name="NO", price=0.28)],
+        liquidity_usdc=1000.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=3),
+        resolution_criteria="Official source",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        bet_size_pct=0.20,
+        reasoning="Computed probability but no primary source URL.",
+        implied_prob_external=0.48,
+        my_prob=0.72,
+        edge_external=0.24,
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=0.95,
+        source_match_class="settlement_aligned",
+    )
+
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.72,
+        evidence_basis_class="direct",
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url_present=False,
+    )
+
+    assert result.source_confirmed_edge is False
+    assert "non_positive_market_edge" in result.rejection_reasons
+
+
+def test_historical_family_signal_softly_adjusts_score_and_size() -> None:
+    market = Market(
+        id="KXSPORTS-26MAY161900TEAMATEAMB",
+        question="Will Team A win?",
+        outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        liquidity_usdc=1000.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+        resolution_criteria="Official score",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.72,
+        bet_size_pct=0.25,
+        reasoning="Direct evidence and market edge.",
+        edge_external=0.12,
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=0.85,
+    )
+
+    positive = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.58,
+        evidence_basis_class="direct",
+        edge_source="computed",
+        historical_family_pnl_total=12.0,
+        historical_family_sample_size=172,
+        historical_family_win_rate=0.57,
+        historical_family_deployed_usdc=1009.28,
+        historical_family_high_conf_losses=0,
+    )
+    negative = compute_final_score(
+        market.model_copy(update={"id": "KXGENERIC-B1"}),
+        decision.model_copy(update={"evidence_basis": "proxy", "confidence": 0.92}),
+        implied_prob_market=0.58,
+        evidence_basis_class="proxy",
+        edge_source="computed",
+        historical_family_pnl_total=-102.88,
+        historical_family_sample_size=168,
+        historical_family_win_rate=0.5476,
+        historical_family_deployed_usdc=850.85,
+        historical_family_high_conf_losses=18,
+    )
+
+    assert positive.historical_family_score_adjustment > 0.0
+    assert positive.historical_family_size_multiplier > 1.0
+    assert negative.historical_family_score_adjustment < 0.0
+    assert negative.historical_family_size_multiplier < 1.0
+    assert "historical_family_negative_signal" in negative.rejection_reasons
 
 
 def _make_market(market_id: str = "KXSAMPLEGAME-26APR191420TEAMATEAMB-TEAMA", **kw):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 
@@ -62,6 +63,34 @@ def test_research_queue_times_seen_defaults_for_new_entry() -> None:
     )
     entries = mgr.get_active_research_entries(lookback_hours=1)
     assert entries[0]["times_seen"] == 1
+
+
+def test_mark_research_queue_drain_attempt_updates_audit_payload() -> None:
+    mgr = _make_manager()
+    attempted_at = datetime(2026, 5, 16, 20, 0, tzinfo=timezone.utc)
+    mgr.record_research_queue_entry(
+        market_id="KXDRAIN-001",
+        cycle_id="c1",
+        gate_name="score_gate",
+        reason="near_threshold",
+        last_decision_json=json.dumps(
+            {"audit": {"research_priority": 0.71}, "should_trade": False}
+        ),
+    )
+
+    mgr.mark_research_queue_drain_attempt(
+        "KXDRAIN-001",
+        cycle_id="cycle-002",
+        attempted_at=attempted_at,
+    )
+    entries = mgr.get_active_research_entries(lookback_hours=1)
+    attempts, last_attempt = mgr.research_queue_drain_attempt_metadata(entries[0])
+
+    assert attempts == 1
+    assert last_attempt == attempted_at
+    payload = json.loads(entries[0]["last_decision_json"])
+    assert payload["audit"]["research_priority"] == 0.71
+    assert payload["audit"]["research_queue_last_drain_cycle_id"] == "cycle-002"
 
 
 def test_expired_entries_excluded_from_get() -> None:
@@ -415,5 +444,88 @@ def test_estimate_research_entry_priority_returns_none_when_no_signal() -> None:
     the entry as 'unknown' rather than penalizing it."""
     priority = MarketStateManager.estimate_research_entry_priority({})
     assert priority is None
+
+
+def test_repeated_low_yield_synthetic_placeholder_priority_decays() -> None:
+    entry = {
+        "times_seen": 9,
+        "threshold_gap": 0.18,
+        "reason": "pre_analysis_score_soft_research",
+        "last_decision_json": json.dumps(
+            {
+                "should_trade": False,
+                "confidence": 0.50,
+                "edge_source": "none",
+                "evidence_quality": 0.0,
+                "audit": {
+                    "synthetic_decision": True,
+                    "decision_origin": "synthetic_research_queue",
+                    "research_priority": 0.70,
+                    "evidence_quality": 0.0,
+                    "research_queue_drain_attempts": 4,
+                },
+            }
+        ),
+    }
+
+    assert MarketStateManager.is_repeated_low_yield_research_entry(entry)
+    assert MarketStateManager.estimate_research_entry_priority(entry) == 0.25
+
+
+def test_repeated_placeholder_decay_preserves_improving_source_signal() -> None:
+    entry = {
+        "times_seen": 10,
+        "threshold_gap": 0.02,
+        "reason": "pre_analysis_score_soft_research",
+        "last_decision_json": json.dumps(
+            {
+                "should_trade": True,
+                "confidence": 0.68,
+                "edge_source": "computed",
+                "evidence_quality": 0.92,
+                "primary_source_url": "https://espn.com/game",
+                "audit": {
+                    "synthetic_decision": False,
+                    "source_match_class": "settlement_aligned",
+                    "evidence_quality": 0.92,
+                    "research_queue_drain_attempts": 5,
+                },
+            }
+        ),
+    }
+
+    assert not MarketStateManager.is_repeated_low_yield_research_entry(entry)
+
+
+def test_estimate_research_entry_priority_promotes_near_miss_repeated_settlement_signal() -> None:
+    priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "times_seen": 6,
+            "threshold_gap": 0.02,
+            "last_decision_json": (
+                '{"audit": {"research_priority": 0.38, "source_match_class": '
+                '"settlement_aligned", "evidence_quality": 0.94, '
+                '"historical_family_pnl_total": 11.75, '
+                '"historical_family_samples": 172}}'
+            ),
+        }
+    )
+
+    assert priority is not None
+    assert priority >= 0.66
+
+
+def test_estimate_research_entry_priority_promotes_extended_cooldown_near_threshold() -> None:
+    priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "reason": "extended_research_cooldown",
+            "times_seen": 3,
+            "threshold_gap": 0.04,
+            "last_decision_json": '{"audit": {"research_priority": 0.32}}',
+        }
+    )
+
+    assert priority is not None
+    assert priority >= 0.47
 
 
