@@ -40,3 +40,40 @@ def test_kelly_bet_pct_in_range() -> None:
         min_edge=0.05,
     )
     assert 0.0 < bet_pct <= 1.0
+
+
+def test_kelly_bet_pct_uses_dynamic_floor_for_strong_edge() -> None:
+    raw = kelly_fraction(0.75, 0.55)
+    bet_pct = kelly_bet_pct(
+        posterior=0.75,
+        market_price=0.55,
+        fraction=0.25,
+        min_edge=0.05,
+        edge=0.20,
+    )
+    assert math.isclose(bet_pct, raw * 0.40, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_kelly_bet_pct_uses_dynamic_floor_for_marginal_edge() -> None:
+    raw = kelly_fraction(0.70, 0.55)
+    bet_pct = kelly_bet_pct(
+        posterior=0.70,
+        market_price=0.55,
+        fraction=0.25,
+        min_edge=0.05,
+        edge=0.15,
+    )
+    assert math.isclose(bet_pct, raw * 0.35, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_kelly_bet_pct_can_disable_dynamic_fraction() -> None:
+    raw = kelly_fraction(0.70, 0.55)
+    bet_pct = kelly_bet_pct(
+        posterior=0.70,
+        market_price=0.55,
+        fraction=0.25,
+        min_edge=0.05,
+        edge=0.15,
+        dynamic_enabled=False,
+    )
+    assert math.isclose(bet_pct, raw * 0.25, rel_tol=1e-12, abs_tol=1e-12)

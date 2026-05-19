@@ -59,6 +59,74 @@ def _extract_grok_durations(rows: list[dict[str, Any]]) -> list[float]:
     return durations
 
 
+def _nested_number(data: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value: Any = data
+        for part in key.split("."):
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(part)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _extract_profit_lever_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    volume_discounts: list[float] = []
+    edge_reductions: list[float] = []
+    kelly_effective_fractions: list[float] = []
+    for row in rows:
+        data = row.get("data")
+        if not isinstance(data, dict):
+            continue
+        volume_discount = _nested_number(
+            data,
+            "score_volume_amplifier_discount",
+            "score_breakdown.score_volume_amplifier_discount",
+        )
+        if volume_discount is not None:
+            volume_discounts.append(volume_discount)
+        edge_reduction = _nested_number(
+            data,
+            "gate_edge_dynamic_reduction",
+            "score_breakdown.gate_edge_dynamic_reduction",
+        )
+        if edge_reduction is not None:
+            edge_reductions.append(edge_reduction)
+        kelly_fraction = _nested_number(
+            data,
+            "kelly_effective_fraction",
+            "audit.kelly_effective_fraction",
+        )
+        if kelly_fraction is not None:
+            kelly_effective_fractions.append(kelly_fraction)
+
+    reduced_count = sum(1 for value in edge_reductions if value > 1e-9)
+    kelly_gt_half = sum(1 for value in kelly_effective_fractions if value > 0.50)
+    return {
+        "volume_discount_count": len(volume_discounts),
+        "volume_discount_avg": (
+            sum(volume_discounts) / len(volume_discounts)
+            if volume_discounts
+            else 0.0
+        ),
+        "edge_reduction_count": reduced_count,
+        "edge_reduction_rate": (
+            reduced_count / len(edge_reductions)
+            if edge_reductions
+            else 0.0
+        ),
+        "kelly_fraction_count": len(kelly_effective_fractions),
+        "kelly_fraction_gt_half": kelly_gt_half,
+        "kelly_fraction_gt_half_rate": (
+            kelly_gt_half / len(kelly_effective_fractions)
+            if kelly_effective_fractions
+            else 0.0
+        ),
+    }
+
+
 def _p(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -116,6 +184,7 @@ def main() -> None:
         min_samples=args.min_samples,
     )
     grok_durations = _extract_grok_durations(rows)
+    profit_metrics = _extract_profit_lever_metrics(rows)
 
     print("Daily Tuning Recommendations")
     print("============================")
@@ -146,6 +215,22 @@ def main() -> None:
         print(f"grok_duration_p50_ms: {_p(grok_durations, 0.50):.2f}")
         print(f"grok_duration_p90_ms: {_p(grok_durations, 0.90):.2f}")
         print(f"grok_duration_max_ms: {max(grok_durations):.2f}")
+    print(
+        "score_volume_amplifier_discount_avg: "
+        f"{profit_metrics['volume_discount_avg']:.4f} "
+        f"(n={profit_metrics['volume_discount_count']})"
+    )
+    print(
+        "dynamic_edge_reductions_applied: "
+        f"{profit_metrics['edge_reduction_count']} "
+        f"({profit_metrics['edge_reduction_rate'] * 100:.1f}%)"
+    )
+    print(
+        "kelly_effective_fraction_gt_0_50: "
+        f"{profit_metrics['kelly_fraction_gt_half']}/"
+        f"{profit_metrics['kelly_fraction_count']} "
+        f"({profit_metrics['kelly_fraction_gt_half_rate'] * 100:.1f}%)"
+    )
 
 
 if __name__ == "__main__":

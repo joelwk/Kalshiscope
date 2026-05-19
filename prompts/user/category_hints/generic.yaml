@@ -1,4 +1,4 @@
 name: user/category_hints/generic
 description: Fallback guidance for unclassified markets.
 content: >-
-  Generic guidance: prefer primary sources and high-credibility reporting; penalize stale or weakly corroborated claims.
+  Generic guidance: prefer primary sources and high-credibility reporting; penalize stale or weakly corroborated claims. When no domain-specific prior exists, use a transparent 2024-2026 comparable-event base rate or recent resolved-market frequency before adjusting for fresh evidence.

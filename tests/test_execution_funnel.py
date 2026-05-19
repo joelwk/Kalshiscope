@@ -163,6 +163,92 @@ def test_execution_funnel_regression_hou3_direct_edge_stays_tradeable() -> None:
     assert score.final_score >= threshold
 
 
+def test_execution_funnel_source_confirmed_sports_edge_survives_calibration_shrink() -> None:
+    settings = Settings(
+        SCORE_GATE_THRESHOLD=0.38,
+        SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.25,
+    )
+    market = _market(
+        market_id="KXMLB-26MAY171900TEAMATEAMB-TEAMA",
+        category="sports",
+        question="Will Team A win after official lineup news?",
+        liquidity=1500.0,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.64,
+        raw_confidence=0.84,
+        bet_size_pct=0.2,
+        reasoning="Official source and computed external probability support YES.",
+        implied_prob_external=0.45,
+        my_prob=0.68,
+        edge_external=0.23,
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=0.94,
+        primary_source_url="https://www.espn.com/game/example",
+        source_match_class="settlement_aligned",
+    )
+    score = compute_final_score(
+        market=market,
+        decision=decision,
+        implied_prob_market=0.67,
+        evidence_basis_class="direct",
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url_present=True,
+        source_confirmed_edge_min=settings.CONVICTION_REPAIR_MIN_EDGE,
+        source_confirmed_edge_min_evidence_quality=(
+            settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY
+        ),
+        source_confirmed_edge_bonus_base=settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS,
+    )
+    threshold = _effective_score_gate_threshold(
+        settings=settings,
+        market=market,
+        evidence_basis_class="direct",
+        evidence_quality=decision.evidence_quality,
+    )
+    assert score.source_confirmed_edge is True
+    assert "non_positive_market_edge" not in score.rejection_reasons
+    assert score.final_score >= threshold
+
+
+def test_execution_funnel_source_confirmed_path_rejects_proxy_without_primary_source() -> None:
+    market = _market(
+        market_id="KXGENERIC-26MAY17-B1",
+        category="generic",
+        question="Will a generic threshold resolve yes?",
+        liquidity=1500.0,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.64,
+        bet_size_pct=0.2,
+        reasoning="Preview-only proxy source.",
+        implied_prob_external=0.45,
+        my_prob=0.68,
+        edge_external=0.23,
+        edge_source="computed",
+        evidence_basis="proxy",
+        evidence_quality=0.94,
+        source_match_class="preview_or_proxy",
+    )
+    score = compute_final_score(
+        market=market,
+        decision=decision,
+        implied_prob_market=0.67,
+        evidence_basis_class="proxy",
+        edge_source="computed",
+        source_match_class="preview_or_proxy",
+        primary_source_url_present=False,
+    )
+    assert score.source_confirmed_edge is False
+    assert "non_positive_market_edge" in score.rejection_reasons
+
+
 # ---------------------------------------------------------------------------
 # Cycle-14 MLB F5 regression fixture (correlation_id 6a6cc761).
 #

@@ -217,6 +217,7 @@ def main() -> None:
             decision = safe_json(r["decision_json"]) or {}
             audit = safe_json(r["audit_json"]) or {}
             score = safe_json(r["score_json"]) or {}
+            row_identifier = r["rowid"] if "rowid" in r.keys() else r["id"]
             action_counter[r["final_action"]] += 1
             edge_source_counter[(decision.get("edge_source") or "unknown").lower()] += 1
             ev = decision.get("evidence_basis") or audit.get("evidence_basis") or "unknown"
@@ -228,7 +229,7 @@ def main() -> None:
                 if r["final_action"] not in ("order_submitted", "dry_run", "fill", "ordered"):
                     should_trade_blocked.append(
                         {
-                            "rowid": r["rowid"],
+                            "rowid": row_identifier,
                             "market_id": r["market_id"],
                             "final_action": r["final_action"],
                             "family": family,
@@ -247,7 +248,7 @@ def main() -> None:
             if len(sample_decisions) < 25:
                 sample_decisions.append(
                     {
-                        "rowid": r["rowid"],
+                        "rowid": row_identifier,
                         "market": r["market_id"],
                         "final_action": r["final_action"],
                         "family": family,

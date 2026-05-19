@@ -65,9 +65,11 @@ class SequencedChatClient:
     def __init__(self, responses: list[Exception | str]) -> None:
         self.responses = responses
         self.create_calls = 0
+        self.create_kwargs: list[dict] = []
 
     def create(self, **kwargs):
         self.create_calls += 1
+        self.create_kwargs.append(kwargs)
         response = self.responses[min(self.create_calls - 1, len(self.responses) - 1)]
         if isinstance(response, Exception):
             return FailingChatSession(response)
@@ -257,18 +259,107 @@ class TestGrokClient(unittest.TestCase):
             )
         )
 
-    def test_deep_analysis_does_not_retry_on_failure(self) -> None:
+    def test_deep_analysis_retries_retriable_failure_and_attempts_fast_fallback(self) -> None:
         market = Market(
             id="m-deep-noretry",
             question="Will it rain?",
             outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
         )
         client = GrokClient(api_key="x")
-        failing = FailingClient(TimeoutError("Grok stream exceeded 90.0s for market m-deep-noretry"))
+        failing = FailingClient(
+            RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"')
+        )
         client.client = failing
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(RuntimeError):
             client.analyze_market_deep(market)
-        self.assertEqual(failing.chat.create_calls, 1)
+        self.assertEqual(failing.chat.create_calls, 3)
+
+    def test_deep_analysis_fast_fallback_can_recover_without_previous_analysis(self) -> None:
+        market = Market(
+            id="m-deep-fast-fallback",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "Fast fallback found no edge.", '
+            '"evidence_quality": 0.5}'
+        )
+        client = GrokClient(api_key="x", settings=Settings(GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2))
+        sequenced = SequencedClient(
+            [
+                RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"'),
+                RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"'),
+                content,
+            ]
+        )
+        client.client = sequenced
+
+        decision = client.analyze_market_deep(market)
+
+        self.assertFalse(decision.should_trade)
+        self.assertIn("retriable_fast_fallback", decision.reasoning)
+        self.assertEqual(sequenced.chat.create_calls, 3)
+
+    def test_deep_analysis_preserves_previous_on_retriable_retry_exhaustion(self) -> None:
+        market = Market(
+            id="m-deep-fallback",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        previous = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.52,
+            bet_size_pct=0.0,
+            reasoning="First pass found no executable edge.",
+            evidence_quality=0.8,
+        )
+        client = GrokClient(api_key="x", settings=Settings(GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2))
+        failing = FailingClient(
+            RuntimeError('StatusCode.INTERNAL details = "Received RST_STREAM with error code 2"')
+        )
+        client.client = failing
+
+        decision = client.analyze_market_deep(market, previous_analysis=previous)
+
+        self.assertFalse(decision.should_trade)
+        self.assertIn("DeepAnalysisFallback", decision.reasoning)
+        self.assertEqual(failing.chat.create_calls, 2)
+
+    def test_unimplemented_deep_model_falls_back_to_fast_reasoning_model(self) -> None:
+        market = Market(
+            id="m-deep-unimplemented",
+            question="Will it rain?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "No durable edge.", '
+            '"evidence_quality": 0.5}'
+        )
+        client = GrokClient(
+            api_key="x",
+            model="grok-4-1-fast-reasoning",
+            model_deep="grok-4.3-latest",
+        )
+        sequenced = SequencedClient(
+            [
+                RuntimeError("StatusCode.UNIMPLEMENTED 404 model unavailable"),
+                content,
+            ]
+        )
+        client.client = sequenced
+
+        decision = client.analyze_market_deep(market)
+
+        self.assertFalse(decision.should_trade)
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["model"], "grok-4.3-latest")
+        self.assertEqual(
+            sequenced.chat.create_kwargs[1]["model"],
+            "grok-4-1-fast-reasoning",
+        )
 
     def test_initial_analysis_still_retries_on_retriable_error(self) -> None:
         market = Market(
@@ -400,6 +491,142 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(last_kwargs["model"], client.model)
         self.assertEqual(len(last_kwargs["tools"]), 2)
         self.assertIs(last_kwargs["response_format"], TradeDecision)
+        self.assertEqual(last_kwargs["temperature"], 0.7)
+
+    def test_self_consistency_runs_second_pass_and_averages_yes_probability(self) -> None:
+        market = Market(
+            id="m-self-consistency",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.75, '
+            '"probability_yes": 0.75, "bet_size_pct": 0.5, '
+            '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
+            '"evidence_quality": 0.8, "key_sources": ["source A"], '
+            '"base_rate_used": true}'
+        )
+        second = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.65, '
+            '"probability_yes": 0.65, "bet_size_pct": 0.5, '
+            '"reasoning": "Implied prob: 55%, My prob: 65%, Edge: 10%. Counter-evidence lowers this.", '
+            '"evidence_quality": 0.8, "key_sources": ["source B"], '
+            '"self_critique": "Recent base rate lowers probability."}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, second])
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["temperature"], 0.3)
+        self.assertEqual(sequenced.chat.create_kwargs[1]["temperature"], 0.7)
+        self.assertAlmostEqual(decision.probability_yes or 0.0, 0.70)
+        self.assertLessEqual(decision.confidence, 0.70)
+        self.assertIn("source A", decision.key_sources)
+        self.assertIn("source B", decision.key_sources)
+        self.assertIn("self_consistency_agreement", decision.reasoning)
+        self.assertIn("Recent base rate", decision.self_critique or "")
+
+    def test_self_consistency_disagreement_marks_deep_repair_required(self) -> None:
+        market = Market(
+            id="m-self-consistency-disagree",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.78, '
+            '"probability_yes": 0.78, "bet_size_pct": 0.5, '
+            '"reasoning": "YES edge", "evidence_quality": 0.8}'
+        )
+        second = (
+            '{"should_trade": false, "outcome": "NO", "confidence": 0.62, '
+            '"probability_yes": 0.38, "bet_size_pct": 0.0, '
+            '"reasoning": "Counter-evidence favors NO.", '
+            '"evidence_quality": 0.8, "self_critique": "Sources conflict."}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, second])
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertFalse(decision.should_trade)
+        self.assertTrue(decision.abstain)
+        self.assertIn("self_consistency_disagreement", decision.reasoning)
+        self.assertIn("deep repair required", decision.self_critique or "")
+
+    def test_self_consistency_skips_second_pass_below_thresholds(self) -> None:
+        market = Market(
+            id="m-no-self-consistency",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=100.0,
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.60, '
+            '"probability_yes": 0.60, "bet_size_pct": 0.0, '
+            '"reasoning": "Implied prob: 55%, My prob: 60%, Edge: 5%", '
+            '"evidence_quality": 0.7}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([content])
+        client.client = sequenced
+
+        client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 1)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["temperature"], 0.3)
+
+    def test_self_consistency_second_pass_timeout_is_not_logged_as_error(self) -> None:
+        market = Market(
+            id="m-self-consistency-timeout",
+            question="Will it rain?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "YES", "confidence": 0.75, '
+            '"probability_yes": 0.75, "bet_size_pct": 0.5, '
+            '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
+            '"evidence_quality": 0.8}'
+        )
+        timeout = RuntimeError('StatusCode.DEADLINE_EXCEEDED details = "Deadline Exceeded"')
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, timeout])
+        client.client = sequenced
+
+        with patch("grok_client.logger.error") as error_mock, patch(
+            "grok_client.logger.warning"
+        ) as warning_mock:
+            decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertTrue(decision.should_trade)
+        error_mock.assert_not_called()
+        self.assertTrue(
+            any(
+                call.kwargs.get("data", {}).get("self_consistency_variant") is True
+                and call.kwargs.get("data", {}).get("will_retry") is False
+                for call in warning_mock.call_args_list
+            )
+        )
 
     def test_tools_use_search_config(self) -> None:
         market = Market(
@@ -1090,11 +1317,11 @@ class TestGrokClient(unittest.TestCase):
                 "Final score in official recap from Reuters confirms settlement outcome."
             ),
             implied_prob_external=None,
-            my_prob=0.85,
+            my_prob=0.97,
             edge_external=0.35,
             edge_source="fallback",
             likelihood_ratio=25.0,
-            evidence_quality=0.10,
+            evidence_quality=0.80,
             primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(api_key="x")
@@ -1108,6 +1335,39 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.source_match_class, "settlement_aligned")
         self.assertEqual(validated.evidence_basis, "direct")
+
+    def test_validate_and_enrich_definitive_outcome_requires_structured_probability(self) -> None:
+        market = Market(
+            id="m-definitive-no-my-prob",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap from Reuters confirms settlement outcome. "
+                "My probability: 97%."
+            ),
+            implied_prob_external=None,
+            my_prob=None,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.90,
+            primary_source_url="https://www.reuters.com/sports/example",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertFalse(validated.definitive_outcome_detected)
+        self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
 
     def test_validate_and_enrich_suppresses_non_sports_direct_floor_without_primary_url(self) -> None:
         market = Market(
@@ -1141,6 +1401,42 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
         self.assertEqual(validated.evidence_basis, "proxy")
 
+    def test_validate_and_enrich_extracts_primary_url_from_key_sources(self) -> None:
+        market = Market(
+            id="m-definitive-key-source",
+            question="Player prop post-game market",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Final score in official recap confirms settlement outcome."
+            ),
+            key_sources=["Reuters recap https://www.reuters.com/sports/example."],
+            implied_prob_external=None,
+            my_prob=0.97,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.80,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+
+        self.assertEqual(
+            validated.primary_source_url,
+            "https://www.reuters.com/sports/example",
+        )
+        self.assertTrue(validated.definitive_outcome_detected)
+        self.assertEqual(validated.evidence_basis, "direct")
+
     def test_validate_and_enrich_direct_fallback_bypasses_min_evidence_gate(self) -> None:
         market = Market(
             id="m-definitive-bypass",
@@ -1156,11 +1452,11 @@ class TestGrokClient(unittest.TestCase):
                 "Final score in official recap from Reuters confirms settlement outcome."
             ),
             implied_prob_external=None,
-            my_prob=0.85,
+            my_prob=0.97,
             edge_external=0.35,
             edge_source="fallback",
             likelihood_ratio=25.0,
-            evidence_quality=0.10,
+            evidence_quality=0.80,
             primary_source_url="https://www.reuters.com/sports/example",
         )
         client = GrokClient(

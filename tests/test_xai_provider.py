@@ -143,3 +143,26 @@ def test_create_chat_passes_image_understanding_to_web_search() -> None:
 
     assert captured["web"]["enable_image_understanding"] is True
     assert captured["x"]["enable_image_understanding"] is True
+
+
+def test_create_chat_passes_temperature_to_sdk() -> None:
+    flaky_chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            temperature=0.7,
+        )
+
+    assert response["kwargs"]["temperature"] == 0.7

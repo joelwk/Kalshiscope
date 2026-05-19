@@ -64,7 +64,7 @@ def test_evaluate_market_respects_min_sample_guard() -> None:
     assert reason is None
 
 
-def test_evaluate_market_blocks_losing_family_when_enabled() -> None:
+def test_evaluate_market_flags_losing_family_without_blocking() -> None:
     allowed, reason, metrics = evaluate_market(
         market_id="ZZZZZZ999999-TEST",
         family="crypto",
@@ -83,7 +83,7 @@ def test_evaluate_market_blocks_losing_family_when_enabled() -> None:
         family_pnl_cutoff=-12.0,
         family_win_rate_cutoff=0.40,
     )
-    assert allowed is False
+    assert allowed is True
     assert reason == "historical_family_pnl_block"
     assert metrics["historical_gate_market_family"] == "crypto"
     assert metrics["historical_family_samples"] == 30
@@ -274,7 +274,7 @@ def test_tiered_sample_just_below_hard_block_floor_stays_soft() -> None:
     assert result.allowed is True
 
 
-def test_tiered_n12_low_wilson_is_hard_deny() -> None:
+def test_tiered_n12_low_wilson_is_historical_signal_not_block() -> None:
     """With n=12 >= hard_block_min_samples and low Wilson LB, the tiered
     evaluator should produce HARD_DENY."""
     result = evaluate_market_tiered(
@@ -299,7 +299,7 @@ def test_tiered_n12_low_wilson_is_hard_deny() -> None:
     )
     assert result.tier == GateTier.HARD_DENY
     assert result.reason == "historical_prefix_pnl_block"
-    assert result.allowed is False
+    assert result.allowed is True
 
 
 def test_high_win_rate_negative_pnl_is_entry_price_caution_not_hard_deny() -> None:

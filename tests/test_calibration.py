@@ -110,8 +110,29 @@ def test_historical_confidence_shrink_is_monotonic_down_only() -> None:
     )
     assert shrunk.applied is True
     assert shrunk.calibrated_confidence < 0.84
+    assert round(shrunk.calibrated_confidence, 3) == 0.636
     assert not_raised.applied is False
     assert not_raised.calibrated_confidence == 0.84
+
+
+def test_historical_confidence_shrink_is_stronger_for_low_sample_buckets() -> None:
+    buckets = {
+        "all": {
+            0.8: {
+                "sample_size": 20,
+                "win_rate": 0.50,
+            }
+        }
+    }
+    result = historical_confidence_shrink(
+        0.84,
+        family="generic",
+        calibration_buckets=buckets,
+        min_samples=15,
+    )
+    assert result.applied is True
+    assert result.sample_size == 20
+    assert round(result.calibrated_confidence, 3) == 0.585
 
 
 def test_historical_confidence_shrink_family_scoped() -> None:

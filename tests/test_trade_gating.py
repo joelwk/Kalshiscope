@@ -7,11 +7,13 @@ import pytest
 from config import Settings
 from main import (
     _adjust_bet_size_for_edge,
+    _apply_definitive_outcome_floors,
     _build_execution_audit,
     _effective_score_gate_threshold,
     _extract_winning_outcome,
     _filter_markets,
     _is_confidence_override_allowed,
+    _is_definitive_outcome_eligible,
     _is_definitive_validated,
     _is_high_quality_settled_evidence,
     _is_uniform_implied_probability,
@@ -266,10 +268,10 @@ def test_zero_bet_skip_message_is_mode_aware() -> None:
     assert "edge scaling" in _zero_bet_skip_message("edge_scaling")
 
 
-def test_min_evidence_quality_floor_default_is_raised() -> None:
+def test_min_evidence_quality_floor_default_allows_crypto_volume_tuning() -> None:
     settings = Settings()
     generic_market = Market(id="m-eq-floor", question="Will BTC close above threshold?", category="crypto")
-    assert _min_evidence_quality_for_market(generic_market, settings) == 0.75
+    assert _min_evidence_quality_for_market(generic_market, settings) == 0.55
 
 
 def test_edge_gate_blocks_below_tightened_global_min_edge() -> None:
@@ -556,9 +558,11 @@ def test_definitive_outcome_edge_cap_raised() -> None:
         reasoning="Game resolved",
         evidence_basis="direct",
         evidence_quality=0.85,
+        raw_evidence_quality=0.85,
         primary_source_url="https://reuters.com/article/test",
         definitive_outcome_detected=True,
         source_match_class="settlement_aligned",
+        my_prob=0.95,
     )
     market = Market(
         id="KXSAMPLEPERIOD-26APR251415TEAMATEAMB-TEAMA",
@@ -747,9 +751,131 @@ def test_legacy_definitive_validated_path_unchanged() -> None:
     decision = _kehlani_style_decision(
         evidence_quality=0.85,
         definitive_outcome_detected=True,
+    ).model_copy(
+        update={
+            "my_prob": 0.99,
+            "raw_evidence_quality": 0.85,
+        }
     )
     assert _is_definitive_validated(decision, settings) is True
     assert _is_high_quality_settled_evidence(decision, settings) is False
+
+
+def test_definitive_outcome_requires_structured_near_binary_my_prob() -> None:
+    settings = Settings(
+        DIRECT_SOURCE_WHITELIST=("espn.com",),
+        DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR=0.80,
+    )
+    market = Market(
+        id="KXMLBHRR-SAMPLE",
+        question="Brandon Nimmo: 2+ hits + runs + RBIs?",
+        category="sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.45),
+            MarketOutcome(name="NO", price=0.55),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.80,
+        bet_size_pct=0.5,
+        reasoning="ESPN box score says Brandon Nimmo cleared the prop.",
+        evidence_basis="direct",
+        evidence_quality=0.80,
+        raw_evidence_quality=0.95,
+        primary_source_url="https://www.espn.com/mlb/boxscore/_/gameId/1",
+        definitive_outcome_detected=True,
+        source_match_class="settlement_aligned",
+        edge_source="none",
+    )
+
+    updated, applied = _apply_definitive_outcome_floors(decision, market, settings)
+    assert updated is decision
+    assert applied is False
+    assert _is_definitive_outcome_eligible(decision, settings, market=market) is False
+    ok, edge, reason = _passes_edge_threshold(0.45, decision, settings, market=market)
+    assert ok is False
+    assert edge == pytest.approx(0.35)
+    assert reason == "missing_structured_probability"
+
+
+def test_definitive_outcome_rejects_mismatched_sports_entity() -> None:
+    settings = Settings(
+        DIRECT_SOURCE_WHITELIST=("espn.com",),
+        DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR=0.80,
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.60,
+        MAX_REASONABLE_EDGE=0.35,
+    )
+    market = Market(
+        id="KXMLBHRR-SAMPLE",
+        question="Brandon Nimmo: 2+ hits + runs + RBIs?",
+        category="sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.45),
+            MarketOutcome(name="NO", price=0.55),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.95,
+        bet_size_pct=0.5,
+        reasoning="ESPN box score says Adley Rutschman cleared the prop.",
+        evidence_basis="direct",
+        evidence_quality=0.95,
+        raw_evidence_quality=0.95,
+        primary_source_url="https://www.espn.com/mlb/boxscore/_/gameId/1",
+        definitive_outcome_detected=True,
+        source_match_class="settlement_aligned",
+        edge_source="computed",
+        my_prob=0.99,
+    )
+
+    assert _is_definitive_validated(decision, settings, market=market) is False
+    ok, edge, reason = _passes_edge_threshold(0.45, decision, settings, market=market)
+    assert ok is False
+    assert edge == pytest.approx(0.50)
+    assert reason == "edge_above_reasonable_max"
+
+
+def test_definitive_outcome_accepts_matching_sports_entity_with_structured_probability() -> None:
+    settings = Settings(
+        DIRECT_SOURCE_WHITELIST=("espn.com",),
+        DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR=0.80,
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.60,
+        MAX_REASONABLE_EDGE=0.35,
+    )
+    market = Market(
+        id="KXMLBHRR-SAMPLE",
+        question="Brandon Nimmo: 2+ hits + runs + RBIs?",
+        category="sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.45),
+            MarketOutcome(name="NO", price=0.55),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.95,
+        bet_size_pct=0.5,
+        reasoning="ESPN box score confirms Brandon Nimmo cleared the prop.",
+        evidence_basis="direct",
+        evidence_quality=0.95,
+        raw_evidence_quality=0.95,
+        primary_source_url="https://www.espn.com/mlb/boxscore/_/gameId/1",
+        definitive_outcome_detected=True,
+        source_match_class="settlement_aligned",
+        edge_source="computed",
+        my_prob=0.99,
+    )
+
+    assert _is_definitive_validated(decision, settings, market=market) is True
+    ok, edge, reason = _passes_edge_threshold(0.45, decision, settings, market=market)
+    assert ok is True
+    assert edge == pytest.approx(0.50)
+    assert reason == ""
 
 
 def test_high_quality_settled_caps_extreme_edge_at_095() -> None:

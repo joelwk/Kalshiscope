@@ -6,6 +6,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from config import (
     SearchConfig,
@@ -29,6 +30,7 @@ _RE_NO_EXTERNAL_ODDS = re.compile(
     r"(no (?:external )?(?:betting )?odds found|implied[_ ]prob(?:ability)?\s*[:=]\s*(?:unknown|n/?a|null))",
     re.IGNORECASE,
 )
+_RE_URL = re.compile(r"https?://[^\s,\])}>\"']+", re.IGNORECASE)
 _RE_LOW_INFORMATION = re.compile(
     r"(no (?:search )?results|zero mentions|no mentions of|no evidence(?: found)?|"
     r"no information(?: found)?|no data(?: available)?|could not find (?:any )?"
@@ -94,13 +96,12 @@ _VERIFIABLE_EVIDENCE_KEYWORDS = (
 )
 _MAX_MODEL_RESPONSE_LOG_CHARS = 500
 _ANALYSIS_MAX_ATTEMPTS = 3
-# Deep refinement always has `previous_analysis` as a safe fallback in the
-# caller, so a single failed attempt should short-circuit rather than burn
-# budget that other candidates could use. Initial analyses (no fallback)
-# still use the full attempt count.
-_DEEP_ANALYSIS_MAX_ATTEMPTS = 1
+# May 16 logs showed retriable deep RST_STREAM failures with max_attempts=1.
+# Keep the deep budget bounded, but allow one retry by default.
+_DEEP_ANALYSIS_MAX_ATTEMPTS = 2
 _ANALYSIS_RETRY_WAIT_SECONDS = 2
 _DEFAULT_MAX_ANALYSIS_BUDGET_SECONDS = 240
+_FAST_REASONING_FALLBACK_MODEL = "grok-4-1-fast-reasoning"
 _SLOW_FAILURE_THRESHOLD_MS = 15_000
 # Reserve a small cushion inside the per-attempt deadline so post-stream work
 # (JSON parse, validation, logging) still fits within the overall budget.
@@ -161,6 +162,22 @@ def _response_preview(text: str, max_chars: int = _MAX_MODEL_RESPONSE_LOG_CHARS)
     if len(preview) <= max_chars:
         return preview
     return preview[:max_chars] + "..."
+
+
+def _clean_extracted_url(value: str) -> str | None:
+    candidate = str(value or "").strip().rstrip(".,;:!?)]}>\"'")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return candidate
+
+
+def _extract_first_url_from_text(text: str) -> str | None:
+    for match in _RE_URL.finditer(text or ""):
+        cleaned = _clean_extracted_url(match.group(0))
+        if cleaned:
+            return cleaned
+    return None
 
 
 _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
@@ -236,6 +253,15 @@ def _is_quota_exhausted_grok_error(exc: Exception) -> bool:
     """Detect xAI account quota/credit exhaustion (non-retriable, non-transient)."""
     error_text = str(exc).lower()
     return any(marker in error_text for marker in _QUOTA_EXHAUSTED_MARKERS)
+
+
+def _is_model_unimplemented_grok_error(exc: Exception) -> bool:
+    """Detect model/tooling 404s that should fall back to the fast model once."""
+    error_text = str(exc).lower()
+    return (
+        "unimplemented" in error_text
+        and ("404" in error_text or "statuscode.unimplemented" in error_text)
+    )
 
 
 def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
@@ -523,6 +549,16 @@ class GrokClient:
             value = value / 100.0
         return max(-1.0, min(1.0, value))
 
+    @staticmethod
+    def _near_binary_probability(value: float | None) -> bool:
+        if value is None:
+            return False
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            return False
+        return normalized >= 0.95 or normalized <= 0.05
+
     def _derive_edge(
         self,
         implied: float | None,
@@ -608,6 +644,23 @@ class GrokClient:
             return "direct"
         return "proxy"
 
+    @staticmethod
+    def _extract_primary_source_url(decision: TradeDecision) -> str | None:
+        existing = _clean_extracted_url(str(decision.primary_source_url or ""))
+        if existing:
+            return existing
+        key_sources = decision.key_sources or []
+        if isinstance(key_sources, (list, tuple)):
+            for source in key_sources:
+                extracted = _extract_first_url_from_text(str(source or ""))
+                if extracted:
+                    return extracted
+        elif key_sources:
+            extracted = _extract_first_url_from_text(str(key_sources))
+            if extracted:
+                return extracted
+        return _extract_first_url_from_text(decision.reasoning or "")
+
     def _validate_and_enrich_decision(
         self,
         market: Market,
@@ -658,14 +711,24 @@ class GrokClient:
             prob_consistency_ok = False
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
+        primary_source_url = self._extract_primary_source_url(decision)
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
         low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
-        has_verifiable_signal = self._has_verifiable_source_signal(decision.reasoning)
+        source_text_for_validation = " ".join(
+            part
+            for part in (
+                decision.reasoning or "",
+                " ".join(str(source) for source in (decision.key_sources or [])),
+                primary_source_url or "",
+            )
+            if part
+        )
+        has_verifiable_signal = self._has_verifiable_source_signal(source_text_for_validation)
         has_definitive_outcome_signal = bool(
-            _RE_DEFINITIVE_OUTCOME_SIGNAL.search(decision.reasoning or "")
+            _RE_DEFINITIVE_OUTCOME_SIGNAL.search(source_text_for_validation)
         )
         source_match_class = self._source_match_class(
-            decision.reasoning or "",
+            source_text_for_validation,
             has_verifiable_signal=has_verifiable_signal,
             has_definitive_outcome_signal=has_definitive_outcome_signal,
             no_external_odds=no_external_odds,
@@ -736,6 +799,12 @@ class GrokClient:
             0.0,
             min(1.0, active_settings.GROK_ABSTAIN_EVIDENCE_THRESHOLD),
         )
+        definitive_raw_evidence_floor = max(
+            0.0,
+            min(1.0, active_settings.DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR),
+        )
+        definitive_raw_evidence_ok = raw_evidence_quality >= definitive_raw_evidence_floor
+        definitive_probability_ok = self._near_binary_probability(decision.my_prob)
         validated_confidence = float(max(0.0, min(1.0, decision.confidence)))
         if (
             decision.should_trade
@@ -756,7 +825,6 @@ class GrokClient:
             if market_implied is not None
             else None
         )
-        primary_source_url = str(decision.primary_source_url or "").strip()
         primary_source_required_for_direct = profile_name != "sports"
         primary_source_satisfies_direct = (
             bool(primary_source_url) or not primary_source_required_for_direct
@@ -791,6 +859,8 @@ class GrokClient:
                 has_definitive_outcome_signal
                 and decision.likelihood_ratio is not None
                 and decision.likelihood_ratio >= 10.0
+                and definitive_raw_evidence_ok
+                and definitive_probability_ok
             ):
                 evidence_floor = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
             if market_edge is None or abs(market_edge) < _LOW_QUALITY_EDGE_BUFFER:
@@ -825,6 +895,8 @@ class GrokClient:
             and has_definitive_outcome_signal
             and decision.likelihood_ratio is not None
             and decision.likelihood_ratio >= 10.0
+            and definitive_raw_evidence_ok
+            and definitive_probability_ok
             and not low_information
             and primary_source_satisfies_direct
         )
@@ -950,6 +1022,7 @@ class GrokClient:
                 "evidence_quality_floor_applied": evidence_quality_floor_applied,
                 "source_match_class": source_match_class,
                 "evidence_floor_suppressed_reason": evidence_floor_suppressed_reason,
+                "primary_source_url": primary_source_url,
                 "reasoning": (
                     f"[Validated eq={evidence_quality:.2f} gate={gate_status} reason={reason_code} "
                     f"basis={evidence_basis_class} "
@@ -1043,7 +1116,12 @@ class GrokClient:
     ) -> dict[str, Any]:
         """Normalize numeric payload fields from LLM output before schema validation."""
         normalized_payload = dict(payload)
-        probability_fields = ("confidence", "my_prob", "implied_prob_external")
+        probability_fields = (
+            "confidence",
+            "my_prob",
+            "implied_prob_external",
+            "probability_yes",
+        )
         edge_fields = ("edge_external",)
         likelihood_fields = ("likelihood_ratio",)
 
@@ -1166,6 +1244,7 @@ class GrokClient:
         enable_multimedia: bool,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        temperature: float | None = None,
     ):
         return self.provider.create_chat(
             model=model or self.model,
@@ -1173,6 +1252,7 @@ class GrokClient:
             config=config,
             enable_multimedia=enable_multimedia,
             timeout_seconds=timeout_seconds,
+            temperature=temperature,
         )
 
     def _build_market_prompt(
@@ -1181,6 +1261,7 @@ class GrokClient:
         active_config: SearchConfig,
         previous_summary: str,
         deep: bool,
+        self_consistency_variant: bool = False,
     ) -> str:
         outcome_prices = _format_market_outcome_prices(market)
         constraints = [_category_research_hint(active_config.profile_name, market)]
@@ -1196,6 +1277,14 @@ class GrokClient:
                     max_bet_usdc=self.max_bet_usdc,
                 ),
             )
+        if self_consistency_variant:
+            constraints.append(
+                "Self-consistency critique pass: use the prior analysis as a draft. "
+                "Actively search for counter-evidence, base-rate misses, stale news, "
+                "or settlement-rule mismatches that would lower probability by 8-15%. "
+                "Return the same valid JSON schema with revised probability_yes, "
+                "confidence, uncertainty_note, and self_critique."
+            )
         return render(
             "user/market_analysis_request",
             ticker=market.id,
@@ -1209,6 +1298,208 @@ class GrokClient:
             lookback_hours=active_config.lookback_hours,
             previous_analysis=previous_summary,
             constraints="\n".join(constraints),
+        )
+
+    @staticmethod
+    def _bounded_temperature(value: float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return max(0.0, min(2.0, numeric))
+
+    @staticmethod
+    def _bounded_probability(value: float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return max(0.0, min(1.0, numeric))
+
+    def _decision_yes_probability(self, market: Market, decision: TradeDecision) -> float | None:
+        explicit = self._bounded_probability(decision.probability_yes)
+        if explicit is not None:
+            return explicit
+        outcome = self._canonical_outcome_for_market(market, decision.outcome) or decision.outcome
+        normalized = self._normalize_outcome_label(outcome)
+        confidence = self._bounded_probability(decision.confidence)
+        if confidence is None:
+            return None
+        if normalized in {"yes", "true", "1"}:
+            return confidence
+        if normalized in {"no", "false", "0"}:
+            return 1.0 - confidence
+        return self._bounded_probability(decision.my_prob) or confidence
+
+    def _decision_market_edge(self, market: Market, decision: TradeDecision) -> float | None:
+        implied = self._market_implied_probability(market, decision.outcome)
+        confidence = self._bounded_probability(
+            decision.raw_confidence if decision.raw_confidence is not None else decision.confidence
+        )
+        if implied is None or confidence is None:
+            return None
+        return confidence - implied
+
+    def _should_run_self_consistency(
+        self,
+        market: Market,
+        decision: TradeDecision,
+        *,
+        deep: bool,
+    ) -> bool:
+        if deep or not bool(getattr(self.settings, "GROK_SELF_CONSISTENCY_ENABLED", True)):
+            return False
+        liquidity = float(market.liquidity_usdc or 0.0)
+        liquidity_threshold = max(
+            0.0,
+            float(getattr(self.settings, "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD", 300.0)),
+        )
+        edge_threshold = max(
+            0.0,
+            float(getattr(self.settings, "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD", 0.15)),
+        )
+        edge = self._decision_market_edge(market, decision)
+        return liquidity > liquidity_threshold or (edge is not None and edge >= edge_threshold)
+
+    def _merge_self_consistency_decisions(
+        self,
+        market: Market,
+        first: TradeDecision,
+        second: TradeDecision,
+        *,
+        profile_name: str,
+    ) -> TradeDecision:
+        first_yes = self._decision_yes_probability(market, first)
+        second_yes = self._decision_yes_probability(market, second)
+        if first_yes is None or second_yes is None:
+            return first
+
+        averaged_yes = max(0.0, min(1.0, (first_yes + second_yes) / 2.0))
+        first_outcome = (
+            self._canonical_outcome_for_market(market, first.outcome) or first.outcome
+        )
+        second_outcome = (
+            self._canonical_outcome_for_market(market, second.outcome) or second.outcome
+        )
+        first_side = self._normalize_outcome_label(first_outcome)
+        second_side = self._normalize_outcome_label(second_outcome)
+        side_disagree = (
+            first_side in {"yes", "true", "1", "no", "false", "0"}
+            and second_side in {"yes", "true", "1", "no", "false", "0"}
+            and (first_side in {"yes", "true", "1"}) != (second_side in {"yes", "true", "1"})
+        )
+        trade_disagree = bool(first.should_trade) != bool(second.should_trade)
+        probability_gap = abs(first_yes - second_yes)
+        material_probability_gap = max(
+            0.12,
+            float(getattr(self.settings, "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD", 0.15)),
+        )
+        probability_disagree = probability_gap >= material_probability_gap
+        yes_outcome = self._canonical_outcome_for_market(market, "YES")
+        no_outcome = self._canonical_outcome_for_market(market, "NO")
+        if yes_outcome and no_outcome:
+            merged_outcome = yes_outcome if averaged_yes >= 0.5 else no_outcome
+            merged_confidence = averaged_yes if merged_outcome == yes_outcome else 1.0 - averaged_yes
+        else:
+            merged_outcome = first.outcome
+            normalized = self._normalize_outcome_label(first.outcome)
+            merged_confidence = 1.0 - averaged_yes if normalized in {"no", "false", "0"} else averaged_yes
+
+        merged_sources = list(dict.fromkeys([*(first.key_sources or []), *(second.key_sources or [])]))[:4]
+        critique = second.self_critique or second.uncertainty_note or second.reasoning
+        if trade_disagree or side_disagree or probability_disagree:
+            repair_critique = (
+                "self_consistency_disagreement: "
+                f"trade_disagree={trade_disagree}, side_disagree={side_disagree}, "
+                f"probability_gap={probability_gap:.4f}; deep repair required before execution. "
+                f"second-pass critique: {str(critique or '').strip()}"
+            )
+            conservative_confidence = min(
+                value
+                for value in (
+                    self._bounded_probability(first.confidence),
+                    self._bounded_probability(second.confidence),
+                    self._bounded_probability(merged_confidence),
+                )
+                if value is not None
+            )
+            return first.model_copy(
+                update={
+                    "should_trade": False,
+                    "abstain": True,
+                    "bet_size_pct": 0.0,
+                    "outcome": merged_outcome,
+                    "confidence": conservative_confidence,
+                    "probability_yes": averaged_yes,
+                    "my_prob": conservative_confidence,
+                    "implied_prob_external": self._market_implied_probability(
+                        market,
+                        merged_outcome,
+                    ),
+                    "key_sources": merged_sources,
+                    "uncertainty_note": second.uncertainty_note or first.uncertainty_note,
+                    "self_critique": repair_critique[:800],
+                    "raw_confidence": conservative_confidence,
+                    "raw_outcome": merged_outcome,
+                    "prompt_tokens": (first.prompt_tokens or 0) + (second.prompt_tokens or 0),
+                    "completion_tokens": (first.completion_tokens or 0) + (second.completion_tokens or 0),
+                    "reasoning_tokens": (first.reasoning_tokens or 0) + (second.reasoning_tokens or 0),
+                    "cached_tokens": (first.cached_tokens or 0) + (second.cached_tokens or 0),
+                    "reasoning": (
+                        f"{first.reasoning}\n"
+                        f"[self_consistency_disagreement] average YES={averaged_yes:.4f}; "
+                        f"trade_disagree={trade_disagree}; side_disagree={side_disagree}; "
+                        f"probability_gap={probability_gap:.4f}; "
+                        f"second-pass critique: {str(critique or '').strip()}"
+                    ).strip(),
+                }
+            )
+        merged = first.model_copy(
+            update={
+                "should_trade": bool(first.should_trade and second.should_trade),
+                "outcome": merged_outcome,
+                "confidence": max(0.0, min(1.0, merged_confidence)),
+                "probability_yes": averaged_yes,
+                "my_prob": max(0.0, min(1.0, merged_confidence)),
+                "implied_prob_external": self._market_implied_probability(
+                    market,
+                    merged_outcome,
+                ),
+                "key_sources": merged_sources,
+                "base_rate_used": (
+                    first.base_rate_used if first.base_rate_used is not None else second.base_rate_used
+                ),
+                "uncertainty_note": second.uncertainty_note or first.uncertainty_note,
+                "self_critique": (
+                    f"self_consistency_agreement: probability_gap={probability_gap:.4f}; "
+                    f"second-pass critique: {str(critique or '').strip()}"
+                )[:800],
+                "raw_confidence": max(0.0, min(1.0, merged_confidence)),
+                "raw_outcome": merged_outcome,
+                "prompt_tokens": (first.prompt_tokens or 0) + (second.prompt_tokens or 0),
+                "completion_tokens": (first.completion_tokens or 0) + (second.completion_tokens or 0),
+                "reasoning_tokens": (first.reasoning_tokens or 0) + (second.reasoning_tokens or 0),
+                "cached_tokens": (first.cached_tokens or 0) + (second.cached_tokens or 0),
+                "reasoning": (
+                    f"{first.reasoning}\n"
+                    f"[self_consistency_agreement probability_gap={probability_gap:.4f}] "
+                    f"average YES={averaged_yes:.4f}; "
+                    f"second-pass critique: {str(critique or '').strip()}"
+                ).strip(),
+            }
+        )
+        return self._validate_and_enrich_decision(
+            market,
+            merged,
+            profile_name=profile_name,
         )
 
     def _parse_response_payload(self, market_id: str, content: str, deep: bool) -> dict[str, Any]:
@@ -1348,7 +1639,21 @@ class GrokClient:
     ) -> TradeDecision:
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
         last_error: Exception | None = None
-        max_attempts = _DEEP_ANALYSIS_MAX_ATTEMPTS if deep else _ANALYSIS_MAX_ATTEMPTS
+        max_attempts = _ANALYSIS_MAX_ATTEMPTS
+        if deep:
+            max_attempts = max(
+                1,
+                int(
+                    getattr(
+                        self.settings,
+                        "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS",
+                        _DEEP_ANALYSIS_MAX_ATTEMPTS,
+                    )
+                    or _DEEP_ANALYSIS_MAX_ATTEMPTS
+                ),
+            )
+        first_decision: TradeDecision | None = None
+        active_config_for_merge: SearchConfig | None = None
         for attempt in range(1, max_attempts + 1):
             budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
             if budget_remaining_ms <= 0:
@@ -1371,7 +1676,19 @@ class GrokClient:
                 )
                 break
             try:
-                return self._run_analysis_once(
+                primary_temperature = (
+                    self._bounded_temperature(
+                        getattr(
+                            self.settings,
+                            "GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE",
+                            0.3,
+                        )
+                    )
+                    if bool(getattr(self.settings, "GROK_SELF_CONSISTENCY_ENABLED", True))
+                    and not deep
+                    else None
+                )
+                first_decision = self._run_analysis_once(
                     market=market,
                     search_config=search_config,
                     previous_analysis=previous_analysis,
@@ -1379,7 +1696,10 @@ class GrokClient:
                     retry_attempt=attempt,
                     budget_remaining_ms=budget_remaining_ms,
                     max_attempts=max_attempts,
+                    temperature=primary_temperature,
                 )
+                active_config_for_merge = self._active_search_config(search_config)
+                break
             except Exception as exc:
                 last_error = exc
                 duration_ms = float(getattr(exc, "_grok_duration_ms", 0.0))
@@ -1390,6 +1710,8 @@ class GrokClient:
                     or attempt >= max_attempts
                     or budget_remaining_ms <= 0
                 ):
+                    if deep and retriable:
+                        break
                     raise
                 sleep_seconds = min(
                     _ANALYSIS_RETRY_WAIT_SECONDS,
@@ -1412,9 +1734,157 @@ class GrokClient:
                 )
                 if sleep_seconds > 0:
                     time.sleep(sleep_seconds)
-        raise TimeoutError(
-            f"Grok analysis budget exhausted for market {market.id}"
-        ) from last_error
+        if first_decision is None:
+            if deep and previous_analysis is not None and last_error is not None:
+                duration_ms = float(getattr(last_error, "_grok_duration_ms", 0.0))
+                if _is_retriable_grok_error(last_error, duration_ms):
+                    logger.warning(
+                        "Deep market analysis exhausted retries; preserving previous analysis: market=%s error=%s",
+                        market.id,
+                        last_error,
+                        data={
+                            "market_id": market.id,
+                            "deep_analysis_failed_retriable": True,
+                            "error": str(last_error),
+                            "error_type": type(last_error).__name__,
+                            "max_attempts": max_attempts,
+                        },
+                    )
+                    return previous_analysis.model_copy(
+                        update={
+                            "reasoning": (
+                                "[DeepAnalysisFallback reason=retriable_failure] "
+                                f"{previous_analysis.reasoning}"
+                            )
+                        }
+                    )
+            if deep and previous_analysis is None and last_error is not None:
+                duration_ms = float(getattr(last_error, "_grok_duration_ms", 0.0))
+                budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
+                if (
+                    _is_retriable_grok_error(last_error, duration_ms)
+                    and budget_remaining_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0
+                ):
+                    logger.warning(
+                        "Deep market analysis exhausted retries; attempting fast fallback: market=%s error=%s",
+                        market.id,
+                        last_error,
+                        data={
+                            "market_id": market.id,
+                            "deep_analysis_failed_retriable": True,
+                            "deep_analysis_fast_fallback_attempted": True,
+                            "fallback_model": _FAST_REASONING_FALLBACK_MODEL,
+                            "budget_remaining_ms": round(budget_remaining_ms, 2),
+                            "error": str(last_error),
+                            "error_type": type(last_error).__name__,
+                            "max_attempts": max_attempts,
+                        },
+                    )
+                    fallback_decision = self._run_analysis_once(
+                        market=market,
+                        search_config=search_config,
+                        previous_analysis=None,
+                        deep=False,
+                        retry_attempt=1,
+                        budget_remaining_ms=budget_remaining_ms,
+                        max_attempts=1,
+                        temperature=None,
+                        model_override=_FAST_REASONING_FALLBACK_MODEL,
+                        allow_model_fallback=False,
+                    )
+                    return fallback_decision.model_copy(
+                        update={
+                            "reasoning": (
+                                "[DeepAnalysisFallback reason=retriable_fast_fallback] "
+                                f"{fallback_decision.reasoning}"
+                            )
+                        }
+                    )
+            raise TimeoutError(
+                f"Grok analysis budget exhausted for market {market.id}"
+            ) from last_error
+
+        if self._should_run_self_consistency(market, first_decision, deep=deep):
+            budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
+            if budget_remaining_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0:
+                try:
+                    second_decision = self._run_analysis_once(
+                        market=market,
+                        search_config=search_config,
+                        previous_analysis=first_decision,
+                        deep=deep,
+                        retry_attempt=1,
+                        budget_remaining_ms=budget_remaining_ms,
+                        max_attempts=1,
+                        temperature=self._bounded_temperature(
+                            getattr(
+                                self.settings,
+                                "GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE",
+                                0.7,
+                            )
+                        ),
+                        self_consistency_variant=True,
+                    )
+                    profile_name = (
+                        active_config_for_merge.profile_name
+                        if active_config_for_merge is not None
+                        else self._active_search_config(search_config).profile_name
+                    )
+                    merged = self._merge_self_consistency_decisions(
+                        market,
+                        first_decision,
+                        second_decision,
+                        profile_name=profile_name,
+                    )
+                    logger.info(
+                        "Grok self-consistency merged decision: market=%s conf=%.4f probability_yes=%s",
+                        market.id,
+                        merged.confidence,
+                        (
+                            f"{merged.probability_yes:.4f}"
+                            if merged.probability_yes is not None
+                            else "n/a"
+                        ),
+                        data={
+                            "market_id": market.id,
+                            "first_confidence": first_decision.confidence,
+                            "second_confidence": second_decision.confidence,
+                            "merged_confidence": merged.confidence,
+                            "merged_probability_yes": merged.probability_yes,
+                            "self_consistency_agreement": (
+                                "self_consistency_disagreement"
+                                not in (merged.reasoning or "")
+                            ),
+                            "self_consistency_probability_gap": abs(
+                                (
+                                    first_decision.probability_yes
+                                    if first_decision.probability_yes is not None
+                                    else first_decision.confidence
+                                )
+                                - (
+                                    second_decision.probability_yes
+                                    if second_decision.probability_yes is not None
+                                    else second_decision.confidence
+                                )
+                            ),
+                            "liquidity_usdc": market.liquidity_usdc,
+                            "first_edge_market": self._decision_market_edge(
+                                market, first_decision
+                            ),
+                            "second_edge_market": self._decision_market_edge(
+                                market, second_decision
+                            ),
+                        },
+                    )
+                    return merged
+                except Exception as exc:
+                    logger.warning(
+                        "Grok self-consistency second pass failed; using first pass: market=%s error=%s",
+                        market.id,
+                        exc,
+                        data={"market_id": market.id, "error": str(exc)},
+                    )
+        return first_decision
 
     def _run_analysis_once(
         self,
@@ -1426,11 +1896,15 @@ class GrokClient:
         retry_attempt: int,
         budget_remaining_ms: float,
         max_attempts: int,
+        temperature: float | None = None,
+        self_consistency_variant: bool = False,
+        model_override: str | None = None,
+        allow_model_fallback: bool = True,
     ) -> TradeDecision:
         start_time = time.monotonic()
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
-        model = self.model_deep if deep else self.model
+        model = model_override or (self.model_deep if deep else self.model)
         phase_label = "deep market analysis" if deep else "market analysis"
         logger.debug(
             "Starting %s: id=%s",
@@ -1445,6 +1919,8 @@ class GrokClient:
                 "search_profile": active_config.profile_name,
                 "lookback_hours": active_config.lookback_hours,
                 "model": model,
+                "temperature": temperature,
+                "self_consistency_variant": self_consistency_variant,
             },
         )
 
@@ -1467,6 +1943,7 @@ class GrokClient:
                 timeout_seconds=self._resolve_rpc_timeout_seconds(
                     stream_deadline_seconds
                 ),
+                temperature=temperature,
             )
             chat.append(
                 self.provider.system_message(
@@ -1480,6 +1957,7 @@ class GrokClient:
                         active_config=active_config,
                         previous_summary=previous_summary,
                         deep=deep,
+                        self_consistency_variant=self_consistency_variant,
                     )
                 )
             )
@@ -1586,6 +2064,8 @@ class GrokClient:
                     "search_profile": active_config.profile_name,
                     "lookback_hours": active_config.lookback_hours,
                     "model": model,
+                    "temperature": temperature,
+                    "self_consistency_variant": self_consistency_variant,
                     "chunks": chunk_count,
                     "prompt_tokens": usage_metrics["prompt_tokens"],
                     "completion_tokens": usage_metrics["completion_tokens"],
@@ -1600,6 +2080,40 @@ class GrokClient:
             duration = (time.monotonic() - start_time) * 1000
             retriable = _is_retriable_grok_error(exc, duration)
             budget_after_error_ms = max(0.0, budget_remaining_ms - duration)
+            if (
+                allow_model_fallback
+                and _is_model_unimplemented_grok_error(exc)
+                and model != _FAST_REASONING_FALLBACK_MODEL
+                and budget_after_error_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0
+            ):
+                logger.warning(
+                    "Grok model unimplemented; retrying with fast model: market=%s model=%s fallback_model=%s",
+                    market.id,
+                    model,
+                    _FAST_REASONING_FALLBACK_MODEL,
+                    data={
+                        "market_id": market.id,
+                        "model": model,
+                        "fallback_model": _FAST_REASONING_FALLBACK_MODEL,
+                        "deep": deep,
+                        "self_consistency_variant": self_consistency_variant,
+                        "budget_remaining_ms": round(budget_after_error_ms, 2),
+                        "error": str(exc),
+                    },
+                )
+                return self._run_analysis_once(
+                    market=market,
+                    search_config=search_config,
+                    previous_analysis=previous_analysis,
+                    deep=False,
+                    retry_attempt=1,
+                    budget_remaining_ms=budget_after_error_ms,
+                    max_attempts=1,
+                    temperature=temperature,
+                    self_consistency_variant=self_consistency_variant,
+                    model_override=_FAST_REASONING_FALLBACK_MODEL,
+                    allow_model_fallback=False,
+                )
             will_retry = (
                 retriable
                 and retry_attempt < max_attempts
@@ -1616,7 +2130,7 @@ class GrokClient:
                         "response_preview": _response_preview(content),
                     },
                 )
-            log_fn = logger.warning if will_retry else logger.error
+            log_fn = logger.warning if (will_retry or self_consistency_variant) else logger.error
             log_fn(
                 "%s failed: id=%s, error=%s, duration=%.2fms",
                 phase_label.capitalize(),
@@ -1632,9 +2146,12 @@ class GrokClient:
                     "will_retry": will_retry,
                     "quota_exhausted": _is_quota_exhausted_grok_error(exc),
                     "retry_attempt": retry_attempt,
+                    "max_attempts": max_attempts,
                     "budget_remaining_ms": round(budget_after_error_ms, 2),
                     "previous_analysis": previous_summary if deep else None,
                     "search_profile": active_config.profile_name,
+                    "model": model,
+                    "self_consistency_variant": self_consistency_variant,
                 },
             )
             setattr(exc, "_grok_duration_ms", duration)

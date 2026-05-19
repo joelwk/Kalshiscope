@@ -186,6 +186,18 @@ class MarketStateManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS confidence_calibration_online (
+                    family TEXT NOT NULL,
+                    bucket REAL NOT NULL,
+                    win_rate REAL NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (family, bucket)
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS decision_receipts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     cycle_id TEXT,
@@ -223,6 +235,9 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_exchange_settlements_market_id ON exchange_settlements (market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_confidence_calibration_online_family ON confidence_calibration_online (family)"
             )
             self._conn.execute(
                 """
@@ -1041,6 +1056,84 @@ class MarketStateManager:
             }
         return snapshot
 
+    def get_family_signal_snapshot(
+        self,
+        *,
+        lookback: int = 400,
+    ) -> dict[str, dict[str, float | int]]:
+        """Return family PnL efficiency and high-confidence loss signals.
+
+        This is intentionally read-only and uses existing trade_outcomes rows;
+        no schema migration is needed for the execution score/sizing signal.
+        """
+        window = max(1, int(lookback))
+        rows = self._conn.execute(
+            """
+            SELECT
+                t.market_id AS market_id,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category,
+                t.won AS won,
+                t.pnl_estimate AS pnl_estimate,
+                t.amount_usdc AS amount_usdc,
+                t.confidence AS confidence
+            FROM trade_outcomes t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE COALESCE(t.resolution_state, '') LIKE 'resolved%'
+              AND t.won IS NOT NULL
+            ORDER BY COALESCE(t.resolved_at, t.last_updated, '') DESC
+            LIMIT ?
+            """,
+            (window,),
+        ).fetchall()
+        grouped: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {
+                "sample_size": 0,
+                "wins": 0,
+                "pnl_total": 0.0,
+                "deployed_usdc": 0.0,
+                "high_conf_losses": 0,
+            }
+        )
+        for row in rows:
+            family = self._infer_family_from_state_row(
+                market_id=str(row["market_id"] or ""),
+                question=str(row["question"] or ""),
+                category=str(row["category"] or ""),
+            )
+            bucket = grouped[family]
+            won = int(row["won"] or 0)
+            confidence = float(row["confidence"] or 0.0)
+            bucket["sample_size"] = int(bucket["sample_size"]) + 1
+            if won == 1:
+                bucket["wins"] = int(bucket["wins"]) + 1
+            elif confidence >= 0.90:
+                bucket["high_conf_losses"] = int(bucket["high_conf_losses"]) + 1
+            bucket["pnl_total"] = float(bucket["pnl_total"]) + float(
+                row["pnl_estimate"] or 0.0
+            )
+            bucket["deployed_usdc"] = float(bucket["deployed_usdc"]) + abs(
+                float(row["amount_usdc"] or 0.0)
+            )
+        snapshot: dict[str, dict[str, float | int]] = {}
+        for family, values in grouped.items():
+            sample_size = int(values["sample_size"])
+            wins = int(values["wins"])
+            pnl_total = float(values["pnl_total"])
+            deployed_usdc = float(values["deployed_usdc"])
+            snapshot[family] = {
+                "sample_size": sample_size,
+                "wins": wins,
+                "win_rate": (wins / sample_size) if sample_size > 0 else 0.0,
+                "pnl_total": pnl_total,
+                "deployed_usdc": deployed_usdc,
+                "pnl_per_deployed_usdc": (
+                    pnl_total / deployed_usdc if deployed_usdc > 0.0 else 0.0
+                ),
+                "high_conf_losses": int(values["high_conf_losses"]),
+            }
+        return snapshot
+
     def get_confidence_tier_outcomes(self) -> list[dict[str, float | int | str]]:
         rows = self._conn.execute(
             """
@@ -1206,7 +1299,158 @@ class MarketStateManager:
                         else 0.0
                     ),
                 }
+        online_rows = self._conn.execute(
+            """
+            SELECT family, bucket, win_rate, sample_size
+            FROM confidence_calibration_online
+            WHERE sample_size > 0
+            """
+        ).fetchall()
+        for row in online_rows:
+            family_key = str(row["family"] or "all")
+            bucket = float(row["bucket"] or 0.0)
+            online_sample_size = int(row["sample_size"] or 0)
+            if online_sample_size <= 0:
+                continue
+            online_win_rate = max(0.0, min(1.0, float(row["win_rate"] or 0.0)))
+            family_snapshot = snapshot.setdefault(family_key, {})
+            existing = family_snapshot.get(bucket)
+            if existing is None:
+                family_snapshot[bucket] = {
+                    "sample_size": online_sample_size,
+                    "wins": online_win_rate * online_sample_size,
+                    "win_rate": online_win_rate,
+                    "mean_confidence": bucket,
+                }
+                continue
+            existing_sample_size = int(existing.get("sample_size", 0) or 0)
+            combined_sample_size = existing_sample_size + online_sample_size
+            if combined_sample_size <= 0:
+                continue
+            existing_win_rate = max(
+                0.0,
+                min(1.0, float(existing.get("win_rate", 0.0) or 0.0)),
+            )
+            combined_win_rate = (
+                (existing_win_rate * existing_sample_size)
+                + (online_win_rate * online_sample_size)
+            ) / combined_sample_size
+            existing_mean = float(existing.get("mean_confidence", bucket) or bucket)
+            combined_mean = (
+                (existing_mean * existing_sample_size) + (bucket * online_sample_size)
+            ) / combined_sample_size
+            family_snapshot[bucket] = {
+                "sample_size": combined_sample_size,
+                "wins": combined_win_rate * combined_sample_size,
+                "win_rate": combined_win_rate,
+                "mean_confidence": combined_mean,
+            }
         return snapshot
+
+    def record_online_confidence_calibration(
+        self,
+        *,
+        market_id: str,
+        confidence: float | None,
+        won: bool | int | None,
+        question: str = "",
+        category: str = "",
+        alpha: float = 0.15,
+        max_samples_per_bucket: int = 500,
+        updated_at: datetime | None = None,
+    ) -> bool:
+        if confidence is None or won is None:
+            return False
+        try:
+            bounded_confidence = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            return False
+        sample_value = 1.0 if int(won) == 1 else 0.0
+        bucket = int(bounded_confidence * 10.0) / 10.0
+        family = self._infer_family_from_state_row(
+            market_id=str(market_id or ""),
+            question=str(question or ""),
+            category=str(category or ""),
+        )
+        normalized_alpha = max(0.0, min(1.0, float(alpha or 0.15)))
+        sample_cap = max(1, int(max_samples_per_bucket or 500))
+        timestamp = (updated_at or datetime.now(timezone.utc)).isoformat()
+        changed = False
+        with self._conn:
+            for family_key in ("all", family):
+                row = self._conn.execute(
+                    """
+                    SELECT win_rate, sample_size
+                    FROM confidence_calibration_online
+                    WHERE family = ? AND bucket = ?
+                    """,
+                    (family_key, bucket),
+                ).fetchone()
+                if row is None:
+                    next_win_rate = sample_value
+                    next_sample_size = 1
+                else:
+                    old_win_rate = max(0.0, min(1.0, float(row["win_rate"] or 0.0)))
+                    old_sample_size = max(0, int(row["sample_size"] or 0))
+                    next_win_rate = (
+                        normalized_alpha * sample_value
+                        + (1.0 - normalized_alpha) * old_win_rate
+                    )
+                    next_sample_size = min(sample_cap, old_sample_size + 1)
+                self._conn.execute(
+                    """
+                    INSERT INTO confidence_calibration_online (
+                        family, bucket, win_rate, sample_size, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(family, bucket) DO UPDATE SET
+                        win_rate = excluded.win_rate,
+                        sample_size = excluded.sample_size,
+                        updated_at = excluded.updated_at
+                    """,
+                    (family_key, bucket, next_win_rate, next_sample_size, timestamp),
+                )
+                changed = True
+        return changed
+
+    def record_online_confidence_calibration_from_trade(
+        self,
+        market_id: str,
+        *,
+        alpha: float = 0.15,
+        max_samples_per_bucket: int = 500,
+    ) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT
+                t.confidence AS confidence,
+                t.won AS won,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category,
+                COALESCE(t.resolved_at, t.last_updated, '') AS updated_at
+            FROM trade_outcomes t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE t.market_id = ?
+              AND t.won IS NOT NULL
+            """,
+            (market_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        confidence = row["confidence"]
+        if confidence is None:
+            confidence = self._get_latest_confidence(market_id)
+        updated_at = _parse_timestamp(row["updated_at"]) or datetime.now(timezone.utc)
+        return self.record_online_confidence_calibration(
+            market_id=market_id,
+            confidence=confidence,
+            won=row["won"],
+            question=str(row["question"] or ""),
+            category=str(row["category"] or ""),
+            alpha=alpha,
+            max_samples_per_bucket=max_samples_per_bucket,
+            updated_at=updated_at,
+        )
 
     def get_exchange_realized_pnl_total(self) -> float:
         row = self._conn.execute(
@@ -1301,6 +1545,193 @@ class MarketStateManager:
             ),
         )
         self._conn.commit()
+
+    def mark_research_queue_drain_attempt(
+        self,
+        market_id: str,
+        *,
+        cycle_id: str | None = None,
+        attempted_at: datetime | None = None,
+    ) -> None:
+        """Record a queue-drain probe in the existing JSON audit payload."""
+        row = self._conn.execute(
+            """
+            SELECT last_decision_json
+            FROM research_queue_entries
+            WHERE market_id = ?
+            """,
+            (market_id,),
+        ).fetchone()
+        if not row:
+            return
+        payload: dict[str, Any]
+        raw_payload = row["last_decision_json"]
+        if raw_payload:
+            try:
+                loaded = json.loads(raw_payload)
+            except (TypeError, ValueError):
+                loaded = {}
+            payload = loaded if isinstance(loaded, dict) else {}
+        else:
+            payload = {}
+        raw_audit = payload.get("audit")
+        audit: dict[str, Any] = raw_audit if isinstance(raw_audit, dict) else {}
+        try:
+            attempts = int(audit.get("research_queue_drain_attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        timestamp = attempted_at or datetime.now(timezone.utc)
+        audit["research_queue_drain_attempts"] = attempts + 1
+        audit["research_queue_last_drain_attempt_at"] = timestamp.isoformat()
+        if cycle_id:
+            audit["research_queue_last_drain_cycle_id"] = cycle_id
+        payload["audit"] = audit
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE research_queue_entries
+                SET last_decision_json = ?
+                WHERE market_id = ?
+                """,
+                (json.dumps(payload, sort_keys=True), market_id),
+            )
+
+    @staticmethod
+    def research_queue_drain_attempt_metadata(
+        entry: dict[str, Any],
+    ) -> tuple[int, datetime | None]:
+        """Return persisted drain attempts and most recent attempt timestamp."""
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                loaded = json.loads(decision_json)
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                payload = loaded
+                raw_audit = loaded.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        attempts_raw = audit.get("research_queue_drain_attempts")
+        if attempts_raw is None and isinstance(payload, dict):
+            attempts_raw = payload.get("research_queue_drain_attempts")
+        try:
+            attempts = max(0, int(attempts_raw or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        last_raw = audit.get("research_queue_last_drain_attempt_at")
+        if last_raw is None and isinstance(payload, dict):
+            last_raw = payload.get("research_queue_last_drain_attempt_at")
+        last_attempt: datetime | None = None
+        if isinstance(last_raw, str) and last_raw.strip():
+            try:
+                parsed = datetime.fromisoformat(last_raw.strip().replace("Z", "+00:00"))
+                last_attempt = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                last_attempt = None
+        return attempts, last_attempt
+
+    @staticmethod
+    def is_repeated_low_yield_research_entry(
+        entry: dict[str, Any],
+        *,
+        min_attempts: int = 4,
+        min_times_seen: int = 8,
+        min_gap: float = 0.08,
+    ) -> bool:
+        """Detect stale synthetic queue placeholders without hard-blocking families."""
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                loaded = json.loads(decision_json)
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                payload = loaded
+                raw_audit = loaded.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(entry)
+        try:
+            times_seen = max(0, int(entry.get("times_seen") or 0))
+        except (TypeError, ValueError):
+            times_seen = 0
+        if attempts < max(1, int(min_attempts)) and times_seen < max(1, int(min_times_seen)):
+            return False
+
+        threshold_gap = entry.get("threshold_gap")
+        if threshold_gap is None:
+            threshold_gap = audit.get("threshold_gap")
+        try:
+            gap = float(threshold_gap) if threshold_gap is not None else None
+        except (TypeError, ValueError):
+            gap = None
+        if gap is not None and gap <= max(0.0, float(min_gap)):
+            return False
+
+        source_match = str(
+            audit.get("source_match_class")
+            or (payload or {}).get("source_match_class")
+            or ""
+        ).strip().lower()
+        evidence_basis = str(
+            audit.get("evidence_basis")
+            or audit.get("evidence_basis_class")
+            or (payload or {}).get("evidence_basis")
+            or ""
+        ).strip().lower()
+        primary_source_url = str(
+            audit.get("primary_source_url")
+            or (payload or {}).get("primary_source_url")
+            or ""
+        ).strip()
+        evidence_quality = 0.0
+        for source in (audit, payload or {}, entry):
+            raw_eq = source.get("evidence_quality") if isinstance(source, dict) else None
+            if isinstance(raw_eq, (int, float)):
+                evidence_quality = max(0.0, min(1.0, float(raw_eq)))
+                break
+        if (
+            evidence_quality >= 0.65
+            or evidence_basis == "direct"
+            or source_match == "settlement_aligned"
+            or primary_source_url
+        ):
+            return False
+
+        decision_origin = str(
+            audit.get("decision_origin") or (payload or {}).get("decision_origin") or ""
+        ).strip().lower()
+        synthetic = bool(audit.get("synthetic_decision")) or decision_origin.startswith(
+            "synthetic_"
+        )
+        confidence = None
+        for source in (payload or {}, audit):
+            raw_conf = source.get("confidence") if isinstance(source, dict) else None
+            if isinstance(raw_conf, (int, float)):
+                confidence = float(raw_conf)
+                break
+        placeholder_confidence = confidence is None or abs(confidence - 0.50) <= 0.05
+        edge_source = str(
+            audit.get("edge_source") or (payload or {}).get("edge_source") or ""
+        ).strip().lower()
+        reason = str(entry.get("reason") or audit.get("final_reason") or "").lower()
+        placeholder_reason = (
+            "pre_analysis" in reason
+            or "soft_research" in reason
+            or "analysis_cap" in reason
+            or "lifetime" in reason
+        )
+        return bool(
+            (synthetic or placeholder_reason)
+            and placeholder_confidence
+            and evidence_quality <= 0.05
+            and edge_source in {"", "none", "fallback"}
+        )
 
     def get_active_research_entries(
         self,
@@ -1439,13 +1870,14 @@ class MarketStateManager:
     def estimate_research_entry_priority(entry: dict[str, Any]) -> float | None:
         """Best-effort priority for a queued research entry.
 
-        Reads ``last_decision_json.audit.pre_analysis_score`` first (most
-        accurate), falls back to ``last_decision_json.pre_analysis_score`` for
-        legacy payloads, then to ``1.0 - threshold_gap`` for entries that have
-        only the gap metadata. Returns ``None`` when no signal is available so
-        callers can treat unknown-priority entries as "skip-worthy" rather than
-        "low-priority".
+        Prefer explicit persisted ``research_priority`` first, then enrich it
+        with near-miss, repeated-sighting, source-alignment, evidence, and
+        family-performance signals. Returns ``None`` when no signal is
+        available so callers can treat unknown-priority entries as admissible
+        rather than low-priority.
         """
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
         decision_json = entry.get("last_decision_json")
         if decision_json:
             try:
@@ -1453,18 +1885,88 @@ class MarketStateManager:
             except (TypeError, ValueError):
                 payload = None
             if isinstance(payload, dict):
-                audit = payload.get("audit")
-                if isinstance(audit, dict):
-                    score = audit.get("pre_analysis_score")
-                    if isinstance(score, (int, float)):
-                        return float(score)
-                score = payload.get("pre_analysis_score")
+                raw_audit = payload.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        signals_present = False
+        priority: float | None = None
+        for source in (entry, audit, payload or {}):
+            score = source.get("research_priority") if isinstance(source, dict) else None
+            if isinstance(score, (int, float)):
+                priority = float(score)
+                signals_present = True
+                break
+        if priority is None:
+            for source in (audit, payload or {}):
+                score = source.get("pre_analysis_score") if isinstance(source, dict) else None
                 if isinstance(score, (int, float)):
-                    return float(score)
+                    priority = float(score)
+                    signals_present = True
+                    break
         threshold_gap = entry.get("threshold_gap")
+        if threshold_gap is None and isinstance(audit, dict):
+            threshold_gap = audit.get("threshold_gap")
         if isinstance(threshold_gap, (int, float)):
-            return max(0.0, 1.0 - float(threshold_gap))
-        return None
+            gap = max(0.0, float(threshold_gap))
+            if priority is None:
+                priority = max(0.0, 1.0 - gap)
+            if gap <= 0.03:
+                priority += 0.10
+            elif gap <= 0.08:
+                priority += 0.05
+            signals_present = True
+        try:
+            times_seen = max(0, int(entry.get("times_seen") or 0))
+        except (TypeError, ValueError):
+            times_seen = 0
+        if times_seen > 1:
+            priority = (priority if priority is not None else 0.0) + min(
+                0.10,
+                float(times_seen - 1) * 0.01,
+            )
+            signals_present = True
+        source_match = str(
+            (audit or {}).get("source_match_class")
+            or (payload or {}).get("source_match_class")
+            or ""
+        ).strip().lower()
+        if source_match == "settlement_aligned":
+            priority = (priority if priority is not None else 0.0) + 0.08
+            signals_present = True
+        evidence_quality = None
+        for source in (audit, payload or {}, entry):
+            raw_eq = source.get("evidence_quality") if isinstance(source, dict) else None
+            if isinstance(raw_eq, (int, float)):
+                evidence_quality = float(raw_eq)
+                break
+        if evidence_quality is not None and evidence_quality >= 0.90:
+            priority = (priority if priority is not None else 0.0) + 0.05
+            signals_present = True
+        family_pnl = (audit or {}).get("historical_family_pnl_total")
+        family_samples = (
+            (audit or {}).get("historical_family_samples")
+            or (audit or {}).get("historical_family_sample_size")
+        )
+        if isinstance(family_pnl, (int, float)) and isinstance(family_samples, (int, float)):
+            if float(family_pnl) > 0.0 and int(family_samples) >= 10:
+                priority = (priority if priority is not None else 0.0) + 0.05
+                signals_present = True
+        reason_text = str(entry.get("reason") or (audit or {}).get("final_reason") or "").lower()
+        if "extended_research_cooldown" in reason_text and (
+            (isinstance(threshold_gap, (int, float)) and float(threshold_gap) <= 0.08)
+            or times_seen >= 3
+            or source_match == "settlement_aligned"
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.08
+            signals_present = True
+        if MarketStateManager.is_repeated_low_yield_research_entry(entry):
+            if priority is None:
+                return 0.20
+            priority = min(float(priority), 0.25)
+            signals_present = True
+        if not signals_present or priority is None:
+            return None
+        return max(0.0, min(1.0, float(priority)))
 
     @staticmethod
     def _infer_family_from_state_row(*, market_id: str, question: str, category: str) -> str:
@@ -1475,6 +1977,10 @@ class MarketStateManager:
         market_id: str,
         winning_outcome: str,
         resolved_at: datetime | None,
+        *,
+        online_calibration_enabled: bool = False,
+        online_calibration_alpha: float = 0.15,
+        online_calibration_max_samples_per_bucket: int = 500,
     ) -> bool:
         resolved_ts = resolved_at or datetime.now(timezone.utc)
         row = self._conn.execute(
@@ -1536,6 +2042,12 @@ class MarketStateManager:
             won,
             pnl_estimate if pnl_estimate is not None else 0.0,
         )
+        if online_calibration_enabled:
+            self.record_online_confidence_calibration_from_trade(
+                market_id,
+                alpha=online_calibration_alpha,
+                max_samples_per_bucket=online_calibration_max_samples_per_bucket,
+            )
         return True
 
     def record_exchange_settlement(
@@ -1550,6 +2062,9 @@ class MarketStateManager:
         avg_price: float | None,
         settled_at: datetime | None,
         raw: dict[str, Any],
+        online_calibration_enabled: bool = False,
+        online_calibration_alpha: float = 0.15,
+        online_calibration_max_samples_per_bucket: int = 500,
     ) -> None:
         normalized_settlement_id = str(settlement_id or "").strip()
         normalized_market_id = str(market_id or "").strip()
@@ -1649,6 +2164,12 @@ class MarketStateManager:
                     datetime.now(timezone.utc).isoformat(),
                     resolution_state,
                 ),
+            )
+        if online_calibration_enabled:
+            self.record_online_confidence_calibration_from_trade(
+                normalized_market_id,
+                alpha=online_calibration_alpha,
+                max_samples_per_bucket=online_calibration_max_samples_per_bucket,
             )
 
     def _upsert_trade_outcome_entry(

@@ -267,6 +267,88 @@ def test_load_confidence_calibration_buckets_groups_all_and_family(tmp_path) -> 
         manager.close()
 
 
+def test_online_confidence_calibration_ema_and_sample_cap(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_online_confidence_calibration(
+            market_id="KXRAINNYC-TEST",
+            confidence=0.84,
+            won=True,
+            question="Will NYC rain tomorrow?",
+            category="weather",
+            alpha=0.25,
+            max_samples_per_bucket=2,
+        )
+        manager.record_online_confidence_calibration(
+            market_id="KXRAINNYC-TEST",
+            confidence=0.84,
+            won=False,
+            question="Will NYC rain tomorrow?",
+            category="weather",
+            alpha=0.25,
+            max_samples_per_bucket=2,
+        )
+        manager.record_online_confidence_calibration(
+            market_id="KXRAINNYC-TEST",
+            confidence=0.84,
+            won=False,
+            question="Will NYC rain tomorrow?",
+            category="weather",
+            alpha=0.25,
+            max_samples_per_bucket=2,
+        )
+
+        row = manager._conn.execute(
+            """
+            SELECT win_rate, sample_size
+            FROM confidence_calibration_online
+            WHERE family = 'weather' AND bucket = 0.8
+            """
+        ).fetchone()
+        assert row is not None
+        assert row["sample_size"] == 2
+        assert round(float(row["win_rate"]), 4) == 0.5625
+    finally:
+        manager.close()
+
+
+def test_record_resolution_can_update_online_calibration(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "KXRAINNYC-RES"
+        manager._conn.execute(
+            "INSERT OR REPLACE INTO markets (id, question, close_time, category) VALUES (?, ?, ?, ?)",
+            (market_id, "Will NYC rain tomorrow?", "", "weather"),
+        )
+        manager.record_analysis(market_id, _decision(0.84), is_refined=False)
+        manager.record_trade(
+            market_id,
+            OrderResponse(id="o-online", raw={"outcome": "YES"}),
+            10.0,
+            outcome="YES",
+        )
+        updated = manager.record_resolution(
+            market_id,
+            "YES",
+            datetime.now(timezone.utc),
+            online_calibration_enabled=True,
+            online_calibration_alpha=0.15,
+            online_calibration_max_samples_per_bucket=500,
+        )
+        assert updated is True
+
+        buckets = manager.load_confidence_calibration_buckets(days=30)
+        assert "weather" in buckets
+        assert buckets["weather"][0.8]["sample_size"] >= 1
+        row = manager._conn.execute(
+            "SELECT sample_size FROM confidence_calibration_online WHERE family = 'weather' AND bucket = 0.8"
+        ).fetchone()
+        assert row is not None
+        assert row["sample_size"] == 1
+    finally:
+        manager.close()
+
+
 def test_record_resolution_idempotent(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:
@@ -458,6 +540,50 @@ def test_record_exchange_settlement_upserts_trade_outcome_and_pnl(tmp_path) -> N
         assert round(float(row["pnl_estimate"]), 2) == 2.15
         assert row["resolution_state"] == "resolved_exchange"
         assert round(manager.get_exchange_realized_pnl_total(), 2) == 2.15
+    finally:
+        manager.close()
+
+
+def test_record_exchange_settlement_can_update_online_calibration(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "KXWTI-26APR13-T94.99"
+        now = datetime.now(timezone.utc).isoformat()
+        with manager._conn:
+            manager._conn.execute(
+                "INSERT OR REPLACE INTO markets (id, question, close_time, category) VALUES (?, ?, ?, ?)",
+                (market_id, "Will WTI settle above threshold?", "", "commodities"),
+            )
+            manager._conn.execute(
+                """
+                INSERT OR REPLACE INTO trade_outcomes (
+                    market_id, predicted_outcome, confidence, last_updated
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (market_id, "YES", 0.76, now),
+            )
+        manager.record_exchange_settlement(
+            settlement_id="settle-online",
+            market_id=market_id,
+            winning_outcome="YES",
+            predicted_outcome="YES",
+            pnl_realized=2.15,
+            contracts=5,
+            avg_price=0.57,
+            settled_at=datetime.now(timezone.utc),
+            raw={"market_result": "yes"},
+            online_calibration_enabled=True,
+            online_calibration_alpha=0.15,
+            online_calibration_max_samples_per_bucket=500,
+        )
+
+        row = manager._conn.execute(
+            "SELECT sample_size, win_rate FROM confidence_calibration_online WHERE family = 'all' AND bucket = 0.7"
+        ).fetchone()
+        assert row is not None
+        assert row["sample_size"] == 1
+        assert row["win_rate"] == 1.0
     finally:
         manager.close()
 

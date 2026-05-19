@@ -1,4 +1,4 @@
 name: user/category_hints/crypto
 description: Crypto-specific research guidance.
 content: >-
-  Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, and time-sensitive catalysts over rumor accounts.
+  Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, spot price feeds, and time-sensitive catalysts over rumor accounts. Compare threshold probabilities against 2024-2026 realized volatility, recent intraday move distributions, and current buffer-to-threshold before setting confidence.

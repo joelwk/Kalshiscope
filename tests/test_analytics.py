@@ -62,7 +62,7 @@ def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:
             """
             INSERT INTO decision_receipts (audit_json, decision_json)
             VALUES (
-                '{"market_family":"crypto","evidence_basis_class":"proxy","final_action":"skip","final_reason":"score_gate_blocked","score_liquidity_penalty":0.04,"score_weather_penalty":0.00,"score_proxy_evidence_penalty":0.08,"score_repeated_penalty":0.02,"score_generic_bin_penalty":0.01,"score_ambiguous_resolution_penalty":0.00}',
+                '{"market_family":"crypto","evidence_basis_class":"proxy","final_action":"skip","final_reason":"score_gate_blocked","score_liquidity_penalty":0.04,"score_weather_penalty":0.00,"score_proxy_evidence_penalty":0.08,"score_repeated_penalty":0.02,"score_generic_bin_penalty":0.01,"score_ambiguous_resolution_penalty":0.00,"score_volume_amplifier_discount":0.02,"kelly_effective_fraction":0.55}',
                 '{"edge_source":"fallback","should_trade":true}'
             )
             """
@@ -71,7 +71,7 @@ def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:
             """
             INSERT INTO decision_receipts (audit_json, decision_json)
             VALUES (
-                '{"market_family":"weather","evidence_basis_class":"direct","final_action":"order_attempt","final_reason":"dry_run","score_liquidity_penalty":0.01,"score_weather_penalty":0.02,"score_proxy_evidence_penalty":0.00,"score_repeated_penalty":0.00,"score_generic_bin_penalty":0.00,"score_ambiguous_resolution_penalty":0.00}',
+                '{"market_family":"weather","evidence_basis_class":"direct","final_action":"order_attempt","final_reason":"dry_run","score_liquidity_penalty":0.01,"score_weather_penalty":0.02,"score_proxy_evidence_penalty":0.00,"score_repeated_penalty":0.00,"score_generic_bin_penalty":0.00,"score_ambiguous_resolution_penalty":0.00,"score_volume_amplifier_discount":0.00,"kelly_effective_fraction":0.45}',
                 '{"edge_source":"computed","should_trade":true}'
             )
             """
@@ -98,4 +98,6 @@ def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:
     assert "Should-trade block rate" in output
     assert "should_trade_block_rate=50.00%" in output
     assert "Average score penalties (decision receipts)" in output
+    assert "volume_amplifier_discount=0.0100" in output
+    assert "Kelly dynamic fraction >0.50: 1/2 (50.0%)" in output
     assert "Should-trade block rate by family" in output

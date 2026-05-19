@@ -21,27 +21,33 @@ class Settings:
     MAX_BET_USDC: float = 50.0
     MIN_CONFIDENCE: float = 0.62  # Raised to avoid low-confidence churn and improve calibration
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
-    CONFIDENCE_GATE_MIN_EDGE: float = 0.10
+    CONFIDENCE_GATE_MIN_EDGE: float = 0.08
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
     CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
-    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.75
-    SPORTS_MIN_EVIDENCE_QUALITY: float = 0.70
+    MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.55
+    SPORTS_MIN_EVIDENCE_QUALITY: float = 0.55
     MIN_LIQUIDITY_USDC: float = 15.0
     POLL_INTERVAL_SEC: int = 300
     DRY_STREAK_SLEEP_ENABLED: bool = True
 
     # Edge gating / sizing
     MIN_EDGE: float = 0.12
+    MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD: float = 300.0
+    MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER: float = 0.70
+    MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD: float = 100.0
+    MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER: float = 0.85
     LOW_PRICE_THRESHOLD: float = 0.50
     VERY_LOW_PRICE_THRESHOLD: float = 0.25
     HIGH_PRICE_THRESHOLD: float = 0.65
     LOW_PRICE_MIN_EDGE: float = 0.18
     VERY_LOW_PRICE_MIN_EDGE: float = 0.28
+    LOW_PRICE_MIN_EDGE_MULTIPLIER: float = 0.85
     COINFLIP_PRICE_LOWER: float = 0.48
     COINFLIP_PRICE_UPPER: float = 0.52
     EDGE_SCALING_RANGE: float = 0.15
     LOW_PRICE_BET_PENALTY: float = 0.50
     FALLBACK_EDGE_MIN_EDGE: float = 0.30
+    FALLBACK_EDGE_MIN_EDGE_MULTIPLIER: float = 0.90
     WEATHER_MIN_EDGE: float = 0.14
     WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.34
     REQUIRE_IMPLIED_PRICE: bool = True
@@ -402,7 +408,7 @@ class Settings:
     REFINEMENT_SKIP_BORDERLINE_FAMILIES: tuple[str, ...] = ("sports",)
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 2
-    MAX_MARKETS_PER_CYCLE: int = 3
+    MAX_MARKETS_PER_CYCLE: int = 20
     MAX_WEATHER_CANDIDATES_PER_CYCLE: int = 1
     MAX_CRYPTO_CANDIDATES_PER_CYCLE: int = 1
     # Music/speech candidates per cycle were raised from 1 to 2 after the
@@ -421,7 +427,7 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
-    MAX_TRADES_PER_CYCLE: int = 2
+    MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
     MAX_DAILY_DRAWDOWN_USDC: float = 30.0
@@ -439,7 +445,23 @@ class Settings:
     # initial pass; keep its per-attempt deadline at the pre-fix value of 90s
     # so legitimate refinements (e.g. KXINXU at ~75s) don't timeout.
     GROK_STREAM_TIMEOUT_SECONDS_DEEP: int = 90
-    GROK_ANALYSIS_MAX_BUDGET_SECONDS: int = 240
+    GROK_DEEP_ANALYSIS_MAX_ATTEMPTS: int = 2
+    GROK_ANALYSIS_MAX_BUDGET_SECONDS: int = 420
+    GROK_SELF_CONSISTENCY_ENABLED: bool = True
+    GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD: float = 400.0
+    GROK_SELF_CONSISTENCY_EDGE_THRESHOLD: float = 0.15
+    GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE: float = 0.3
+    GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE: float = 0.7
+    EDGE_REPAIR_ENABLED: bool = True
+    EDGE_BAND_CALIBRATION_ENABLED: bool = True
+    CONVICTION_REPAIR_ENABLED: bool = True
+    CONVICTION_REPAIR_MIN_EDGE: float = 0.20
+    CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY: float = 0.90
+    CONVICTION_REPAIR_SCORE_GAP_MAX: float = 0.08
+    CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR: float = 0.0
+    DAILY_EXPECTANCY_ENABLED: bool = True
+    DAILY_EXPECTANCY_PRIMARY_TARGETS: int = 2
+    DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT: float = 0.25
 
     # Resolution tracking
     RESOLUTION_SYNC_INTERVAL_CYCLES: int = 3
@@ -459,17 +481,19 @@ class Settings:
     SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY: float = 0.30
     SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.60
     SCORE_LOW_INFO_PENALTY_BASE: float = 0.08
-    SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.25
+    SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.025
     SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT: int = 1
     SCORE_CONFIDENCE_CALIBRATION_FLOOR: float = 0.55
     SCORE_CONFIDENCE_CALIBRATION_PENALTY_SCALE: float = 0.10
     SCORE_FALLBACK_EDGE_PENALTY_BASE: float = 0.12
-    SCORE_OVERCONFIDENCE_PENALTY_BASE: float = 0.11
+    SCORE_OVERCONFIDENCE_PENALTY_BASE: float = 0.05
     SCORE_COMPUTED_EDGE_BONUS: float = 0.03
+    SCORE_SOURCE_CONFIRMED_EDGE_BONUS: float = 0.06
     SCORE_PROXY_EVIDENCE_PENALTY_BASE: float = 0.11
-    SCORE_GENERIC_BIN_PENALTY_BASE: float = 0.04
+    SCORE_GENERIC_BIN_PENALTY_BASE: float = 0.015
     SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE: float = 0.08
-    SCORE_HALLUCINATED_EDGE_PENALTY_BASE: float = 0.22
+    SCORE_HALLUCINATED_EDGE_PENALTY_BASE: float = 0.08
+    SCORE_VOLUME_AMPLIFIER_ENABLED: bool = True
     SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE: float = 0.08
     SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE: float = 0.12
     SCORE_EXTREME_CONFIDENCE_THRESHOLD: float = 0.90
@@ -507,7 +531,7 @@ class Settings:
         "the-numbers.com",
     )
     PRE_ANALYSIS_OPPORTUNITY_ENABLED: bool = True
-    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.55
+    PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE: float = 0.28
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND: float = 0.20
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_ENABLED: bool = True
     # Adaptive widening of the soft-research band when sustained zero-execution
@@ -519,7 +543,7 @@ class Settings:
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED: bool = True
     PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_MAX: float = 0.30
     PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD: float = 0.50
-    PRE_ANALYSIS_REDUCED_MAX_CANDIDATES: int = 3
+    PRE_ANALYSIS_REDUCED_MAX_CANDIDATES: int = 8
     PRE_ANALYSIS_NON_ACTIONABLE_STREAK_PENALTY: float = 0.25
     PRE_ANALYSIS_NON_ACTIONABLE_STREAK_CAP: int = 8
     PRE_ANALYSIS_ANALYSIS_COUNT_PENALTY: float = 0.15
@@ -542,6 +566,7 @@ class Settings:
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_PENALTY: float = 0.10
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_THRESHOLD: float = -15.0
     PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY: float = 0.15
+    PRE_ANALYSIS_ADAPTIVE_BOOST: float = 0.03
     # Cap on the combined "stacked historical-family penalty" set in
     # _pre_analysis_opportunity_score. The fallback-family, historical-family
     # win-rate, historical-family PnL, zero-trade-rate, negative-prefix and
@@ -572,6 +597,9 @@ class Settings:
     HISTORICAL_FAMILY_MIN_SAMPLES: int = 12
     HISTORICAL_FAMILY_PNL_CUTOFF: float = -12.0
     HISTORICAL_FAMILY_WIN_RATE_CUTOFF: float = 0.40
+    HISTORICAL_FAMILY_SIGNAL_ENABLED: bool = True
+    HISTORICAL_FAMILY_SCORE_SCALE: float = 0.06
+    HISTORICAL_FAMILY_SIZE_SCALE_MAX: float = 0.25
     HISTORICAL_SHORT_PREFIX_LEN: int = 5
     HISTORICAL_SHORT_PREFIX_MIN_SAMPLES: int = 3
     HISTORICAL_SHORT_PREFIX_PNL_CUTOFF: float = -5.0
@@ -594,6 +622,9 @@ class Settings:
     CONFIDENCE_SHRINKAGE_FACTOR: float = 0.32
     CONFIDENCE_SHRINKAGE_FACTOR_HIGH: float = 0.28
     CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST: float = 2.0
+    CALIBRATION_ONLINE_UPDATE_ENABLED: bool = True
+    CALIBRATION_ONLINE_ALPHA: float = 0.15
+    CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET: int = 500
     HISTORICAL_CONFIDENCE_SHRINK_ENABLED: bool = True
     HISTORICAL_CONFIDENCE_SHRINK_MIN_SAMPLES: int = 15
     HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS: int = 30
@@ -611,11 +642,16 @@ class Settings:
     # the queue is not a write-only black hole. Conservative defaults: at most one
     # forced probe per cycle, only after the entry has aged at least an hour.
     RESEARCH_QUEUE_DRAIN_ENABLED: bool = True
-    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 1
+    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 8
     RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
     RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
-    RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.55
+    RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
     RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
+    RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES: float = 45.0
+    RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS: int = 2
+    RESEARCH_QUEUE_SCORE_PROMOTION_GAP: float = 0.03
+    RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS: int = 4
+    RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN: int = 8
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
     EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
     DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR: float = 0.80
@@ -656,7 +692,8 @@ class Settings:
     LMSR_LIQUIDITY_PARAM_B: float = 100000.0
     LMSR_MIN_INEFFICIENCY: float = 0.05
     KELLY_SIZING_ENABLED: bool = False
-    KELLY_FRACTION_DEFAULT: float = 0.25
+    KELLY_DYNAMIC_ENABLED: bool = True
+    KELLY_FRACTION_DEFAULT: float = 0.45
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
@@ -808,6 +845,22 @@ def load_settings() -> Settings:
             Settings.SPORTS_MIN_EVIDENCE_QUALITY,
         ),
         MIN_EDGE=_read_env_float("MIN_EDGE", Settings.MIN_EDGE),
+        MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD=_read_env_float(
+            "MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD",
+            Settings.MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD,
+        ),
+        MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER=_read_env_float(
+            "MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER",
+            Settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER,
+        ),
+        MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD=_read_env_float(
+            "MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD",
+            Settings.MIN_EDGE_MEDIUM_LIQUIDITY_THRESHOLD,
+        ),
+        MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER=_read_env_float(
+            "MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER",
+            Settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER,
+        ),
         LOW_PRICE_THRESHOLD=_read_env_float(
             "LOW_PRICE_THRESHOLD", Settings.LOW_PRICE_THRESHOLD
         ),
@@ -823,6 +876,10 @@ def load_settings() -> Settings:
         VERY_LOW_PRICE_MIN_EDGE=_read_env_float(
             "VERY_LOW_PRICE_MIN_EDGE", Settings.VERY_LOW_PRICE_MIN_EDGE
         ),
+        LOW_PRICE_MIN_EDGE_MULTIPLIER=_read_env_float(
+            "LOW_PRICE_MIN_EDGE_MULTIPLIER",
+            Settings.LOW_PRICE_MIN_EDGE_MULTIPLIER,
+        ),
         COINFLIP_PRICE_LOWER=_read_env_float(
             "COINFLIP_PRICE_LOWER", Settings.COINFLIP_PRICE_LOWER
         ),
@@ -837,6 +894,10 @@ def load_settings() -> Settings:
         ),
         FALLBACK_EDGE_MIN_EDGE=_read_env_float(
             "FALLBACK_EDGE_MIN_EDGE", Settings.FALLBACK_EDGE_MIN_EDGE
+        ),
+        FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=_read_env_float(
+            "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER",
+            Settings.FALLBACK_EDGE_MIN_EDGE_MULTIPLIER,
         ),
         WEATHER_MIN_EDGE=_read_env_float(
             "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
@@ -1264,9 +1325,73 @@ def load_settings() -> Settings:
             "GROK_STREAM_TIMEOUT_SECONDS_DEEP",
             Settings.GROK_STREAM_TIMEOUT_SECONDS_DEEP,
         ),
+        GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=_read_env_int(
+            "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS",
+            Settings.GROK_DEEP_ANALYSIS_MAX_ATTEMPTS,
+        ),
         GROK_ANALYSIS_MAX_BUDGET_SECONDS=_read_env_int(
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS",
             Settings.GROK_ANALYSIS_MAX_BUDGET_SECONDS,
+        ),
+        GROK_SELF_CONSISTENCY_ENABLED=_read_env_bool(
+            "GROK_SELF_CONSISTENCY_ENABLED",
+            Settings.GROK_SELF_CONSISTENCY_ENABLED,
+        ),
+        GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD=_read_env_float(
+            "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD",
+            Settings.GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD,
+        ),
+        GROK_SELF_CONSISTENCY_EDGE_THRESHOLD=_read_env_float(
+            "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD",
+            Settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD,
+        ),
+        GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE=_read_env_float(
+            "GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE",
+            Settings.GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE,
+        ),
+        GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE=_read_env_float(
+            "GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE",
+            Settings.GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE,
+        ),
+        EDGE_REPAIR_ENABLED=_read_env_bool(
+            "EDGE_REPAIR_ENABLED",
+            Settings.EDGE_REPAIR_ENABLED,
+        ),
+        EDGE_BAND_CALIBRATION_ENABLED=_read_env_bool(
+            "EDGE_BAND_CALIBRATION_ENABLED",
+            Settings.EDGE_BAND_CALIBRATION_ENABLED,
+        ),
+        CONVICTION_REPAIR_ENABLED=_read_env_bool(
+            "CONVICTION_REPAIR_ENABLED",
+            Settings.CONVICTION_REPAIR_ENABLED,
+        ),
+        CONVICTION_REPAIR_MIN_EDGE=_read_env_float(
+            "CONVICTION_REPAIR_MIN_EDGE",
+            Settings.CONVICTION_REPAIR_MIN_EDGE,
+        ),
+        CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY",
+            Settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY,
+        ),
+        CONVICTION_REPAIR_SCORE_GAP_MAX=_read_env_float(
+            "CONVICTION_REPAIR_SCORE_GAP_MAX",
+            Settings.CONVICTION_REPAIR_SCORE_GAP_MAX,
+        ),
+        CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=_read_env_float(
+            "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR",
+            Settings.CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR,
+        ),
+        DAILY_EXPECTANCY_ENABLED=_read_env_bool(
+            "DAILY_EXPECTANCY_ENABLED",
+            Settings.DAILY_EXPECTANCY_ENABLED,
+        ),
+        DAILY_EXPECTANCY_PRIMARY_TARGETS=_read_env_int(
+            "DAILY_EXPECTANCY_PRIMARY_TARGETS",
+            Settings.DAILY_EXPECTANCY_PRIMARY_TARGETS,
+        ),
+        DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=_read_env_float(
+            "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT",
+            Settings.DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT,
         ),
         RESOLUTION_SYNC_INTERVAL_CYCLES=_read_env_int(
             "RESOLUTION_SYNC_INTERVAL_CYCLES",
@@ -1348,6 +1473,10 @@ def load_settings() -> Settings:
             "SCORE_COMPUTED_EDGE_BONUS",
             Settings.SCORE_COMPUTED_EDGE_BONUS,
         ),
+        SCORE_SOURCE_CONFIRMED_EDGE_BONUS=_read_env_float(
+            "SCORE_SOURCE_CONFIRMED_EDGE_BONUS",
+            Settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS,
+        ),
         SCORE_PROXY_EVIDENCE_PENALTY_BASE=_read_env_float(
             "SCORE_PROXY_EVIDENCE_PENALTY_BASE",
             Settings.SCORE_PROXY_EVIDENCE_PENALTY_BASE,
@@ -1363,6 +1492,10 @@ def load_settings() -> Settings:
         SCORE_HALLUCINATED_EDGE_PENALTY_BASE=_read_env_float(
             "SCORE_HALLUCINATED_EDGE_PENALTY_BASE",
             Settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE,
+        ),
+        SCORE_VOLUME_AMPLIFIER_ENABLED=_read_env_bool(
+            "SCORE_VOLUME_AMPLIFIER_ENABLED",
+            Settings.SCORE_VOLUME_AMPLIFIER_ENABLED,
         ),
         SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE=_read_env_float(
             "SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE",
@@ -1528,6 +1661,10 @@ def load_settings() -> Settings:
             "PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY",
             Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_SEVERE_PENALTY,
         ),
+        PRE_ANALYSIS_ADAPTIVE_BOOST=_read_env_float(
+            "PRE_ANALYSIS_ADAPTIVE_BOOST",
+            Settings.PRE_ANALYSIS_ADAPTIVE_BOOST,
+        ),
         PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=_read_env_float(
             "PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP",
             Settings.PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP,
@@ -1622,6 +1759,18 @@ def load_settings() -> Settings:
             "HISTORICAL_FAMILY_WIN_RATE_CUTOFF",
             Settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
         ),
+        HISTORICAL_FAMILY_SIGNAL_ENABLED=_read_env_bool(
+            "HISTORICAL_FAMILY_SIGNAL_ENABLED",
+            Settings.HISTORICAL_FAMILY_SIGNAL_ENABLED,
+        ),
+        HISTORICAL_FAMILY_SCORE_SCALE=_read_env_float(
+            "HISTORICAL_FAMILY_SCORE_SCALE",
+            Settings.HISTORICAL_FAMILY_SCORE_SCALE,
+        ),
+        HISTORICAL_FAMILY_SIZE_SCALE_MAX=_read_env_float(
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX",
+            Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX,
+        ),
         HISTORICAL_SHORT_PREFIX_LEN=_read_env_int(
             "HISTORICAL_SHORT_PREFIX_LEN",
             Settings.HISTORICAL_SHORT_PREFIX_LEN,
@@ -1708,6 +1857,18 @@ def load_settings() -> Settings:
             "CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST",
             Settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST,
         ),
+        CALIBRATION_ONLINE_UPDATE_ENABLED=_read_env_bool(
+            "CALIBRATION_ONLINE_UPDATE_ENABLED",
+            Settings.CALIBRATION_ONLINE_UPDATE_ENABLED,
+        ),
+        CALIBRATION_ONLINE_ALPHA=_read_env_float(
+            "CALIBRATION_ONLINE_ALPHA",
+            Settings.CALIBRATION_ONLINE_ALPHA,
+        ),
+        CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET=_read_env_int(
+            "CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET",
+            Settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET,
+        ),
         HISTORICAL_CONFIDENCE_SHRINK_ENABLED=_read_env_bool(
             "HISTORICAL_CONFIDENCE_SHRINK_ENABLED",
             Settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED,
@@ -1763,6 +1924,26 @@ def load_settings() -> Settings:
         RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=_read_env_bool(
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH",
             Settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH,
+        ),
+        RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=_read_env_float(
+            "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES",
+            Settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES,
+        ),
+        RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS=_read_env_int(
+            "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS",
+            Settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS,
+        ),
+        RESEARCH_QUEUE_SCORE_PROMOTION_GAP=_read_env_float(
+            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP",
+            Settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP,
+        ),
+        RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS=_read_env_int(
+            "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS",
+            Settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS,
+        ),
+        RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN=_read_env_int(
+            "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN",
+            Settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN,
         ),
         EXTENDED_RESEARCH_AFTER_STREAK=_read_env_int(
             "EXTENDED_RESEARCH_AFTER_STREAK",
@@ -1862,6 +2043,10 @@ def load_settings() -> Settings:
         KELLY_SIZING_ENABLED=_read_env_bool(
             "KELLY_SIZING_ENABLED",
             Settings.KELLY_SIZING_ENABLED,
+        ),
+        KELLY_DYNAMIC_ENABLED=_read_env_bool(
+            "KELLY_DYNAMIC_ENABLED",
+            Settings.KELLY_DYNAMIC_ENABLED,
         ),
         KELLY_FRACTION_DEFAULT=_read_env_float(
             "KELLY_FRACTION_DEFAULT",

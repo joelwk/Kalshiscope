@@ -31,13 +31,17 @@ from main import (
     _collapse_event_ladders,
     _confidence_gate_override_metrics,
     _compute_next_wakeup_seconds,
+    _conviction_repair_reason,
     _daily_balance_delta_usdc,
     _daily_drawdown_cap_reached,
     _daily_trade_cap_reached,
+    _daily_expectancy_role,
     _dry_streak_sleep_seconds,
+    _edge_band_label,
     _edge_threshold_for_market,
     _event_concentration_blocked,
     _event_side_conflict_blocked,
+    _expected_value_usdc,
     _should_apply_definitive_side_override,
     _event_ticker_prefix,
     _effective_position_override_threshold,
@@ -56,6 +60,9 @@ from main import (
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
     _research_queue_last_decision_json,
+    _research_queue_drain_sort_key,
+    _research_queue_recent_drain_attempt,
+    _research_queue_zero_yield_sort_key,
     _resolve_dynamic_analysis_candidate_cap,
     _resolve_min_bet_floor,
     _score_breakdown_from_execution_audit,
@@ -85,11 +92,17 @@ class DummyStateManager:
 
 
 class DummyGrokClient:
-    def __init__(self, decision: TradeDecision) -> None:
+    def __init__(self, decision: TradeDecision, deep_decision: TradeDecision | None = None) -> None:
         self.decision = decision
+        self.deep_decision = deep_decision or decision
+        self.deep_calls = 0
 
     def analyze_market(self, market, search_config=None, previous_analysis=None):
         return self.decision
+
+    def analyze_market_deep(self, market, previous_analysis=None, search_config=None):
+        self.deep_calls += 1
+        return self.deep_decision
 
 
 class FailingGrokClient:
@@ -247,6 +260,7 @@ class TestMainUtils(unittest.TestCase):
         )
 
         self.assertEqual(score_fields["score_final"], runtime_score.final_score)
+        self.assertIn("score_source_confirmed_edge", score_fields)
         self.assertEqual(audit_context["score_final"], runtime_score.final_score)
         self.assertEqual(
             audit_context["score_breakdown"]["score_final"],
@@ -873,7 +887,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(reason, "pre_analysis_repeated_churn_market")
         self.assertEqual(metadata["participation_demotion_analysis_count"], 5)
 
-    def test_pre_analysis_demotion_for_unprofitable_crypto_fallback_family(self) -> None:
+    def test_pre_analysis_crypto_history_is_signal_not_demotion(self) -> None:
         market = Market(
             id="KXBTCD-26APR1217-T70999.99",
             question="Bitcoin threshold",
@@ -904,8 +918,8 @@ class TestMainUtils(unittest.TestCase):
             fallback_family_edge_rate=0.70,
             fallback_family_sample_size=30,
         )
-        self.assertTrue(rejected)
-        self.assertEqual(reason, "pre_analysis_crypto_historically_unprofitable")
+        self.assertFalse(rejected)
+        self.assertIsNone(reason)
         self.assertEqual(metadata["participation_demotion_family"], "crypto")
 
     def test_pre_analysis_opportunity_score_penalizes_generic_bin_churn(self) -> None:
@@ -1001,6 +1015,67 @@ class TestMainUtils(unittest.TestCase):
             places=6,
         )
 
+    def test_pre_analysis_opportunity_score_adds_small_positive_family_volume_bonus(self) -> None:
+        market = Market(
+            id="KXBTCD-26APR0917-T70499.99",
+            question="Bitcoin threshold",
+            category="crypto",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings()
+        baseline_score, baseline_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 7, "win_rate": 0.50, "pnl_total": 2.0},
+        )
+        boosted_score, boosted_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 8, "win_rate": 0.50, "pnl_total": 2.0},
+        )
+
+        self.assertEqual(baseline_breakdown["pre_score_historical_family_volume_bonus"], 0.0)
+        self.assertGreater(boosted_breakdown["pre_score_historical_family_volume_bonus"], 0.0)
+        self.assertEqual(boosted_breakdown["pre_score_positive_family_pnl_bonus"], 0.02)
+        self.assertGreater(boosted_score, baseline_score)
+
+    def test_pre_analysis_opportunity_score_boosts_profitable_family_pnl(self) -> None:
+        market = Market(
+            id="KXMLBF5-26APR0917-TEST",
+            question="MLB First 5 Innings threshold",
+            category="sports",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=10),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(PRE_ANALYSIS_ADAPTIVE_BOOST=0.03)
+        baseline_score, baseline_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 0, "win_rate": 0.0, "pnl_total": 0.0},
+        )
+        boosted_score, boosted_breakdown = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_family_stats={"sample_size": 1, "win_rate": 1.0, "pnl_total": 1.0},
+        )
+
+        self.assertEqual(baseline_breakdown["pre_score_positive_family_pnl_bonus"], 0.0)
+        self.assertEqual(boosted_breakdown["pre_score_positive_family_pnl_bonus"], 0.02)
+        self.assertAlmostEqual(boosted_score - baseline_score, 0.02, places=6)
+
     def test_pre_analysis_opportunity_score_adds_post_event_bonus(self) -> None:
         settings = Settings()
         market_past = Market(
@@ -1078,7 +1153,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(unpenalized_breakdown["pre_score_zero_trade_rate_penalty"], 0.0)
         self.assertLess(penalized_score, unpenalized_score)
 
-    def test_pre_analysis_demotion_for_historical_prefix_loss_gate(self) -> None:
+    def test_pre_analysis_historical_prefix_loss_gate_is_signal_not_demotion(self) -> None:
         market = Market(
             id="KXTESTMARKET-26APR20-T50",
             question="Test market",
@@ -1104,8 +1179,8 @@ class TestMainUtils(unittest.TestCase):
                 "historical_gate_prefix_pnl_total": -12.0,
             },
         )
-        self.assertTrue(rejected)
-        self.assertEqual(reason, "pre_analysis_historical_prefix_pnl_block")
+        self.assertFalse(rejected)
+        self.assertIsNone(reason)
         self.assertEqual(metadata["historical_gate_prefix_sample_size"], 6)
 
     def test_resolve_dynamic_analysis_candidate_cap_reduces_when_best_score_low(self) -> None:
@@ -1150,6 +1225,201 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(cap, 1)
         self.assertTrue(applied)
         self.assertTrue(neg_floor)
+
+    def test_research_queue_drain_sort_key_prioritizes_small_threshold_gap(self) -> None:
+        entries = [
+            {"market_id": "KXWIDE", "threshold_gap": 0.11, "queued_at": "2026-05-13T00:01:00+00:00"},
+            {"market_id": "KXCLOSE", "threshold_gap": 0.01, "queued_at": "2026-05-13T00:02:00+00:00"},
+            {"market_id": "KXUNKNOWN", "threshold_gap": None, "queued_at": "2026-05-13T00:00:00+00:00"},
+        ]
+
+        ordered = sorted(entries, key=_research_queue_drain_sort_key)
+
+        self.assertEqual([entry["market_id"] for entry in ordered], ["KXCLOSE", "KXWIDE", "KXUNKNOWN"])
+
+    def test_zero_yield_queue_sort_uses_gap_then_times_seen(self) -> None:
+        entries = [
+            {"market_id": "KXONCE", "threshold_gap": 0.04, "times_seen": 1, "queued_at": "2026-05-13T00:02:00+00:00"},
+            {"market_id": "KXMANY", "threshold_gap": 0.04, "times_seen": 7, "queued_at": "2026-05-13T00:03:00+00:00"},
+            {"market_id": "KXCLOSE", "threshold_gap": 0.01, "times_seen": 1, "queued_at": "2026-05-13T00:04:00+00:00"},
+        ]
+
+        ordered = sorted(entries, key=_research_queue_zero_yield_sort_key)
+
+        self.assertEqual(
+            [entry["market_id"] for entry in ordered],
+            ["KXCLOSE", "KXMANY", "KXONCE"],
+        )
+
+    def test_research_queue_recent_drain_attempt_respects_cooldown(self) -> None:
+        now = datetime(2026, 5, 16, 20, 0, tzinfo=timezone.utc)
+        recent = {
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 1,
+                        "research_queue_last_drain_attempt_at": (
+                            now - timedelta(minutes=20)
+                        ).isoformat(),
+                    }
+                }
+            )
+        }
+        old = {
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 1,
+                        "research_queue_last_drain_attempt_at": (
+                            now - timedelta(minutes=90)
+                        ).isoformat(),
+                    }
+                }
+            )
+        }
+
+        self.assertTrue(
+            _research_queue_recent_drain_attempt(
+                recent,
+                cooldown_minutes=45,
+                now=now,
+            )
+        )
+        self.assertFalse(
+            _research_queue_recent_drain_attempt(
+                old,
+                cooldown_minutes=45,
+                now=now,
+            )
+        )
+
+    def test_conviction_repair_triggers_on_high_edge_high_evidence_no_trade(self) -> None:
+        market = Market(
+            id="KXSPORTS-26MAY161900TEAMATEAMB",
+            question="Will Team A win?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.48),
+                MarketOutcome(name="NO", price=0.52),
+            ],
+            liquidity_usdc=800.0,
+            resolution_criteria="Official score",
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.0,
+            reasoning="Strong edge but no trade.",
+            edge_external=0.24,
+            edge_source="computed",
+            evidence_basis="proxy",
+            evidence_quality=0.93,
+            primary_source_url="https://espn.com/game",
+            source_match_class="settlement_aligned",
+        )
+
+        reason = _conviction_repair_reason(
+            decision=decision,
+            market=market,
+            settings=Settings(),
+            score_result=None,
+            score_threshold=None,
+        )
+
+        self.assertEqual(reason, "conviction_repair_no_trade_contradiction")
+
+    def test_conviction_repair_triggers_on_calibrated_confidence_block(self) -> None:
+        market = Market(
+            id="KXSPORTS-26MAY161900TEAMATEAMB",
+            question="Will Team A win?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.44),
+                MarketOutcome(name="NO", price=0.56),
+            ],
+            liquidity_usdc=800.0,
+            resolution_criteria="Official score",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            raw_should_trade=True,
+            outcome="YES",
+            raw_confidence=0.74,
+            confidence=0.50,
+            bet_size_pct=0.05,
+            reasoning="Raw edge was strong before calibration.",
+            edge_external=0.24,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=0.95,
+            primary_source_url="https://espn.com/game",
+            source_match_class="settlement_aligned",
+        )
+        diagnostics: dict[str, object] = {}
+        score_result = type("ScoreResultStub", (), {"final_score": 0.04})()
+
+        reason = _conviction_repair_reason(
+            decision=decision,
+            market=market,
+            settings=Settings(MIN_CONFIDENCE=0.62),
+            score_result=score_result,
+            score_threshold=0.40,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(reason, "conviction_repair_confidence_calibration_block")
+        self.assertTrue(diagnostics["conviction_repair_triggerable"])
+        self.assertEqual(
+            diagnostics["conviction_repair_reason"],
+            "conviction_repair_confidence_calibration_block",
+        )
+
+    def test_conviction_repair_rejects_absence_only_or_missing_source(self) -> None:
+        market = Market(
+            id="KXGENERIC-B1",
+            question="Will a generic outcome happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.48),
+                MarketOutcome(name="NO", price=0.52),
+            ],
+            liquidity_usdc=800.0,
+            resolution_criteria="Official source",
+        )
+        absence_decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.0,
+            reasoning="Absence-only edge.",
+            edge_external=0.24,
+            edge_source="computed",
+            evidence_basis="absence_only",
+            evidence_quality=0.95,
+            source_match_class="settlement_aligned",
+        )
+        missing_source_decision = absence_decision.model_copy(
+            update={"evidence_basis": "proxy"}
+        )
+        diagnostics: dict[str, object] = {}
+
+        self.assertIsNone(
+            _conviction_repair_reason(
+                decision=absence_decision,
+                market=market,
+                settings=Settings(),
+                diagnostics=diagnostics,
+            )
+        )
+        self.assertEqual(
+            diagnostics["conviction_repair_missed_reason"],
+            "absence_only_evidence",
+        )
+        self.assertIsNone(
+            _conviction_repair_reason(
+                decision=missing_source_decision,
+                market=market,
+                settings=Settings(),
+            )
+        )
 
     def test_parallel_attempt_limit_does_not_add_failure_buffer(self) -> None:
         settings = Settings(MAX_MARKETS_PER_CYCLE=6, XAI_CIRCUIT_BREAKER_MAX_FAILURES=3)
@@ -1578,6 +1848,22 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_calculate_bet(100, -1), 0)
         self.assertEqual(_calculate_bet(100, 2), 100)
 
+    def test_expected_value_usdc_uses_entry_price_and_probability(self) -> None:
+        ev = _expected_value_usdc(probability=0.65, entry_price=0.50, amount_usdc=10.0)
+        self.assertAlmostEqual(ev or 0.0, 3.0, places=6)
+        self.assertEqual(_edge_band_label(0.30), "25-35pp")
+
+    def test_daily_expectancy_role_selects_primary_then_satellite_cap(self) -> None:
+        settings = Settings(
+            DAILY_EXPECTANCY_ENABLED=True,
+            DAILY_EXPECTANCY_PRIMARY_TARGETS=2,
+            DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.25,
+        )
+
+        self.assertEqual(_daily_expectancy_role(settings=settings, opportunity_rank=1), ("primary_target", None))
+        self.assertEqual(_daily_expectancy_role(settings=settings, opportunity_rank=2), ("primary_target", None))
+        self.assertEqual(_daily_expectancy_role(settings=settings, opportunity_rank=3), ("satellite", 0.25))
+
     def test_filter_markets_populates_skip_counters(self) -> None:
         now = datetime.now(timezone.utc)
         markets = [
@@ -1959,6 +2245,27 @@ class TestMainUtils(unittest.TestCase):
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=4)
         self.assertEqual([item["market"].id for item in capped], ["c2", "c1", "s1", "p1"])
         self.assertIn("selection_rank_components", capped[0])
+
+    def test_cap_analysis_candidates_prioritizes_research_queue_score_promotions(self) -> None:
+        candidates = [
+            {
+                "market": Market(id="normal-high", question="Normal high", category="sports"),
+                "pre_analysis_score": 0.95,
+            },
+            {
+                "market": Market(id="score-promo", question="Queued near miss", category="generic"),
+                "pre_analysis_score": 0.30,
+                "is_research_queue_score_promotion": True,
+            },
+            {
+                "market": Market(id="normal-mid", question="Normal mid", category="sports"),
+                "pre_analysis_score": 0.80,
+            },
+        ]
+
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+
+        self.assertEqual([item["market"].id for item in capped], ["score-promo", "normal-high"])
 
     def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
         candidates = [
@@ -2443,9 +2750,9 @@ class TestMainUtils(unittest.TestCase):
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
         )
         self.assertEqual(_edge_threshold_for_market(0.60, settings, "computed"), 0.05)
-        self.assertEqual(_edge_threshold_for_market(0.20, settings, "computed"), 0.25)
-        self.assertEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.08)
-        self.assertEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.08)
+        self.assertAlmostEqual(_edge_threshold_for_market(0.20, settings, "computed"), 0.2125)
+        self.assertAlmostEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.068)
+        self.assertAlmostEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.072)
         weather_market = Market(
             id="w-edge",
             question="Will rainfall exceed 1 inch in Miami tomorrow?",
@@ -2457,7 +2764,32 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(
             _edge_threshold_for_market(0.60, settings, "fallback", market=weather_market),
-            0.15,
+            0.135,
+        )
+        liquid_market = Market(
+            id="liq-edge",
+            question="Liquid sports market",
+            category="sports",
+            liquidity_usdc=200.0,
+        )
+        very_liquid_market = liquid_market.model_copy(update={"liquidity_usdc": 501.0})
+        self.assertAlmostEqual(
+            _edge_threshold_for_market(0.60, settings, "computed", market=liquid_market),
+            0.05 * settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER,
+        )
+        self.assertAlmostEqual(
+            _edge_threshold_for_market(0.60, settings, "computed", market=very_liquid_market),
+            0.05 * settings.MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER,
+        )
+        self.assertEqual(
+            _edge_threshold_for_market(
+                0.20,
+                settings,
+                "fallback",
+                market=very_liquid_market,
+                definitive_outcome_eligible=True,
+            ),
+            0.05,
         )
 
     def test_passes_edge_threshold_blocks_very_low_price_without_extreme_edge(self) -> None:
@@ -2483,7 +2815,7 @@ class TestMainUtils(unittest.TestCase):
         passed, edge, reason = _passes_edge_threshold(0.14, decision, settings)
         self.assertFalse(passed)
         self.assertAlmostEqual(edge or 0.0, 0.20, places=6)
-        self.assertIn("below min 0.25", reason)
+        self.assertIn("below min 0.2125", reason)
 
     def test_min_evidence_quality_for_weather_market_uses_weather_floor(self) -> None:
         settings = Settings(
@@ -2979,6 +3311,102 @@ class TestMainUtils(unittest.TestCase):
         self.assertFalse(result["was_refined"])
         self.assertEqual(result["decision"].outcome, "YES")
 
+    def test_analyze_market_candidate_repairs_edge_source_none_before_execution(self) -> None:
+        market = Market(
+            id="m-edge-repair",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=500.0,
+            category="sports",
+        )
+        initial = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.4,
+            reasoning="Trade but edge fields are missing.",
+            edge_source="none",
+            evidence_quality=0.8,
+        )
+        repaired = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.72,
+            probability_yes=0.72,
+            bet_size_pct=0.35,
+            reasoning="Computed implied=0.55, probability_yes=0.72, edge=0.17 with source.",
+            implied_prob_external=0.55,
+            my_prob=0.72,
+            edge_external=0.17,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=0.8,
+        )
+        client = DummyGrokClient(initial, deep_decision=repaired)
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            MAX_GLOBAL_CONFIDENCE=1.0,
+            MAX_SPORTS_CONFIDENCE=1.0,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=client,
+        )
+
+        self.assertEqual(client.deep_calls, 1)
+        self.assertTrue(result["edge_repair_attempted"])
+        self.assertEqual(result["edge_repair_reason"], "edge_source_none")
+        self.assertIsNone(result["edge_repair_unresolved_reason"])
+        self.assertEqual(result["decision"].edge_source, "computed")
+
+    def test_analyze_market_candidate_blocks_unresolved_edge_repair(self) -> None:
+        market = Market(
+            id="m-edge-repair-unresolved",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=500.0,
+            category="sports",
+        )
+        initial = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.4,
+            reasoning="Trade but edge fields are missing.",
+            edge_source="none",
+            evidence_quality=0.8,
+        )
+        client = DummyGrokClient(initial, deep_decision=initial)
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            MAX_GLOBAL_CONFIDENCE=1.0,
+            MAX_SPORTS_CONFIDENCE=1.0,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=client,
+        )
+
+        self.assertEqual(client.deep_calls, 1)
+        self.assertTrue(result["edge_repair_attempted"])
+        self.assertEqual(result["edge_repair_unresolved_reason"], "edge_source_none")
+        self.assertFalse(result["decision"].should_trade)
+        self.assertTrue(result["decision"].abstain)
+
     def test_analyze_market_candidate_returns_failure_payload_on_initial_error(self) -> None:
         market = Market(
             id="m-candidate-fail",
@@ -3269,8 +3697,12 @@ class TestNonDefinitiveConfidenceCeiling(unittest.TestCase):
         decision = self._make_decision(
             confidence=0.95,
             evidence_basis="direct",
+            evidence_quality=0.90,
+            raw_evidence_quality=0.90,
             definitive_outcome_detected=True,
             primary_source_url="https://apnews.com/article/example",
+            source_match_class="settlement_aligned",
+            my_prob=0.97,
         )
         settings = Settings()
         ceiling = _non_definitive_confidence_ceiling(decision, settings)

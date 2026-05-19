@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from models import Market, TradeDecision
 
 _WEATHER_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
-_NARROW_WEATHER_BIN_PENALTY = 0.03
+_NARROW_WEATHER_BIN_PENALTY = 0.015
 _MENTION_MARKET_TICKER_PATTERN = re.compile(r"MENTION", re.IGNORECASE)
 _GENERIC_BIN_TICKER_PATTERN = re.compile(r"-B\d", re.IGNORECASE)
 _NUMERIC_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+$", re.IGNORECASE)
@@ -35,8 +35,13 @@ class ScoreResult:
     kelly_component: float
     confidence_alignment_bonus: float
     computed_edge_bonus: float = 0.0
+    source_confirmed_edge_bonus: float = 0.0
+    source_confirmed_edge: bool = False
+    source_confirmed_edge_value: float = 0.0
     definitive_outcome_bonus: float = 0.0
     evidence_basis_bonus: float = 0.0
+    source_alignment_bonus: float = 0.0
+    proxy_penalty_reduced: bool = False
     observed_data_bonus: float = 0.0
     low_information_penalty: float = 0.0
     no_external_odds_penalty: float = 0.0
@@ -62,10 +67,14 @@ class ScoreResult:
     late_stage_overconfidence_penalty: float = 0.0
     short_prefix_penalty: float = 0.0
     historical_family_bonus: float = 0.0
+    historical_family_signal: float = 0.0
+    historical_family_score_adjustment: float = 0.0
+    historical_family_size_multiplier: float = 1.0
     historical_prefix_bonus: float = 0.0
     historical_prefix_penalty: float = 0.0
     extreme_confidence_band_penalty: float = 0.0
     numeric_strike_computed_overconfidence_penalty: float = 0.0
+    volume_amplifier_discount: float = 0.0
     rejection_reasons: tuple[str, ...] = ()
     bayesian_posterior: float | None = None
     lmsr_price: float | None = None
@@ -87,19 +96,22 @@ def compute_final_score(
     low_info_penalty_base: float = 0.05,
     repeated_analysis_count: int = 0,
     non_actionable_streak: int = 0,
-    repeated_analysis_penalty_base: float = 0.05,
+    repeated_analysis_penalty_base: float = 0.025,
     repeated_analysis_penalty_start_count: int = 1,
     mention_market_penalty_base: float = 0.0,
     confidence_calibration_floor: float = 0.50,
     confidence_calibration_penalty_scale: float = 0.0,
     fallback_edge_penalty_base: float = 0.04,
     computed_edge_bonus_base: float = 0.03,
+    source_confirmed_edge_min: float = 0.20,
+    source_confirmed_edge_min_evidence_quality: float = 0.90,
+    source_confirmed_edge_bonus_base: float = 0.06,
     proxy_evidence_penalty_base: float = 0.05,
-    overconfidence_penalty_base: float = 0.08,
-    generic_bin_penalty_base: float = 0.03,
+    overconfidence_penalty_base: float = 0.05,
+    generic_bin_penalty_base: float = 0.015,
     ambiguous_resolution_penalty_base: float = 0.06,
     max_reasonable_edge: float = 0.45,
-    hallucinated_edge_penalty_base: float = 0.15,
+    hallucinated_edge_penalty_base: float = 0.08,
     extreme_market_edge_penalty_base: float = 0.08,
     late_stage_overconfidence_penalty_base: float = 0.08,
     extreme_confidence_threshold: float = 0.90,
@@ -109,17 +121,26 @@ def compute_final_score(
     definitive_outcome_eligible: bool = False,
     historical_family_pnl_total: float | None = None,
     historical_family_sample_size: int = 0,
+    historical_family_win_rate: float | None = None,
+    historical_family_deployed_usdc: float | None = None,
+    historical_family_high_conf_losses: int = 0,
     historical_family_bonus_base: float = 0.04,
     historical_family_min_samples: int = 8,
     historical_family_positive_pnl_threshold: float = 10.0,
+    historical_family_signal_enabled: bool = True,
+    historical_family_signal_score_scale: float = 0.06,
+    historical_family_size_scale_max: float = 0.25,
     now: datetime | None = None,
     evidence_basis_class: str = "",
     edge_source: str = "",
+    source_match_class: str = "",
+    primary_source_url_present: bool = False,
     market_family: str = "",
     coinflip_price_lower: float = 0.45,
     coinflip_price_upper: float = 0.55,
     historical_prefix_pnl_per_trade: float | None = None,
     historical_prefix_sample_size: int = 0,
+    volume_amplifier_enabled: bool = True,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -174,10 +195,44 @@ def compute_final_score(
             evidence_basis_bonus = 0.08
         elif evidence_quality >= 0.65:
             evidence_basis_bonus = 0.04
+    normalized_source_match = str(source_match_class or "").strip().lower()
+    source_alignment_bonus = 0.0
+    settlement_aligned_high_quality = (
+        normalized_source_match == "settlement_aligned"
+        and evidence_quality >= 0.90
+        and bool(primary_source_url_present)
+        and normalized_evidence_basis in {"direct", "proxy"}
+    )
+    if settlement_aligned_high_quality:
+        source_alignment_bonus = 0.02 if normalized_evidence_basis == "direct" else 0.03
     low_information_penalty = 0.0
     low_info_threshold = max(0.0, min(1.0, low_info_penalty_threshold))
     low_info_base = max(0.0, low_info_penalty_base)
     normalized_edge_source = (edge_source or decision.edge_source or "").strip().lower()
+    source_confirmed_edge_value = max(edge_market, edge_external)
+    source_confirmed_edge = (
+        normalized_edge_source == "computed"
+        and bool(primary_source_url_present)
+        and evidence_quality >= max(0.0, min(1.0, float(source_confirmed_edge_min_evidence_quality)))
+        and source_confirmed_edge_value >= max(0.0, min(1.0, float(source_confirmed_edge_min)))
+        and (
+            normalized_evidence_basis == "direct"
+            or (
+                normalized_source_match == "settlement_aligned"
+                and normalized_evidence_basis in {"direct", "proxy"}
+            )
+        )
+    )
+    source_confirmed_edge_bonus = 0.0
+    if source_confirmed_edge:
+        edge_headroom = max(
+            0.0,
+            source_confirmed_edge_value - max(0.0, float(source_confirmed_edge_min)),
+        )
+        source_confirmed_edge_bonus = max(
+            0.0,
+            min(0.10, float(source_confirmed_edge_bonus_base) + min(0.04, edge_headroom * 0.20)),
+        )
     definitive_outcome_bonus = 0.0
     likelihood_ratio = decision.likelihood_ratio
     if (
@@ -337,6 +392,7 @@ def compute_final_score(
         weather_bin_penalty = _weather_bin_penalty(market)
     fallback_edge_penalty = 0.0
     proxy_evidence_penalty = 0.0
+    proxy_penalty_reduced = False
     generic_bin_penalty = 0.0
     numeric_strike_bin_penalty = 0.0
     ambiguous_resolution_penalty = 0.0
@@ -360,6 +416,9 @@ def compute_final_score(
             else:
                 fallback_edge_penalty *= 0.40
                 proxy_evidence_penalty *= 0.40
+        elif settlement_aligned_high_quality and proxy_evidence_penalty > 0.0:
+            proxy_evidence_penalty *= 0.60
+            proxy_penalty_reduced = True
     if _GENERIC_BIN_TICKER_PATTERN.search((market.id or "").strip()) and not _is_weather_market(market):
         generic_bin_penalty = max(0.0, generic_bin_penalty_base) * (1.0 + max(0.0, 0.65 - evidence_quality))
     if (
@@ -375,7 +434,67 @@ def compute_final_score(
         )
     short_prefix_penalty = max(0.0, float(short_prefix_penalty))
     historical_family_bonus = 0.0
+    historical_family_signal = 0.0
+    historical_family_score_adjustment = 0.0
+    historical_family_size_multiplier = 1.0
+    normalized_market_family = str(market_family or "").strip().lower()
+    has_continuous_family_inputs = (
+        historical_family_win_rate is not None
+        or historical_family_deployed_usdc is not None
+        or int(historical_family_high_conf_losses or 0) > 0
+    )
     if (
+        historical_family_signal_enabled
+        and has_continuous_family_inputs
+        and historical_family_sample_size >= max(1, int(historical_family_min_samples))
+    ):
+        sample_size = max(0, int(historical_family_sample_size))
+        wins_rate = (
+            max(0.0, min(1.0, float(historical_family_win_rate)))
+            if historical_family_win_rate is not None
+            else 0.50
+        )
+        pnl_total = float(historical_family_pnl_total or 0.0)
+        deployed = float(historical_family_deployed_usdc or 0.0)
+        if deployed > 0.0:
+            pnl_efficiency = pnl_total / deployed
+        else:
+            pnl_efficiency = pnl_total / max(1.0, float(sample_size) * 5.0)
+        high_conf_loss_rate = max(0.0, float(historical_family_high_conf_losses or 0)) / max(
+            1.0, float(sample_size)
+        )
+        raw_signal = ((wins_rate - 0.52) * 2.0) + pnl_efficiency
+        raw_signal -= min(0.35, high_conf_loss_rate * 2.0)
+        if (
+            normalized_market_family == "sports"
+            and pnl_total > 0.0
+            and wins_rate >= 0.55
+            and high_conf_loss_rate <= 0.005
+            and source_confirmed_edge_value > 0.0
+            and evidence_quality >= 0.65
+        ):
+            raw_signal += 0.08
+        elif normalized_market_family in {"generic", "crypto"} and pnl_efficiency < 0.0:
+            # Historical generic/crypto losses should scale conviction and size,
+            # not categorically exclude otherwise eligible source-backed markets.
+            raw_signal -= min(0.40, (abs(pnl_efficiency) * 1.5) + (high_conf_loss_rate * 1.5))
+        if normalized_evidence_basis != "direct" and raw_signal < 0.0:
+            raw_signal *= 1.25
+        shrink = sample_size / (sample_size + 20.0)
+        historical_family_signal = max(-1.0, min(1.0, raw_signal * shrink))
+        score_scale = max(0.0, float(historical_family_signal_score_scale))
+        historical_family_score_adjustment = historical_family_signal * score_scale
+        if historical_family_score_adjustment > 0.0 and not (
+            max(edge_market, edge_external) > 0.0 and evidence_quality >= 0.65
+        ):
+            historical_family_score_adjustment = 0.0
+        size_scale = max(0.0, min(1.0, float(historical_family_size_scale_max)))
+        historical_family_size_multiplier = max(
+            1.0 - size_scale,
+            min(1.0 + size_scale, 1.0 + (historical_family_signal * size_scale)),
+        )
+        historical_family_bonus = max(0.0, historical_family_score_adjustment)
+    elif (
         historical_family_pnl_total is not None
         and historical_family_sample_size >= max(1, int(historical_family_min_samples))
         and float(historical_family_pnl_total)
@@ -421,7 +540,6 @@ def compute_final_score(
             0.06, 0.05 * (decision.confidence - 0.85) * 4
         )
 
-    normalized_market_family = str(market_family or "").strip().lower()
     coinflip_sports_penalty = 0.0
     if (
         normalized_market_family == "sports"
@@ -435,7 +553,7 @@ def compute_final_score(
     if not (getattr(market, "resolution_criteria", "") or "").strip():
         ambiguous_resolution_penalty = max(0.0, ambiguous_resolution_penalty_base)
 
-    final_score = (
+    positive_score = (
         (evidence_multiplier * weighted_edge)
         + evidence_component
         + bayesian_component
@@ -443,41 +561,50 @@ def compute_final_score(
         + kelly_component
         + confidence_alignment_bonus
         + computed_edge_bonus
+        + source_confirmed_edge_bonus
         + definitive_outcome_bonus
         + evidence_basis_bonus
+        + source_alignment_bonus
         + observed_data_bonus
         + historical_family_bonus
         + historical_prefix_bonus
-        - historical_prefix_penalty
-        - extreme_confidence_band_penalty
-        - numeric_strike_computed_overconfidence_penalty
-        - low_information_penalty
-        - no_external_odds_penalty
-        - repeated_analysis_penalty
-        - mention_market_penalty
-        - confidence_calibration_penalty
-        - overconfidence_penalty
-        - extreme_confidence_penalty
-        - late_stage_overconfidence_penalty
-        - fallback_high_confidence_penalty
-        - extreme_market_edge_penalty
-        - hallucinated_edge_penalty
-        - high_edge_calibration_penalty
-        - fallback_edge_penalty
-        - proxy_evidence_penalty
-        - liquidity_penalty
-        - staleness_penalty
-        - weather_uncertainty_penalty
-        - weather_bin_penalty
-        - generic_bin_penalty
-        - numeric_strike_bin_penalty
-        - short_prefix_penalty
-        - ambiguous_resolution_penalty
-        - coinflip_sports_penalty
     )
+    total_penalty = (
+        historical_prefix_penalty
+        + max(0.0, -historical_family_score_adjustment)
+        + extreme_confidence_band_penalty
+        + numeric_strike_computed_overconfidence_penalty
+        + low_information_penalty
+        + no_external_odds_penalty
+        + repeated_analysis_penalty
+        + mention_market_penalty
+        + confidence_calibration_penalty
+        + overconfidence_penalty
+        + extreme_confidence_penalty
+        + late_stage_overconfidence_penalty
+        + fallback_high_confidence_penalty
+        + extreme_market_edge_penalty
+        + hallucinated_edge_penalty
+        + high_edge_calibration_penalty
+        + fallback_edge_penalty
+        + proxy_evidence_penalty
+        + liquidity_penalty
+        + staleness_penalty
+        + weather_uncertainty_penalty
+        + weather_bin_penalty
+        + generic_bin_penalty
+        + numeric_strike_bin_penalty
+        + short_prefix_penalty
+        + ambiguous_resolution_penalty
+        + coinflip_sports_penalty
+    )
+    volume_amplifier_discount = 0.0
+    if volume_amplifier_enabled and total_penalty > 0 and (liquidity > 500.0 or evidence_quality > 0.80):
+        volume_amplifier_discount = total_penalty * 0.20
+    final_score = positive_score - total_penalty + volume_amplifier_discount
 
     rejection_reasons: list[str] = []
-    if edge_market <= 0:
+    if edge_market <= 0 and not source_confirmed_edge:
         rejection_reasons.append("non_positive_market_edge")
     if evidence_quality < low_info_threshold:
         rejection_reasons.append("low_evidence_quality")
@@ -531,6 +658,8 @@ def compute_final_score(
         rejection_reasons.append("ambiguous_resolution_penalty")
     if historical_prefix_penalty > 0:
         rejection_reasons.append("historical_prefix_unprofitable")
+    if historical_family_score_adjustment < 0:
+        rejection_reasons.append("historical_family_negative_signal")
     if extreme_confidence_band_penalty > 0:
         rejection_reasons.append("extreme_confidence_band")
     if numeric_strike_computed_overconfidence_penalty > 0:
@@ -551,8 +680,13 @@ def compute_final_score(
         kelly_component=kelly_component,
         confidence_alignment_bonus=confidence_alignment_bonus,
         computed_edge_bonus=computed_edge_bonus,
+        source_confirmed_edge_bonus=source_confirmed_edge_bonus,
+        source_confirmed_edge=source_confirmed_edge,
+        source_confirmed_edge_value=source_confirmed_edge_value,
         definitive_outcome_bonus=definitive_outcome_bonus,
         evidence_basis_bonus=evidence_basis_bonus,
+        source_alignment_bonus=source_alignment_bonus,
+        proxy_penalty_reduced=proxy_penalty_reduced,
         observed_data_bonus=observed_data_bonus,
         low_information_penalty=low_information_penalty,
         no_external_odds_penalty=no_external_odds_penalty,
@@ -572,10 +706,14 @@ def compute_final_score(
         late_stage_overconfidence_penalty=late_stage_overconfidence_penalty,
         short_prefix_penalty=short_prefix_penalty,
         historical_family_bonus=historical_family_bonus,
+        historical_family_signal=historical_family_signal,
+        historical_family_score_adjustment=historical_family_score_adjustment,
+        historical_family_size_multiplier=historical_family_size_multiplier,
         historical_prefix_bonus=historical_prefix_bonus,
         historical_prefix_penalty=historical_prefix_penalty,
         extreme_confidence_band_penalty=extreme_confidence_band_penalty,
         numeric_strike_computed_overconfidence_penalty=numeric_strike_computed_overconfidence_penalty,
+        volume_amplifier_discount=volume_amplifier_discount,
         weather_uncertainty_penalty=weather_uncertainty_penalty,
         weather_bin_penalty=weather_bin_penalty,
         generic_bin_penalty=generic_bin_penalty,
@@ -636,14 +774,18 @@ def score_breakdown_explanation(result: ScoreResult) -> str:
         ("kelly", result.kelly_component),
         ("alignment", result.confidence_alignment_bonus),
         ("computed_edge", result.computed_edge_bonus),
+        ("src_conf_edge", result.source_confirmed_edge_bonus),
         ("definitive", result.definitive_outcome_bonus),
         ("evidence_basis", result.evidence_basis_bonus),
+        ("source_align", result.source_alignment_bonus),
         ("observed_data", result.observed_data_bonus),
         ("hist_family", result.historical_family_bonus),
         ("hist_prefix", result.historical_prefix_bonus),
+        ("volume_amp", result.volume_amplifier_discount),
     ]
     penalty_fields = [
         ("low_info", result.low_information_penalty),
+        ("hist_family", max(0.0, -result.historical_family_score_adjustment)),
         ("no_ext_odds", result.no_external_odds_penalty),
         ("repeated", result.repeated_analysis_penalty),
         ("mention", result.mention_market_penalty),
