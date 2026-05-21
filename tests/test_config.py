@@ -238,7 +238,7 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",
             "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
-            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.03",
+            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.05",
             "CONVICTION_REPAIR_ENABLED=true",
             "CONVICTION_REPAIR_MIN_EDGE=0.20",
             "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
@@ -738,7 +738,10 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES, 45.0)
         self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 2)
-        self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.03)
+        self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.05)
+        self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX, 5)
+        self.assertTrue(settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED)
+        self.assertTrue(settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 4)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 8)
 

@@ -200,6 +200,10 @@ class TradeDecision(BaseModel):
         ge=0,
         description=_TRADE_DECISION_DESCRIPTIONS["cached_tokens"],
     )
+    code_execution_used: bool | None = Field(
+        default=None,
+        description="True when xAI code_execution tool was invoked during analysis.",
+    )
 
 
 class OrderRequest(BaseModel):

@@ -7,7 +7,7 @@ from models import Market, MarketOutcome, TradeDecision
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
     "analyze": "16c54e452c9a4d1874c364974de508538cfa46e203855542f04133c2343e28a6",
-    "deep": "c3e28460578626ac1fc5b84fbe6905b9250e8fedc748b1bae9ae51fd140c04d1",
+    "deep": "e4f28045d9428e4e540138ce7b6cc3c159d96c3f1963a9afb806ffc68091ce30",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
@@ -36,6 +36,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "base_rate_used": "37af25f50be73dbfece673e830b4583f4c3efeaca815fd0fffeeae0b1f68ac5a",
     "bet_size_pct": "641a0cd6d5347f4b1e64447cfe665638765238c6505b67697d4b2e2750d80dc4",
     "cached_tokens": "17c3feb94f70c94185ca5932f3717f8808124cb104f6a59ca433d72b6970a180",
+    "code_execution_used": "01fa8db002c20f439e072fdc6edbb98dd81754b999e3cd1ae3e763ddb84956a0",
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
     "confidence": "3993782437221b5549e1c1d527d246a5a9899919641c5bceb63a90a89d4ea137",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",

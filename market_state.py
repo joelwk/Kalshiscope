@@ -1463,6 +1463,26 @@ class MarketStateManager:
             return 0.0
         return float(row["pnl_total"] or 0.0)
 
+    def get_exchange_realized_pnl_since_hours(self, hours: float) -> float:
+        """Sum realized PnL from exchange settlements within the last *hours*."""
+        if hours <= 0:
+            return self.get_exchange_realized_pnl_total()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=float(hours))
+        ).isoformat()
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl_realized), 0.0) AS pnl_total
+            FROM exchange_settlements
+            WHERE settled_at IS NOT NULL
+              AND settled_at >= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        if not row:
+            return 0.0
+        return float(row["pnl_total"] or 0.0)
+
     def get_prefix_pnl_stats(self, prefix: str) -> dict[str, float | int]:
         """Aggregate settlement PnL for markets whose id starts with *prefix*.
 
@@ -1931,7 +1951,7 @@ class MarketStateManager:
             or ""
         ).strip().lower()
         if source_match == "settlement_aligned":
-            priority = (priority if priority is not None else 0.0) + 0.08
+            priority = (priority if priority is not None else 0.0) + 0.12
             signals_present = True
         evidence_quality = None
         for source in (audit, payload or {}, entry):
@@ -1948,7 +1968,10 @@ class MarketStateManager:
             or (audit or {}).get("historical_family_sample_size")
         )
         if isinstance(family_pnl, (int, float)) and isinstance(family_samples, (int, float)):
-            if float(family_pnl) > 0.0 and int(family_samples) >= 10:
+            if float(family_pnl) > 0.0 and int(family_samples) >= 20:
+                priority = (priority if priority is not None else 0.0) + 0.10
+                signals_present = True
+            elif float(family_pnl) > 0.0 and int(family_samples) >= 10:
                 priority = (priority if priority is not None else 0.0) + 0.05
                 signals_present = True
         reason_text = str(entry.get("reason") or (audit or {}).get("final_reason") or "").lower()

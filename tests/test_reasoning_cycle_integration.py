@@ -16,12 +16,12 @@ class DummyGrokClient:
         self.seen_correlation_id: str | None = None
         self.last_search_config = None
 
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         self.seen_correlation_id = get_correlation_id()
         self.last_search_config = search_config
         return self.analyze_decision
 
-    def analyze_market_deep(self, market, previous_analysis=None, search_config=None):
+    def analyze_market_deep(self, market, previous_analysis=None, search_config=None, **kwargs):
         return self.deep_decision
 
 

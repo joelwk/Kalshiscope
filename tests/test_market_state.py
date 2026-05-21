@@ -544,6 +544,39 @@ def test_record_exchange_settlement_upserts_trade_outcome_and_pnl(tmp_path) -> N
         manager.close()
 
 
+def test_get_exchange_realized_pnl_since_hours_filters_by_settled_at(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        old_time = datetime.now(timezone.utc) - timedelta(days=10)
+        recent_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        manager.record_exchange_settlement(
+            settlement_id="old-settlement",
+            market_id="OLD-1",
+            predicted_outcome="YES",
+            winning_outcome="YES",
+            pnl_realized=-5.0,
+            contracts=10,
+            avg_price=0.5,
+            settled_at=old_time,
+            raw={"settled_time": old_time.isoformat()},
+        )
+        manager.record_exchange_settlement(
+            settlement_id="recent-settlement",
+            market_id="NEW-1",
+            predicted_outcome="YES",
+            winning_outcome="YES",
+            pnl_realized=3.0,
+            contracts=10,
+            avg_price=0.5,
+            settled_at=recent_time,
+            raw={"settled_time": recent_time.isoformat()},
+        )
+        assert round(manager.get_exchange_realized_pnl_since_hours(24.0), 2) == 3.0
+        assert round(manager.get_exchange_realized_pnl_total(), 2) == -2.0
+    finally:
+        manager.close()
+
+
 def test_record_exchange_settlement_can_update_online_calibration(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:

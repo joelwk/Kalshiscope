@@ -97,16 +97,16 @@ class DummyGrokClient:
         self.deep_decision = deep_decision or decision
         self.deep_calls = 0
 
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         return self.decision
 
-    def analyze_market_deep(self, market, previous_analysis=None, search_config=None):
+    def analyze_market_deep(self, market, previous_analysis=None, search_config=None, **kwargs):
         self.deep_calls += 1
         return self.deep_decision
 
 
 class FailingGrokClient:
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         raise RuntimeError("StatusCode.INTERNAL: internal server error")
 
 
@@ -115,7 +115,7 @@ class RecordingGrokClient:
         self.decision = decision
         self.last_search_config = None
 
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         self.last_search_config = search_config
         return self.decision
 

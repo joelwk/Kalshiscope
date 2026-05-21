@@ -1643,6 +1643,46 @@ class TestQuotaExhaustedClassification(unittest.TestCase):
         result = _is_retriable_grok_error(exc, 100.0)
         self.assertFalse(result)
 
+    def test_validate_and_enrich_applies_convergent_evidence_floor(self) -> None:
+        from config import Settings
+
+        market = Market(
+            id="m-convergent",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.50),
+                MarketOutcome(name="NO", price=0.50),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.2,
+            reasoning="No external odds found. Implied prob: unknown. My prob: 70%.",
+            implied_prob_external=0.50,
+            my_prob=0.70,
+            edge_external=0.20,
+            evidence_quality=0.9,
+        )
+        settings = Settings(
+            EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED=True,
+            EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE=0.60,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+            self_consistency_passed=True,
+            family_is_profitable=True,
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.60)
+        self.assertEqual(
+            validated.evidence_quality_floor_applied,
+            "convergent_evidence_floor",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

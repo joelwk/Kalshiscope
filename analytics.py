@@ -4,6 +4,7 @@ import argparse
 import json
 import sqlite3
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from research_profiles import family_from_text
@@ -611,6 +612,132 @@ def run(db_path: str) -> None:
             )
         else:
             print("\nAPI cost per profitable trade (est.): n/a (no resolved profitable trades)")
+
+        if _table_exists(conn, "decision_receipts"):
+            lookback_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=7)
+            ).isoformat()
+            signal_rows = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                json_extract(audit_json, '$.evidence_quality_floor_applied'),
+                                ''
+                            ) = 'convergent_evidence_floor'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS convergent_floor,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(json_extract(audit_json, '$.proxy_penalty_reduction_reason'), '')
+                                != ''
+                            THEN 1 ELSE 0
+                        END
+                    ) AS proxy_reduction_any,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                json_extract(audit_json, '$.proxy_penalty_reduction_reason'),
+                                ''
+                            ) = 'self_consistency_plus_family'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS proxy_reduction_convergent,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                json_extract(audit_json, '$.proxy_penalty_reduction_reason'),
+                                ''
+                            ) = 'family_profitable_alone'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS proxy_reduction_family,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                json_extract(audit_json, '$.proxy_penalty_reduction_reason'),
+                                ''
+                            ) = 'direct_high_quality'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS proxy_reduction_direct,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                json_extract(audit_json, '$.family_conditional_bonus_applied'),
+                                0
+                            ) = 1
+                            THEN 1 ELSE 0
+                        END
+                    ) AS family_bonus,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                json_extract(audit_json, '$.borderline_critique_refinement_triggered'),
+                                0
+                            ) = 1
+                            THEN 1 ELSE 0
+                        END
+                    ) AS borderline_critique,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(json_extract(audit_json, '$.code_execution_used'), 0) = 1
+                            THEN 1 ELSE 0
+                        END
+                    ) AS code_execution
+                FROM decision_receipts
+                WHERE timestamp >= ?
+                  AND COALESCE(json_extract(audit_json, '$.synthetic_decision'), 0) != 1
+                """,
+                (lookback_cutoff,),
+            ).fetchone()
+            if signal_rows and int(signal_rows["total"] or 0) > 0:
+                total = int(signal_rows["total"] or 0)
+
+                def _rate(count: int) -> str:
+                    return f"{(count / total):.1%}"
+
+                print("\nOptimization signal firing rates (last 7 days):")
+                print(
+                    "  convergent_evidence_floor: "
+                    f"{int(signal_rows['convergent_floor'] or 0)}/{total} "
+                    f"({_rate(int(signal_rows['convergent_floor'] or 0))})"
+                )
+                print(
+                    "  proxy_penalty_reduction (any): "
+                    f"{int(signal_rows['proxy_reduction_any'] or 0)}/{total} "
+                    f"({_rate(int(signal_rows['proxy_reduction_any'] or 0))})"
+                )
+                print(
+                    "    self_consistency_plus_family: "
+                    f"{int(signal_rows['proxy_reduction_convergent'] or 0)}"
+                )
+                print(
+                    "    family_profitable_alone: "
+                    f"{int(signal_rows['proxy_reduction_family'] or 0)}"
+                )
+                print(
+                    "    direct_high_quality: "
+                    f"{int(signal_rows['proxy_reduction_direct'] or 0)}"
+                )
+                print(
+                    "  family_conditional_bonus_applied: "
+                    f"{int(signal_rows['family_bonus'] or 0)}/{total} "
+                    f"({_rate(int(signal_rows['family_bonus'] or 0))})"
+                )
+                print(
+                    "  borderline_critique_refinement_triggered: "
+                    f"{int(signal_rows['borderline_critique'] or 0)}/{total} "
+                    f"({_rate(int(signal_rows['borderline_critique'] or 0))})"
+                )
+                print(
+                    "  code_execution_used: "
+                    f"{int(signal_rows['code_execution'] or 0)}/{total} "
+                    f"({_rate(int(signal_rows['code_execution'] or 0))})"
+                )
     finally:
         conn.close()
 

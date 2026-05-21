@@ -42,6 +42,8 @@ class ScoreResult:
     evidence_basis_bonus: float = 0.0
     source_alignment_bonus: float = 0.0
     proxy_penalty_reduced: bool = False
+    proxy_penalty_reduction_reason: str = ""
+    family_conditional_bonus_applied: bool = False
     observed_data_bonus: float = 0.0
     low_information_penalty: float = 0.0
     no_external_odds_penalty: float = 0.0
@@ -141,6 +143,10 @@ def compute_final_score(
     historical_prefix_pnl_per_trade: float | None = None,
     historical_prefix_sample_size: int = 0,
     volume_amplifier_enabled: bool = True,
+    proxy_penalty_convergent_reduction_enabled: bool = True,
+    self_consistency_passed: bool = False,
+    historical_family_high_conf_loss_relax_threshold: float = 0.05,
+    historical_family_boost_evidence_min: float = 0.55,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -393,6 +399,7 @@ def compute_final_score(
     fallback_edge_penalty = 0.0
     proxy_evidence_penalty = 0.0
     proxy_penalty_reduced = False
+    proxy_penalty_reduction_reason = ""
     generic_bin_penalty = 0.0
     numeric_strike_bin_penalty = 0.0
     ambiguous_resolution_penalty = 0.0
@@ -410,15 +417,42 @@ def compute_final_score(
             if evidence_quality >= 0.75:
                 fallback_edge_penalty *= 0.20
                 proxy_evidence_penalty *= 0.20
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "direct_high_quality"
             elif evidence_quality >= 0.55:
                 fallback_edge_penalty *= 0.25
                 proxy_evidence_penalty *= 0.25
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "direct_high_quality"
             else:
                 fallback_edge_penalty *= 0.40
                 proxy_evidence_penalty *= 0.40
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "direct_high_quality"
         elif settlement_aligned_high_quality and proxy_evidence_penalty > 0.0:
             proxy_evidence_penalty *= 0.60
             proxy_penalty_reduced = True
+            proxy_penalty_reduction_reason = "settlement_aligned_high_quality"
+        if proxy_penalty_convergent_reduction_enabled and proxy_evidence_penalty > 0.0:
+            original_proxy_penalty = proxy_evidence_penalty
+            family_is_profitable = (
+                historical_family_pnl_total is not None
+                and float(historical_family_pnl_total) > 0.0
+                and historical_family_sample_size >= 20
+            )
+            if self_consistency_passed and family_is_profitable:
+                proxy_evidence_penalty *= 0.50
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "self_consistency_plus_family"
+            elif family_is_profitable:
+                proxy_evidence_penalty *= 0.70
+                proxy_penalty_reduced = True
+                if not proxy_penalty_reduction_reason:
+                    proxy_penalty_reduction_reason = "family_profitable_alone"
+            proxy_evidence_penalty = max(
+                proxy_evidence_penalty,
+                original_proxy_penalty * 0.15,
+            )
     if _GENERIC_BIN_TICKER_PATTERN.search((market.id or "").strip()) and not _is_weather_market(market):
         generic_bin_penalty = max(0.0, generic_bin_penalty_base) * (1.0 + max(0.0, 0.65 - evidence_quality))
     if (
@@ -437,6 +471,7 @@ def compute_final_score(
     historical_family_signal = 0.0
     historical_family_score_adjustment = 0.0
     historical_family_size_multiplier = 1.0
+    family_conditional_bonus_applied = False
     normalized_market_family = str(market_family or "").strip().lower()
     has_continuous_family_inputs = (
         historical_family_win_rate is not None
@@ -469,11 +504,13 @@ def compute_final_score(
             normalized_market_family == "sports"
             and pnl_total > 0.0
             and wins_rate >= 0.55
-            and high_conf_loss_rate <= 0.005
+            and high_conf_loss_rate
+            <= max(0.0, float(historical_family_high_conf_loss_relax_threshold))
             and source_confirmed_edge_value > 0.0
-            and evidence_quality >= 0.65
+            and evidence_quality >= max(0.0, float(historical_family_boost_evidence_min))
         ):
             raw_signal += 0.08
+            family_conditional_bonus_applied = True
         elif normalized_market_family in {"generic", "crypto"} and pnl_efficiency < 0.0:
             # Historical generic/crypto losses should scale conviction and size,
             # not categorically exclude otherwise eligible source-backed markets.
@@ -687,6 +724,8 @@ def compute_final_score(
         evidence_basis_bonus=evidence_basis_bonus,
         source_alignment_bonus=source_alignment_bonus,
         proxy_penalty_reduced=proxy_penalty_reduced,
+        proxy_penalty_reduction_reason=proxy_penalty_reduction_reason,
+        family_conditional_bonus_applied=family_conditional_bonus_applied,
         observed_data_bonus=observed_data_bonus,
         low_information_penalty=low_information_penalty,
         no_external_odds_penalty=no_external_odds_penalty,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -262,6 +263,35 @@ def _is_model_unimplemented_grok_error(exc: Exception) -> bool:
         "unimplemented" in error_text
         and ("404" in error_text or "statuscode.unimplemented" in error_text)
     )
+
+
+def _response_used_code_execution(response: Any) -> bool:
+    """Return True when the xAI response indicates code_execution was invoked."""
+    tool_usage = getattr(response, "server_side_tool_usage", None)
+    if tool_usage is None and isinstance(response, dict):
+        tool_usage = response.get("server_side_tool_usage")
+    if isinstance(tool_usage, dict):
+        for key in tool_usage:
+            if "code_execution" in str(key).lower():
+                return True
+    for chunk_attr in ("tool_calls",):
+        tool_calls = getattr(response, chunk_attr, None)
+        if tool_calls is None and isinstance(response, dict):
+            tool_calls = response.get(chunk_attr)
+        if not tool_calls:
+            continue
+        for tool_call in tool_calls:
+            function = getattr(tool_call, "function", None)
+            if function is None and isinstance(tool_call, dict):
+                function = tool_call.get("function")
+            name = ""
+            if function is not None:
+                name = str(getattr(function, "name", "") or "")
+                if not name and isinstance(function, dict):
+                    name = str(function.get("name") or "")
+            if "code_execution" in name.lower():
+                return True
+    return False
 
 
 def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
@@ -666,6 +696,9 @@ class GrokClient:
         market: Market,
         decision: TradeDecision,
         profile_name: str,
+        *,
+        self_consistency_passed: bool = False,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         canonical_outcome = self._canonical_outcome_for_market(market, decision.outcome)
         if canonical_outcome is None:
@@ -833,6 +866,27 @@ class GrokClient:
             evidence_basis_class = "proxy"
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
+        if active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED:
+            convergent_signals = sum(
+                [
+                    bool(self_consistency_passed),
+                    source_match_class == "settlement_aligned",
+                    bool(family_is_profitable),
+                ]
+            )
+            convergent_floor_value = max(
+                0.0,
+                min(
+                    1.0,
+                    float(active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE),
+                ),
+            )
+            if (
+                convergent_signals >= 2
+                and evidence_quality < convergent_floor_value
+            ):
+                evidence_quality = convergent_floor_value
+                evidence_quality_floor_applied = "convergent_evidence_floor"
         verifiable_floor_allowed = (
             has_verifiable_signal
             and not low_information
@@ -1245,12 +1299,14 @@ class GrokClient:
         model: str | None = None,
         timeout_seconds: float | None = None,
         temperature: float | None = None,
+        enable_code_execution: bool = False,
     ):
         return self.provider.create_chat(
             model=model or self.model,
             response_format=TradeDecision,
             config=config,
             enable_multimedia=enable_multimedia,
+            enable_code_execution=enable_code_execution,
             timeout_seconds=timeout_seconds,
             temperature=temperature,
         )
@@ -1500,6 +1556,8 @@ class GrokClient:
             market,
             merged,
             profile_name=profile_name,
+            self_consistency_passed=True,
+            family_is_profitable=getattr(self, "_current_family_is_profitable", False),
         )
 
     def _parse_response_payload(self, market_id: str, content: str, deep: bool) -> dict[str, Any]:
@@ -1609,6 +1667,7 @@ class GrokClient:
             "reasoning_tokens": None,
             "cached_tokens": None,
         }
+        code_execution_used = False
         if deadline_seconds is None:
             deadline_seconds = self._resolve_stream_deadline_seconds(
                 budget_remaining_ms,
@@ -1622,11 +1681,14 @@ class GrokClient:
                     f"Grok stream exceeded {deadline_seconds:.1f}s for market {market_id}"
                 )
             usage_metrics = _extract_usage_metrics(response)
+            if _response_used_code_execution(response) or _response_used_code_execution(chunk):
+                code_execution_used = True
             if chunk.content:
                 content += chunk.content
                 chunk_count += 1
         if not content:
             raise ValueError("Empty response from Grok")
+        usage_metrics["code_execution_used"] = int(code_execution_used)
         return content, chunk_count, usage_metrics
 
     def _run_analysis(
@@ -1636,7 +1698,9 @@ class GrokClient:
         search_config: SearchConfig | None,
         previous_analysis: TradeDecision | None,
         deep: bool,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
+        self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
         last_error: Exception | None = None
         max_attempts = _ANALYSIS_MAX_ATTEMPTS
@@ -1714,7 +1778,7 @@ class GrokClient:
                         break
                     raise
                 sleep_seconds = min(
-                    _ANALYSIS_RETRY_WAIT_SECONDS,
+                    _ANALYSIS_RETRY_WAIT_SECONDS + random.uniform(0.0, 1.5),
                     budget_remaining_ms / 1000.0,
                 )
                 logger.warning(
@@ -1936,6 +2000,14 @@ class GrokClient:
                 decision=previous_analysis,
                 config=active_config,
             )
+            enable_code_execution = bool(
+                deep
+                and getattr(
+                    self.settings,
+                    "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
+                    True,
+                )
+            )
             chat = self._build_chat(
                 active_config,
                 enable_multimedia,
@@ -1944,6 +2016,7 @@ class GrokClient:
                     stream_deadline_seconds
                 ),
                 temperature=temperature,
+                enable_code_execution=enable_code_execution,
             )
             chat.append(
                 self.provider.system_message(
@@ -1985,9 +2058,12 @@ class GrokClient:
                 market,
                 decision,
                 profile_name=active_config.profile_name,
+                family_is_profitable=getattr(self, "_current_family_is_profitable", False),
             )
+            code_execution_used = bool(usage_metrics.get("code_execution_used"))
             decision = decision.model_copy(
                 update={
+                    "code_execution_used": code_execution_used,
                     "raw_should_trade": (
                         bool(raw_payload.get("should_trade"))
                         if isinstance(raw_payload.get("should_trade"), bool)
@@ -2162,12 +2238,15 @@ class GrokClient:
         market: Market,
         search_config: SearchConfig | None = None,
         previous_analysis: TradeDecision | None = None,
+        *,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
             search_config=search_config,
             previous_analysis=previous_analysis,
             deep=False,
+            family_is_profitable=family_is_profitable,
         )
 
     def analyze_market_deep(
@@ -2175,10 +2254,13 @@ class GrokClient:
         market: Market,
         previous_analysis: TradeDecision | None = None,
         search_config: SearchConfig | None = None,
+        *,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
             search_config=search_config,
             previous_analysis=previous_analysis,
             deep=True,
+            family_is_profitable=family_is_profitable,
         )

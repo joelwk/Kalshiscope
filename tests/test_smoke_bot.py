@@ -11,7 +11,7 @@ class DummyGrok:
     def __init__(self, decision):
         self._decision = decision
 
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         return self._decision
 
     def analyze_market_deep(
@@ -19,6 +19,7 @@ class DummyGrok:
         market,
         previous_analysis=None,
         search_config=None,
+        **kwargs,
     ):
         return self._decision
 

@@ -4325,6 +4325,12 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
             if hasattr(score_result, "final_score")
             else None
         ),
+        "proxy_penalty_reduction_reason": str(
+            getattr(score_result, "proxy_penalty_reduction_reason", "") or ""
+        ),
+        "family_conditional_bonus_applied": bool(
+            getattr(score_result, "family_conditional_bonus_applied", False)
+        ),
     }
 
 
@@ -4443,6 +4449,7 @@ def _score_kwargs(
     historical_prefix_sample_size: int = 0,
     source_match_class: str = "",
     primary_source_url_present: bool = False,
+    self_consistency_passed: bool = False,
 ) -> dict[str, Any]:
     return {
         "is_weather_market": is_weather_market,
@@ -4496,7 +4503,50 @@ def _score_kwargs(
         "historical_prefix_sample_size": historical_prefix_sample_size,
         "source_match_class": source_match_class,
         "primary_source_url_present": primary_source_url_present,
+        "proxy_penalty_convergent_reduction_enabled": (
+            settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED
+        ),
+        "historical_family_high_conf_loss_relax_threshold": (
+            settings.HISTORICAL_FAMILY_HIGH_CONF_LOSS_RELAX_THRESHOLD
+        ),
+        "historical_family_boost_evidence_min": (
+            settings.HISTORICAL_FAMILY_BOOST_EVIDENCE_MIN
+        ),
+        "self_consistency_passed": self_consistency_passed,
     }
+
+
+def _family_context_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "historical_family_pnl_total": candidate.get("historical_family_pnl_total"),
+        "historical_family_sample_size": candidate.get("historical_family_sample_size"),
+        "historical_family_win_rate": candidate.get("historical_family_win_rate"),
+        "historical_family_deployed_usdc": candidate.get("historical_family_deployed_usdc"),
+        "historical_family_high_conf_losses": candidate.get(
+            "historical_family_high_conf_losses"
+        ),
+    }
+
+
+def _family_is_profitable_from_context(context: dict[str, Any] | None) -> bool:
+    if not context:
+        return False
+    return (
+        float(context.get("historical_family_pnl_total", 0.0) or 0.0) > 0.0
+        and int(context.get("historical_family_sample_size", 0) or 0) >= 20
+    )
+
+
+def _decision_self_consistency_passed(decision: TradeDecision) -> bool:
+    combined = " ".join(
+        part
+        for part in (
+            decision.reasoning or "",
+            decision.self_critique or "",
+        )
+        if part
+    ).lower()
+    return "self_consistency_agreement" in combined
 
 
 def _effective_score_gate_threshold(
@@ -4808,6 +4858,7 @@ def _analyze_market_candidate_via_thread_local_client(
     correlation_id: str | None = None,
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
+    family_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Worker entry point that reuses one GrokClient per worker thread."""
     grok_client = _get_or_create_worker_grok_client(settings, provider)
@@ -4821,6 +4872,7 @@ def _analyze_market_candidate_via_thread_local_client(
         correlation_id=correlation_id,
         force_extended_research=force_extended_research,
         research_queue_context=research_queue_context,
+        family_context=family_context,
     )
 
 
@@ -4834,6 +4886,7 @@ def _analyze_market_candidate_for_worker(
     correlation_id: str | None = None,
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
+    family_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Worker-safe wrapper that restores cycle correlation context."""
     if correlation_id:
@@ -4847,6 +4900,7 @@ def _analyze_market_candidate_for_worker(
         historical_confidence_buckets=historical_confidence_buckets,
         force_extended_research=force_extended_research,
         research_queue_context=research_queue_context,
+        family_context=family_context,
     )
 
 
@@ -5080,7 +5134,9 @@ def _pre_analysis_opportunity_score(
         and historical_family_pnl > abs(float(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD))
         and historical_family_win_rate >= 0.55
     ):
-        historical_profit_bonus = _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS
+        historical_profit_bonus = float(
+            settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS
+        )
     source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(family, 0.0)
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
@@ -5737,10 +5793,12 @@ def _analyze_market_candidate(
     historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
+    family_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run analysis/refinement/guardrails for a market candidate."""
     previous_analysis = _build_previous_analysis(anchor_analysis)
     analysis_market = _market_with_research_queue_context(market, research_queue_context)
+    family_is_profitable = _family_is_profitable_from_context(family_context)
     search_config = build_market_search_config(settings, analysis_market)
     used_extended_research = bool(force_extended_research)
     if used_extended_research:
@@ -5753,6 +5811,7 @@ def _analyze_market_candidate(
             analysis_market,
             search_config=search_config,
             previous_analysis=previous_analysis,
+            family_is_profitable=family_is_profitable,
         )
     except Exception as exc:
         error_text = str(exc)
@@ -5825,6 +5884,7 @@ def _analyze_market_candidate(
                 analysis_market,
                 previous_analysis=repair_previous,
                 search_config=repair_search_config,
+                family_is_profitable=family_is_profitable,
             )
             decision = repaired_decision
             was_refined = True
@@ -5887,12 +5947,73 @@ def _analyze_market_candidate(
         if implied_prob_for_refine is not None
         else decision.edge_external
     )
+    pre_execution_score_for_refine: float | None = None
+    score_threshold_for_refine: float | None = None
+    borderline_critique_refinement_triggered = False
+    if family_context is not None:
+        implied_prob_pre_score = implied_prob_for_refine
+        evidence_basis_pre = _decision_evidence_basis(decision)
+        pre_score_result = compute_final_score(
+            market=market,
+            decision=decision,
+            implied_prob_market=implied_prob_pre_score,
+            **_score_kwargs(
+                settings=settings,
+                repeated_analysis_count=int(
+                    state.analysis_count if state and state.analysis_count is not None else 0
+                ),
+                non_actionable_streak=int(
+                    state.non_actionable_streak
+                    if state and state.non_actionable_streak is not None
+                    else 0
+                ),
+                is_weather_market=(market_family(market) == "weather"),
+                evidence_basis_class=evidence_basis_pre,
+                edge_source=decision.edge_source or "",
+                market_family=market_family(market),
+                historical_family_pnl_total=float(
+                    family_context.get("historical_family_pnl_total", 0.0) or 0.0
+                ),
+                historical_family_sample_size=int(
+                    family_context.get("historical_family_sample_size", 0) or 0
+                ),
+                historical_family_win_rate=float(
+                    family_context.get("historical_family_win_rate", 0.0) or 0.0
+                ),
+                historical_family_deployed_usdc=float(
+                    family_context.get("historical_family_deployed_usdc", 0.0) or 0.0
+                ),
+                historical_family_high_conf_losses=int(
+                    family_context.get("historical_family_high_conf_losses", 0) or 0
+                ),
+                source_match_class=str(
+                    getattr(decision, "source_match_class", "") or ""
+                ),
+                primary_source_url_present=bool(
+                    str(getattr(decision, "primary_source_url", "") or "").strip()
+                ),
+                self_consistency_passed=_decision_self_consistency_passed(decision),
+            ),
+        )
+        pre_execution_score_for_refine = pre_score_result.final_score
+        score_threshold_for_refine = _effective_score_gate_threshold(
+            settings=settings,
+            market=market,
+            evidence_basis_class=evidence_basis_pre,
+            evidence_quality=decision.evidence_quality,
+        )
     refinement_reasons = refinement.get_refinement_reasons(
         decision,
         state,
         implied_prob=implied_prob_for_refine,
         evidence_quality=decision.evidence_quality,
         edge_value=edge_for_refine,
+        settings=settings,
+        pre_execution_score=pre_execution_score_for_refine,
+        score_threshold=score_threshold_for_refine,
+    )
+    borderline_critique_refinement_triggered = (
+        "borderline_pre_execution_score" in refinement_reasons
     )
     if anchor_outcome and not _outcomes_match(decision.outcome, anchor_outcome):
         if "side_flip_vs_anchor" not in refinement_reasons:
@@ -5948,6 +6069,8 @@ def _analyze_market_candidate(
                 analysis_market,
                 decision,
                 search_config=refinement_search_config,
+                refinement_reasons=refinement_reasons,
+                family_is_profitable=family_is_profitable,
             )
             was_refined = True
 
@@ -6076,6 +6199,12 @@ def _analyze_market_candidate(
         "confidence_history_gap_applied": confidence_history_gap_applied,
         "historical_confidence_shrink_applied": confidence_history_gap_applied > 0.0,
         "definitive_outcome_for_calibration": definitive_outcome_for_calibration,
+        "borderline_critique_refinement_triggered": borderline_critique_refinement_triggered,
+        "code_execution_used": bool(getattr(decision, "code_execution_used", False)),
+        "evidence_quality_floor_applied": getattr(
+            decision, "evidence_quality_floor_applied", None
+        ),
+        "family_is_profitable": family_is_profitable,
     }
 
 
@@ -7048,15 +7177,30 @@ def main(max_cycles: int | None = None) -> None:
                 drain_per_cycle_quota = max(
                     1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE
                 )
+                last_24h_realized_pnl = state_manager.get_exchange_realized_pnl_since_hours(
+                    24.0
+                )
+                adaptive_zero_yield_drought = (
+                    consecutive_zero_execution_yield_cycles >= 5
+                    or last_24h_realized_pnl < 0.0
+                )
                 zero_yield_eligible = (
-                    settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
-                    and consecutive_zero_execution_yield_cycles
-                    >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                    (
+                        settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+                        and consecutive_zero_execution_yield_cycles
+                        >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                    )
+                    or adaptive_zero_yield_drought
                 )
                 zero_yield_target = max(
                     0,
                     int(getattr(settings, "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS", 0) or 0),
                 )
+                if adaptive_zero_yield_drought:
+                    zero_yield_target = min(
+                        int(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX),
+                        zero_yield_target + 3,
+                    )
                 zero_yield_reserved_slots = (
                     min(zero_yield_target, drain_per_cycle_quota)
                     if zero_yield_eligible
@@ -8796,6 +8940,7 @@ def main(max_cycles: int | None = None) -> None:
                                 cycle_id,
                                 bool(candidate.get("force_extended_research")),
                                 candidate.get("research_queue_drain_entry"),
+                                _family_context_from_candidate(candidate),
                             )
                             future_to_market[future] = candidate["market"]
 
@@ -8943,6 +9088,7 @@ def main(max_cycles: int | None = None) -> None:
                             research_queue_context=candidate.get(
                                 "research_queue_drain_entry"
                             ),
+                            family_context=_family_context_from_candidate(candidate),
                         )
                         analysis_results[market.id] = result
                         if result.get("analysis_failed"):
@@ -9188,6 +9334,9 @@ def main(max_cycles: int | None = None) -> None:
                         primary_source_url_present=bool(
                             str(getattr(decision, "primary_source_url", "") or "").strip()
                         ),
+                        self_consistency_passed=_decision_self_consistency_passed(
+                            decision
+                        ),
                     ),
                 )
                 analysis_result["historical_family_win_rate"] = float(
@@ -9234,6 +9383,10 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     "source_alignment_bonus": rank_score.source_alignment_bonus,
                     "proxy_penalty_reduced": rank_score.proxy_penalty_reduced,
+                    "proxy_penalty_reduction_reason": rank_score.proxy_penalty_reduction_reason,
+                    "family_conditional_bonus_applied": (
+                        rank_score.family_conditional_bonus_applied
+                    ),
                     "ambiguous_resolution_penalty": rank_score.ambiguous_resolution_penalty,
                 }
 
@@ -9658,6 +9811,16 @@ def main(max_cycles: int | None = None) -> None:
                     "edge_repair_unresolved_reason": analysis_result.get(
                         "edge_repair_unresolved_reason"
                     ),
+                    "borderline_critique_refinement_triggered": bool(
+                        analysis_result.get("borderline_critique_refinement_triggered", False)
+                    ),
+                    "code_execution_used": bool(
+                        analysis_result.get("code_execution_used", False)
+                        or getattr(decision, "code_execution_used", False)
+                    ),
+                    "family_is_profitable": bool(
+                        analysis_result.get("family_is_profitable", False)
+                    ),
                     "research_only": bool(candidate.get("research_only", False)),
                     "research_queue_drain_probe": bool(
                         candidate.get("is_research_queue_drain_probe", False)
@@ -9985,6 +10148,9 @@ def main(max_cycles: int | None = None) -> None:
                                     str(
                                         getattr(decision, "primary_source_url", "") or ""
                                     ).strip()
+                                ),
+                                self_consistency_passed=_decision_self_consistency_passed(
+                                    decision
                                 ),
                             ),
                         )
@@ -11114,6 +11280,9 @@ def main(max_cycles: int | None = None) -> None:
                                 getattr(decision_for_edge, "primary_source_url", "") or ""
                             ).strip()
                         ),
+                        self_consistency_passed=_decision_self_consistency_passed(
+                            decision_for_edge
+                        ),
                     ),
                 )
                 runtime_score_evaluation_count += 1
@@ -11128,6 +11297,12 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 audit_context["historical_family_bonus_applied"] = bool(
                     float(getattr(score_result, "historical_family_bonus", 0.0) or 0.0) > 0.0
+                )
+                audit_context["family_conditional_bonus_applied"] = bool(
+                    getattr(score_result, "family_conditional_bonus_applied", False)
+                )
+                audit_context["proxy_penalty_reduction_reason"] = str(
+                    getattr(score_result, "proxy_penalty_reduction_reason", "") or ""
                 )
                 audit_context["source_confirmed_edge"] = bool(
                     getattr(score_result, "source_confirmed_edge", False)
