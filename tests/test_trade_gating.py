@@ -415,6 +415,55 @@ def test_effective_score_gate_threshold_uses_direct_high_quality_override() -> N
     assert threshold == 0.25
 
 
+def test_effective_score_gate_threshold_profitable_family_convergent_bypass() -> None:
+    settings = Settings(
+        SCORE_GATE_THRESHOLD=0.52,
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED=True,
+        SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT=0.08,
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES=30,
+    )
+    sports_market = Market(
+        id="KXMLB-26MAY23-TOR",
+        question="Will Toronto win?",
+        category="sports",
+    )
+    threshold = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.50,
+        family_is_profitable=True,
+        self_consistency_passed=True,
+        family_sample_size=40,
+    )
+    assert threshold == 0.08
+
+    thin_history = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.50,
+        family_is_profitable=True,
+        self_consistency_passed=True,
+        family_sample_size=10,
+    )
+    assert thin_history == 0.52
+
+    disabled = _effective_score_gate_threshold(
+        settings=Settings(
+            SCORE_GATE_THRESHOLD=0.52,
+            SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED=False,
+        ),
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.50,
+        family_is_profitable=True,
+        self_consistency_passed=True,
+        family_sample_size=40,
+    )
+    assert disabled == 0.52
+
+
 def test_research_queue_receipt_emitted_on_soft_block() -> None:
     payload = _build_execution_audit(
         decision_terminal=False,

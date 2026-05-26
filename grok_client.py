@@ -48,6 +48,23 @@ _RE_WEATHER_OBS_LOCKED = re.compile(
     r"physically impossible|threshold (?:already )?(?:met|exceeded)|high already reached)",
     re.IGNORECASE,
 )
+_RE_WEATHER_DAILY_LOW = re.compile(
+    r"(daily (?:low|minimum)|overnight low|minimum (?:temperature )?(?:recorded|observed|reported)"
+    r"|today['\u2019]?s low|observed low|station low|low (?:temperature )?(?:was|is|recorded))",
+    re.IGNORECASE,
+)
+
+
+def _is_low_temp_market_ticker(market_id: str) -> bool:
+    return "LOWT" in (market_id or "").upper()
+
+
+def _weather_obs_locked_reasoning_ok(*, market_id: str, reasoning: str) -> bool:
+    if not _RE_WEATHER_OBS_LOCKED.search(reasoning or ""):
+        return False
+    if _is_low_temp_market_ticker(market_id):
+        return bool(_RE_WEATHER_DAILY_LOW.search(reasoning or ""))
+    return True
 _RE_DEFINITIVE_OUTCOME_SIGNAL = re.compile(
     r"(final score|game (?:completed|concluded|final)|confirmed|official recap|box score)",
     re.IGNORECASE,
@@ -626,13 +643,17 @@ class GrokClient:
         has_definitive_outcome_signal: bool,
         no_external_odds: bool,
         low_information: bool,
+        market_id: str = "",
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
         if low_information or (no_external_odds and not has_verifiable_signal):
             return "missing_or_absence_only"
         if _RE_PREVIEW_OR_PROXY_SOURCE.search(normalized_reasoning):
             return "preview_or_proxy"
-        if has_definitive_outcome_signal or _RE_WEATHER_OBS_LOCKED.search(normalized_reasoning):
+        if has_definitive_outcome_signal or _weather_obs_locked_reasoning_ok(
+            market_id=market_id,
+            reasoning=reasoning or "",
+        ):
             return "settlement_aligned"
         if _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL.search(normalized_reasoning):
             return "settlement_aligned"
@@ -766,6 +787,7 @@ class GrokClient:
             has_definitive_outcome_signal=has_definitive_outcome_signal,
             no_external_odds=no_external_odds,
             low_information=low_information,
+            market_id=market.id or "",
         )
         prob_component = 0.0
         if implied is not None and my_prob is not None:
@@ -867,12 +889,24 @@ class GrokClient:
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
         if active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED:
+            settlement_aligned = source_match_class == "settlement_aligned"
             convergent_signals = sum(
                 [
                     bool(self_consistency_passed),
-                    source_match_class == "settlement_aligned",
+                    settlement_aligned,
                     bool(family_is_profitable),
                 ]
+            )
+            logger.debug(
+                "convergent_floor_check",
+                data={
+                    "self_consistency_passed": self_consistency_passed,
+                    "family_is_profitable": family_is_profitable,
+                    "settlement_aligned": settlement_aligned,
+                    "convergent_signals": convergent_signals,
+                    "evidence_quality_pre": round(evidence_quality, 3),
+                    "floor_enabled": active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED,
+                },
             )
             convergent_floor_value = max(
                 0.0,
@@ -938,7 +972,10 @@ class GrokClient:
         if (
             profile_name == "weather"
             and (decision.raw_confidence or decision.confidence) >= _WEATHER_OBS_CONFIDENCE_FLOOR
-            and _RE_WEATHER_OBS_LOCKED.search(decision.reasoning or "")
+            and _weather_obs_locked_reasoning_ok(
+                market_id=market.id or "",
+                reasoning=decision.reasoning or "",
+            )
             and primary_source_satisfies_direct
         ):
             if evidence_quality < _WEATHER_OBS_EVIDENCE_FLOOR:

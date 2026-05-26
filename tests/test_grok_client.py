@@ -1561,6 +1561,66 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertGreaterEqual(validated.evidence_quality, 0.75)
 
+    def test_validate_and_enrich_skips_weather_observed_floor_for_lowt_without_daily_low(self) -> None:
+        market = Market(
+            id="KXLOWTOKC-26MAY24-T63",
+            question="Lowest temperature in Oklahoma City today?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.90,
+            raw_confidence=0.90,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Current METAR reading is 63F, already above the 63F threshold and threshold already exceeded."
+            ),
+            implied_prob_external=None,
+            my_prob=0.90,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.1,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=35.4&lon=-97.6",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertLess(validated.evidence_quality, 0.75)
+
+    def test_validate_and_enrich_applies_weather_observed_floor_for_lowt_with_daily_low(self) -> None:
+        market = Market(
+            id="KXLOWTOKC-26MAY24-T63",
+            question="Lowest temperature in Oklahoma City today?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.90,
+            raw_confidence=0.90,
+            bet_size_pct=0.2,
+            reasoning=(
+                "NWS reports today's observed daily low was 64F at 6:12 AM, threshold already exceeded."
+            ),
+            implied_prob_external=None,
+            my_prob=0.90,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.1,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=35.4&lon=-97.6",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.75)
+
     def test_validate_and_enrich_normalizes_outcome_label(self) -> None:
         market = Market(
             id="m7",

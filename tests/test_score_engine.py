@@ -2205,3 +2205,97 @@ def test_sports_family_conditional_bonus_relaxes_high_conf_loss_threshold() -> N
     assert score.family_conditional_bonus_applied is True
     assert score.historical_family_signal > 0.0
 
+
+def test_no_external_odds_penalty_reduced_when_convergent() -> None:
+    market = Market(
+        id="KXSPORTS-NOEXT",
+        question="Sports no external odds",
+        outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        liquidity_usdc=900.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=5),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.3,
+        reasoning="No external odds found for this matchup.",
+        edge_external=0.10,
+        edge_source="fallback",
+        evidence_quality=0.50,
+        evidence_basis="proxy",
+        implied_prob_external=None,
+    )
+    baseline = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        edge_source="fallback",
+        evidence_basis_class="proxy",
+        proxy_penalty_convergent_reduction_enabled=False,
+        self_consistency_passed=True,
+        historical_family_pnl_total=30.0,
+        historical_family_sample_size=30,
+    )
+    reduced = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        edge_source="fallback",
+        evidence_basis_class="proxy",
+        proxy_penalty_convergent_reduction_enabled=True,
+        self_consistency_passed=True,
+        historical_family_pnl_total=30.0,
+        historical_family_sample_size=30,
+    )
+    assert reduced.no_external_odds_penalty > 0.0
+    assert reduced.no_external_odds_penalty < baseline.no_external_odds_penalty
+
+
+def test_generic_family_loss_drag_stronger_for_established_samples() -> None:
+    market = Market(
+        id="KXGENERIC-LOSS",
+        question="Generic market drag",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        bet_size_pct=0.2,
+        reasoning="Proxy signal",
+        edge_external=0.08,
+        edge_source="computed",
+        evidence_quality=0.55,
+        evidence_basis="proxy",
+    )
+    small_sample = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.50,
+        market_family="generic",
+        historical_family_pnl_total=-50.0,
+        historical_family_sample_size=10,
+        historical_family_win_rate=0.45,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_loss_drag_scale=1.8,
+        historical_family_loss_drag_sample_min=30,
+    )
+    large_sample = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.50,
+        market_family="generic",
+        historical_family_pnl_total=-50.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.45,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_loss_drag_scale=1.8,
+        historical_family_loss_drag_sample_min=30,
+    )
+    assert large_sample.historical_family_signal < small_sample.historical_family_signal
+

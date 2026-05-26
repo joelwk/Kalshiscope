@@ -724,6 +724,72 @@ class MarketStateManager:
                 ),
             )
 
+    def get_daily_order_attempt_summary(
+        self,
+        *,
+        since: datetime,
+        include_dry_run: bool = True,
+    ) -> tuple[int, int, float]:
+        """Return attempted orders, credited exposures, and their EV since `since`."""
+        since_utc = since
+        if since_utc.tzinfo is None:
+            since_utc = since_utc.replace(tzinfo=timezone.utc)
+        else:
+            since_utc = since_utc.astimezone(timezone.utc)
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS attempt_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                CAST(json_extract(audit_json, '$.daily_expectancy_ev_credited') AS INTEGER),
+                                CASE
+                                    WHEN final_reason IN ('order_submitted', 'dry_run') THEN 1
+                                    ELSE 0
+                                END
+                            ) = 1
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS credited_exposure_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN COALESCE(
+                                CAST(json_extract(audit_json, '$.daily_expectancy_ev_credited') AS INTEGER),
+                                CASE
+                                    WHEN final_reason IN ('order_submitted', 'dry_run') THEN 1
+                                    ELSE 0
+                                END
+                            ) = 1
+                            THEN COALESCE(
+                                CAST(json_extract(audit_json, '$.expected_value_usdc') AS REAL),
+                                0.0
+                            )
+                            ELSE 0.0
+                        END
+                    ),
+                    0.0
+                ) AS projected_expected_value_usdc
+            FROM decision_receipts
+            WHERE timestamp >= ?
+              AND final_action = 'order_attempt'
+              AND (? = 1 OR final_reason != 'dry_run')
+            """,
+            (since_utc.isoformat(), 1 if include_dry_run else 0),
+        ).fetchone()
+        if row is None:
+            return 0, 0, 0.0
+        return (
+            int(row["attempt_count"] or 0),
+            int(row["credited_exposure_count"] or 0),
+            float(row["projected_expected_value_usdc"] or 0.0),
+        )
+
     def upsert_position_snapshot(
         self,
         *,

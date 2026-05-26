@@ -146,7 +146,9 @@ def compute_final_score(
     proxy_penalty_convergent_reduction_enabled: bool = True,
     self_consistency_passed: bool = False,
     historical_family_high_conf_loss_relax_threshold: float = 0.05,
-    historical_family_boost_evidence_min: float = 0.55,
+    historical_family_boost_evidence_min: float = 0.44,
+    historical_family_loss_drag_scale: float = 1.8,
+    historical_family_loss_drag_sample_min: int = 30,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -433,18 +435,20 @@ def compute_final_score(
             proxy_evidence_penalty *= 0.60
             proxy_penalty_reduced = True
             proxy_penalty_reduction_reason = "settlement_aligned_high_quality"
-        if proxy_penalty_convergent_reduction_enabled and proxy_evidence_penalty > 0.0:
-            original_proxy_penalty = proxy_evidence_penalty
-            family_is_profitable = (
+        convergent_family_is_profitable = False
+        if proxy_penalty_convergent_reduction_enabled:
+            convergent_family_is_profitable = (
                 historical_family_pnl_total is not None
                 and float(historical_family_pnl_total) > 0.0
                 and historical_family_sample_size >= 20
             )
-            if self_consistency_passed and family_is_profitable:
+        if proxy_penalty_convergent_reduction_enabled and proxy_evidence_penalty > 0.0:
+            original_proxy_penalty = proxy_evidence_penalty
+            if self_consistency_passed and convergent_family_is_profitable:
                 proxy_evidence_penalty *= 0.50
                 proxy_penalty_reduced = True
                 proxy_penalty_reduction_reason = "self_consistency_plus_family"
-            elif family_is_profitable:
+            elif convergent_family_is_profitable:
                 proxy_evidence_penalty *= 0.70
                 proxy_penalty_reduced = True
                 if not proxy_penalty_reduction_reason:
@@ -453,6 +457,13 @@ def compute_final_score(
                 proxy_evidence_penalty,
                 original_proxy_penalty * 0.15,
             )
+        if (
+            proxy_penalty_convergent_reduction_enabled
+            and no_external_odds_penalty > 0.0
+            and self_consistency_passed
+            and convergent_family_is_profitable
+        ):
+            no_external_odds_penalty *= 0.50
     if _GENERIC_BIN_TICKER_PATTERN.search((market.id or "").strip()) and not _is_weather_market(market):
         generic_bin_penalty = max(0.0, generic_bin_penalty_base) * (1.0 + max(0.0, 0.65 - evidence_quality))
     if (
@@ -514,7 +525,15 @@ def compute_final_score(
         elif normalized_market_family in {"generic", "crypto"} and pnl_efficiency < 0.0:
             # Historical generic/crypto losses should scale conviction and size,
             # not categorically exclude otherwise eligible source-backed markets.
-            raw_signal -= min(0.40, (abs(pnl_efficiency) * 1.5) + (high_conf_loss_rate * 1.5))
+            drag_scale = (
+                float(historical_family_loss_drag_scale)
+                if sample_size >= max(1, int(historical_family_loss_drag_sample_min))
+                else 1.5
+            )
+            raw_signal -= min(
+                0.55,
+                (abs(pnl_efficiency) * drag_scale) + (high_conf_loss_rate * drag_scale),
+            )
         if normalized_evidence_basis != "direct" and raw_signal < 0.0:
             raw_signal *= 1.25
         shrink = sample_size / (sample_size + 20.0)
