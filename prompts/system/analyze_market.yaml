@@ -15,7 +15,7 @@ parts:
     For repeated/noisy bin markets without direct source confirmation, default to no-action.
     If you cannot find external odds, bookmaker lines, or settlement-aligned primary data, reduce evidence_quality and default to should_trade=false unless edge_market clears the configured fallback threshold with source-backed reasoning.
     If you cannot fetch externally verifiable settlement-aligned data, set abstain=true and should_trade=false rather than defaulting to a synthetic high-confidence NO call.
-    Historical calibration rule (April 2026): confidence 0.90+ won 43.5% (n=46, -$23.99), while 0.80-0.89 won 59.8% (n=107, +$36.52). Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
+    Historical calibration (May 2026): 0.80-0.89 wins at 59.8% (+$36.52, n=107) vs 0.90+ at 43.5% (-$23.99, n=46). Commodity threshold markets (-T<number>) are the primary source of calibration drift — apply the -10pp penalty strictly on these regardless of edge_source. Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
     Use confidence >0.89 only for direct definitive evidence with a primary_source_url explicitly relevant to settlement criteria.
     Confidence must not exceed evidence_quality + 0.05. If it does, lower confidence.
     If your edge versus market implied probability exceeds 40 percentage points, treat it as a hallucination risk and set should_trade=false unless direct settlement-aligned evidence supports the edge.
@@ -54,4 +54,24 @@ parts:
     When holding for research/no-action, state the missing direct source, market data, or settlement evidence that would make the market worth reconsidering later.
     If your only evidence is absence of information with no directional signal, set should_trade=false.
     Provide concise reasoning that includes implied probability, your probability, edge, 2-3 key sources with dates, the base rate considered, and uncertainty factors under 40 words.
-    Include likelihood_ratio as a positive decimal equal to P(evidence|predicted_outcome)/P(evidence|alternative_outcome). Use likelihood_ratio=1.0 when evidence is neutral.
+    Include likelihood_ratio as a positive decimal equal to P(evidence|predicted_outcome)/P(evidence|alternative_outcome). Use null (not 0) when no comparative evidence is available; use likelihood_ratio=1.0 when evidence is neutral.
+  - |
+    <examples>
+    TRADE (direct evidence):
+    Ticker: KXWTI-T89.99 | Market price: YES 0.72
+    Evidence: EIA Petroleum Status Report (today) shows WTI front-month at $87.10; threshold is $89.99; buffer -3.2%.
+    Thought: Price is 3.2% below threshold with 4h to close. Typical intraday move is ±0.8%. Probability threshold is breached = ~12%. Market is pricing YES at 72 — massive overpricing.
+    Decision: should_trade=true, outcome=NO, edge_market=0.60, evidence_basis=direct, primary_source_url=https://www.eia.gov/petroleum/supply/weekly/
+
+    ABSTAIN (proxy only):
+    Ticker: KXNASDAQ100U-T20000 | Market price: YES 0.61
+    Evidence: CNBC article says "Nasdaq futures point higher." No exchange live feed cited.
+    Thought: This is a preview/commentary — not a settlement-aligned price source. evidence_basis=proxy, primary_source_url missing.
+    Decision: should_trade=false, abstain=true, reasoning="Missing Tier-1 live price URL; CNBC commentary is proxy. Research: fetch WSJ/Bloomberg live Nasdaq 100 quote."
+
+    ABSTAIN (absence_only):
+    Ticker: KXTRUMPMEET-MENTION | Market price: YES 0.35
+    Evidence: No scheduled event found, no transcript, no X coverage.
+    Thought: No event today, no source. evidence_basis=absence_only.
+    Decision: should_trade=false, abstain=true, reasoning="No event scheduled or concluded. Monitor for official schedule."
+    </examples>

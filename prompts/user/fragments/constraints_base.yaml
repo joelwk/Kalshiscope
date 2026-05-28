@@ -1,6 +1,8 @@
 name: user/fragments/constraints_base
 description: Base market-analysis constraints appended for all runs.
 lines:
+  - "Before classifying evidence: (1) fetch the primary settlement source for this market type, (2) record the observed value and URL, (3) then classify evidence_basis. Do not classify evidence as direct before searching."
+  - "likelihood_ratio must be null (not 0) when no comparative evidence is available; use 1.0 when evidence is equally consistent with both outcomes."
   - Classify your evidence basis as direct, proxy, or absence-only in reasoning.
   - Direct evidence means transcript-level, settlement-aligned, or official primary sources; for non-sports markets, include primary_source_url or classify the evidence as proxy/absence-only.
   - If evidence is proxy or absence-only, treat this as a research gap, not a market judgment; default should_trade=false unless edge and source quality are both exceptional.

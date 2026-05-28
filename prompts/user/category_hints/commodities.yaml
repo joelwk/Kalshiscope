@@ -1,4 +1,10 @@
 name: user/category_hints/commodities
 description: Commodity-market guidance.
 content: >-
-  Commodities guidance: prioritize exchange settlement/last prices, front-month contract data, and time-specific catalysts over opinion commentary.
+  Commodities guidance: settlement prices come from CME Group (WTI/Natural Gas/Gold/Silver/Copper) and ICE Futures (Brent). Required sources: CME settlement feed or EIA weekly report for energy; COMEX official close for metals. Live quote pages (WSJ, Bloomberg, Reuters) are acceptable for real-time threshold checks but must include the observed value and timestamp.
+
+  Before setting should_trade=true: (1) Fetch the current front-month contract price from a cited exchange or Tier-1 feed. (2) Compute buffer_to_threshold_pct = (price - threshold) / threshold. (3) Estimate remaining intraday volatility from the market's 30-day ATR or typical daily range — if buffer exceeds 1.5x typical move, edge is likely real; if buffer is within 0.5x typical move, the market is already pricing in the risk.
+
+  Time context: CME energy markets settle at 2:30 PM ET; metals at 1:30 PM ET. Analysis within 2 hours of settlement with a large buffer (>2%) is high-certainty; analysis outside the session window requires a forward price or overnight-session quote.
+
+  Do not use: analyst forecast articles, commentary, or social posts as primary evidence for threshold markets. Always require a URL-cited exchange or wire-service live price.
