@@ -122,6 +122,31 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.EXTENDED_RESEARCH_SOURCE_OFFSET, 4)
         self.assertEqual(settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET, 8)
 
+    def test_settlement_source_allowlist_default_and_override(self) -> None:
+        default_allowlist = config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+        self.assertTrue(default_allowlist)
+        self.assertIn("cmegroup.com", default_allowlist)
+        self.assertIn("eia.gov", default_allowlist)
+        self.assertNotIn("tradingeconomics.com", default_allowlist)
+
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
+            default_allowlist,
+        )
+
+        env = {
+            **self._required_env(),
+            "SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS": "cmegroup.com, eia.gov",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
+            ("cmegroup.com", "eia.gov"),
+        )
+
     def test_search_profile_limits_clamp_to_xai_provider_caps(self) -> None:
         env = {
             **self._required_env(),

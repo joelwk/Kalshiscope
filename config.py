@@ -156,6 +156,34 @@ class Settings:
     MULTIMEDIA_CONFIDENCE_THRESHOLD: tuple[float, float] = (0.55, 0.75)
     SEARCH_PROFILE_MAX_DOMAINS: int = 5
     SEARCH_PROFILE_MAX_X_HANDLES: int = 10
+    # Domains whose pages count as settlement-grade primary sources for direct
+    # evidence on non-sports markets. URLs outside this allowlist (e.g. commodity
+    # aggregators) are treated as proxy-tier and cannot satisfy direct evidence.
+    SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS: tuple[str, ...] = (
+        "cmegroup.com",
+        "theice.com",
+        "eia.gov",
+        "treasury.gov",
+        "bls.gov",
+        "bea.gov",
+        "federalreserve.gov",
+        "sec.gov",
+        "weather.gov",
+        "noaa.gov",
+        "wsj.com",
+        "bloomberg.com",
+        "reuters.com",
+        "apnews.com",
+        "coinbase.com",
+        "binance.com",
+        "kraken.com",
+        "coindesk.com",
+        "spotify.com",
+        "billboard.com",
+        "luminate.com",
+        "netflix.com",
+        "boxofficemojo.com",
+    )
     EXTENDED_RESEARCH_SOURCE_OFFSET: int = 5
     EXTENDED_RESEARCH_X_HANDLE_OFFSET: int = 10
     # Dynamic search windows by market horizon
@@ -1047,6 +1075,10 @@ def load_settings() -> Settings:
         ),
         SEARCH_ALLOWED_X_HANDLES=_read_env_csv(
             "SEARCH_ALLOWED_X_HANDLES", Settings.SEARCH_ALLOWED_X_HANDLES
+        ),
+        SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS=_read_env_csv(
+            "SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS",
+            Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
         ),
         MULTIMEDIA_CONFIDENCE_THRESHOLD=_read_env_float_pair(
             "MULTIMEDIA_CONFIDENCE_THRESHOLD",

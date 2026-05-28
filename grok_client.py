@@ -93,6 +93,7 @@ _WEATHER_OBS_CONFIDENCE_FLOOR = 0.85
 _WEATHER_OBS_EVIDENCE_FLOOR = 0.75
 _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE = 0.65
 _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR = 0.72
+_PROXY_EVIDENCE_QUALITY_CAP = 0.75
 _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "official",
     "official recap",
@@ -696,6 +697,16 @@ class GrokClient:
         return "proxy"
 
     @staticmethod
+    def _primary_source_is_settlement_grade(
+        url: str | None, allowlist: tuple[str, ...]
+    ) -> bool:
+        if not url:
+            return False
+        host = urlparse(url).netloc.lower().split(":")[0]
+        host = host[4:] if host.startswith("www.") else host
+        return any(host == domain or host.endswith("." + domain) for domain in allowlist)
+
+    @staticmethod
     def _extract_primary_source_url(decision: TradeDecision) -> str | None:
         existing = _clean_extracted_url(str(decision.primary_source_url or ""))
         if existing:
@@ -881,8 +892,13 @@ class GrokClient:
             else None
         )
         primary_source_required_for_direct = profile_name != "sports"
+        primary_source_is_settlement_grade = self._primary_source_is_settlement_grade(
+            primary_source_url,
+            active_settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
+        )
         primary_source_satisfies_direct = (
-            bool(primary_source_url) or not primary_source_required_for_direct
+            (bool(primary_source_url) and primary_source_is_settlement_grade)
+            or not primary_source_required_for_direct
         )
         if evidence_basis_class == "direct" and not primary_source_satisfies_direct:
             evidence_basis_class = "proxy"
@@ -997,6 +1013,14 @@ class GrokClient:
         ):
             evidence_quality = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
             evidence_quality_floor_applied = "definitive_outcome_floor"
+        if (
+            evidence_basis_class == "proxy"
+            and evidence_quality > _PROXY_EVIDENCE_QUALITY_CAP
+        ):
+            evidence_quality = _PROXY_EVIDENCE_QUALITY_CAP
+            evidence_quality_floor_applied = (
+                evidence_quality_floor_applied or "proxy_evidence_cap"
+            )
         direct_fallback_gate_override = (
             evidence_basis_class == "direct"
             and source_match_class == "settlement_aligned"
