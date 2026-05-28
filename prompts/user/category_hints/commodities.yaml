@@ -8,3 +8,5 @@ content: >-
   Time context: CME energy markets settle at 2:30 PM ET; metals at 1:30 PM ET. Analysis within 2 hours of settlement with a large buffer (>2%) is high-certainty; analysis outside the session window requires a forward price or overnight-session quote.
 
   Do not use: analyst forecast articles, commentary, or social posts as primary evidence for threshold markets. Always require a URL-cited exchange or wire-service live price.
+
+  If primary_source_url cannot be populated for a commodity threshold market, set evidence_quality <= 0.60 and evidence_basis=proxy — do not award higher EQ without a URL.
