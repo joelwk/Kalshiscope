@@ -86,6 +86,12 @@ parts:
     Thought: This is a preview/commentary — not a settlement-aligned price source. evidence_basis=proxy, primary_source_url missing.
     Decision: should_trade=false, abstain=true, reasoning="Missing Tier-1 live price URL; CNBC commentary is proxy. Research: fetch WSJ/Bloomberg live Nasdaq 100 quote."
 
+    ABSTAIN (proxy with URL — aggregator, not settlement source):
+    Ticker: KXGOLDD-T4439 | Market price: NO 0.62
+    Evidence: Trading Economics shows gold at $4,374 (May 28 00:45 UTC). Threshold $4,439. Buffer -1.46%.
+    Thought: Trading Economics is an aggregator, not the COMEX official settlement feed. evidence_basis=proxy even though I have a URL. The proxy EQ ceiling applies unconditionally: evidence_quality=0.65. Buffer is within typical intraday range; no edge.
+    Decision: should_trade=false, evidence_basis=proxy, evidence_quality=0.65, reasoning="Need COMEX official settlement or CME front-month close to reclassify as direct. Trading Economics URL is proxy-tier."
+
     ABSTAIN (absence_only):
     Ticker: KXTRUMPMEET-MENTION | Market price: YES 0.35
     Evidence: No scheduled event found, no transcript, no X coverage.

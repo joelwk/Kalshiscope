@@ -4,7 +4,7 @@ lines:
   - "Before classifying evidence: (1) fetch the primary settlement source for this market type, (2) record the observed value and URL, (3) then classify evidence_basis. Do not classify evidence as direct before searching."
   - "likelihood_ratio must be null (not 0) when no comparative evidence is available; use 1.0 when evidence is equally consistent with both outcomes."
   - "If your source is settlement-aligned (directly resolves the market's settlement criterion), classify it as direct and populate primary_source_url. Proxy is for sources that are adjacent, predictive, or indirectly relevant — not settlement-aligned."
-  - "evidence_quality must not exceed 0.75 when evidence_basis=proxy. If you are awarding eq > 0.75, you must have a primary_source_url — if you do not, lower eq to 0.75 and set evidence_basis=proxy."
+  - "evidence_quality must not exceed 0.75 when evidence_basis=proxy, unconditionally. Having a primary_source_url does NOT change this ceiling — only evidence_basis=direct may have eq > 0.75. If you find yourself awarding eq > 0.75 with evidence_basis=proxy, this is always an error: either reclassify to direct (requires a settlement-aligned URL) or lower eq to 0.75."
   - Classify your evidence basis as direct, proxy, or absence-only in reasoning.
   - Direct evidence means transcript-level, settlement-aligned, or official primary sources; for non-sports markets, include primary_source_url or classify the evidence as proxy/absence-only.
   - If evidence is proxy or absence-only, treat this as a research gap, not a market judgment; default should_trade=false unless edge and source quality are both exceptional.
