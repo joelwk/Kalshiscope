@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from logging_config import get_logger
 from grok_client import GrokClient
-from config import SearchConfig
+from config import SearchConfig, Settings
 from models import Market, MarketState, TradeDecision
 from research_profiles import market_family
 
@@ -71,6 +71,10 @@ class RefinementStrategy:
         implied_prob: float | None = None,
         evidence_quality: float | None = None,
         edge_value: float | None = None,
+        *,
+        settings: Settings | None = None,
+        pre_execution_score: float | None = None,
+        score_threshold: float | None = None,
     ) -> list[str]:
         reasons: list[str] = []
         quality = decision.evidence_quality if evidence_quality is None else evidence_quality
@@ -107,6 +111,18 @@ class RefinementStrategy:
             reasons.append("low_evidence_quality")
         if decision.should_trade and decision.confidence >= 0.78 and edge is not None and edge < 0.08:
             reasons.append("high_conf_small_edge")
+        if (
+            settings is not None
+            and settings.BORDERLINE_CRITIQUE_REFINEMENT_ENABLED
+            and pre_execution_score is not None
+            and score_threshold is not None
+            and bool(str(getattr(decision, "primary_source_url", "") or "").strip())
+            and not self._family_skipped_for_borderline_trade()
+        ):
+            score_band = max(0.0, float(settings.BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND))
+            lower_bound = float(score_threshold) - score_band
+            if lower_bound <= float(pre_execution_score) < float(score_threshold):
+                reasons.append("borderline_pre_execution_score")
 
         if reasons:
             return reasons
@@ -152,10 +168,24 @@ class RefinementStrategy:
         market: Market,
         initial: TradeDecision,
         search_config: SearchConfig | None = None,
+        refinement_reasons: list[str] | None = None,
+        *,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         """Execute multi-pass refinement with flip-flop protection."""
         decision = initial
         initial_outcome = initial.outcome
+        if refinement_reasons and "borderline_pre_execution_score" in refinement_reasons:
+            decision = decision.model_copy(
+                update={
+                    "reasoning": (
+                        "[BorderlineScoreCritique] Prior score was just below the "
+                        "execution threshold. Re-check whether conservative "
+                        "probability or evidence assumptions hide a real edge. "
+                        f"{decision.reasoning}"
+                    )
+                }
+            )
         
         for pass_index in range(1, MAX_REFINEMENT_PASSES + 1):
             logger.info(
@@ -171,6 +201,7 @@ class RefinementStrategy:
                     market,
                     previous_analysis=decision,
                     search_config=search_config,
+                    family_is_profitable=family_is_profitable,
                 )
             except Exception as deep_exc:
                 logger.warning(

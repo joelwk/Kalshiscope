@@ -185,6 +185,69 @@ def test_decision_receipt_infers_order_summary_from_audit(tmp_path) -> None:
         manager.close()
 
 
+def test_daily_order_attempt_summary_restores_count_and_expected_value(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_decision_receipt(
+            cycle_id="cycle-order-1",
+            market_id="m-order-1",
+            decision={"should_trade": True},
+            execution_audit={
+                "final_action": "order_attempt",
+                "final_reason": "order_submitted",
+                "expected_value_usdc": 1.25,
+            },
+        )
+        manager.record_decision_receipt(
+            cycle_id="cycle-order-2",
+            market_id="m-order-2",
+            decision={"should_trade": True},
+            execution_audit={
+                "final_action": "order_attempt",
+                "final_reason": "dry_run",
+                "expected_value_usdc": 0.75,
+            },
+        )
+        manager.record_decision_receipt(
+            cycle_id="cycle-skip",
+            market_id="m-skip",
+            decision={"should_trade": False},
+            execution_audit={
+                "final_action": "skip",
+                "final_reason": "score_gate_blocked",
+                "expected_value_usdc": 100.0,
+            },
+        )
+        manager.record_decision_receipt(
+            cycle_id="cycle-failed-attempt",
+            market_id="m-failed-attempt",
+            decision={"should_trade": True},
+            execution_audit={
+                "final_action": "order_attempt",
+                "final_reason": "order_submission_failed",
+                "expected_value_usdc": 20.0,
+                "daily_expectancy_ev_credited": False,
+            },
+        )
+
+        attempts, exposures, projected_ev = manager.get_daily_order_attempt_summary(
+            since=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        live_attempts, live_exposures, live_projected_ev = manager.get_daily_order_attempt_summary(
+            since=datetime.now(timezone.utc) - timedelta(hours=1),
+            include_dry_run=False,
+        )
+
+        assert attempts == 3
+        assert exposures == 2
+        assert projected_ev == 2.0
+        assert live_attempts == 2
+        assert live_exposures == 1
+        assert live_projected_ev == 1.25
+    finally:
+        manager.close()
+
+
 def test_decision_receipt_audit_json_populated_on_abstain_and_skip(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:
@@ -540,6 +603,39 @@ def test_record_exchange_settlement_upserts_trade_outcome_and_pnl(tmp_path) -> N
         assert round(float(row["pnl_estimate"]), 2) == 2.15
         assert row["resolution_state"] == "resolved_exchange"
         assert round(manager.get_exchange_realized_pnl_total(), 2) == 2.15
+    finally:
+        manager.close()
+
+
+def test_get_exchange_realized_pnl_since_hours_filters_by_settled_at(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        old_time = datetime.now(timezone.utc) - timedelta(days=10)
+        recent_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        manager.record_exchange_settlement(
+            settlement_id="old-settlement",
+            market_id="OLD-1",
+            predicted_outcome="YES",
+            winning_outcome="YES",
+            pnl_realized=-5.0,
+            contracts=10,
+            avg_price=0.5,
+            settled_at=old_time,
+            raw={"settled_time": old_time.isoformat()},
+        )
+        manager.record_exchange_settlement(
+            settlement_id="recent-settlement",
+            market_id="NEW-1",
+            predicted_outcome="YES",
+            winning_outcome="YES",
+            pnl_realized=3.0,
+            contracts=10,
+            avg_price=0.5,
+            settled_at=recent_time,
+            raw={"settled_time": recent_time.isoformat()},
+        )
+        assert round(manager.get_exchange_realized_pnl_since_hours(24.0), 2) == 3.0
+        assert round(manager.get_exchange_realized_pnl_total(), 2) == -2.0
     finally:
         manager.close()
 

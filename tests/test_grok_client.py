@@ -1401,6 +1401,166 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
         self.assertEqual(validated.evidence_basis, "proxy")
 
+    def test_validate_and_enrich_caps_proxy_evidence_quality(self) -> None:
+        market = Market(
+            id="m-proxy-cap",
+            question="Will the index close above the threshold?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 65%. "
+                "Edge from momentum and sentiment trends."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.65,
+            edge_external=0.25,
+            edge_source="computed",
+            evidence_quality=0.95,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertLessEqual(validated.evidence_quality, 0.75)
+        self.assertEqual(validated.evidence_quality_floor_applied, "proxy_evidence_cap")
+
+    def test_validate_and_enrich_allows_higher_proxy_cap_for_sports_with_odds(self) -> None:
+        market = Market(
+            id="m-sports-odds-cap",
+            question="Will the favorite win the game?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 65%. "
+                "Edge from momentum and sentiment trends."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.65,
+            edge_external=0.25,
+            edge_source="computed",
+            evidence_quality=0.95,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertEqual(validated.evidence_quality_floor_applied, "proxy_evidence_cap")
+        self.assertAlmostEqual(validated.evidence_quality, 0.80)
+
+    def test_validate_and_enrich_sports_proxy_cap_is_sports_specific(self) -> None:
+        # The identical proxy decision under a non-sports profile keeps the
+        # standard 0.75 ceiling, proving the 0.80 ceiling is sports-only.
+        market = Market(
+            id="m-sports-odds-cap",
+            question="Will the index close above the threshold?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 65%. "
+                "Edge from momentum and sentiment trends."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.65,
+            edge_external=0.25,
+            edge_source="computed",
+            evidence_quality=0.95,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertEqual(validated.evidence_quality_floor_applied, "proxy_evidence_cap")
+        self.assertAlmostEqual(validated.evidence_quality, 0.75)
+
+    def test_validate_and_enrich_treats_aggregator_url_as_proxy(self) -> None:
+        market = Market(
+            id="m-aggregator-url",
+            question="Will gold close above the threshold?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.65,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 65%. "
+                "Live quote shows spot price 4374 as of today; threshold 4439."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.65,
+            edge_external=0.25,
+            edge_source="computed",
+            likelihood_ratio=1.0,
+            evidence_quality=0.95,
+            primary_source_url="https://tradingeconomics.com/commodity/gold",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="commodities",
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertLessEqual(validated.evidence_quality, 0.75)
+        self.assertIn("tradingeconomics.com", validated.primary_source_url or "")
+
+    def test_validate_and_enrich_allows_settlement_grade_url_direct(self) -> None:
+        market = Market(
+            id="m-allowlisted-url",
+            question="Will WTI close above the threshold?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.85,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 85%. "
+                "EIA weekly report confirms official settlement; observed value 87.10 as of today."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.85,
+            edge_external=0.45,
+            edge_source="computed",
+            likelihood_ratio=1.0,
+            evidence_quality=0.95,
+            primary_source_url="https://www.eia.gov/petroleum/supply/weekly/",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="commodities",
+        )
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertGreater(validated.evidence_quality, 0.75)
+
     def test_validate_and_enrich_extracts_primary_url_from_key_sources(self) -> None:
         market = Market(
             id="m-definitive-key-source",
@@ -1561,6 +1721,66 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertGreaterEqual(validated.evidence_quality, 0.75)
 
+    def test_validate_and_enrich_skips_weather_observed_floor_for_lowt_without_daily_low(self) -> None:
+        market = Market(
+            id="KXLOWTOKC-26MAY24-T63",
+            question="Lowest temperature in Oklahoma City today?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.90,
+            raw_confidence=0.90,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Current METAR reading is 63F, already above the 63F threshold and threshold already exceeded."
+            ),
+            implied_prob_external=None,
+            my_prob=0.90,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.1,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=35.4&lon=-97.6",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertLess(validated.evidence_quality, 0.75)
+
+    def test_validate_and_enrich_applies_weather_observed_floor_for_lowt_with_daily_low(self) -> None:
+        market = Market(
+            id="KXLOWTOKC-26MAY24-T63",
+            question="Lowest temperature in Oklahoma City today?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.90,
+            raw_confidence=0.90,
+            bet_size_pct=0.2,
+            reasoning=(
+                "NWS reports today's observed daily low was 64F at 6:12 AM, threshold already exceeded."
+            ),
+            implied_prob_external=None,
+            my_prob=0.90,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.1,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=35.4&lon=-97.6",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.75)
+
     def test_validate_and_enrich_normalizes_outcome_label(self) -> None:
         market = Market(
             id="m7",
@@ -1642,6 +1862,46 @@ class TestQuotaExhaustedClassification(unittest.TestCase):
         )
         result = _is_retriable_grok_error(exc, 100.0)
         self.assertFalse(result)
+
+    def test_validate_and_enrich_applies_convergent_evidence_floor(self) -> None:
+        from config import Settings
+
+        market = Market(
+            id="m-convergent",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.50),
+                MarketOutcome(name="NO", price=0.50),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.2,
+            reasoning="No external odds found. Implied prob: unknown. My prob: 70%.",
+            implied_prob_external=0.50,
+            my_prob=0.70,
+            edge_external=0.20,
+            evidence_quality=0.9,
+        )
+        settings = Settings(
+            EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED=True,
+            EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE=0.60,
+        )
+        client = GrokClient(api_key="x", settings=settings)
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+            self_consistency_passed=True,
+            family_is_profitable=True,
+        )
+        self.assertGreaterEqual(validated.evidence_quality, 0.60)
+        self.assertEqual(
+            validated.evidence_quality_floor_applied,
+            "convergent_evidence_floor",
+        )
 
 
 if __name__ == "__main__":

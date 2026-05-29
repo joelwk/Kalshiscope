@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,23 @@ _RE_WEATHER_OBS_LOCKED = re.compile(
     r"physically impossible|threshold (?:already )?(?:met|exceeded)|high already reached)",
     re.IGNORECASE,
 )
+_RE_WEATHER_DAILY_LOW = re.compile(
+    r"(daily (?:low|minimum)|overnight low|minimum (?:temperature )?(?:recorded|observed|reported)"
+    r"|today['\u2019]?s low|observed low|station low|low (?:temperature )?(?:was|is|recorded))",
+    re.IGNORECASE,
+)
+
+
+def _is_low_temp_market_ticker(market_id: str) -> bool:
+    return "LOWT" in (market_id or "").upper()
+
+
+def _weather_obs_locked_reasoning_ok(*, market_id: str, reasoning: str) -> bool:
+    if not _RE_WEATHER_OBS_LOCKED.search(reasoning or ""):
+        return False
+    if _is_low_temp_market_ticker(market_id):
+        return bool(_RE_WEATHER_DAILY_LOW.search(reasoning or ""))
+    return True
 _RE_DEFINITIVE_OUTCOME_SIGNAL = re.compile(
     r"(final score|game (?:completed|concluded|final)|confirmed|official recap|box score)",
     re.IGNORECASE,
@@ -75,6 +93,13 @@ _WEATHER_OBS_CONFIDENCE_FLOOR = 0.85
 _WEATHER_OBS_EVIDENCE_FLOOR = 0.75
 _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE = 0.65
 _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR = 0.72
+_PROXY_EVIDENCE_QUALITY_CAP = 0.75
+# Sports markets backed by external bookmaker/sportsbook odds get a slightly
+# higher proxy ceiling: odds are settlement-predictive, and sports is the one
+# historically profitable family, so over-capping its evidence_quality was
+# suppressing its strongest signal. All other proxy evidence keeps the standard
+# 0.75 ceiling.
+_SPORTS_PROXY_ODDS_EVIDENCE_QUALITY_CAP = 0.80
 _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "official",
     "official recap",
@@ -262,6 +287,35 @@ def _is_model_unimplemented_grok_error(exc: Exception) -> bool:
         "unimplemented" in error_text
         and ("404" in error_text or "statuscode.unimplemented" in error_text)
     )
+
+
+def _response_used_code_execution(response: Any) -> bool:
+    """Return True when the xAI response indicates code_execution was invoked."""
+    tool_usage = getattr(response, "server_side_tool_usage", None)
+    if tool_usage is None and isinstance(response, dict):
+        tool_usage = response.get("server_side_tool_usage")
+    if isinstance(tool_usage, dict):
+        for key in tool_usage:
+            if "code_execution" in str(key).lower():
+                return True
+    for chunk_attr in ("tool_calls",):
+        tool_calls = getattr(response, chunk_attr, None)
+        if tool_calls is None and isinstance(response, dict):
+            tool_calls = response.get(chunk_attr)
+        if not tool_calls:
+            continue
+        for tool_call in tool_calls:
+            function = getattr(tool_call, "function", None)
+            if function is None and isinstance(tool_call, dict):
+                function = tool_call.get("function")
+            name = ""
+            if function is not None:
+                name = str(getattr(function, "name", "") or "")
+                if not name and isinstance(function, dict):
+                    name = str(function.get("name") or "")
+            if "code_execution" in name.lower():
+                return True
+    return False
 
 
 def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
@@ -596,13 +650,17 @@ class GrokClient:
         has_definitive_outcome_signal: bool,
         no_external_odds: bool,
         low_information: bool,
+        market_id: str = "",
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
         if low_information or (no_external_odds and not has_verifiable_signal):
             return "missing_or_absence_only"
         if _RE_PREVIEW_OR_PROXY_SOURCE.search(normalized_reasoning):
             return "preview_or_proxy"
-        if has_definitive_outcome_signal or _RE_WEATHER_OBS_LOCKED.search(normalized_reasoning):
+        if has_definitive_outcome_signal or _weather_obs_locked_reasoning_ok(
+            market_id=market_id,
+            reasoning=reasoning or "",
+        ):
             return "settlement_aligned"
         if _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL.search(normalized_reasoning):
             return "settlement_aligned"
@@ -645,6 +703,16 @@ class GrokClient:
         return "proxy"
 
     @staticmethod
+    def _primary_source_is_settlement_grade(
+        url: str | None, allowlist: tuple[str, ...]
+    ) -> bool:
+        if not url:
+            return False
+        host = urlparse(url).netloc.lower().split(":")[0]
+        host = host[4:] if host.startswith("www.") else host
+        return any(host == domain or host.endswith("." + domain) for domain in allowlist)
+
+    @staticmethod
     def _extract_primary_source_url(decision: TradeDecision) -> str | None:
         existing = _clean_extracted_url(str(decision.primary_source_url or ""))
         if existing:
@@ -666,6 +734,9 @@ class GrokClient:
         market: Market,
         decision: TradeDecision,
         profile_name: str,
+        *,
+        self_consistency_passed: bool = False,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         canonical_outcome = self._canonical_outcome_for_market(market, decision.outcome)
         if canonical_outcome is None:
@@ -733,6 +804,7 @@ class GrokClient:
             has_definitive_outcome_signal=has_definitive_outcome_signal,
             no_external_odds=no_external_odds,
             low_information=low_information,
+            market_id=market.id or "",
         )
         prob_component = 0.0
         if implied is not None and my_prob is not None:
@@ -826,13 +898,51 @@ class GrokClient:
             else None
         )
         primary_source_required_for_direct = profile_name != "sports"
+        primary_source_is_settlement_grade = self._primary_source_is_settlement_grade(
+            primary_source_url,
+            active_settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
+        )
         primary_source_satisfies_direct = (
-            bool(primary_source_url) or not primary_source_required_for_direct
+            (bool(primary_source_url) and primary_source_is_settlement_grade)
+            or not primary_source_required_for_direct
         )
         if evidence_basis_class == "direct" and not primary_source_satisfies_direct:
             evidence_basis_class = "proxy"
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
+        if active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED:
+            settlement_aligned = source_match_class == "settlement_aligned"
+            convergent_signals = sum(
+                [
+                    bool(self_consistency_passed),
+                    settlement_aligned,
+                    bool(family_is_profitable),
+                ]
+            )
+            logger.debug(
+                "convergent_floor_check",
+                data={
+                    "self_consistency_passed": self_consistency_passed,
+                    "family_is_profitable": family_is_profitable,
+                    "settlement_aligned": settlement_aligned,
+                    "convergent_signals": convergent_signals,
+                    "evidence_quality_pre": round(evidence_quality, 3),
+                    "floor_enabled": active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED,
+                },
+            )
+            convergent_floor_value = max(
+                0.0,
+                min(
+                    1.0,
+                    float(active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE),
+                ),
+            )
+            if (
+                convergent_signals >= 2
+                and evidence_quality < convergent_floor_value
+            ):
+                evidence_quality = convergent_floor_value
+                evidence_quality_floor_applied = "convergent_evidence_floor"
         verifiable_floor_allowed = (
             has_verifiable_signal
             and not low_information
@@ -884,7 +994,10 @@ class GrokClient:
         if (
             profile_name == "weather"
             and (decision.raw_confidence or decision.confidence) >= _WEATHER_OBS_CONFIDENCE_FLOOR
-            and _RE_WEATHER_OBS_LOCKED.search(decision.reasoning or "")
+            and _weather_obs_locked_reasoning_ok(
+                market_id=market.id or "",
+                reasoning=decision.reasoning or "",
+            )
             and primary_source_satisfies_direct
         ):
             if evidence_quality < _WEATHER_OBS_EVIDENCE_FLOOR:
@@ -906,6 +1019,17 @@ class GrokClient:
         ):
             evidence_quality = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
             evidence_quality_floor_applied = "definitive_outcome_floor"
+        if evidence_basis_class == "proxy":
+            proxy_evidence_quality_cap = (
+                _SPORTS_PROXY_ODDS_EVIDENCE_QUALITY_CAP
+                if profile_name == "sports" and implied is not None
+                else _PROXY_EVIDENCE_QUALITY_CAP
+            )
+            if evidence_quality > proxy_evidence_quality_cap:
+                evidence_quality = proxy_evidence_quality_cap
+                evidence_quality_floor_applied = (
+                    evidence_quality_floor_applied or "proxy_evidence_cap"
+                )
         direct_fallback_gate_override = (
             evidence_basis_class == "direct"
             and source_match_class == "settlement_aligned"
@@ -1245,12 +1369,14 @@ class GrokClient:
         model: str | None = None,
         timeout_seconds: float | None = None,
         temperature: float | None = None,
+        enable_code_execution: bool = False,
     ):
         return self.provider.create_chat(
             model=model or self.model,
             response_format=TradeDecision,
             config=config,
             enable_multimedia=enable_multimedia,
+            enable_code_execution=enable_code_execution,
             timeout_seconds=timeout_seconds,
             temperature=temperature,
         )
@@ -1500,6 +1626,8 @@ class GrokClient:
             market,
             merged,
             profile_name=profile_name,
+            self_consistency_passed=True,
+            family_is_profitable=getattr(self, "_current_family_is_profitable", False),
         )
 
     def _parse_response_payload(self, market_id: str, content: str, deep: bool) -> dict[str, Any]:
@@ -1609,6 +1737,7 @@ class GrokClient:
             "reasoning_tokens": None,
             "cached_tokens": None,
         }
+        code_execution_used = False
         if deadline_seconds is None:
             deadline_seconds = self._resolve_stream_deadline_seconds(
                 budget_remaining_ms,
@@ -1622,11 +1751,14 @@ class GrokClient:
                     f"Grok stream exceeded {deadline_seconds:.1f}s for market {market_id}"
                 )
             usage_metrics = _extract_usage_metrics(response)
+            if _response_used_code_execution(response) or _response_used_code_execution(chunk):
+                code_execution_used = True
             if chunk.content:
                 content += chunk.content
                 chunk_count += 1
         if not content:
             raise ValueError("Empty response from Grok")
+        usage_metrics["code_execution_used"] = int(code_execution_used)
         return content, chunk_count, usage_metrics
 
     def _run_analysis(
@@ -1636,7 +1768,9 @@ class GrokClient:
         search_config: SearchConfig | None,
         previous_analysis: TradeDecision | None,
         deep: bool,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
+        self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
         last_error: Exception | None = None
         max_attempts = _ANALYSIS_MAX_ATTEMPTS
@@ -1714,7 +1848,7 @@ class GrokClient:
                         break
                     raise
                 sleep_seconds = min(
-                    _ANALYSIS_RETRY_WAIT_SECONDS,
+                    _ANALYSIS_RETRY_WAIT_SECONDS + random.uniform(0.0, 1.5),
                     budget_remaining_ms / 1000.0,
                 )
                 logger.warning(
@@ -1936,6 +2070,14 @@ class GrokClient:
                 decision=previous_analysis,
                 config=active_config,
             )
+            enable_code_execution = bool(
+                deep
+                and getattr(
+                    self.settings,
+                    "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
+                    True,
+                )
+            )
             chat = self._build_chat(
                 active_config,
                 enable_multimedia,
@@ -1944,6 +2086,7 @@ class GrokClient:
                     stream_deadline_seconds
                 ),
                 temperature=temperature,
+                enable_code_execution=enable_code_execution,
             )
             chat.append(
                 self.provider.system_message(
@@ -1985,9 +2128,12 @@ class GrokClient:
                 market,
                 decision,
                 profile_name=active_config.profile_name,
+                family_is_profitable=getattr(self, "_current_family_is_profitable", False),
             )
+            code_execution_used = bool(usage_metrics.get("code_execution_used"))
             decision = decision.model_copy(
                 update={
+                    "code_execution_used": code_execution_used,
                     "raw_should_trade": (
                         bool(raw_payload.get("should_trade"))
                         if isinstance(raw_payload.get("should_trade"), bool)
@@ -2162,12 +2308,15 @@ class GrokClient:
         market: Market,
         search_config: SearchConfig | None = None,
         previous_analysis: TradeDecision | None = None,
+        *,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
             search_config=search_config,
             previous_analysis=previous_analysis,
             deep=False,
+            family_is_profitable=family_is_profitable,
         )
 
     def analyze_market_deep(
@@ -2175,10 +2324,13 @@ class GrokClient:
         market: Market,
         previous_analysis: TradeDecision | None = None,
         search_config: SearchConfig | None = None,
+        *,
+        family_is_profitable: bool = False,
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
             search_config=search_config,
             previous_analysis=previous_analysis,
             deep=True,
+            family_is_profitable=family_is_profitable,
         )

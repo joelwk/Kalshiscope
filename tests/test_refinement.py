@@ -16,6 +16,7 @@ class DummyGrok:
         market: Market,
         previous_analysis: TradeDecision | None = None,
         search_config=None,
+        **kwargs,
     ) -> TradeDecision:
         decision = self.decisions[self.calls]
         self.calls += 1
@@ -367,8 +368,35 @@ def test_skip_borderline_families_handles_missing_market() -> None:
     assert "borderline_trade_confidence" in reasons
 
 
-def test_settings_default_skip_borderline_families_includes_sports() -> None:
-    """Sports is the canonical skip target after the post-7-cycle audit."""
+def test_settings_default_skip_borderline_families_is_empty() -> None:
+    """Sports borderline critique is enabled so profitable-family proxy paths can refine."""
     from config import Settings
     s = Settings()
-    assert "sports" in s.REFINEMENT_SKIP_BORDERLINE_FAMILIES
+    assert s.REFINEMENT_SKIP_BORDERLINE_FAMILIES == ()
+
+
+def test_borderline_pre_execution_score_trigger() -> None:
+    from config import Settings
+
+    market = _market("m-borderline", None)
+    refinement = RefinementStrategy(market=market)
+    settings = Settings(
+        BORDERLINE_CRITIQUE_REFINEMENT_ENABLED=True,
+        BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND=0.10,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.3,
+        reasoning="test",
+        primary_source_url="https://example.com/source",
+    )
+    reasons = refinement.get_refinement_reasons(
+        decision,
+        None,
+        settings=settings,
+        pre_execution_score=0.48,
+        score_threshold=0.52,
+    )
+    assert "borderline_pre_execution_score" in reasons

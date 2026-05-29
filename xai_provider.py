@@ -5,7 +5,7 @@ from typing import Any
 
 from xai_sdk import Client
 from xai_sdk.chat import system, user
-from xai_sdk.tools import web_search, x_search
+from xai_sdk.tools import code_execution, web_search, x_search
 
 from config import SearchConfig
 from logging_config import get_logger
@@ -13,7 +13,7 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 _DEFAULT_CREATE_CHAT_MAX_ATTEMPTS = 3
-_DEFAULT_CREATE_CHAT_BACKOFF_SECONDS = 0.5
+_DEFAULT_CREATE_CHAT_BACKOFF_SECONDS = 1.0
 _MAX_CREATE_CHAT_BACKOFF_SECONDS = 4.0
 
 
@@ -55,29 +55,33 @@ class XAIProvider:
         response_format: Any,
         config: SearchConfig,
         enable_multimedia: bool,
+        enable_code_execution: bool = False,
         timeout_seconds: float | None = None,
         temperature: float | None = None,
     ):
         client = self._client_for_timeout(timeout_seconds)
+        tools: list[Any] = [
+            web_search(
+                allowed_domains=config.allowed_domains,
+                enable_image_understanding=enable_multimedia,
+            ),
+            x_search(
+                from_date=config.from_date,
+                to_date=config.to_date,
+                allowed_x_handles=config.allowed_x_handles,
+                enable_image_understanding=enable_multimedia,
+                enable_video_understanding=enable_multimedia,
+            ),
+        ]
+        if enable_code_execution:
+            tools.append(code_execution())
         for attempt in range(1, self.create_chat_max_attempts + 1):
             try:
                 return client.chat.create(
                     model=model,
                     response_format=response_format,
                     temperature=temperature,
-                    tools=[
-                        web_search(
-                            allowed_domains=config.allowed_domains,
-                            enable_image_understanding=enable_multimedia,
-                        ),
-                        x_search(
-                            from_date=config.from_date,
-                            to_date=config.to_date,
-                            allowed_x_handles=config.allowed_x_handles,
-                            enable_image_understanding=enable_multimedia,
-                            enable_video_understanding=enable_multimedia,
-                        ),
-                    ],
+                    tools=tools,
                 )
             except Exception:
                 if attempt >= self.create_chat_max_attempts:

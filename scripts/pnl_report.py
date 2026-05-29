@@ -31,6 +31,11 @@ DAILY_HISTORY_HEADER = (
     f"{'Date':<12} {'Trades':>7} {'W':>5} {'L':>5} {'WR':>7} {'PnL':>12}"
 )
 POSITIONS_HEADER = f"{'Ticker':<28} {'Side':<4} {'Contracts':>10} {'Exposure':>12}"
+CONVERSION_FUNNEL_HEADER = (
+    f"{'Family':<14} {'Analyzed':>9} {'Trade':>7} {'Executed':>9} "
+    f"{'Conv':>7} {'PnL':>12}"
+)
+CONVERSION_FUNNEL_LOOKBACK_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -476,6 +481,90 @@ def _print_total_realized_pnl(rows: list[sqlite3.Row], state_manager: MarketStat
     print(f"Profit factor:        {profit_factor:.2f}")
 
 
+def _print_conversion_funnel(db_path: str, *, lookback_days: int = CONVERSION_FUNNEL_LOOKBACK_DAYS) -> None:
+    _print_section(f"Analyzed -> Executed Conversion (last {lookback_days} days)")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        table_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'decision_receipts'"
+        ).fetchone()
+        if table_row is None:
+            print("No decision_receipts table found.")
+            return
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, lookback_days))
+        ).isoformat()
+        family_pnl_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(json_extract(d.audit_json, '$.market_family'), 'unknown') AS market_family,
+                COUNT(*) AS analyzed,
+                SUM(
+                    CASE
+                        WHEN COALESCE(json_extract(d.decision_json, '$.should_trade'), 0) = 1
+                        THEN 1 ELSE 0
+                    END
+                ) AS trade_true,
+                SUM(
+                    CASE
+                        WHEN COALESCE(json_extract(d.audit_json, '$.final_action'), '') IN (
+                            'order_attempt', 'order_submitted', 'dry_run'
+                        )
+                        THEN 1 ELSE 0
+                    END
+                ) AS executed
+            FROM decision_receipts d
+            WHERE d.timestamp >= ?
+              AND COALESCE(json_extract(d.audit_json, '$.synthetic_decision'), 0) != 1
+            GROUP BY market_family
+            ORDER BY analyzed DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        if not family_pnl_rows:
+            print("No non-synthetic decision receipts in lookback window.")
+            return
+        pnl_by_family: dict[str, float] = {}
+        settlement_rows = conn.execute(
+            """
+            SELECT
+                s.market_id,
+                s.pnl_realized,
+                COALESCE(m.question, '') AS question,
+                COALESCE(m.category, '') AS category
+            FROM exchange_settlements s
+            LEFT JOIN markets m ON m.id = s.market_id
+            WHERE s.settled_at >= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in settlement_rows:
+            family = MarketStateManager._infer_family_from_state_row(
+                market_id=str(row["market_id"] or ""),
+                question=str(row["question"] or ""),
+                category=str(row["category"] or ""),
+            )
+            pnl_by_family[family] = pnl_by_family.get(family, 0.0) + float(
+                row["pnl_realized"] or 0.0
+            )
+        print(CONVERSION_FUNNEL_HEADER)
+        print("-" * len(CONVERSION_FUNNEL_HEADER))
+        for row in family_pnl_rows:
+            family = str(row["market_family"] or "unknown")
+            analyzed = int(row["analyzed"] or 0)
+            trade_true = int(row["trade_true"] or 0)
+            executed = int(row["executed"] or 0)
+            conv = (executed / analyzed) if analyzed > 0 else 0.0
+            family_pnl = float(pnl_by_family.get(family, 0.0))
+            print(
+                f"{family:<14} {analyzed:>9} {trade_true:>7} {executed:>9} "
+                f"{conv:>6.1%} {family_pnl:>12,.2f}"
+            )
+    finally:
+        conn.close()
+
+
 def _print_category_breakdown(rows: list[sqlite3.Row]) -> None:
     _print_section("PnL by Category")
     if not rows:
@@ -744,6 +833,7 @@ def main() -> None:
         _print_total_realized_pnl(report_rows, state_manager)
         _print_daily_run_history(report_rows, rolling_days=max(1, args.rolling_days))
         _print_category_breakdown(report_rows)
+        _print_conversion_funnel(args.db)
         _print_monthly_breakdown(report_rows)
         _print_open_positions(open_positions, live_api_available=live_api_available)
     finally:

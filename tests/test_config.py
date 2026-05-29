@@ -122,6 +122,31 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.EXTENDED_RESEARCH_SOURCE_OFFSET, 4)
         self.assertEqual(settings.EXTENDED_RESEARCH_X_HANDLE_OFFSET, 8)
 
+    def test_settlement_source_allowlist_default_and_override(self) -> None:
+        default_allowlist = config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+        self.assertTrue(default_allowlist)
+        self.assertIn("cmegroup.com", default_allowlist)
+        self.assertIn("eia.gov", default_allowlist)
+        self.assertNotIn("tradingeconomics.com", default_allowlist)
+
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
+            default_allowlist,
+        )
+
+        env = {
+            **self._required_env(),
+            "SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS": "cmegroup.com, eia.gov",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
+            ("cmegroup.com", "eia.gov"),
+        )
+
     def test_search_profile_limits_clamp_to_xai_provider_caps(self) -> None:
         env = {
             **self._required_env(),
@@ -172,7 +197,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
         self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
-        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.12)
+        self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.30)
         self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
     def test_profit_tuning_defaults_are_loaded(self) -> None:
@@ -207,6 +232,7 @@ class TestConfig(unittest.TestCase):
             "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.40",
             "MIN_BET_USDC=5.0",
             "MAX_BET_USDC=12.0",
+            "DRY_RUN=true",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
@@ -233,12 +259,12 @@ class TestConfig(unittest.TestCase):
             "PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.28",
             "PRE_ANALYSIS_ADAPTIVE_BOOST=0.03",
             "PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=8",
-            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=8",
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=1",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=0.40",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",
             "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
-            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.03",
+            "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.05",
             "CONVICTION_REPAIR_ENABLED=true",
             "CONVICTION_REPAIR_MIN_EDGE=0.20",
             "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
@@ -544,7 +570,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 500)
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
-        self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 40.0)
+        self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 30.0)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.025)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
         self.assertEqual(settings.SCORE_GENERIC_BIN_PENALTY_BASE, 0.015)
@@ -731,14 +757,17 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
-        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 8)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 1)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES, 45.0)
-        self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 2)
-        self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.03)
+        self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 1)
+        self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.05)
+        self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX, 1)
+        self.assertTrue(settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED)
+        self.assertTrue(settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 4)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 8)
 

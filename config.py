@@ -156,6 +156,34 @@ class Settings:
     MULTIMEDIA_CONFIDENCE_THRESHOLD: tuple[float, float] = (0.55, 0.75)
     SEARCH_PROFILE_MAX_DOMAINS: int = 5
     SEARCH_PROFILE_MAX_X_HANDLES: int = 10
+    # Domains whose pages count as settlement-grade primary sources for direct
+    # evidence on non-sports markets. URLs outside this allowlist (e.g. commodity
+    # aggregators) are treated as proxy-tier and cannot satisfy direct evidence.
+    SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS: tuple[str, ...] = (
+        "cmegroup.com",
+        "theice.com",
+        "eia.gov",
+        "treasury.gov",
+        "bls.gov",
+        "bea.gov",
+        "federalreserve.gov",
+        "sec.gov",
+        "weather.gov",
+        "noaa.gov",
+        "wsj.com",
+        "bloomberg.com",
+        "reuters.com",
+        "apnews.com",
+        "coinbase.com",
+        "binance.com",
+        "kraken.com",
+        "coindesk.com",
+        "spotify.com",
+        "billboard.com",
+        "luminate.com",
+        "netflix.com",
+        "boxofficemojo.com",
+    )
     EXTENDED_RESEARCH_SOURCE_OFFSET: int = 5
     EXTENDED_RESEARCH_X_HANDLE_OFFSET: int = 10
     # Dynamic search windows by market horizon
@@ -405,7 +433,7 @@ class Settings:
     # market price. Other refinement triggers (low_evidence_quality,
     # missing_implied_probability, high_conf_small_edge, legacy_borderline_urgent)
     # still fire for these families. Empty tuple disables this behavior.
-    REFINEMENT_SKIP_BORDERLINE_FAMILIES: tuple[str, ...] = ("sports",)
+    REFINEMENT_SKIP_BORDERLINE_FAMILIES: tuple[str, ...] = ()
     PARALLEL_ANALYSIS_ENABLED: bool = True
     ANALYSIS_MAX_WORKERS: int = 2
     MAX_MARKETS_PER_CYCLE: int = 20
@@ -477,8 +505,11 @@ class Settings:
     # Score gate (phase A/B can run in shadow mode)
     SCORE_GATE_MODE: str = "active"  # off|shadow|active
     SCORE_GATE_THRESHOLD: float = 0.52
-    SCORE_GATE_THRESHOLD_WEATHER_DIRECT: float = 0.12
+    SCORE_GATE_THRESHOLD_WEATHER_DIRECT: float = 0.30
     SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY: float = 0.30
+    SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED: bool = True
+    SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT: float = 0.08
+    SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES: int = 30
     SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.60
     SCORE_LOW_INFO_PENALTY_BASE: float = 0.08
     SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.025
@@ -642,14 +673,15 @@ class Settings:
     # the queue is not a write-only black hole. Conservative defaults: at most one
     # forced probe per cycle, only after the entry has aged at least an hour.
     RESEARCH_QUEUE_DRAIN_ENABLED: bool = True
-    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 8
+    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 1
     RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
     RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
     RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
     RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
     RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES: float = 45.0
-    RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS: int = 2
-    RESEARCH_QUEUE_SCORE_PROMOTION_GAP: float = 0.03
+    RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS: int = 1
+    RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX: int = 1
+    RESEARCH_QUEUE_SCORE_PROMOTION_GAP: float = 0.05
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS: int = 4
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN: int = 8
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
@@ -698,7 +730,7 @@ class Settings:
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
     KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
-    KELLY_MIN_BANKROLL_USDC: float = 40.0
+    KELLY_MIN_BANKROLL_USDC: float = 30.0
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -709,6 +741,17 @@ class Settings:
     FLIP_CIRCUIT_BREAKER_ENABLED: bool = True
     FLIP_CIRCUIT_BREAKER_MAX_FLIPS: int = 3
     EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE: bool = False
+    EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED: bool = True
+    EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE: float = 0.60
+    PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED: bool = True
+    HISTORICAL_FAMILY_HIGH_CONF_LOSS_RELAX_THRESHOLD: float = 0.05
+    HISTORICAL_FAMILY_BOOST_EVIDENCE_MIN: float = 0.44
+    HISTORICAL_FAMILY_LOSS_DRAG_SCALE: float = 1.8
+    HISTORICAL_FAMILY_LOSS_DRAG_SAMPLE_MIN: int = 30
+    PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS: float = 0.10
+    BORDERLINE_CRITIQUE_REFINEMENT_ENABLED: bool = True
+    BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND: float = 0.10
+    CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED: bool = True
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -1032,6 +1075,10 @@ def load_settings() -> Settings:
         ),
         SEARCH_ALLOWED_X_HANDLES=_read_env_csv(
             "SEARCH_ALLOWED_X_HANDLES", Settings.SEARCH_ALLOWED_X_HANDLES
+        ),
+        SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS=_read_env_csv(
+            "SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS",
+            Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
         ),
         MULTIMEDIA_CONFIDENCE_THRESHOLD=_read_env_float_pair(
             "MULTIMEDIA_CONFIDENCE_THRESHOLD",
@@ -1436,6 +1483,18 @@ def load_settings() -> Settings:
         SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=_read_env_float(
             "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY",
             Settings.SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY,
+        ),
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED=_read_env_bool(
+            "SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED",
+            Settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED,
+        ),
+        SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT=_read_env_float(
+            "SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT",
+            Settings.SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT,
+        ),
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES=_read_env_int(
+            "SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES",
+            Settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES,
         ),
         SCORE_LOW_INFO_PENALTY_THRESHOLD=_read_env_float(
             "SCORE_LOW_INFO_PENALTY_THRESHOLD",
@@ -1933,6 +1992,10 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS",
             Settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS,
         ),
+        RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX=_read_env_int(
+            "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX",
+            Settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX,
+        ),
         RESEARCH_QUEUE_SCORE_PROMOTION_GAP=_read_env_float(
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP",
             Settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP,
@@ -2103,6 +2166,50 @@ def load_settings() -> Settings:
         EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE=_read_env_bool(
             "EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE",
             Settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE,
+        ),
+        EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED=_read_env_bool(
+            "EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED",
+            Settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED,
+        ),
+        EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE=_read_env_float(
+            "EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE",
+            Settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_VALUE,
+        ),
+        PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED=_read_env_bool(
+            "PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED",
+            Settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED,
+        ),
+        HISTORICAL_FAMILY_HIGH_CONF_LOSS_RELAX_THRESHOLD=_read_env_float(
+            "HISTORICAL_FAMILY_HIGH_CONF_LOSS_RELAX_THRESHOLD",
+            Settings.HISTORICAL_FAMILY_HIGH_CONF_LOSS_RELAX_THRESHOLD,
+        ),
+        HISTORICAL_FAMILY_BOOST_EVIDENCE_MIN=_read_env_float(
+            "HISTORICAL_FAMILY_BOOST_EVIDENCE_MIN",
+            Settings.HISTORICAL_FAMILY_BOOST_EVIDENCE_MIN,
+        ),
+        HISTORICAL_FAMILY_LOSS_DRAG_SCALE=_read_env_float(
+            "HISTORICAL_FAMILY_LOSS_DRAG_SCALE",
+            Settings.HISTORICAL_FAMILY_LOSS_DRAG_SCALE,
+        ),
+        HISTORICAL_FAMILY_LOSS_DRAG_SAMPLE_MIN=_read_env_int(
+            "HISTORICAL_FAMILY_LOSS_DRAG_SAMPLE_MIN",
+            Settings.HISTORICAL_FAMILY_LOSS_DRAG_SAMPLE_MIN,
+        ),
+        PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS=_read_env_float(
+            "PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS",
+            Settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS,
+        ),
+        BORDERLINE_CRITIQUE_REFINEMENT_ENABLED=_read_env_bool(
+            "BORDERLINE_CRITIQUE_REFINEMENT_ENABLED",
+            Settings.BORDERLINE_CRITIQUE_REFINEMENT_ENABLED,
+        ),
+        BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND=_read_env_float(
+            "BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND",
+            Settings.BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND,
+        ),
+        CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED=_read_env_bool(
+            "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
+            Settings.CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED,
         ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),

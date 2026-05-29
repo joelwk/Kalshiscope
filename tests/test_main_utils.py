@@ -34,10 +34,12 @@ from main import (
     _conviction_repair_reason,
     _daily_balance_delta_usdc,
     _daily_drawdown_cap_reached,
+    _daily_expectancy_ev_block_reason,
     _daily_trade_cap_reached,
     _daily_expectancy_role,
     _dry_streak_sleep_seconds,
     _edge_band_label,
+    _effective_research_queue_drain_quota,
     _edge_threshold_for_market,
     _event_concentration_blocked,
     _event_side_conflict_blocked,
@@ -97,16 +99,16 @@ class DummyGrokClient:
         self.deep_decision = deep_decision or decision
         self.deep_calls = 0
 
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         return self.decision
 
-    def analyze_market_deep(self, market, previous_analysis=None, search_config=None):
+    def analyze_market_deep(self, market, previous_analysis=None, search_config=None, **kwargs):
         self.deep_calls += 1
         return self.deep_decision
 
 
 class FailingGrokClient:
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         raise RuntimeError("StatusCode.INTERNAL: internal server error")
 
 
@@ -115,7 +117,7 @@ class RecordingGrokClient:
         self.decision = decision
         self.last_search_config = None
 
-    def analyze_market(self, market, search_config=None, previous_analysis=None):
+    def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
         self.last_search_config = search_config
         return self.decision
 
@@ -1211,6 +1213,22 @@ class TestMainUtils(unittest.TestCase):
         self.assertFalse(applied)
         self.assertFalse(neg_floor)
 
+    def test_resolve_dynamic_analysis_candidate_cap_reduces_after_zero_yield_streak(self) -> None:
+        settings = Settings(
+            MAX_MARKETS_PER_CYCLE=20,
+            PRE_ANALYSIS_MUST_ANALYZE_THRESHOLD=0.50,
+            PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=8,
+            CYCLE_YIELD_ALERT_ESCALATE_AFTER=4,
+        )
+        cap, applied, neg_floor = _resolve_dynamic_analysis_candidate_cap(
+            settings=settings,
+            best_pre_analysis_score=0.90,
+            consecutive_zero_execution_yield_cycles=4,
+        )
+        self.assertEqual(cap, 8)
+        self.assertTrue(applied)
+        self.assertFalse(neg_floor)
+
     def test_resolve_dynamic_analysis_candidate_cap_negative_floor_applied(self) -> None:
         settings = Settings(
             MAX_MARKETS_PER_CYCLE=6,
@@ -1249,6 +1267,22 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(
             [entry["market_id"] for entry in ordered],
             ["KXCLOSE", "KXMANY", "KXONCE"],
+        )
+
+    def test_zero_yield_drought_limits_queue_drain_to_diagnostic_probe(self) -> None:
+        self.assertEqual(
+            _effective_research_queue_drain_quota(
+                configured_quota=8,
+                sustained_zero_yield=True,
+            ),
+            1,
+        )
+        self.assertEqual(
+            _effective_research_queue_drain_quota(
+                configured_quota=8,
+                sustained_zero_yield=False,
+            ),
+            8,
         )
 
     def test_research_queue_recent_drain_attempt_respects_cooldown(self) -> None:
@@ -1860,9 +1894,34 @@ class TestMainUtils(unittest.TestCase):
             DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.25,
         )
 
-        self.assertEqual(_daily_expectancy_role(settings=settings, opportunity_rank=1), ("primary_target", None))
-        self.assertEqual(_daily_expectancy_role(settings=settings, opportunity_rank=2), ("primary_target", None))
-        self.assertEqual(_daily_expectancy_role(settings=settings, opportunity_rank=3), ("satellite", 0.25))
+        self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=0), ("primary_target", None))
+        self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=1), ("primary_target", None))
+        self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=2), ("satellite", 0.25))
+
+    def test_daily_expectancy_ev_blocks_non_positive_primary_and_unfunded_satellite(self) -> None:
+        self.assertEqual(
+            _daily_expectancy_ev_block_reason(
+                opportunity_role="primary_target",
+                expected_value_usdc=-0.01,
+                projected_daily_ev_after_usdc=-0.01,
+            ),
+            "daily_expectancy_primary_ev_blocked",
+        )
+        self.assertEqual(
+            _daily_expectancy_ev_block_reason(
+                opportunity_role="satellite",
+                expected_value_usdc=-0.25,
+                projected_daily_ev_after_usdc=0.0,
+            ),
+            "daily_expectancy_satellite_ev_blocked",
+        )
+        self.assertIsNone(
+            _daily_expectancy_ev_block_reason(
+                opportunity_role="satellite",
+                expected_value_usdc=-0.25,
+                projected_daily_ev_after_usdc=0.10,
+            )
+        )
 
     def test_filter_markets_populates_skip_counters(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2246,7 +2305,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual([item["market"].id for item in capped], ["c2", "c1", "s1", "p1"])
         self.assertIn("selection_rank_components", capped[0])
 
-    def test_cap_analysis_candidates_prioritizes_research_queue_score_promotions(self) -> None:
+    def test_cap_analysis_candidates_score_promotions_do_not_displace_stronger_candidates(self) -> None:
         candidates = [
             {
                 "market": Market(id="normal-high", question="Normal high", category="sports"),
@@ -2265,7 +2324,7 @@ class TestMainUtils(unittest.TestCase):
 
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
 
-        self.assertEqual([item["market"].id for item in capped], ["score-promo", "normal-high"])
+        self.assertEqual([item["market"].id for item in capped], ["normal-high", "normal-mid"])
 
     def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
         candidates = [

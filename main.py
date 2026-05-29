@@ -1346,7 +1346,7 @@ def _decision_outcome_probability(
 def _daily_expectancy_role(
     *,
     settings: Settings,
-    opportunity_rank: int,
+    daily_exposure_count: int,
 ) -> tuple[str, float | None]:
     if not getattr(settings, "DAILY_EXPECTANCY_ENABLED", True):
         return "standard", None
@@ -1354,7 +1354,8 @@ def _daily_expectancy_role(
         0,
         int(getattr(settings, "DAILY_EXPECTANCY_PRIMARY_TARGETS", 2) or 0),
     )
-    if max(1, int(opportunity_rank)) <= primary_target_limit:
+    opportunity_rank = max(0, int(daily_exposure_count)) + 1
+    if opportunity_rank <= primary_target_limit:
         return "primary_target", None
     satellite_cap_pct = max(
         0.0,
@@ -1364,6 +1365,21 @@ def _daily_expectancy_role(
         ),
     )
     return "satellite", satellite_cap_pct
+
+
+def _daily_expectancy_ev_block_reason(
+    *,
+    opportunity_role: str,
+    expected_value_usdc: float | None,
+    projected_daily_ev_after_usdc: float,
+) -> str | None:
+    if opportunity_role == "primary_target":
+        if expected_value_usdc is None or expected_value_usdc <= 0.0:
+            return "daily_expectancy_primary_ev_blocked"
+    elif opportunity_role == "satellite":
+        if expected_value_usdc is None or projected_daily_ev_after_usdc <= 0.0:
+            return "daily_expectancy_satellite_ev_blocked"
+    return None
 
 
 def _edge_threshold_for_market(
@@ -4325,6 +4341,12 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
             if hasattr(score_result, "final_score")
             else None
         ),
+        "proxy_penalty_reduction_reason": str(
+            getattr(score_result, "proxy_penalty_reduction_reason", "") or ""
+        ),
+        "family_conditional_bonus_applied": bool(
+            getattr(score_result, "family_conditional_bonus_applied", False)
+        ),
     }
 
 
@@ -4443,6 +4465,7 @@ def _score_kwargs(
     historical_prefix_sample_size: int = 0,
     source_match_class: str = "",
     primary_source_url_present: bool = False,
+    self_consistency_passed: bool = False,
 ) -> dict[str, Any]:
     return {
         "is_weather_market": is_weather_market,
@@ -4496,7 +4519,54 @@ def _score_kwargs(
         "historical_prefix_sample_size": historical_prefix_sample_size,
         "source_match_class": source_match_class,
         "primary_source_url_present": primary_source_url_present,
+        "proxy_penalty_convergent_reduction_enabled": (
+            settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED
+        ),
+        "historical_family_high_conf_loss_relax_threshold": (
+            settings.HISTORICAL_FAMILY_HIGH_CONF_LOSS_RELAX_THRESHOLD
+        ),
+        "historical_family_boost_evidence_min": (
+            settings.HISTORICAL_FAMILY_BOOST_EVIDENCE_MIN
+        ),
+        "historical_family_loss_drag_scale": settings.HISTORICAL_FAMILY_LOSS_DRAG_SCALE,
+        "historical_family_loss_drag_sample_min": (
+            settings.HISTORICAL_FAMILY_LOSS_DRAG_SAMPLE_MIN
+        ),
+        "self_consistency_passed": self_consistency_passed,
     }
+
+
+def _family_context_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "historical_family_pnl_total": candidate.get("historical_family_pnl_total"),
+        "historical_family_sample_size": candidate.get("historical_family_sample_size"),
+        "historical_family_win_rate": candidate.get("historical_family_win_rate"),
+        "historical_family_deployed_usdc": candidate.get("historical_family_deployed_usdc"),
+        "historical_family_high_conf_losses": candidate.get(
+            "historical_family_high_conf_losses"
+        ),
+    }
+
+
+def _family_is_profitable_from_context(context: dict[str, Any] | None) -> bool:
+    if not context:
+        return False
+    return (
+        float(context.get("historical_family_pnl_total", 0.0) or 0.0) > 0.0
+        and int(context.get("historical_family_sample_size", 0) or 0) >= 20
+    )
+
+
+def _decision_self_consistency_passed(decision: TradeDecision) -> bool:
+    combined = " ".join(
+        part
+        for part in (
+            decision.reasoning or "",
+            decision.self_critique or "",
+        )
+        if part
+    ).lower()
+    return "self_consistency_agreement" in combined
 
 
 def _effective_score_gate_threshold(
@@ -4505,11 +4575,22 @@ def _effective_score_gate_threshold(
     market: Market,
     evidence_basis_class: str,
     evidence_quality: float = 0.0,
+    family_is_profitable: bool = False,
+    self_consistency_passed: bool = False,
+    family_sample_size: int = 0,
 ) -> float:
     if market_family(market) == "weather" and evidence_basis_class == "direct":
         return settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT
     if evidence_basis_class == "direct" and evidence_quality >= 0.80:
         return settings.SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY
+    if (
+        settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED
+        and family_is_profitable
+        and self_consistency_passed
+        and evidence_quality >= 0.48
+        and family_sample_size >= settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES
+    ):
+        return settings.SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT
     return settings.SCORE_GATE_THRESHOLD
 
 
@@ -4808,6 +4889,7 @@ def _analyze_market_candidate_via_thread_local_client(
     correlation_id: str | None = None,
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
+    family_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Worker entry point that reuses one GrokClient per worker thread."""
     grok_client = _get_or_create_worker_grok_client(settings, provider)
@@ -4821,6 +4903,7 @@ def _analyze_market_candidate_via_thread_local_client(
         correlation_id=correlation_id,
         force_extended_research=force_extended_research,
         research_queue_context=research_queue_context,
+        family_context=family_context,
     )
 
 
@@ -4834,6 +4917,7 @@ def _analyze_market_candidate_for_worker(
     correlation_id: str | None = None,
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
+    family_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Worker-safe wrapper that restores cycle correlation context."""
     if correlation_id:
@@ -4847,6 +4931,7 @@ def _analyze_market_candidate_for_worker(
         historical_confidence_buckets=historical_confidence_buckets,
         force_extended_research=force_extended_research,
         research_queue_context=research_queue_context,
+        family_context=family_context,
     )
 
 
@@ -5080,7 +5165,9 @@ def _pre_analysis_opportunity_score(
         and historical_family_pnl > abs(float(settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PNL_THRESHOLD))
         and historical_family_win_rate >= 0.55
     ):
-        historical_profit_bonus = _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS
+        historical_profit_bonus = float(
+            settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS
+        )
     source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(family, 0.0)
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
@@ -5448,15 +5535,14 @@ def _cap_analysis_candidates(
         }
         candidate["selection_rank_score"] = round(risk_adjusted_score, 4)
         candidate["selection_rank_components"] = selection_components
-        # Research-queue drain probes and score-promoted near-misses rank ahead
-        # of normal candidates so queue work that has improved is not dropped by
-        # the per-cycle cap after it finally becomes actionable.
+        # Keep one explicit drain probe eligible for diagnosis. Score-promoted
+        # queue entries already receive their research_queue_bump in the base
+        # score and must compete with fresh candidates on quality; otherwise a
+        # backlog of near misses can displace substantially stronger setups.
         if candidate.get("is_research_queue_drain_probe"):
             drain_probe_priority = 0
-        elif candidate.get("is_research_queue_score_promotion"):
-            drain_probe_priority = 1
         else:
-            drain_probe_priority = 2
+            drain_probe_priority = 1
         ranked_candidates.append(
             (
                 (
@@ -5536,6 +5622,7 @@ def _resolve_dynamic_analysis_candidate_cap(
     *,
     settings: Settings,
     best_pre_analysis_score: float,
+    consecutive_zero_execution_yield_cycles: int = 0,
 ) -> tuple[int, bool, bool]:
     """Return (cap, reduced_applied, negative_score_floor_applied)."""
     dynamic_max_markets_per_cycle = settings.MAX_MARKETS_PER_CYCLE
@@ -5551,7 +5638,29 @@ def _resolve_dynamic_analysis_candidate_cap(
             max(1, settings.PRE_ANALYSIS_REDUCED_MAX_CANDIDATES),
         )
         reduced_candidate_cap_applied = True
+    if (
+        settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+        and consecutive_zero_execution_yield_cycles
+        >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+    ):
+        dynamic_max_markets_per_cycle = min(
+            dynamic_max_markets_per_cycle,
+            max(1, settings.PRE_ANALYSIS_REDUCED_MAX_CANDIDATES),
+        )
+        reduced_candidate_cap_applied = True
     return dynamic_max_markets_per_cycle, reduced_candidate_cap_applied, negative_score_floor_applied
+
+
+def _effective_research_queue_drain_quota(
+    *,
+    configured_quota: int,
+    sustained_zero_yield: bool,
+) -> int:
+    """Keep queue re-analysis diagnostic during a proven execution drought."""
+    quota = max(0, int(configured_quota))
+    if sustained_zero_yield:
+        return min(quota, 1)
+    return quota
 
 
 def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, str, str]:
@@ -5737,10 +5846,12 @@ def _analyze_market_candidate(
     historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
+    family_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run analysis/refinement/guardrails for a market candidate."""
     previous_analysis = _build_previous_analysis(anchor_analysis)
     analysis_market = _market_with_research_queue_context(market, research_queue_context)
+    family_is_profitable = _family_is_profitable_from_context(family_context)
     search_config = build_market_search_config(settings, analysis_market)
     used_extended_research = bool(force_extended_research)
     if used_extended_research:
@@ -5753,6 +5864,7 @@ def _analyze_market_candidate(
             analysis_market,
             search_config=search_config,
             previous_analysis=previous_analysis,
+            family_is_profitable=family_is_profitable,
         )
     except Exception as exc:
         error_text = str(exc)
@@ -5825,6 +5937,7 @@ def _analyze_market_candidate(
                 analysis_market,
                 previous_analysis=repair_previous,
                 search_config=repair_search_config,
+                family_is_profitable=family_is_profitable,
             )
             decision = repaired_decision
             was_refined = True
@@ -5887,12 +6000,78 @@ def _analyze_market_candidate(
         if implied_prob_for_refine is not None
         else decision.edge_external
     )
+    pre_execution_score_for_refine: float | None = None
+    score_threshold_for_refine: float | None = None
+    borderline_critique_refinement_triggered = False
+    if family_context is not None:
+        implied_prob_pre_score = implied_prob_for_refine
+        evidence_basis_pre = _decision_evidence_basis(decision)
+        pre_score_result = compute_final_score(
+            market=market,
+            decision=decision,
+            implied_prob_market=implied_prob_pre_score,
+            **_score_kwargs(
+                settings=settings,
+                repeated_analysis_count=int(
+                    state.analysis_count if state and state.analysis_count is not None else 0
+                ),
+                non_actionable_streak=int(
+                    state.non_actionable_streak
+                    if state and state.non_actionable_streak is not None
+                    else 0
+                ),
+                is_weather_market=(market_family(market) == "weather"),
+                evidence_basis_class=evidence_basis_pre,
+                edge_source=decision.edge_source or "",
+                market_family=market_family(market),
+                historical_family_pnl_total=float(
+                    family_context.get("historical_family_pnl_total", 0.0) or 0.0
+                ),
+                historical_family_sample_size=int(
+                    family_context.get("historical_family_sample_size", 0) or 0
+                ),
+                historical_family_win_rate=float(
+                    family_context.get("historical_family_win_rate", 0.0) or 0.0
+                ),
+                historical_family_deployed_usdc=float(
+                    family_context.get("historical_family_deployed_usdc", 0.0) or 0.0
+                ),
+                historical_family_high_conf_losses=int(
+                    family_context.get("historical_family_high_conf_losses", 0) or 0
+                ),
+                source_match_class=str(
+                    getattr(decision, "source_match_class", "") or ""
+                ),
+                primary_source_url_present=bool(
+                    str(getattr(decision, "primary_source_url", "") or "").strip()
+                ),
+                self_consistency_passed=_decision_self_consistency_passed(decision),
+            ),
+        )
+        pre_execution_score_for_refine = pre_score_result.final_score
+        score_threshold_for_refine = _effective_score_gate_threshold(
+            settings=settings,
+            market=market,
+            evidence_basis_class=evidence_basis_pre,
+            evidence_quality=decision.evidence_quality,
+            family_is_profitable=family_is_profitable,
+            self_consistency_passed=_decision_self_consistency_passed(decision),
+            family_sample_size=int(
+                (family_context or {}).get("historical_family_sample_size", 0) or 0
+            ),
+        )
     refinement_reasons = refinement.get_refinement_reasons(
         decision,
         state,
         implied_prob=implied_prob_for_refine,
         evidence_quality=decision.evidence_quality,
         edge_value=edge_for_refine,
+        settings=settings,
+        pre_execution_score=pre_execution_score_for_refine,
+        score_threshold=score_threshold_for_refine,
+    )
+    borderline_critique_refinement_triggered = (
+        "borderline_pre_execution_score" in refinement_reasons
     )
     if anchor_outcome and not _outcomes_match(decision.outcome, anchor_outcome):
         if "side_flip_vs_anchor" not in refinement_reasons:
@@ -5948,6 +6127,8 @@ def _analyze_market_candidate(
                 analysis_market,
                 decision,
                 search_config=refinement_search_config,
+                refinement_reasons=refinement_reasons,
+                family_is_profitable=family_is_profitable,
             )
             was_refined = True
 
@@ -6076,6 +6257,12 @@ def _analyze_market_candidate(
         "confidence_history_gap_applied": confidence_history_gap_applied,
         "historical_confidence_shrink_applied": confidence_history_gap_applied > 0.0,
         "definitive_outcome_for_calibration": definitive_outcome_for_calibration,
+        "borderline_critique_refinement_triggered": borderline_critique_refinement_triggered,
+        "code_execution_used": bool(getattr(decision, "code_execution_used", False)),
+        "evidence_quality_floor_applied": getattr(
+            decision, "evidence_quality_floor_applied", None
+        ),
+        "family_is_profitable": family_is_profitable,
     }
 
 
@@ -6161,6 +6348,8 @@ def main(max_cycles: int | None = None) -> None:
     cycle_count = 0
     current_trade_day = datetime.now(timezone.utc).date()
     daily_trade_count = 0
+    daily_expectancy_exposure_count = 0
+    daily_projected_expected_value_usdc = 0.0
     daily_start_balance: float | None = None
     cumulative_api_cost_estimate_usd = 0.0
     consecutive_zero_order_cycles = 0
@@ -6294,9 +6483,41 @@ def main(max_cycles: int | None = None) -> None:
             if cycle_trade_day != current_trade_day:
                 current_trade_day = cycle_trade_day
                 daily_trade_count = 0
+                daily_expectancy_exposure_count = 0
+                daily_projected_expected_value_usdc = 0.0
                 daily_start_balance = cycle_bankroll
             elif daily_start_balance is None and cycle_bankroll is not None:
                 daily_start_balance = cycle_bankroll
+            try:
+                (
+                    persisted_daily_trade_count,
+                    persisted_daily_expectancy_exposure_count,
+                    persisted_daily_expected_value_usdc,
+                ) = state_manager.get_daily_order_attempt_summary(
+                    since=datetime.combine(
+                        cycle_trade_day,
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    ),
+                    include_dry_run=settings.DRY_RUN,
+                )
+                daily_trade_count = max(
+                    daily_trade_count,
+                    persisted_daily_trade_count,
+                )
+                daily_expectancy_exposure_count = max(
+                    daily_expectancy_exposure_count,
+                    persisted_daily_expectancy_exposure_count,
+                )
+                daily_projected_expected_value_usdc = (
+                    persisted_daily_expected_value_usdc
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Daily execution summary lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
             if (
                 settings.POSITION_SYNC_ENABLED
                 and settings.POSITION_SYNC_INTERVAL_CYCLES > 0
@@ -6402,7 +6623,7 @@ def main(max_cycles: int | None = None) -> None:
             trades_skipped_position = 0
             cycle_definitive_overrides_applied = 0
             trades_skipped_kelly_sub_floor = 0
-            cycle_projected_daily_ev_usdc = 0.0
+            cycle_projected_daily_ev_usdc = daily_projected_expected_value_usdc
             cycle_primary_targets_selected = 0
             cycle_satellites_selected = 0
             scheduler_skipped_closed = 0
@@ -6891,6 +7112,23 @@ def main(max_cycles: int | None = None) -> None:
                             normalized_outcome
                         )
 
+            def _credit_daily_expectancy_exposure(
+                *,
+                opportunity_role: str,
+                expected_value_usdc: float | None,
+            ) -> None:
+                nonlocal daily_expectancy_exposure_count
+                nonlocal cycle_projected_daily_ev_usdc
+                nonlocal cycle_primary_targets_selected
+                nonlocal cycle_satellites_selected
+                daily_expectancy_exposure_count += 1
+                if expected_value_usdc is not None:
+                    cycle_projected_daily_ev_usdc += float(expected_value_usdc)
+                if opportunity_role == "primary_target":
+                    cycle_primary_targets_selected += 1
+                elif opportunity_role == "satellite":
+                    cycle_satellites_selected += 1
+
             traded_market_ids: set[str] = set()
             try:
                 traded_market_ids = set(state_manager.get_traded_market_ids())
@@ -7036,26 +7274,44 @@ def main(max_cycles: int | None = None) -> None:
                     for m in markets
                     if isinstance(m, Market)
                 }
-                # Over-fetch beyond the per-cycle drain limit so the priority
-                # filter, stale-market filter, and recent-attempt rotation don't
-                # starve the per-cycle quota.
-                drain_pool_limit = max(
-                    1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE * 12
-                )
                 _drain_min_priority = max(
                     0.0, float(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY)
                 )
-                drain_per_cycle_quota = max(
-                    1, settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE
+                last_24h_realized_pnl = state_manager.get_exchange_realized_pnl_since_hours(
+                    24.0
+                )
+                adaptive_zero_yield_drought = (
+                    consecutive_zero_execution_yield_cycles >= 5
+                    or last_24h_realized_pnl < 0.0
                 )
                 zero_yield_eligible = (
-                    settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
-                    and consecutive_zero_execution_yield_cycles
-                    >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                    (
+                        settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER > 0
+                        and consecutive_zero_execution_yield_cycles
+                        >= settings.CYCLE_YIELD_ALERT_ESCALATE_AFTER
+                    )
+                    or adaptive_zero_yield_drought
                 )
-                zero_yield_target = max(
-                    0,
-                    int(getattr(settings, "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS", 0) or 0),
+                drain_per_cycle_quota = _effective_research_queue_drain_quota(
+                    configured_quota=settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE,
+                    sustained_zero_yield=zero_yield_eligible,
+                )
+                # Over-fetch beyond the quota so priority/cooldown filters do
+                # not starve the single diagnostic probe retained in a drought.
+                drain_pool_limit = max(1, drain_per_cycle_quota * 12)
+                zero_yield_target = min(
+                    drain_per_cycle_quota,
+                    max(
+                        0,
+                        int(
+                            getattr(
+                                settings,
+                                "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS",
+                                0,
+                            )
+                            or 0
+                        ),
+                    ),
                 )
                 zero_yield_reserved_slots = (
                     min(zero_yield_target, drain_per_cycle_quota)
@@ -8384,6 +8640,9 @@ def main(max_cycles: int | None = None) -> None:
             ) = _resolve_dynamic_analysis_candidate_cap(
                 settings=settings,
                 best_pre_analysis_score=best_pre_analysis_score,
+                consecutive_zero_execution_yield_cycles=(
+                    consecutive_zero_execution_yield_cycles
+                ),
             )
             if negative_score_floor_applied:
                 negative_best_score_skipped_count += 1
@@ -8796,6 +9055,7 @@ def main(max_cycles: int | None = None) -> None:
                                 cycle_id,
                                 bool(candidate.get("force_extended_research")),
                                 candidate.get("research_queue_drain_entry"),
+                                _family_context_from_candidate(candidate),
                             )
                             future_to_market[future] = candidate["market"]
 
@@ -8943,6 +9203,7 @@ def main(max_cycles: int | None = None) -> None:
                             research_queue_context=candidate.get(
                                 "research_queue_drain_entry"
                             ),
+                            family_context=_family_context_from_candidate(candidate),
                         )
                         analysis_results[market.id] = result
                         if result.get("analysis_failed"):
@@ -9188,6 +9449,9 @@ def main(max_cycles: int | None = None) -> None:
                         primary_source_url_present=bool(
                             str(getattr(decision, "primary_source_url", "") or "").strip()
                         ),
+                        self_consistency_passed=_decision_self_consistency_passed(
+                            decision
+                        ),
                     ),
                 )
                 analysis_result["historical_family_win_rate"] = float(
@@ -9234,6 +9498,10 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     "source_alignment_bonus": rank_score.source_alignment_bonus,
                     "proxy_penalty_reduced": rank_score.proxy_penalty_reduced,
+                    "proxy_penalty_reduction_reason": rank_score.proxy_penalty_reduction_reason,
+                    "family_conditional_bonus_applied": (
+                        rank_score.family_conditional_bonus_applied
+                    ),
                     "ambiguous_resolution_penalty": rank_score.ambiguous_resolution_penalty,
                 }
 
@@ -9658,6 +9926,16 @@ def main(max_cycles: int | None = None) -> None:
                     "edge_repair_unresolved_reason": analysis_result.get(
                         "edge_repair_unresolved_reason"
                     ),
+                    "borderline_critique_refinement_triggered": bool(
+                        analysis_result.get("borderline_critique_refinement_triggered", False)
+                    ),
+                    "code_execution_used": bool(
+                        analysis_result.get("code_execution_used", False)
+                        or getattr(decision, "code_execution_used", False)
+                    ),
+                    "family_is_profitable": bool(
+                        analysis_result.get("family_is_profitable", False)
+                    ),
                     "research_only": bool(candidate.get("research_only", False)),
                     "research_queue_drain_probe": bool(
                         candidate.get("is_research_queue_drain_probe", False)
@@ -9809,6 +10087,15 @@ def main(max_cycles: int | None = None) -> None:
                     market=market,
                     evidence_basis_class=evidence_basis,
                     evidence_quality=decision.evidence_quality,
+                    family_is_profitable=_family_is_profitable_from_context(
+                        _family_context_from_candidate(candidate)
+                    ),
+                    self_consistency_passed=_decision_self_consistency_passed(
+                        decision
+                    ),
+                    family_sample_size=int(
+                        candidate.get("historical_family_sample_size", 0) or 0
+                    ),
                 )
                 conviction_repair_diagnostics: dict[str, Any] = {}
                 conviction_repair_reason = _conviction_repair_reason(
@@ -9985,6 +10272,9 @@ def main(max_cycles: int | None = None) -> None:
                                     str(
                                         getattr(decision, "primary_source_url", "") or ""
                                     ).strip()
+                                ),
+                                self_consistency_passed=_decision_self_consistency_passed(
+                                    decision
                                 ),
                             ),
                         )
@@ -11064,6 +11354,34 @@ def main(max_cycles: int | None = None) -> None:
                     if exec_pfx_n > 0
                     else None
                 )
+                # Compute the LMSR execution price + inefficiency signal up front
+                # (using a nominal max-bet quantity) so the score gate actually
+                # sees the mispricing signal. Previously these were computed only
+                # after sizing, so compute_final_score always received None and
+                # the inefficiency/lmsr score components were dead. With the
+                # configured liquidity parameter the nominal vs. final-sized
+                # execution price are effectively identical; the precise
+                # post-sizing recompute below still drives the LMSR execution gate.
+                if settings.LMSR_ENABLED:
+                    lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
+                        market=market,
+                        decision_outcome=decision_for_edge.outcome,
+                        amount_usdc=settings.MAX_BET_USDC,
+                        settings=settings,
+                    )
+                    if lmsr_execution_price is not None:
+                        posterior_for_signal = (
+                            bayesian_posterior_applied
+                            if bayesian_posterior_applied is not None
+                            else effective_confidence
+                        )
+                        try:
+                            ineff_signal = lmsr_inefficiency_signal(
+                                posterior_for_signal,
+                                lmsr_execution_price,
+                            )
+                        except ValueError:
+                            ineff_signal = None
                 score_result = compute_final_score(
                     market=market,
                     decision=decision_for_edge,
@@ -11114,6 +11432,9 @@ def main(max_cycles: int | None = None) -> None:
                                 getattr(decision_for_edge, "primary_source_url", "") or ""
                             ).strip()
                         ),
+                        self_consistency_passed=_decision_self_consistency_passed(
+                            decision_for_edge
+                        ),
                     ),
                 )
                 runtime_score_evaluation_count += 1
@@ -11129,6 +11450,12 @@ def main(max_cycles: int | None = None) -> None:
                 audit_context["historical_family_bonus_applied"] = bool(
                     float(getattr(score_result, "historical_family_bonus", 0.0) or 0.0) > 0.0
                 )
+                audit_context["family_conditional_bonus_applied"] = bool(
+                    getattr(score_result, "family_conditional_bonus_applied", False)
+                )
+                audit_context["proxy_penalty_reduction_reason"] = str(
+                    getattr(score_result, "proxy_penalty_reduction_reason", "") or ""
+                )
                 audit_context["source_confirmed_edge"] = bool(
                     getattr(score_result, "source_confirmed_edge", False)
                 )
@@ -11141,6 +11468,15 @@ def main(max_cycles: int | None = None) -> None:
                     market=market,
                     evidence_basis_class=evidence_basis,
                     evidence_quality=decision_for_edge.evidence_quality,
+                    family_is_profitable=_family_is_profitable_from_context(
+                        _family_context_from_candidate(candidate)
+                    ),
+                    self_consistency_passed=_decision_self_consistency_passed(
+                        decision_for_edge
+                    ),
+                    family_sample_size=int(
+                        candidate.get("historical_family_sample_size", 0) or 0
+                    ),
                 )
                 score_gate_critical_reasons = _score_gate_critical_rejection_reasons(
                     rejection_reasons=score_result.rejection_reasons,
@@ -11566,6 +11902,12 @@ def main(max_cycles: int | None = None) -> None:
                     continue
 
                 proposed_bet_amount = _calculate_bet(settings.MAX_BET_USDC, adjusted_bet_pct)
+                # Precise post-sizing recompute of the LMSR execution price for the
+                # mispricing gate. The pre-gate computation above already fed the
+                # score; this re-derives it with the actual proposed bet amount.
+                # With the configured liquidity parameter this is a mispricing
+                # check (|posterior - market_price|); LMSR_MIN_INEFFICIENCY is kept
+                # below the edge gate so it is a light floor, not a double-block.
                 if settings.LMSR_ENABLED:
                     lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
                         market=market,
@@ -11645,12 +11987,12 @@ def main(max_cycles: int | None = None) -> None:
                         continue
 
                 opportunity_role = "standard"
-                opportunity_rank = execution_candidates + 1
+                opportunity_rank = daily_expectancy_exposure_count + 1
                 satellite_cap_pct: float | None = None
                 if getattr(settings, "DAILY_EXPECTANCY_ENABLED", True):
                     opportunity_role, satellite_cap_pct = _daily_expectancy_role(
                         settings=settings,
-                        opportunity_rank=opportunity_rank,
+                        daily_exposure_count=daily_expectancy_exposure_count,
                     )
                     if (
                         opportunity_role == "satellite"
@@ -11924,16 +12266,19 @@ def main(max_cycles: int | None = None) -> None:
                 audit_context["expected_value_usdc"] = expected_value_usdc
                 audit_context["daily_expected_value_before_usdc"] = daily_ev_before
                 audit_context["daily_expected_value_after_usdc"] = daily_ev_after
-                if (
-                    getattr(settings, "DAILY_EXPECTANCY_ENABLED", True)
-                    and opportunity_role == "satellite"
-                    and (expected_value_usdc is None or daily_ev_after <= 0.0)
-                ):
+                daily_expectancy_block_reason = None
+                if getattr(settings, "DAILY_EXPECTANCY_ENABLED", True):
+                    daily_expectancy_block_reason = _daily_expectancy_ev_block_reason(
+                        opportunity_role=opportunity_role,
+                        expected_value_usdc=expected_value_usdc,
+                        projected_daily_ev_after_usdc=daily_ev_after,
+                    )
+                if daily_expectancy_block_reason is not None:
                     trades_skipped_edge += 1
-                    _record_should_trade_blocked("daily_expectancy_satellite_ev_blocked")
+                    _record_should_trade_blocked(daily_expectancy_block_reason)
                     _record_rejection_reason(
                         rejection_breakdown,
-                        "daily_expectancy_satellite_ev_blocked",
+                        daily_expectancy_block_reason,
                     )
                     log_trade_decision(
                         market_id=market.id,
@@ -11945,7 +12290,7 @@ def main(max_cycles: int | None = None) -> None:
                             decision_phase="post_daily_expectancy",
                             decision_terminal=True,
                             final_action="skip",
-                            final_reason="daily_expectancy_satellite_ev_blocked",
+                            final_reason=daily_expectancy_block_reason,
                             bet_amount_usdc=bet_amount,
                             **audit_context,
                         ),
@@ -11953,7 +12298,7 @@ def main(max_cycles: int | None = None) -> None:
                     _record_terminal_outcome(
                         state_manager,
                         market.id,
-                        "daily_expectancy_satellite_ev_blocked",
+                        daily_expectancy_block_reason,
                     )
                     continue
                 if (
@@ -11990,12 +12335,6 @@ def main(max_cycles: int | None = None) -> None:
                         "daily_expectancy_satellite_cap_blocked",
                     )
                     continue
-                cycle_projected_daily_ev_usdc = daily_ev_after
-                if opportunity_role == "primary_target":
-                    cycle_primary_targets_selected += 1
-                elif opportunity_role == "satellite":
-                    cycle_satellites_selected += 1
-
                 # Skip order placement if in analysis-only mode (insufficient balance)
                 if analysis_only_mode:
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
@@ -12073,6 +12412,11 @@ def main(max_cycles: int | None = None) -> None:
                         market.id,
                         decision_for_edge.outcome,
                     )
+                    _credit_daily_expectancy_exposure(
+                        opportunity_role=opportunity_role,
+                        expected_value_usdc=expected_value_usdc,
+                    )
+                    audit_context["daily_expectancy_ev_credited"] = True
                     family_stats = execution_family_stats.setdefault(
                         market_family_name,
                         {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
@@ -12814,6 +13158,7 @@ def main(max_cycles: int | None = None) -> None:
                         market.id,
                         decision_for_edge.outcome,
                     )
+                    audit_context["daily_expectancy_ev_credited"] = False
                     family_stats = execution_family_stats.setdefault(
                         market_family_name,
                         {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
@@ -12866,6 +13211,7 @@ def main(max_cycles: int | None = None) -> None:
                         market.id,
                         decision_for_edge.outcome,
                     )
+                    audit_context["daily_expectancy_ev_credited"] = False
                     family_stats = execution_family_stats.setdefault(
                         market_family_name,
                         {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
@@ -13008,12 +13354,18 @@ def main(max_cycles: int | None = None) -> None:
                     state_manager.increment_fill_failure_count(market.id)
                     final_reason = "order_canceled_unfilled"
                     terminal_outcome = "order_canceled_unfilled"
+                    audit_context["daily_expectancy_ev_credited"] = False
                 else:
                     trades_filled += 1
                     total_usd_deployed += bet_amount
                     family_stats["orders_filled"] += 1
                     family_stats["usd_deployed"] += bet_amount
                     state_manager.reset_fill_failure_count(market.id)
+                    _credit_daily_expectancy_exposure(
+                        opportunity_role=opportunity_role,
+                        expected_value_usdc=expected_value_usdc,
+                    )
+                    audit_context["daily_expectancy_ev_credited"] = True
                     if last_known_balance is not None:
                         last_known_balance = max(0.0, float(last_known_balance) - float(bet_amount))
                 _refresh_last_known_balance()

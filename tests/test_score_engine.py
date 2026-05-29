@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from models import Market, MarketOutcome, TradeDecision
-from score_engine import calibrate_confidence, compute_final_score
+from score_engine import (
+    _BAYESIAN_COMPONENT_WEIGHT,
+    _INEFFICIENCY_COMPONENT_WEIGHT,
+    _KELLY_COMPONENT_WEIGHT,
+    calibrate_confidence,
+    compute_final_score,
+)
 
 
 def test_compute_final_score_higher_with_edge_and_evidence() -> None:
@@ -860,6 +866,40 @@ def test_compute_final_score_uses_kelly_and_inefficiency_signals() -> None:
     assert boosted.final_score > baseline.final_score
     assert boosted.kelly_component > 0
     assert boosted.inefficiency_component > 0
+
+
+def test_compute_final_score_edge_signal_component_weights() -> None:
+    market = Market(
+        id="m6w",
+        question="Test",
+        outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.66,
+        bet_size_pct=0.4,
+        reasoning="test",
+        edge_external=0.09,
+        evidence_quality=0.75,
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.45,
+        bayesian_posterior=0.72,
+        inefficiency_signal=0.18,
+        kelly_raw=0.35,
+    )
+    assert result.kelly_component == pytest.approx(_KELLY_COMPONENT_WEIGHT * 0.35)
+    assert result.inefficiency_component == pytest.approx(
+        _INEFFICIENCY_COMPONENT_WEIGHT * 0.18
+    )
+    assert result.bayesian_component == pytest.approx(
+        _BAYESIAN_COMPONENT_WEIGHT * (0.72 - 0.5)
+    )
 
 
 def test_compute_final_score_applies_weather_uncertainty_penalty() -> None:
@@ -2132,4 +2172,170 @@ def test_high_edge_calibration_penalty_exempts_direct_definitive() -> None:
         evidence_basis_class="direct",
     )
     assert result.high_edge_calibration_penalty == 0.0
+
+
+def test_proxy_penalty_convergent_reduction_for_family_and_self_consistency() -> None:
+    market = Market(
+        id="KXSPORTS-TEST",
+        question="Sports edge test",
+        outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        liquidity_usdc=800.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=6),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.72,
+        bet_size_pct=0.4,
+        reasoning="No external odds found for this prop.",
+        edge_external=0.10,
+        edge_source="fallback",
+        evidence_quality=0.62,
+        evidence_basis="proxy",
+    )
+    score = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        edge_source="fallback",
+        evidence_basis_class="proxy",
+        proxy_penalty_convergent_reduction_enabled=True,
+        self_consistency_passed=True,
+        historical_family_pnl_total=25.0,
+        historical_family_sample_size=30,
+        historical_family_win_rate=0.58,
+    )
+    assert score.proxy_penalty_reduced is True
+    assert score.proxy_penalty_reduction_reason == "self_consistency_plus_family"
+    assert score.proxy_evidence_penalty < 0.11
+
+
+def test_sports_family_conditional_bonus_relaxes_high_conf_loss_threshold() -> None:
+    market = Market(
+        id="KXMLB-TEST",
+        question="MLB prop",
+        outcomes=[MarketOutcome(name="YES", price=0.52), MarketOutcome(name="NO", price=0.48)],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=4),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.3,
+        reasoning="Sports line value",
+        edge_external=0.12,
+        edge_source="computed",
+        evidence_quality=0.60,
+        evidence_basis="proxy",
+    )
+    score = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.52,
+        market_family="sports",
+        historical_family_pnl_total=40.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.58,
+        historical_family_high_conf_losses=2,
+        historical_family_high_conf_loss_relax_threshold=0.05,
+        historical_family_boost_evidence_min=0.55,
+        historical_family_signal_enabled=True,
+    )
+    assert score.family_conditional_bonus_applied is True
+    assert score.historical_family_signal > 0.0
+
+
+def test_no_external_odds_penalty_reduced_when_convergent() -> None:
+    market = Market(
+        id="KXSPORTS-NOEXT",
+        question="Sports no external odds",
+        outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+        liquidity_usdc=900.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=5),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.3,
+        reasoning="No external odds found for this matchup.",
+        edge_external=0.10,
+        edge_source="fallback",
+        evidence_quality=0.50,
+        evidence_basis="proxy",
+        implied_prob_external=None,
+    )
+    baseline = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        edge_source="fallback",
+        evidence_basis_class="proxy",
+        proxy_penalty_convergent_reduction_enabled=False,
+        self_consistency_passed=True,
+        historical_family_pnl_total=30.0,
+        historical_family_sample_size=30,
+    )
+    reduced = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        edge_source="fallback",
+        evidence_basis_class="proxy",
+        proxy_penalty_convergent_reduction_enabled=True,
+        self_consistency_passed=True,
+        historical_family_pnl_total=30.0,
+        historical_family_sample_size=30,
+    )
+    assert reduced.no_external_odds_penalty > 0.0
+    assert reduced.no_external_odds_penalty < baseline.no_external_odds_penalty
+
+
+def test_generic_family_loss_drag_stronger_for_established_samples() -> None:
+    market = Market(
+        id="KXGENERIC-LOSS",
+        question="Generic market drag",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        bet_size_pct=0.2,
+        reasoning="Proxy signal",
+        edge_external=0.08,
+        edge_source="computed",
+        evidence_quality=0.55,
+        evidence_basis="proxy",
+    )
+    small_sample = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.50,
+        market_family="generic",
+        historical_family_pnl_total=-50.0,
+        historical_family_sample_size=10,
+        historical_family_win_rate=0.45,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_loss_drag_scale=1.8,
+        historical_family_loss_drag_sample_min=30,
+    )
+    large_sample = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.50,
+        market_family="generic",
+        historical_family_pnl_total=-50.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.45,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_loss_drag_scale=1.8,
+        historical_family_loss_drag_sample_min=30,
+    )
+    assert large_sample.historical_family_signal < small_sample.historical_family_signal
 

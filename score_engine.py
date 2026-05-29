@@ -19,6 +19,14 @@ _OVERCONFIDENCE_STEP_HIGH_GAP = 0.25
 _OVERCONFIDENCE_STEP_LOW_PENALTY = 0.06
 _OVERCONFIDENCE_STEP_HIGH_PENALTY = 0.12
 _LATE_STAGE_OVERCONFIDENCE_THRESHOLD = 0.85
+# Score weights for the model-edge signals (Bayesian posterior, LMSR
+# inefficiency, Kelly fraction). Raised from the prior 0.05/0.05/0.10 so genuine
+# edge competes with the stacked penalties instead of being dwarfed by them: the
+# penalty stack on a typical proxy decision routinely exceeds 0.5, while these
+# components previously topped out near 0.10 combined.
+_BAYESIAN_COMPONENT_WEIGHT = 0.08
+_INEFFICIENCY_COMPONENT_WEIGHT = 0.10
+_KELLY_COMPONENT_WEIGHT = 0.15
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,8 @@ class ScoreResult:
     evidence_basis_bonus: float = 0.0
     source_alignment_bonus: float = 0.0
     proxy_penalty_reduced: bool = False
+    proxy_penalty_reduction_reason: str = ""
+    family_conditional_bonus_applied: bool = False
     observed_data_bonus: float = 0.0
     low_information_penalty: float = 0.0
     no_external_odds_penalty: float = 0.0
@@ -141,6 +151,12 @@ def compute_final_score(
     historical_prefix_pnl_per_trade: float | None = None,
     historical_prefix_sample_size: int = 0,
     volume_amplifier_enabled: bool = True,
+    proxy_penalty_convergent_reduction_enabled: bool = True,
+    self_consistency_passed: bool = False,
+    historical_family_high_conf_loss_relax_threshold: float = 0.05,
+    historical_family_boost_evidence_min: float = 0.44,
+    historical_family_loss_drag_scale: float = 1.8,
+    historical_family_loss_drag_sample_min: int = 30,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -169,13 +185,13 @@ def compute_final_score(
     evidence_component = 0.15 * evidence_quality
     bayesian_component = 0.0
     if bayesian_posterior is not None:
-        bayesian_component = 0.05 * (bayesian_posterior - 0.5)
+        bayesian_component = _BAYESIAN_COMPONENT_WEIGHT * (bayesian_posterior - 0.5)
     inefficiency_component = 0.0
     if inefficiency_signal is not None:
-        inefficiency_component = 0.05 * abs(inefficiency_signal)
+        inefficiency_component = _INEFFICIENCY_COMPONENT_WEIGHT * abs(inefficiency_signal)
     kelly_component = 0.0
     if kelly_raw is not None:
-        kelly_component = 0.10 * max(0.0, min(1.0, kelly_raw))
+        kelly_component = _KELLY_COMPONENT_WEIGHT * max(0.0, min(1.0, kelly_raw))
     confidence_alignment_bonus = 0.0
     if (
         bayesian_posterior is not None
@@ -393,6 +409,7 @@ def compute_final_score(
     fallback_edge_penalty = 0.0
     proxy_evidence_penalty = 0.0
     proxy_penalty_reduced = False
+    proxy_penalty_reduction_reason = ""
     generic_bin_penalty = 0.0
     numeric_strike_bin_penalty = 0.0
     ambiguous_resolution_penalty = 0.0
@@ -410,15 +427,51 @@ def compute_final_score(
             if evidence_quality >= 0.75:
                 fallback_edge_penalty *= 0.20
                 proxy_evidence_penalty *= 0.20
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "direct_high_quality"
             elif evidence_quality >= 0.55:
                 fallback_edge_penalty *= 0.25
                 proxy_evidence_penalty *= 0.25
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "direct_high_quality"
             else:
                 fallback_edge_penalty *= 0.40
                 proxy_evidence_penalty *= 0.40
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "direct_high_quality"
         elif settlement_aligned_high_quality and proxy_evidence_penalty > 0.0:
             proxy_evidence_penalty *= 0.60
             proxy_penalty_reduced = True
+            proxy_penalty_reduction_reason = "settlement_aligned_high_quality"
+        convergent_family_is_profitable = False
+        if proxy_penalty_convergent_reduction_enabled:
+            convergent_family_is_profitable = (
+                historical_family_pnl_total is not None
+                and float(historical_family_pnl_total) > 0.0
+                and historical_family_sample_size >= 20
+            )
+        if proxy_penalty_convergent_reduction_enabled and proxy_evidence_penalty > 0.0:
+            original_proxy_penalty = proxy_evidence_penalty
+            if self_consistency_passed and convergent_family_is_profitable:
+                proxy_evidence_penalty *= 0.50
+                proxy_penalty_reduced = True
+                proxy_penalty_reduction_reason = "self_consistency_plus_family"
+            elif convergent_family_is_profitable:
+                proxy_evidence_penalty *= 0.70
+                proxy_penalty_reduced = True
+                if not proxy_penalty_reduction_reason:
+                    proxy_penalty_reduction_reason = "family_profitable_alone"
+            proxy_evidence_penalty = max(
+                proxy_evidence_penalty,
+                original_proxy_penalty * 0.15,
+            )
+        if (
+            proxy_penalty_convergent_reduction_enabled
+            and no_external_odds_penalty > 0.0
+            and self_consistency_passed
+            and convergent_family_is_profitable
+        ):
+            no_external_odds_penalty *= 0.50
     if _GENERIC_BIN_TICKER_PATTERN.search((market.id or "").strip()) and not _is_weather_market(market):
         generic_bin_penalty = max(0.0, generic_bin_penalty_base) * (1.0 + max(0.0, 0.65 - evidence_quality))
     if (
@@ -437,6 +490,7 @@ def compute_final_score(
     historical_family_signal = 0.0
     historical_family_score_adjustment = 0.0
     historical_family_size_multiplier = 1.0
+    family_conditional_bonus_applied = False
     normalized_market_family = str(market_family or "").strip().lower()
     has_continuous_family_inputs = (
         historical_family_win_rate is not None
@@ -469,15 +523,25 @@ def compute_final_score(
             normalized_market_family == "sports"
             and pnl_total > 0.0
             and wins_rate >= 0.55
-            and high_conf_loss_rate <= 0.005
+            and high_conf_loss_rate
+            <= max(0.0, float(historical_family_high_conf_loss_relax_threshold))
             and source_confirmed_edge_value > 0.0
-            and evidence_quality >= 0.65
+            and evidence_quality >= max(0.0, float(historical_family_boost_evidence_min))
         ):
             raw_signal += 0.08
+            family_conditional_bonus_applied = True
         elif normalized_market_family in {"generic", "crypto"} and pnl_efficiency < 0.0:
             # Historical generic/crypto losses should scale conviction and size,
             # not categorically exclude otherwise eligible source-backed markets.
-            raw_signal -= min(0.40, (abs(pnl_efficiency) * 1.5) + (high_conf_loss_rate * 1.5))
+            drag_scale = (
+                float(historical_family_loss_drag_scale)
+                if sample_size >= max(1, int(historical_family_loss_drag_sample_min))
+                else 1.5
+            )
+            raw_signal -= min(
+                0.55,
+                (abs(pnl_efficiency) * drag_scale) + (high_conf_loss_rate * drag_scale),
+            )
         if normalized_evidence_basis != "direct" and raw_signal < 0.0:
             raw_signal *= 1.25
         shrink = sample_size / (sample_size + 20.0)
@@ -687,6 +751,8 @@ def compute_final_score(
         evidence_basis_bonus=evidence_basis_bonus,
         source_alignment_bonus=source_alignment_bonus,
         proxy_penalty_reduced=proxy_penalty_reduced,
+        proxy_penalty_reduction_reason=proxy_penalty_reduction_reason,
+        family_conditional_bonus_applied=family_conditional_bonus_applied,
         observed_data_bonus=observed_data_bonus,
         low_information_penalty=low_information_penalty,
         no_external_odds_penalty=no_external_odds_penalty,
