@@ -7,7 +7,7 @@ parts:
     <evidence_classification>
     Calibrate confidence: 0.50 means no information advantage over market pricing. Use confidence >0.70 only with specific, source-backed evidence that is directly relevant.
     A tradable edge requires positive edge_market, settlement-aligned evidence, and a clear explanation for why the current market price has not fully priced it in.
-    Proxy evidence can support research, but should_trade=true requires a larger edge and stronger pricing-in explanation than direct evidence.
+    Proxy evidence can support research, and should_trade=true on proxy generally requires a larger edge and stronger pricing-in explanation than direct evidence. Exception: for sports markets, bookmaker/sportsbook odds (ESPN, Covers, Pinnacle, DraftKings, etc.) are settlement-predictive; treat a clear odds-derived edge as tradable proxy evidence without demanding a larger edge.
     Always classify evidence basis as direct, proxy, or absence-only in your reasoning.
     Use evidence_basis=direct only when a cited source explicitly addresses the market's settlement criteria. If the reasoning uses previews, form, vague forecasts, missing reports, or inference from silence, use proxy or absence_only instead.
     For non-sports markets, evidence_basis=direct also requires primary_source_url; without that URL, classify the evidence as proxy or absence_only and treat the case as source repair.
@@ -54,7 +54,7 @@ parts:
 
     <trade_entry_criteria>
     Do not claim tradable edge from proxy-only evidence when direct settlement-aligned evidence is unavailable.
-    When evidence_basis=proxy, require |edge_market| >= 0.10 versus market-implied probability; edge_external alone is insufficient.
+    When evidence_basis=proxy, require |edge_market| >= 0.10 versus market-implied probability (edge_external alone is insufficient); for sports markets where the proxy is bookmaker/sportsbook odds, |edge_market| >= 0.07 is sufficient because those odds are settlement-predictive.
     If edge_source=fallback or implied_prob_external is missing, cap confidence at 0.72 and require positive edge_market >= the configured fallback threshold before recommending should_trade=true.
     Never recommend should_trade=true when edge_market is zero or negative, even if edge_external looks favorable.
     If historical or repeated-analysis context suggests poor performance, do not force a trade; explain what additional source would make the market worth researching later.
@@ -63,7 +63,8 @@ parts:
     </trade_entry_criteria>
 
     <trade_defaults>
-    Default to should_trade=false. Favor fewer, higher-quality opportunities; no-trade is expected about 85% of cycles.
+    Be selective but decisive. There is NO target no-trade rate: take should_trade=true whenever edge_market is positive, source-backed, and you can explain why the market has not fully priced it in. Missing a genuine source-backed edge is as costly as a bad trade, so do not skip a clear opportunity just to stay conservative.
+    Sports markets deserve particular attention: bookmaker/sportsbook odds are settlement-predictive, so a clear odds-based edge is tradable proxy evidence.
     Set should_trade=true only when edge_market is positive, source-backed, and the reasoning explains why the market has not priced it in.
     Fallback/no-external-odds trades must clear the configured fallback edge threshold; never trade on edge_external alone.
     If analysis does not produce a clear directional advantage, set should_trade=false and keep no-trade reasoning concise (under 100 words).
@@ -80,17 +81,11 @@ parts:
     Thought: Price is 3.2% below threshold with 4h to close. Typical intraday move is ±0.8%. Probability threshold is breached = ~12%. Market is pricing YES at 72 — massive overpricing.
     Decision: should_trade=true, outcome=NO, edge_market=0.60, evidence_basis=direct, primary_source_url=https://www.eia.gov/petroleum/supply/weekly/
 
-    ABSTAIN (proxy only):
-    Ticker: KXNASDAQ100U-T20000 | Market price: YES 0.61
-    Evidence: CNBC article says "Nasdaq futures point higher." No exchange live feed cited.
-    Thought: This is a preview/commentary — not a settlement-aligned price source. evidence_basis=proxy, primary_source_url missing.
-    Decision: should_trade=false, abstain=true, reasoning="Missing Tier-1 live price URL; CNBC commentary is proxy. Research: fetch WSJ/Bloomberg live Nasdaq 100 quote."
-
-    ABSTAIN (proxy with URL — aggregator, not settlement source):
-    Ticker: KXGOLDD-T4439 | Market price: NO 0.62
-    Evidence: Trading Economics shows gold at $4,374 (May 28 00:45 UTC). Threshold $4,439. Buffer -1.46%.
-    Thought: Trading Economics is an aggregator, not the COMEX official settlement feed. evidence_basis=proxy even though I have a URL. The proxy EQ ceiling applies unconditionally: evidence_quality=0.65. Buffer is within typical intraday range; no edge.
-    Decision: should_trade=false, evidence_basis=proxy, evidence_quality=0.65, reasoning="Need COMEX official settlement or CME front-month close to reclassify as direct. Trading Economics URL is proxy-tier."
+    TRADE (sports, odds-based proxy):
+    Ticker: KXMLBGAME-26MAY29LADSF-LAD | Market price: YES 0.55 (Dodgers win)
+    Evidence: ESPN and Pinnacle moneylines for today's game imply Dodgers ~64% (consensus across two books); Covers projection agrees. Confirmed starters, no injury news.
+    Thought: Sportsbook odds are settlement-predictive proxy evidence. Consensus implied ~0.64 vs market 0.55 -> edge_market ~0.09; Kalshi is lagging the book. Clear odds-based edge, so trade it.
+    Decision: should_trade=true, outcome=YES, edge_market=0.09, evidence_basis=proxy, evidence_quality=0.78, confidence=0.62; reasoning cites both books with implied probabilities and timestamps.
 
     ABSTAIN (absence_only):
     Ticker: KXTRUMPMEET-MENTION | Market price: YES 0.35

@@ -1432,6 +1432,70 @@ class TestGrokClient(unittest.TestCase):
         self.assertLessEqual(validated.evidence_quality, 0.75)
         self.assertEqual(validated.evidence_quality_floor_applied, "proxy_evidence_cap")
 
+    def test_validate_and_enrich_allows_higher_proxy_cap_for_sports_with_odds(self) -> None:
+        market = Market(
+            id="m-sports-odds-cap",
+            question="Will the favorite win the game?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 65%. "
+                "Edge from momentum and sentiment trends."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.65,
+            edge_external=0.25,
+            edge_source="computed",
+            evidence_quality=0.95,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertEqual(validated.evidence_quality_floor_applied, "proxy_evidence_cap")
+        self.assertAlmostEqual(validated.evidence_quality, 0.80)
+
+    def test_validate_and_enrich_sports_proxy_cap_is_sports_specific(self) -> None:
+        # The identical proxy decision under a non-sports profile keeps the
+        # standard 0.75 ceiling, proving the 0.80 ceiling is sports-only.
+        market = Market(
+            id="m-sports-odds-cap",
+            question="Will the index close above the threshold?",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.65,
+            bet_size_pct=0.0,
+            reasoning=(
+                "Implied probability: 40%. My probability: 65%. "
+                "Edge from momentum and sentiment trends."
+            ),
+            implied_prob_external=0.40,
+            my_prob=0.65,
+            edge_external=0.25,
+            edge_source="computed",
+            evidence_quality=0.95,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertEqual(validated.evidence_quality_floor_applied, "proxy_evidence_cap")
+        self.assertAlmostEqual(validated.evidence_quality, 0.75)
+
     def test_validate_and_enrich_treats_aggregator_url_as_proxy(self) -> None:
         market = Market(
             id="m-aggregator-url",

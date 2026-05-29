@@ -19,6 +19,14 @@ _OVERCONFIDENCE_STEP_HIGH_GAP = 0.25
 _OVERCONFIDENCE_STEP_LOW_PENALTY = 0.06
 _OVERCONFIDENCE_STEP_HIGH_PENALTY = 0.12
 _LATE_STAGE_OVERCONFIDENCE_THRESHOLD = 0.85
+# Score weights for the model-edge signals (Bayesian posterior, LMSR
+# inefficiency, Kelly fraction). Raised from the prior 0.05/0.05/0.10 so genuine
+# edge competes with the stacked penalties instead of being dwarfed by them: the
+# penalty stack on a typical proxy decision routinely exceeds 0.5, while these
+# components previously topped out near 0.10 combined.
+_BAYESIAN_COMPONENT_WEIGHT = 0.08
+_INEFFICIENCY_COMPONENT_WEIGHT = 0.10
+_KELLY_COMPONENT_WEIGHT = 0.15
 
 
 @dataclass(frozen=True)
@@ -177,13 +185,13 @@ def compute_final_score(
     evidence_component = 0.15 * evidence_quality
     bayesian_component = 0.0
     if bayesian_posterior is not None:
-        bayesian_component = 0.05 * (bayesian_posterior - 0.5)
+        bayesian_component = _BAYESIAN_COMPONENT_WEIGHT * (bayesian_posterior - 0.5)
     inefficiency_component = 0.0
     if inefficiency_signal is not None:
-        inefficiency_component = 0.05 * abs(inefficiency_signal)
+        inefficiency_component = _INEFFICIENCY_COMPONENT_WEIGHT * abs(inefficiency_signal)
     kelly_component = 0.0
     if kelly_raw is not None:
-        kelly_component = 0.10 * max(0.0, min(1.0, kelly_raw))
+        kelly_component = _KELLY_COMPONENT_WEIGHT * max(0.0, min(1.0, kelly_raw))
     confidence_alignment_bonus = 0.0
     if (
         bayesian_posterior is not None

@@ -11354,6 +11354,34 @@ def main(max_cycles: int | None = None) -> None:
                     if exec_pfx_n > 0
                     else None
                 )
+                # Compute the LMSR execution price + inefficiency signal up front
+                # (using a nominal max-bet quantity) so the score gate actually
+                # sees the mispricing signal. Previously these were computed only
+                # after sizing, so compute_final_score always received None and
+                # the inefficiency/lmsr score components were dead. With the
+                # configured liquidity parameter the nominal vs. final-sized
+                # execution price are effectively identical; the precise
+                # post-sizing recompute below still drives the LMSR execution gate.
+                if settings.LMSR_ENABLED:
+                    lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
+                        market=market,
+                        decision_outcome=decision_for_edge.outcome,
+                        amount_usdc=settings.MAX_BET_USDC,
+                        settings=settings,
+                    )
+                    if lmsr_execution_price is not None:
+                        posterior_for_signal = (
+                            bayesian_posterior_applied
+                            if bayesian_posterior_applied is not None
+                            else effective_confidence
+                        )
+                        try:
+                            ineff_signal = lmsr_inefficiency_signal(
+                                posterior_for_signal,
+                                lmsr_execution_price,
+                            )
+                        except ValueError:
+                            ineff_signal = None
                 score_result = compute_final_score(
                     market=market,
                     decision=decision_for_edge,
@@ -11874,6 +11902,12 @@ def main(max_cycles: int | None = None) -> None:
                     continue
 
                 proposed_bet_amount = _calculate_bet(settings.MAX_BET_USDC, adjusted_bet_pct)
+                # Precise post-sizing recompute of the LMSR execution price for the
+                # mispricing gate. The pre-gate computation above already fed the
+                # score; this re-derives it with the actual proposed bet amount.
+                # With the configured liquidity parameter this is a mispricing
+                # check (|posterior - market_price|); LMSR_MIN_INEFFICIENCY is kept
+                # below the edge gate so it is a light floor, not a double-block.
                 if settings.LMSR_ENABLED:
                     lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
                         market=market,

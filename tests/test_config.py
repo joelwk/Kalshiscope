@@ -570,7 +570,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 500)
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
         self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
-        self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 40.0)
+        self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 30.0)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.025)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
         self.assertEqual(settings.SCORE_GENERIC_BIN_PENALTY_BASE, 0.015)

@@ -94,6 +94,12 @@ _WEATHER_OBS_EVIDENCE_FLOOR = 0.75
 _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE = 0.65
 _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR = 0.72
 _PROXY_EVIDENCE_QUALITY_CAP = 0.75
+# Sports markets backed by external bookmaker/sportsbook odds get a slightly
+# higher proxy ceiling: odds are settlement-predictive, and sports is the one
+# historically profitable family, so over-capping its evidence_quality was
+# suppressing its strongest signal. All other proxy evidence keeps the standard
+# 0.75 ceiling.
+_SPORTS_PROXY_ODDS_EVIDENCE_QUALITY_CAP = 0.80
 _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "official",
     "official recap",
@@ -1013,14 +1019,17 @@ class GrokClient:
         ):
             evidence_quality = _DEFINITIVE_OUTCOME_EVIDENCE_FLOOR
             evidence_quality_floor_applied = "definitive_outcome_floor"
-        if (
-            evidence_basis_class == "proxy"
-            and evidence_quality > _PROXY_EVIDENCE_QUALITY_CAP
-        ):
-            evidence_quality = _PROXY_EVIDENCE_QUALITY_CAP
-            evidence_quality_floor_applied = (
-                evidence_quality_floor_applied or "proxy_evidence_cap"
+        if evidence_basis_class == "proxy":
+            proxy_evidence_quality_cap = (
+                _SPORTS_PROXY_ODDS_EVIDENCE_QUALITY_CAP
+                if profile_name == "sports" and implied is not None
+                else _PROXY_EVIDENCE_QUALITY_CAP
             )
+            if evidence_quality > proxy_evidence_quality_cap:
+                evidence_quality = proxy_evidence_quality_cap
+                evidence_quality_floor_applied = (
+                    evidence_quality_floor_applied or "proxy_evidence_cap"
+                )
         direct_fallback_gate_override = (
             evidence_basis_class == "direct"
             and source_match_class == "settlement_aligned"

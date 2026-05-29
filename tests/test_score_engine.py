@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from models import Market, MarketOutcome, TradeDecision
-from score_engine import calibrate_confidence, compute_final_score
+from score_engine import (
+    _BAYESIAN_COMPONENT_WEIGHT,
+    _INEFFICIENCY_COMPONENT_WEIGHT,
+    _KELLY_COMPONENT_WEIGHT,
+    calibrate_confidence,
+    compute_final_score,
+)
 
 
 def test_compute_final_score_higher_with_edge_and_evidence() -> None:
@@ -860,6 +866,40 @@ def test_compute_final_score_uses_kelly_and_inefficiency_signals() -> None:
     assert boosted.final_score > baseline.final_score
     assert boosted.kelly_component > 0
     assert boosted.inefficiency_component > 0
+
+
+def test_compute_final_score_edge_signal_component_weights() -> None:
+    market = Market(
+        id="m6w",
+        question="Test",
+        outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.66,
+        bet_size_pct=0.4,
+        reasoning="test",
+        edge_external=0.09,
+        evidence_quality=0.75,
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.45,
+        bayesian_posterior=0.72,
+        inefficiency_signal=0.18,
+        kelly_raw=0.35,
+    )
+    assert result.kelly_component == pytest.approx(_KELLY_COMPONENT_WEIGHT * 0.35)
+    assert result.inefficiency_component == pytest.approx(
+        _INEFFICIENCY_COMPONENT_WEIGHT * 0.18
+    )
+    assert result.bayesian_component == pytest.approx(
+        _BAYESIAN_COMPONENT_WEIGHT * (0.72 - 0.5)
+    )
 
 
 def test_compute_final_score_applies_weather_uncertainty_penalty() -> None:
