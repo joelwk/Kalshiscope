@@ -902,6 +902,93 @@ def test_compute_final_score_edge_signal_component_weights() -> None:
     )
 
 
+def test_compute_final_score_component_weights_are_configurable() -> None:
+    """The Kelly/LMSR/Bayesian weights can be overridden so the strategy signals
+    can be tuned to clear the score gate (they were dead at ranking time)."""
+    market = Market(
+        id="m6cfg",
+        question="Test",
+        outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.66,
+        bet_size_pct=0.4,
+        reasoning="test",
+        edge_external=0.09,
+        evidence_quality=0.75,
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.45,
+        bayesian_posterior=0.72,
+        inefficiency_signal=0.18,
+        kelly_raw=0.35,
+        kelly_component_weight=0.50,
+        inefficiency_component_weight=0.40,
+        bayesian_component_weight=0.20,
+    )
+    assert result.kelly_component == pytest.approx(0.50 * 0.35)
+    assert result.inefficiency_component == pytest.approx(0.40 * 0.18)
+    assert result.bayesian_component == pytest.approx(0.20 * (0.72 - 0.5))
+
+
+def test_confidence_calibration_penalty_uses_raw_confidence_when_present() -> None:
+    """The calibration penalty must judge the model's ORIGINAL (raw) confidence,
+    not a value the calibration shrink already lowered, so it does not
+    double-count the shrink and push every shrunk market below the gate."""
+    market = Market(
+        id="m-rawcal",
+        question="Calibration raw test",
+        outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        liquidity_usdc=1000.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    # Calibrated confidence (0.50) is below the floor, but the raw model
+    # confidence (0.74) is above it -> no penalty (the gap is calibration's
+    # doing, not low model conviction).
+    shrunk = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.50,
+        raw_confidence=0.74,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_external=0.08,
+        evidence_quality=0.7,
+    )
+    shrunk_score = compute_final_score(
+        market, shrunk, implied_prob_market=0.45,
+        confidence_calibration_floor=0.60,
+        confidence_calibration_penalty_scale=0.50,
+    )
+    assert shrunk_score.confidence_calibration_penalty == pytest.approx(0.0, abs=1e-9)
+
+    # Genuinely low raw conviction is still penalized.
+    low_raw = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.50,
+        raw_confidence=0.50,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_external=0.08,
+        evidence_quality=0.7,
+    )
+    low_raw_score = compute_final_score(
+        market, low_raw, implied_prob_market=0.45,
+        confidence_calibration_floor=0.60,
+        confidence_calibration_penalty_scale=0.50,
+    )
+    assert low_raw_score.confidence_calibration_penalty == pytest.approx(
+        (0.60 - 0.50) * 0.50, abs=1e-4
+    )
+
+
 def test_compute_final_score_applies_weather_uncertainty_penalty() -> None:
     now = datetime.now(timezone.utc)
     market = Market(

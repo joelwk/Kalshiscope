@@ -210,6 +210,34 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
 
+    def test_strategy_component_weight_defaults(self) -> None:
+        self.assertEqual(config.Settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.30)
+        self.assertEqual(config.Settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT, 0.18)
+        self.assertEqual(config.Settings.SCORE_BAYESIAN_COMPONENT_WEIGHT, 0.10)
+
+    def test_historical_confidence_shrink_cap_defaults(self) -> None:
+        self.assertEqual(config.Settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA, 0.05)
+        self.assertEqual(
+            config.Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE, 0.0
+        )
+
+    def test_strategy_and_shrink_settings_env_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "SCORE_KELLY_COMPONENT_WEIGHT": "0.50",
+            "SCORE_INEFFICIENCY_COMPONENT_WEIGHT": "0.40",
+            "SCORE_BAYESIAN_COMPONENT_WEIGHT": "0.20",
+            "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA": "0.08",
+            "HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE": "0.62",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.50)
+        self.assertEqual(settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT, 0.40)
+        self.assertEqual(settings.SCORE_BAYESIAN_COMPONENT_WEIGHT, 0.20)
+        self.assertEqual(settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA, 0.08)
+        self.assertEqual(settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE, 0.62)
+
     def test_env_example_profit_thresholds_match_conservative_defaults(self) -> None:
         env_example = Path(".env.example").read_text(encoding="utf-8")
         expected_lines = {
@@ -228,15 +256,20 @@ class TestConfig(unittest.TestCase):
             "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.75",
             "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55",
             "MIN_EVIDENCE_QUALITY_FOR_TRADE=0.55",
-            "SCORE_GATE_THRESHOLD=0.48",
-            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.40",
+            "SCORE_GATE_THRESHOLD=0.15",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.10",
+            "SCORE_KELLY_COMPONENT_WEIGHT=0.30",
+            "SCORE_INEFFICIENCY_COMPONENT_WEIGHT=0.18",
+            "SCORE_BAYESIAN_COMPONENT_WEIGHT=0.10",
+            "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=0.05",
             "MIN_BET_USDC=5.0",
             "MAX_BET_USDC=12.0",
             "DRY_RUN=true",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
-            "MAX_SPORTS_CANDIDATES_PER_CYCLE=4",
+            "MAX_SPORTS_CANDIDATES_PER_CYCLE=5",
+            "MAX_MUSIC_CANDIDATES_PER_CYCLE=2",
             "MAX_TRADES_PER_CYCLE=4",
             "MAX_TRADES_PER_DAY=4",
             "MAX_DAILY_DRAWDOWN_USDC=15.0",
@@ -259,7 +292,7 @@ class TestConfig(unittest.TestCase):
             "PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.28",
             "PRE_ANALYSIS_ADAPTIVE_BOOST=0.03",
             "PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=8",
-            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=1",
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=3",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=0.40",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",

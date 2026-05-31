@@ -778,7 +778,21 @@ class GrokClient:
                 consistency_ok = False
 
         prob_consistency_ok = True
-        if my_prob is not None and abs(my_prob - decision.confidence) > _PROB_CONSISTENCY_TOLERANCE:
+        # Compare my_prob against the model's ORIGINAL (raw) confidence when it is
+        # available, not a value that a conservative self-consistency merge or a
+        # calibration shrink may already have pulled down. Otherwise re-validating
+        # such a decision sees an artificial my_prob-vs-confidence gap and flips an
+        # internally-consistent, real edge to no-trade. Falls back to
+        # decision.confidence for first-pass validation where raw is unset.
+        confidence_basis_for_consistency = (
+            decision.raw_confidence
+            if decision.raw_confidence is not None
+            else decision.confidence
+        )
+        if (
+            my_prob is not None
+            and abs(my_prob - confidence_basis_for_consistency) > _PROB_CONSISTENCY_TOLERANCE
+        ):
             prob_consistency_ok = False
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))

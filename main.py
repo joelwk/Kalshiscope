@@ -233,6 +233,23 @@ _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS = 0.06
 _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS = 0.03
 _PRE_ANALYSIS_POSITIVE_FAMILY_PNL_BONUS = 0.02
 _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
+# Nudge selection toward families where settlement-aligned DIRECT evidence is
+# reliably obtainable (Billboard/Luminate, Netflix/box-office, NWS/NOAA). The
+# score engine rewards direct evidence and lightly penalizes proxy, so analysis
+# slots spent here are far more likely to clear the gates and trade. Sports is
+# intentionally excluded: it has direct sources but is efficiently priced, and
+# it is throttled separately via MAX_SPORTS_CANDIDATES_PER_CYCLE.
+_PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY = {
+    "music": 0.05,
+    "entertainment": 0.05,
+    "weather": 0.03,
+}
+# Minimum non-actionable streak before a never-traded market with a recent
+# fallback edge is benched as high-churn. Raised 3 -> 5 in the 10-cycle review:
+# the calibration/scoring fixes mean markets that previously churned on fallback
+# edges can now clear the gates and trade, so they deserve more analysis runway
+# before being routed away from deep analysis.
+_PRE_ANALYSIS_FALLBACK_CHURN_MIN_STREAK = 5
 _AMBIGUOUS_MARKET_TOKENS = (
     "attend",
     "mention",
@@ -4533,6 +4550,9 @@ def _score_kwargs(
             settings.HISTORICAL_FAMILY_LOSS_DRAG_SAMPLE_MIN
         ),
         "self_consistency_passed": self_consistency_passed,
+        "kelly_component_weight": settings.SCORE_KELLY_COMPONENT_WEIGHT,
+        "inefficiency_component_weight": settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT,
+        "bayesian_component_weight": settings.SCORE_BAYESIAN_COMPONENT_WEIGHT,
     }
 
 
@@ -4990,9 +5010,19 @@ def _pre_analysis_opportunity_score(
     coinflip_penalty = 0.0
     if implied_prob is not None and settings.COINFLIP_PRICE_LOWER <= implied_prob <= settings.COINFLIP_PRICE_UPPER:
         coinflip_penalty = 0.15
-    price_center_score = 0.0
+    # Reward the whole tradeable price band instead of coinflip-priced markets.
+    # The previous price_center_score peaked at 0.50 (the hardest price to beat)
+    # and starved opportunities priced away from the middle, where a confident
+    # directional read yields the largest edge. Now markets across [0.20, 0.80]
+    # score equally, with falloff only as price nears the untradeable extremes;
+    # exact coinflips are still trimmed by coinflip_penalty above.
+    tradeable_price_score = 0.5
     if implied_prob is not None:
-        price_center_score = max(0.0, 1.0 - (abs(implied_prob - 0.5) / 0.5))
+        dist_from_center = abs(implied_prob - 0.5)
+        if dist_from_center <= 0.30:
+            tradeable_price_score = 1.0
+        else:
+            tradeable_price_score = max(0.2, 1.0 - ((dist_from_center - 0.30) / 0.25))
     horizon_score = 0.5
     raw_hours_to_close: float | None = None
     if market.close_time is not None:
@@ -5169,6 +5199,9 @@ def _pre_analysis_opportunity_score(
             settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS
         )
     source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(family, 0.0)
+    direct_evidence_family_affinity = _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY.get(
+        family, 0.0
+    )
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
         ambiguous_resolution_penalty = 0.08
@@ -5258,9 +5291,10 @@ def _pre_analysis_opportunity_score(
     if stacked_cap > 0.0 and stacked_historical_penalty > stacked_cap:
         stacked_historical_excess_credited = stacked_historical_penalty - stacked_cap
     score = (
-        (0.40 * price_center_score)
-        + (0.35 * liquidity_score)
-        + (0.25 * horizon_score)
+        (0.25 * tradeable_price_score)
+        + (0.40 * liquidity_score)
+        + (0.35 * horizon_score)
+        + direct_evidence_family_affinity
         + post_event_bonus
         + historical_profit_bonus
         + historical_family_volume_bonus
@@ -5286,7 +5320,8 @@ def _pre_analysis_opportunity_score(
         positive_family_pnl_bonus = _PRE_ANALYSIS_POSITIVE_FAMILY_PNL_BONUS
         score += positive_family_pnl_bonus
     return score, {
-        "pre_score_price_center": price_center_score,
+        "pre_score_tradeable_price": tradeable_price_score,
+        "pre_score_direct_evidence_family_affinity": direct_evidence_family_affinity,
         "pre_score_liquidity": liquidity_score,
         "pre_score_horizon": horizon_score,
         "pre_score_post_event_bonus": post_event_bonus,
@@ -5371,7 +5406,7 @@ def _pre_analysis_participation_hold(
     if state is None:
         return False, None, {}
     if (
-        non_actionable_streak >= 3
+        non_actionable_streak >= _PRE_ANALYSIS_FALLBACK_CHURN_MIN_STREAK
         and had_recent_fallback_edge
         and not traded_before
     ):
@@ -6168,7 +6203,23 @@ def _analyze_market_candidate(
             calibration_buckets=historical_confidence_buckets,
             min_samples=settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_SAMPLES,
         )
-        calibrated_confidence = historical_shrink.calibrated_confidence
+        # Cap the downward adjustment so the historical bucket cannot deflate
+        # confidence into a permanent no-trade spiral (it only ever shrinks, so a
+        # floor on the result equals a cap on the drop). Skip entirely when
+        # stage-one confidence is at/below the configured band (no overconfidence
+        # to correct there).
+        raw_historical_calibrated = historical_shrink.calibrated_confidence
+        shrink_max_delta = max(0.0, settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA)
+        shrink_band_floor = max(0.0, settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE)
+        if stage_one_confidence <= shrink_band_floor:
+            calibrated_confidence = stage_one_confidence
+        elif shrink_max_delta > 0.0:
+            calibrated_confidence = max(
+                raw_historical_calibrated,
+                stage_one_confidence - shrink_max_delta,
+            )
+        else:
+            calibrated_confidence = raw_historical_calibrated
         confidence_history_gap_applied = max(0.0, stage_one_confidence - calibrated_confidence)
         historical_bucket_sample_size = historical_shrink.sample_size
         historical_bucket_family = historical_shrink.family_used
@@ -6734,6 +6785,13 @@ def main(max_cycles: int | None = None) -> None:
             confidence_calibration_delta_sum = 0.0
             confidence_delta_samples: list[float] = []
             confidence_calibration_historical_win_rates: list[float] = []
+            # Strategy-signal score contributions, aggregated to prove the
+            # Kelly/LMSR/Bayesian components are actually influencing the gating
+            # score (a 10-cycle review found all three were 0.0 in the ranking
+            # score because they were never passed at ranking time).
+            strategy_kelly_component_samples: list[float] = []
+            strategy_inefficiency_component_samples: list[float] = []
+            strategy_bayesian_component_samples: list[float] = []
             extended_research_market_ids: set[str] = set()
             cycle_balance_start = cycle_bankroll
             last_known_balance = cycle_cash_balance
@@ -8535,7 +8593,8 @@ def main(max_cycles: int | None = None) -> None:
                                             for k, v in (pre_analysis_breakdown or {}).items()
                                             if k
                                             in {
-                                                "pre_score_price_center",
+                                                "pre_score_tradeable_price",
+                                                "pre_score_direct_evidence_family_affinity",
                                                 "pre_score_liquidity",
                                                 "pre_score_horizon",
                                                 "pre_score_family_penalty",
@@ -9406,10 +9465,41 @@ def main(max_cycles: int | None = None) -> None:
                 pfx_n = int(pfx_stats.get("n", 0))
                 pfx_pnl = float(pfx_stats.get("total_pnl", 0.0))
                 pfx_shrunk = bayesian_shrunk_pnl(pfx_pnl, pfx_n) if pfx_n > 0 else None
+                # Strategy signals (Kelly / LMSR inefficiency / Bayesian posterior)
+                # must influence ranking, not just the runtime execution gate.
+                # Without these the ranking/logged score had 0.0 for all three
+                # components, so the Kelly & LMSR strategy never drove selection.
+                # posterior = effective (post-calibration) confidence on the chosen
+                # outcome; with the configured liquidity parameter the implied price
+                # is an accurate stand-in for the LMSR execution price here.
+                posterior_for_rank = decision.confidence
+                kelly_raw_for_rank = (
+                    kelly_fraction(posterior_for_rank, implied_prob_for_rank)
+                    if settings.KELLY_SIZING_ENABLED
+                    and implied_prob_for_rank is not None
+                    else None
+                )
+                inefficiency_for_rank: float | None = None
+                lmsr_price_for_rank: float | None = None
+                if settings.LMSR_ENABLED and implied_prob_for_rank is not None:
+                    lmsr_price_for_rank = implied_prob_for_rank
+                    try:
+                        inefficiency_for_rank = lmsr_inefficiency_signal(
+                            posterior_for_rank, implied_prob_for_rank
+                        )
+                    except ValueError:
+                        inefficiency_for_rank = None
+                bayesian_posterior_for_rank = (
+                    posterior_for_rank if settings.BAYESIAN_ENABLED else None
+                )
                 rank_score = compute_final_score(
                     market=market,
                     decision=decision,
                     implied_prob_market=implied_prob_for_rank,
+                    bayesian_posterior=bayesian_posterior_for_rank,
+                    lmsr_price=lmsr_price_for_rank,
+                    inefficiency_signal=inefficiency_for_rank,
+                    kelly_raw=kelly_raw_for_rank,
                     **_score_kwargs(
                         settings=settings,
                         repeated_analysis_count=repeated_analysis_count,
@@ -9976,6 +10066,16 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 if analysis_result.get("confidence_calibration_applied"):
                     confidence_calibration_applied_count += 1
+                if pre_execution_score_result is not None:
+                    strategy_kelly_component_samples.append(
+                        float(getattr(pre_execution_score_result, "kelly_component", 0.0) or 0.0)
+                    )
+                    strategy_inefficiency_component_samples.append(
+                        float(getattr(pre_execution_score_result, "inefficiency_component", 0.0) or 0.0)
+                    )
+                    strategy_bayesian_component_samples.append(
+                        float(getattr(pre_execution_score_result, "bayesian_component", 0.0) or 0.0)
+                    )
                 raw_vs_calibrated_delta = float(
                     analysis_result.get("raw_vs_calibrated_delta", 0.0) or 0.0
                 )
@@ -13533,6 +13633,13 @@ def main(max_cycles: int | None = None) -> None:
                 if confidence_delta_samples
                 else 0.0
             )
+
+            def _mean(samples: list[float]) -> float:
+                return sum(samples) / len(samples) if samples else 0.0
+
+            mean_kelly_score_component = _mean(strategy_kelly_component_samples)
+            mean_inefficiency_score_component = _mean(strategy_inefficiency_component_samples)
+            mean_bayesian_score_component = _mean(strategy_bayesian_component_samples)
             calibration_samples: list[dict[str, Any]] = []
             try:
                 calibration_samples = state_manager.get_confidence_bucket_calibration(
@@ -13810,6 +13917,11 @@ def main(max_cycles: int | None = None) -> None:
                     4,
                 ),
                 "mean_raw_vs_calibrated_confidence_delta": round(mean_confidence_delta, 4),
+                "mean_kelly_score_component": round(mean_kelly_score_component, 4),
+                "mean_inefficiency_score_component": round(
+                    mean_inefficiency_score_component, 4
+                ),
+                "mean_bayesian_score_component": round(mean_bayesian_score_component, 4),
                 "historical_win_rate_at_bucket": round(
                     (
                         sum(confidence_calibration_historical_win_rates)

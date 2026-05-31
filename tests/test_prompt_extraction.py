@@ -6,7 +6,10 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    "analyze": "82d922879c9825b60cdbea80d79d5ec74cc76bf40748ff5dcc36461da49c6b53",
+    # Updated after sharpening the opening goal of system/analyze_market to be
+    # explicit about acting on supported edge and searching primary/settlement
+    # sources (10-cycle review: 96% no-trade, evidence stuck on proxy/absence).
+    "analyze": "068c7d1106f8a2c7b59ae8d7c195577586e0ac3da5194ea97153ea6d635e87c7",
     "deep": "45ed84815c5d18e8d37cc8bc73ffbbdfc90eb3d8e7f9c995c65507bda9e924a6",
 }
 

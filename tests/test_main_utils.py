@@ -792,6 +792,65 @@ class TestMainUtils(unittest.TestCase):
         self.assertGreater(breakdown["pre_score_ambiguous_market_penalty"], 0.0)
         self.assertGreater(breakdown["pre_score_ambiguous_resolution_penalty"], 0.0)
 
+    def test_pre_analysis_opportunity_score_does_not_favor_coinflip_prices(self) -> None:
+        """The flat tradeable-price band must not deprioritize a market priced
+        away from 0.50 (where directional edge is easier to find) relative to a
+        coinflip-priced market; coinflips are still trimmed by the penalty."""
+        settings = Settings()
+
+        def _sports(price_yes: float, suffix: str) -> Market:
+            return Market(
+                id=f"KXMLBGAME-26JUN06NYYBOS-{suffix}",
+                question="Will the New York Yankees win the game vs Boston?",
+                category="sports",
+                liquidity_usdc=1000.0,
+                outcomes=[
+                    MarketOutcome(name="YES", price=price_yes),
+                    MarketOutcome(name="NO", price=round(1.0 - price_yes, 2)),
+                ],
+                close_time=datetime.now(timezone.utc) + timedelta(hours=6),
+                resolution_criteria="Per official MLB result",
+            )
+
+        coinflip_score, coinflip_bd = _pre_analysis_opportunity_score(
+            _sports(0.50, "A"),
+            MarketState(market_id="a", analysis_count=0, non_actionable_streak=0),
+            settings,
+            traded_before=False,
+        )
+        directional_score, directional_bd = _pre_analysis_opportunity_score(
+            _sports(0.72, "B"),
+            MarketState(market_id="b", analysis_count=0, non_actionable_streak=0),
+            settings,
+            traded_before=False,
+        )
+        self.assertGreaterEqual(directional_score, coinflip_score)
+        self.assertEqual(directional_bd["pre_score_tradeable_price"], 1.0)
+        self.assertGreater(coinflip_bd["pre_score_coinflip_penalty"], 0.0)
+
+    def test_pre_analysis_opportunity_score_rewards_direct_evidence_family(self) -> None:
+        """Families with reliable direct settlement evidence (music) get a
+        selection affinity nudge so analysis slots favor tradeable edge."""
+        settings = Settings()
+        market = Market(
+            id="KXALBUMSTREAMS-26JUN06-1M",
+            question="Will the album exceed 1,000,000 Spotify streams this week?",
+            category="music",
+            liquidity_usdc=800.0,
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Per Luminate weekly streaming data",
+        )
+        _, breakdown = _pre_analysis_opportunity_score(
+            market,
+            MarketState(market_id=market.id, analysis_count=0, non_actionable_streak=0),
+            settings,
+            traded_before=False,
+        )
+        self.assertGreater(
+            breakdown["pre_score_direct_evidence_family_affinity"], 0.0
+        )
+
     def test_pre_analysis_demotion_for_repeated_non_actionable_family(self) -> None:
         market = Market(
             id="KXPERSONMENTION-26APR09-TERM",
@@ -850,8 +909,12 @@ class TestMainUtils(unittest.TestCase):
         )
         state = MarketState(
             market_id=market.id,
-            analysis_count=4,
-            non_actionable_streak=3,
+            analysis_count=6,
+            # Streak must reach _PRE_ANALYSIS_FALLBACK_CHURN_MIN_STREAK (raised
+            # 3 -> 5) before a never-traded fallback-edge market is benched as
+            # high-churn, giving such markets more analysis runway now that the
+            # calibration/scoring fixes let them clear the gates.
+            non_actionable_streak=5,
             last_terminal_outcome="no_trade_recommended",
         )
         rejected, reason, metadata = _pre_analysis_participation_hold(

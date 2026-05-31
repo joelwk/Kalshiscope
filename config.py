@@ -510,6 +510,13 @@ class Settings:
     SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED: bool = True
     SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT: float = 0.08
     SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES: int = 30
+    # Weights for the Kelly / LMSR-inefficiency / Bayesian-posterior model-edge
+    # signals inside compute_final_score. These are the strategy signals the bot
+    # is meant to follow; they are now applied at both ranking and the execution
+    # score gate so genuine edge can clear the gate. See score_engine defaults.
+    SCORE_KELLY_COMPONENT_WEIGHT: float = 0.30
+    SCORE_INEFFICIENCY_COMPONENT_WEIGHT: float = 0.18
+    SCORE_BAYESIAN_COMPONENT_WEIGHT: float = 0.10
     SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.60
     SCORE_LOW_INFO_PENALTY_BASE: float = 0.08
     SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.025
@@ -659,6 +666,16 @@ class Settings:
     HISTORICAL_CONFIDENCE_SHRINK_ENABLED: bool = True
     HISTORICAL_CONFIDENCE_SHRINK_MIN_SAMPLES: int = 15
     HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS: int = 30
+    # Cap on how far the historical-bucket shrink may pull confidence down in a
+    # single pass. Without it the bucket can deflate confidence so much (a
+    # 10-cycle review saw 0.57 -> 0.46 across 130/136 markets) that nothing
+    # clears MIN_CONFIDENCE / the score gate, which prevents the winning trades
+    # that would recalibrate the bucket -- a self-reinforcing no-trade spiral.
+    HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA: float = 0.05
+    # Only apply the historical shrink when stage-one confidence is above this
+    # band; below it there is no overconfidence to correct and shrinking only
+    # destroys tradeable edge. 0.0 disables the band (cap still applies).
+    HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE: float = 0.0
     RESEARCH_QUEUE_ENABLED: bool = True
     RESEARCH_QUEUE_PERSIST_TO_DB: bool = True
     RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS: int = 6
@@ -1496,6 +1513,18 @@ def load_settings() -> Settings:
             "SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES",
             Settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES,
         ),
+        SCORE_KELLY_COMPONENT_WEIGHT=_read_env_float(
+            "SCORE_KELLY_COMPONENT_WEIGHT",
+            Settings.SCORE_KELLY_COMPONENT_WEIGHT,
+        ),
+        SCORE_INEFFICIENCY_COMPONENT_WEIGHT=_read_env_float(
+            "SCORE_INEFFICIENCY_COMPONENT_WEIGHT",
+            Settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT,
+        ),
+        SCORE_BAYESIAN_COMPONENT_WEIGHT=_read_env_float(
+            "SCORE_BAYESIAN_COMPONENT_WEIGHT",
+            Settings.SCORE_BAYESIAN_COMPONENT_WEIGHT,
+        ),
         SCORE_LOW_INFO_PENALTY_THRESHOLD=_read_env_float(
             "SCORE_LOW_INFO_PENALTY_THRESHOLD",
             Settings.SCORE_LOW_INFO_PENALTY_THRESHOLD,
@@ -1939,6 +1968,14 @@ def load_settings() -> Settings:
         HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS=_read_env_int(
             "HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS",
             Settings.HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS,
+        ),
+        HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=_read_env_float(
+            "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA",
+            Settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA,
+        ),
+        HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE=_read_env_float(
+            "HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE",
+            Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE,
         ),
         RESEARCH_QUEUE_ENABLED=_read_env_bool(
             "RESEARCH_QUEUE_ENABLED",

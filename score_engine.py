@@ -19,14 +19,17 @@ _OVERCONFIDENCE_STEP_HIGH_GAP = 0.25
 _OVERCONFIDENCE_STEP_LOW_PENALTY = 0.06
 _OVERCONFIDENCE_STEP_HIGH_PENALTY = 0.12
 _LATE_STAGE_OVERCONFIDENCE_THRESHOLD = 0.85
-# Score weights for the model-edge signals (Bayesian posterior, LMSR
-# inefficiency, Kelly fraction). Raised from the prior 0.05/0.05/0.10 so genuine
-# edge competes with the stacked penalties instead of being dwarfed by them: the
-# penalty stack on a typical proxy decision routinely exceeds 0.5, while these
-# components previously topped out near 0.10 combined.
-_BAYESIAN_COMPONENT_WEIGHT = 0.08
-_INEFFICIENCY_COMPONENT_WEIGHT = 0.10
-_KELLY_COMPONENT_WEIGHT = 0.15
+# Default score weights for the model-edge signals (Bayesian posterior, LMSR
+# inefficiency, Kelly fraction). These are the strategy signals the bot is meant
+# to follow, so they must carry enough weight to clear the score gate when a
+# genuine edge exists. Raised again (0.08/0.10/0.15 -> 0.10/0.18/0.30) after a
+# 10-cycle review found these components contributed 0.0 to the gating/ranking
+# score (they were never passed at ranking time) while the proxy/fallback penalty
+# stack routinely exceeded 0.4. These are now defaults; callers override them
+# from Settings (SCORE_{BAYESIAN,INEFFICIENCY,KELLY}_COMPONENT_WEIGHT).
+_BAYESIAN_COMPONENT_WEIGHT = 0.10
+_INEFFICIENCY_COMPONENT_WEIGHT = 0.18
+_KELLY_COMPONENT_WEIGHT = 0.30
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,9 @@ def compute_final_score(
     historical_family_boost_evidence_min: float = 0.44,
     historical_family_loss_drag_scale: float = 1.8,
     historical_family_loss_drag_sample_min: int = 30,
+    bayesian_component_weight: float = _BAYESIAN_COMPONENT_WEIGHT,
+    inefficiency_component_weight: float = _INEFFICIENCY_COMPONENT_WEIGHT,
+    kelly_component_weight: float = _KELLY_COMPONENT_WEIGHT,
 ) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
@@ -185,13 +191,13 @@ def compute_final_score(
     evidence_component = 0.15 * evidence_quality
     bayesian_component = 0.0
     if bayesian_posterior is not None:
-        bayesian_component = _BAYESIAN_COMPONENT_WEIGHT * (bayesian_posterior - 0.5)
+        bayesian_component = max(0.0, bayesian_component_weight) * (bayesian_posterior - 0.5)
     inefficiency_component = 0.0
     if inefficiency_signal is not None:
-        inefficiency_component = _INEFFICIENCY_COMPONENT_WEIGHT * abs(inefficiency_signal)
+        inefficiency_component = max(0.0, inefficiency_component_weight) * abs(inefficiency_signal)
     kelly_component = 0.0
     if kelly_raw is not None:
-        kelly_component = _KELLY_COMPONENT_WEIGHT * max(0.0, min(1.0, kelly_raw))
+        kelly_component = max(0.0, kelly_component_weight) * max(0.0, min(1.0, kelly_raw))
     confidence_alignment_bonus = 0.0
     if (
         bayesian_posterior is not None
@@ -301,8 +307,21 @@ def compute_final_score(
         mention_market_penalty = max(0.0, mention_market_penalty_base)
     confidence_calibration_penalty = 0.0
     normalized_conf_floor = max(0.0, min(1.0, confidence_calibration_floor))
-    if decision.confidence < normalized_conf_floor:
-        confidence_shortfall = normalized_conf_floor - max(0.0, decision.confidence)
+    # Penalize against pre-calibration (raw) confidence so this does not
+    # double-count the static + historical confidence shrink that already lowered
+    # decision.confidence. Penalizing the shrunk value was self-defeating:
+    # calibration lowered confidence, then the score punished it again, pushing
+    # every market below the gate. Falls back to decision.confidence when raw is
+    # unavailable (e.g. synthetic decisions, tests).
+    confidence_for_calibration_penalty = (
+        decision.raw_confidence
+        if decision.raw_confidence is not None
+        else decision.confidence
+    )
+    if confidence_for_calibration_penalty < normalized_conf_floor:
+        confidence_shortfall = normalized_conf_floor - max(
+            0.0, confidence_for_calibration_penalty
+        )
         confidence_calibration_penalty = (
             confidence_shortfall * max(0.0, confidence_calibration_penalty_scale)
         )
