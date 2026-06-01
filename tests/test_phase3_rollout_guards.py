@@ -23,6 +23,41 @@ def test_applied_bayesian_posterior_respects_min_updates() -> None:
     assert _applied_bayesian_posterior(0.62, bayesian_update_count=2, min_updates_for_trade=2) == 0.62
 
 
+def test_applied_bayesian_posterior_near_prior_guard() -> None:
+    # An uninformative posterior (within epsilon of the prior) must NOT be applied,
+    # so it cannot overwrite calibrated confidence with the 0.50 prior.
+    assert (
+        _applied_bayesian_posterior(
+            0.52, bayesian_update_count=5, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        is None
+    )
+    assert (
+        _applied_bayesian_posterior(
+            0.50, bayesian_update_count=5, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        is None
+    )
+    # A sufficiently divergent posterior is applied.
+    assert (
+        _applied_bayesian_posterior(
+            0.62, bayesian_update_count=5, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        == 0.62
+    )
+    # Min-updates is still enforced even when divergent.
+    assert (
+        _applied_bayesian_posterior(
+            0.62, bayesian_update_count=2, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        is None
+    )
+
+
 def test_cap_bayesian_confidence_boost_limits_uplift() -> None:
     capped = _cap_bayesian_confidence_boost(
         base_confidence=0.53,

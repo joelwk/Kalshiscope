@@ -38,6 +38,19 @@ class Settings:
     MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER: float = 0.85
     LOW_PRICE_THRESHOLD: float = 0.50
     VERY_LOW_PRICE_THRESHOLD: float = 0.25
+    # Allow high-edge, direct, settlement-aligned trades to bypass the hard
+    # VERY_LOW_PRICE_THRESHOLD entry floor. The min-edge ladder already prices
+    # low-entry risk (VERY_LOW_PRICE_MIN_EDGE), so the hard floor otherwise
+    # discards legitimate cheap longshots backed by direct settlement evidence
+    # (e.g. a 0.21-priced market with a 0.49 direct edge).
+    ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED: bool = True
+    ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE: float = 0.20
+    # eq floor set to MIN_EVIDENCE_QUALITY_FOR_TRADE level (0.60) rather than 0.80
+    # so the override actually recovers the observed lost class (direct,
+    # settlement-aligned, edge 0.49, eq 0.60). The direct + settlement_aligned +
+    # strong-edge gates already make this a high bar; the market must still clear
+    # the separate evidence-quality and edge gates downstream.
+    ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY: float = 0.60
     HIGH_PRICE_THRESHOLD: float = 0.65
     LOW_PRICE_MIN_EDGE: float = 0.18
     VERY_LOW_PRICE_MIN_EDGE: float = 0.28
@@ -734,7 +747,14 @@ class Settings:
     BAYESIAN_ENABLED: bool = False
     BAYESIAN_SKIP_STALE_UPDATES: bool = True
     BAYESIAN_PRIOR_DEFAULT: float = 0.50
-    BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
+    # Raised 1 -> 3: a single neutral update leaves the posterior ~= the 0.50
+    # prior, and that uninformative posterior was overwriting the model's
+    # calibrated confidence (collapsing it to 0.50) on fresh threshold markets.
+    BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 3
+    # Do not apply the posterior when it is within this distance of the prior
+    # (uninformative). Keeps the model's calibrated confidence instead of
+    # reverting it to the prior. 0 disables the guard (legacy behavior).
+    BAYESIAN_MIN_POSTERIOR_DIVERGENCE: float = 0.05
     BAYESIAN_MAX_POSTERIOR: float = 0.90
     BAYESIAN_MAX_CONFIDENCE_BOOST: float = 0.15
     LMSR_ENABLED: bool = False
@@ -755,6 +775,13 @@ class Settings:
     FLIP_GUARD_MIN_CONF_GAIN: float = 0.08
     FLIP_GUARD_MIN_EDGE_GAIN: float = 0.03
     FLIP_GUARD_MIN_EVIDENCE_QUALITY: float = 0.60
+    # Direct-evidence flip bypass: fresh direct, settlement-aligned evidence with
+    # a strong edge legitimately overrides a stale anchor even when the new
+    # confidence is lower than the anchor's (negative conf_delta). Without this,
+    # a deliberate refinement flip on ground-truth evidence is wrongly blocked.
+    FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED: bool = True
+    FLIP_GUARD_DIRECT_MIN_EDGE: float = 0.15
+    FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO: float = 5.0
     FLIP_CIRCUIT_BREAKER_ENABLED: bool = True
     FLIP_CIRCUIT_BREAKER_MAX_FLIPS: int = 3
     EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE: bool = False
@@ -926,6 +953,18 @@ def load_settings() -> Settings:
         ),
         VERY_LOW_PRICE_THRESHOLD=_read_env_float(
             "VERY_LOW_PRICE_THRESHOLD", Settings.VERY_LOW_PRICE_THRESHOLD
+        ),
+        ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED=_read_env_bool(
+            "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED",
+            Settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED,
+        ),
+        ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE=_read_env_float(
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE",
+            Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE,
+        ),
+        ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY",
+            Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY,
         ),
         HIGH_PRICE_THRESHOLD=_read_env_float(
             "HIGH_PRICE_THRESHOLD", Settings.HIGH_PRICE_THRESHOLD
@@ -2120,6 +2159,10 @@ def load_settings() -> Settings:
                 Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
             ),
         ),
+        BAYESIAN_MIN_POSTERIOR_DIVERGENCE=_read_env_float(
+            "BAYESIAN_MIN_POSTERIOR_DIVERGENCE",
+            Settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE,
+        ),
         BAYESIAN_MAX_POSTERIOR=_read_env_float(
             "BAYESIAN_MAX_POSTERIOR",
             Settings.BAYESIAN_MAX_POSTERIOR,
@@ -2191,6 +2234,18 @@ def load_settings() -> Settings:
         FLIP_GUARD_MIN_EVIDENCE_QUALITY=_read_env_float(
             "FLIP_GUARD_MIN_EVIDENCE_QUALITY",
             Settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
+        ),
+        FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED=_read_env_bool(
+            "FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED",
+            Settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED,
+        ),
+        FLIP_GUARD_DIRECT_MIN_EDGE=_read_env_float(
+            "FLIP_GUARD_DIRECT_MIN_EDGE",
+            Settings.FLIP_GUARD_DIRECT_MIN_EDGE,
+        ),
+        FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO=_read_env_float(
+            "FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO",
+            Settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO,
         ),
         FLIP_CIRCUIT_BREAKER_ENABLED=_read_env_bool(
             "FLIP_CIRCUIT_BREAKER_ENABLED",

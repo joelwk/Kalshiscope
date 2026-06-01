@@ -240,9 +240,9 @@ _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
 # intentionally excluded: it has direct sources but is efficiently priced, and
 # it is throttled separately via MAX_SPORTS_CANDIDATES_PER_CYCLE.
 _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY = {
-    "music": 0.05,
-    "entertainment": 0.05,
-    "weather": 0.03,
+    "music": 0.08,
+    "entertainment": 0.08,
+    "weather": 0.05,
 }
 # Minimum non-actionable streak before a never-traded market with a recent
 # fallback edge is benched as high-churn. Raised 3 -> 5 in the 10-cycle review:
@@ -1450,15 +1450,26 @@ def _passes_edge_threshold(
     decision: TradeDecision,
     settings: Settings,
     market: Market | None = None,
+    effective_confidence_override: float | None = None,
 ) -> tuple[bool, float | None, str]:
     if implied_prob is None:
         if settings.REQUIRE_IMPLIED_PRICE:
             return False, None, "missing implied probability"
         return True, None, ""
+    # When an override is supplied (the execution path passes the post-calibration,
+    # post-Bayesian confidence), use it so the edge gate is coherent with the score
+    # gate and Kelly sizing. Previously this gate keyed off pre-calibration
+    # raw_confidence while the rest of execution used the calibrated value, so a
+    # market could pass the edge gate on raw conviction yet be sized off a 0.50
+    # calibrated posterior.
     effective_confidence = (
-        decision.raw_confidence
-        if decision.raw_confidence is not None
-        else decision.confidence
+        effective_confidence_override
+        if effective_confidence_override is not None
+        else (
+            decision.raw_confidence
+            if decision.raw_confidence is not None
+            else decision.confidence
+        )
     )
     edge = effective_confidence - implied_prob
     if (
@@ -2032,10 +2043,19 @@ def _applied_bayesian_posterior(
     bayesian_posterior_raw: float | None,
     bayesian_update_count: int,
     min_updates_for_trade: int,
+    *,
+    prior: float = 0.5,
+    min_posterior_divergence: float = 0.0,
 ) -> float | None:
     if bayesian_posterior_raw is None:
         return None
     if bayesian_update_count < max(0, int(min_updates_for_trade)):
+        return None
+    # Near-prior guard: an uninformative posterior (within epsilon of the prior)
+    # must not overwrite the model's calibrated confidence. Without this a single
+    # neutral update collapsed confidence to the 0.50 prior on fresh threshold
+    # markets, decoupling calibrated conviction from sizing.
+    if abs(float(bayesian_posterior_raw) - float(prior)) < max(0.0, float(min_posterior_divergence)):
         return None
     return bayesian_posterior_raw
 
@@ -2414,6 +2434,21 @@ def _apply_flip_guard(
     evidence_quality = decision.evidence_quality or 0.0
     evidence_ok = evidence_quality >= settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY
     high_evidence_flip_override = evidence_quality >= 0.90 and decision.confidence >= 0.90
+    # Direct-evidence flip bypass: fresh direct, settlement-aligned evidence with a
+    # strong edge legitimately overrides a stale anchor even when the new
+    # confidence is lower than the anchor's. The strict conf_gain path still
+    # governs proxy/unverified flips.
+    normalized_src_match_for_flip = str(
+        getattr(decision, "source_match_class", "") or ""
+    ).strip().lower()
+    direct_evidence_flip_override = (
+        settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED
+        and evidence_basis_class == "direct"
+        and normalized_src_match_for_flip == "settlement_aligned"
+        and likelihood_ratio >= settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO
+        and new_edge is not None
+        and abs(new_edge) >= settings.FLIP_GUARD_DIRECT_MIN_EDGE
+    )
 
     payload = {
         "market_id": market.id,
@@ -2432,10 +2467,15 @@ def _apply_flip_guard(
         "edge_gain_ok": edge_gain_ok,
         "evidence_ok": evidence_ok,
         "high_evidence_flip_override": high_evidence_flip_override,
+        "direct_evidence_flip_override": direct_evidence_flip_override,
         "use_raw_confidence_for_flip_guard": use_raw_confidence_for_flip_guard,
     }
 
-    if high_evidence_flip_override or (abs_conf_ok and conf_gain_ok and edge_gain_ok and evidence_ok):
+    if (
+        high_evidence_flip_override
+        or direct_evidence_flip_override
+        or (abs_conf_ok and conf_gain_ok and edge_gain_ok and evidence_ok)
+    ):
         logger.info(
             "FlipGuard passed: market=%s anchor=%s proposed=%s conf_delta=%.3f edge_delta=%s",
             market.id,
@@ -10787,9 +10827,57 @@ def main(max_cycles: int | None = None) -> None:
                 audit_context["audit_entry_price"] = entry_price
                 audit_context["audit_implied_prob_market"] = implied_prob
                 audit_context["audit_edge_source"] = decision.edge_source
+                # High-edge, direct, settlement-aligned trades may bypass the hard
+                # entry-price floor: the min-edge ladder already prices low-entry
+                # risk, so the blunt floor otherwise discards legitimate cheap
+                # longshots backed by direct settlement evidence (the 10-cycle
+                # review lost a 0.21-priced market with a 0.49 direct edge).
+                _floor_effective_conf = (
+                    decision.raw_confidence
+                    if decision.raw_confidence is not None
+                    else decision.confidence
+                )
+                _floor_edge = (
+                    _floor_effective_conf - implied_prob
+                    if implied_prob is not None
+                    else None
+                )
+                entry_price_floor_override = (
+                    settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED
+                    and str(decision.evidence_basis or "").strip().lower() == "direct"
+                    and str(getattr(decision, "source_match_class", "") or "").strip().lower()
+                    == "settlement_aligned"
+                    and _floor_edge is not None
+                    and _floor_edge >= settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE
+                    and (decision.evidence_quality or 0.0)
+                    >= settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY
+                )
+                audit_context["entry_price_floor_override"] = entry_price_floor_override
+                if entry_price_floor_override and (
+                    entry_price is not None
+                    and entry_price < settings.VERY_LOW_PRICE_THRESHOLD
+                ):
+                    logger.info(
+                        "Entry-price floor bypassed (direct high-edge): market=%s entry=%.3f floor=%.3f edge=%.3f eq=%.2f",
+                        market.id,
+                        entry_price,
+                        settings.VERY_LOW_PRICE_THRESHOLD,
+                        _floor_edge if _floor_edge is not None else 0.0,
+                        decision.evidence_quality or 0.0,
+                        data={
+                            "market_id": market.id,
+                            "entry_price": entry_price,
+                            "entry_price_floor": settings.VERY_LOW_PRICE_THRESHOLD,
+                            "floor_edge": _floor_edge,
+                            "evidence_basis": decision.evidence_basis,
+                            "source_match_class": getattr(decision, "source_match_class", None),
+                            "evidence_quality": decision.evidence_quality,
+                        },
+                    )
                 if (
                     entry_price is not None
                     and entry_price < settings.VERY_LOW_PRICE_THRESHOLD
+                    and not entry_price_floor_override
                 ):
                     trades_skipped_edge += 1
                     _record_should_trade_blocked("entry_price_too_low")
@@ -10913,6 +11001,8 @@ def main(max_cycles: int | None = None) -> None:
                                 bayesian_posterior_raw=bayesian_posterior_raw,
                                 bayesian_update_count=bayesian_update_count,
                                 min_updates_for_trade=settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
+                                prior=settings.BAYESIAN_PRIOR_DEFAULT,
+                                min_posterior_divergence=settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE,
                             )
                             if bayesian_posterior_applied is not None:
                                 bayesian_posterior_applied = min(
@@ -11126,6 +11216,7 @@ def main(max_cycles: int | None = None) -> None:
                     decision_for_edge,
                     settings,
                     market=market,
+                    effective_confidence_override=decision_for_edge.confidence,
                 )
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
@@ -12406,6 +12497,7 @@ def main(max_cycles: int | None = None) -> None:
                     and opportunity_role == "satellite"
                     and satellite_cap_pct is not None
                     and bet_pct > satellite_cap_pct + 1e-9
+                    and not min_bet_floor_applied
                 ):
                     trades_skipped_edge += 1
                     _record_should_trade_blocked("daily_expectancy_satellite_cap_blocked")
@@ -14238,6 +14330,13 @@ def main(max_cycles: int | None = None) -> None:
                         mean_confidence_delta,
                         4,
                     ),
+                    "mean_kelly_score_component": round(mean_kelly_score_component, 4),
+                    "mean_inefficiency_score_component": round(
+                        mean_inefficiency_score_component, 4
+                    ),
+                    "mean_bayesian_score_component": round(
+                        mean_bayesian_score_component, 4
+                    ),
                     "markets_considered": len(markets),
                     "markets_filtered": len(markets),
                 },
@@ -14300,6 +14399,13 @@ def main(max_cycles: int | None = None) -> None:
                     "mean_raw_vs_calibrated_confidence_delta": round(
                         mean_confidence_delta,
                         4,
+                    ),
+                    "mean_kelly_score_component": round(mean_kelly_score_component, 4),
+                    "mean_inefficiency_score_component": round(
+                        mean_inefficiency_score_component, 4
+                    ),
+                    "mean_bayesian_score_component": round(
+                        mean_bayesian_score_component, 4
                     ),
                 },
             )

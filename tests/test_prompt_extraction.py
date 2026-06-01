@@ -6,11 +6,13 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Updated after sharpening the opening goal of system/analyze_market to be
-    # explicit about acting on supported edge and searching primary/settlement
-    # sources (10-cycle review: 96% no-trade, evidence stuck on proxy/absence).
-    "analyze": "068c7d1106f8a2c7b59ae8d7c195577586e0ac3da5194ea97153ea6d635e87c7",
-    "deep": "45ed84815c5d18e8d37cc8bc73ffbbdfc90eb3d8e7f9c995c65507bda9e924a6",
+    # Updated after reinforcing primary_source_url emission for settlement-aligned
+    # evidence in system/analyze_market <source_requirements> and the
+    # shared_output_rules self-check (post-update review: trades only fire on
+    # direct evidence, but settlement-aligned markets were demoted to proxy for a
+    # missing URL). shared_output_rules is shared, so the deep hash moves too.
+    "analyze": "b83948bd7afc18b8fc1a734abd8312d94188cfcbb5686f234ad357a29ac7eb38",
+    "deep": "f248d43a97597d0791b8dc66045285b4b218635c78814707075a2e4e38fc2928",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {

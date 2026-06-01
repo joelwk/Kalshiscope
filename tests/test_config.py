@@ -221,6 +221,41 @@ class TestConfig(unittest.TestCase):
             config.Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE, 0.0
         )
 
+    def test_bayesian_confidence_guard_defaults(self) -> None:
+        self.assertEqual(config.Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
+        self.assertEqual(config.Settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE, 0.05)
+
+    def test_entry_price_floor_override_defaults(self) -> None:
+        self.assertTrue(config.Settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED)
+        self.assertEqual(config.Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE, 0.20)
+        self.assertEqual(
+            config.Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY, 0.60
+        )
+
+    def test_flip_guard_direct_override_defaults(self) -> None:
+        self.assertTrue(config.Settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED)
+        self.assertEqual(config.Settings.FLIP_GUARD_DIRECT_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO, 5.0)
+
+    def test_entry_floor_and_flip_direct_env_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED": "false",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE": "0.25",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY": "0.70",
+            "FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED": "false",
+            "FLIP_GUARD_DIRECT_MIN_EDGE": "0.22",
+            "FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO": "8.0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED)
+        self.assertEqual(settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE, 0.25)
+        self.assertEqual(settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY, 0.70)
+        self.assertFalse(settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED)
+        self.assertEqual(settings.FLIP_GUARD_DIRECT_MIN_EDGE, 0.22)
+        self.assertEqual(settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO, 8.0)
+
     def test_strategy_and_shrink_settings_env_overrides(self) -> None:
         env = {
             **self._required_env(),
@@ -268,8 +303,11 @@ class TestConfig(unittest.TestCase):
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
-            "MAX_SPORTS_CANDIDATES_PER_CYCLE=5",
+            "MAX_SPORTS_CANDIDATES_PER_CYCLE=4",
             "MAX_MUSIC_CANDIDATES_PER_CYCLE=2",
+            "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED=true",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE=0.20",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY=0.60",
             "MAX_TRADES_PER_CYCLE=4",
             "MAX_TRADES_PER_DAY=4",
             "MAX_DAILY_DRAWDOWN_USDC=15.0",
@@ -303,6 +341,9 @@ class TestConfig(unittest.TestCase):
             "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
             "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
             "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
+            "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45",
+            "BAYESIAN_MIN_UPDATES_FOR_TRADE=3",
+            "BAYESIAN_MIN_POSTERIOR_DIVERGENCE=0.05",
             "HISTORICAL_FAMILY_SIGNAL_ENABLED=true",
             "HISTORICAL_FAMILY_SCORE_SCALE=0.06",
             "HISTORICAL_FAMILY_SIZE_SCALE_MAX=0.25",
@@ -500,6 +541,7 @@ class TestConfig(unittest.TestCase):
             "BAYESIAN_SKIP_STALE_UPDATES": "false",
             "BAYESIAN_PRIOR_DEFAULT": "0.58",
             "BAYESIAN_MIN_UPDATES_FOR_TRADE": "3",
+            "BAYESIAN_MIN_POSTERIOR_DIVERGENCE": "0.07",
             "LMSR_ENABLED": "true",
             "LMSR_LIQUIDITY_PARAM_B": "120000",
             "LMSR_MIN_INEFFICIENCY": "0.04",
@@ -523,6 +565,7 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.BAYESIAN_SKIP_STALE_UPDATES)
         self.assertEqual(settings.BAYESIAN_PRIOR_DEFAULT, 0.58)
         self.assertEqual(settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
+        self.assertEqual(settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE, 0.07)
         self.assertEqual(settings.BAYESIAN_MAX_POSTERIOR, 0.90)
         self.assertTrue(settings.LMSR_ENABLED)
         self.assertEqual(settings.LMSR_LIQUIDITY_PARAM_B, 120000.0)

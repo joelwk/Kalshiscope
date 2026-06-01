@@ -1961,6 +1961,34 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=1), ("primary_target", None))
         self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=2), ("satellite", 0.25))
 
+    def test_satellite_cap_block_respects_min_bet_floor(self) -> None:
+        # A satellite bet that only exceeds the cap because the min-bet floor
+        # raised it to MIN_BET must NOT be blocked (it executes at min bet);
+        # the block still fires for genuinely over-cap bets.
+        import main as main_module
+
+        source = inspect.getsource(main_module)
+        self.assertRegex(
+            source,
+            re.compile(
+                r'opportunity_role == "satellite"[\s\S]{0,200}'
+                r"bet_pct > satellite_cap_pct \+ 1e-9[\s\S]{0,80}"
+                r"and not min_bet_floor_applied"
+            ),
+        )
+
+    def test_satellite_cap_executable_above_min_bet_when_configured(self) -> None:
+        # Invariant: the recommended satellite cap (raised to 0.45) x MAX_BET
+        # must be >= MIN_BET so satellite trades are not structurally blocked.
+        settings = Settings(
+            MAX_BET_USDC=12.0,
+            MIN_BET_USDC=5.0,
+            DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45,
+        )
+        _, cap = _daily_expectancy_role(settings=settings, daily_exposure_count=2)
+        self.assertIsNotNone(cap)
+        self.assertGreaterEqual(cap * settings.MAX_BET_USDC, settings.MIN_BET_USDC)
+
     def test_daily_expectancy_ev_blocks_non_positive_primary_and_unfunded_satellite(self) -> None:
         self.assertEqual(
             _daily_expectancy_ev_block_reason(
@@ -3195,6 +3223,27 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertRegex(source, pattern)
 
+    def test_entry_price_floor_skip_guarded_by_edge_override(self) -> None:
+        # The hard entry-price floor must be bypassable for high-edge, direct,
+        # settlement-aligned trades (the ENTRY_PRICE_FLOOR_EDGE_OVERRIDE path).
+        import main as main_module
+
+        source = inspect.getsource(main_module)
+        self.assertRegex(
+            source,
+            re.compile(
+                r"entry_price_floor_override\s*=\s*\([\s\S]{0,400}"
+                r"ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED"
+            ),
+        )
+        self.assertRegex(
+            source,
+            re.compile(
+                r"entry_price\s*<\s*settings\.VERY_LOW_PRICE_THRESHOLD\s*"
+                r"and\s*not\s*entry_price_floor_override"
+            ),
+        )
+
     def test_kelly_fraction_weather_multiplier_applies(self) -> None:
         now = datetime.now(timezone.utc)
         settings = Settings(
@@ -3396,6 +3445,37 @@ class TestMainUtils(unittest.TestCase):
         self.assertTrue(passed)
         self.assertAlmostEqual(edge or 0.0, 0.15, places=6)
         self.assertEqual(reason, "")
+
+    def test_passes_edge_threshold_override_uses_effective_confidence(self) -> None:
+        # Coherence fix: when the execution path supplies the effective
+        # (post-calibration/post-Bayesian) confidence, the edge gate must use it
+        # instead of raw_confidence, so a market whose calibrated conviction is a
+        # coinflip fails the edge gate even though raw conviction looked strong.
+        settings = Settings(
+            MIN_EDGE=0.05,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.50,
+            raw_confidence=0.82,
+            bet_size_pct=0.4,
+            reasoning="test",
+        )
+        # Legacy raw path: edge 0.82 - 0.57 = 0.25 -> passes.
+        passed_raw, edge_raw, _ = _passes_edge_threshold(0.57, decision, settings)
+        self.assertTrue(passed_raw)
+        self.assertAlmostEqual(edge_raw or 0.0, 0.25, places=6)
+        # Effective-confidence override (0.50): edge -0.07 -> fails (coherent with
+        # the score gate and Kelly which also see the 0.50 calibrated conviction).
+        passed_eff, edge_eff, _ = _passes_edge_threshold(
+            0.57, decision, settings, effective_confidence_override=0.50
+        )
+        self.assertFalse(passed_eff)
+        self.assertAlmostEqual(edge_eff or 0.0, -0.07, places=6)
 
     def test_analyze_market_candidate_returns_decision_payload(self) -> None:
         market = Market(

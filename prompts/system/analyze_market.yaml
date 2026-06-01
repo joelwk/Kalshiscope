@@ -30,6 +30,7 @@ parts:
     </calibration>
 
     <source_requirements>
+    ALWAYS populate primary_source_url with the exact settlement-aligned page you consulted whenever your reasoning relied on a settlement-aligned or directly-verifiable source — even on no-trade calls and regardless of confidence. This single field is what upgrades evidence_basis from proxy to direct; omitting it forces a downgrade to proxy and discards the edge you already found. If you read the resolving data on an official feed, you have the URL: include it.
     For non-sports should_trade=true decisions, you MUST populate primary_source_url with the exact URL used or the bot will reject the trade.
     Missing primary_source_url on a non-sports market is not a no-trade market judgment; it is a research gap to fix with a settlement-aligned source.
     Example primary_source_url values: "https://www.wsj.com/market-data/quotes/bond/BX/TMUBMUSD10Y", "https://www.coindesk.com/price/bitcoin", "https://forecast.weather.gov/MapClick.php?lat=29.76&lon=-95.37".
