@@ -221,6 +221,33 @@ class TestConfig(unittest.TestCase):
             config.Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE, 0.0
         )
 
+    def test_direct_posterior_floor_defaults_and_override(self) -> None:
+        self.assertTrue(config.Settings.DIRECT_POSTERIOR_FLOOR_ENABLED)
+        self.assertEqual(
+            config.Settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY, 0.80
+        )
+        env = {
+            **self._required_env(),
+            "DIRECT_POSTERIOR_FLOOR_ENABLED": "false",
+            "DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY": "0.90",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.DIRECT_POSTERIOR_FLOOR_ENABLED)
+        self.assertEqual(settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY, 0.90)
+
+    def test_historical_family_negative_size_scale_default_and_override(self) -> None:
+        self.assertEqual(
+            config.Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE, 0.25
+        )
+        env = {
+            **self._required_env(),
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE": "0.50",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE, 0.50)
+
     def test_bayesian_confidence_guard_defaults(self) -> None:
         self.assertEqual(config.Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
         self.assertEqual(config.Settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE, 0.05)

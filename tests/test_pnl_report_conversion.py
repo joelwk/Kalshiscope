@@ -5,7 +5,11 @@ import sqlite3
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
-from scripts.pnl_report import _print_conversion_funnel
+from scripts.pnl_report import (
+    _confidence_tier_label,
+    _print_confidence_tier_breakdown,
+    _print_conversion_funnel,
+)
 
 
 def test_conversion_funnel_section_renders(tmp_path) -> None:
@@ -94,3 +98,63 @@ def test_conversion_funnel_section_renders(tmp_path) -> None:
     output = output_buffer.getvalue()
     assert "Analyzed -> Executed Conversion" in output
     assert "sports" in output
+
+
+def test_confidence_tier_label_bands_are_contiguous() -> None:
+    assert _confidence_tier_label(0.95) == "0.70+"
+    assert _confidence_tier_label(0.70) == "0.70+"
+    assert _confidence_tier_label(0.69) == "0.62-0.69"
+    assert _confidence_tier_label(0.61) == "0.55-0.61"
+    assert _confidence_tier_label(0.54) == "0.50-0.54"
+    assert _confidence_tier_label(0.49) == "<0.50"
+    assert _confidence_tier_label(0.0) == "<0.50"
+
+
+def test_confidence_tier_section_renders(tmp_path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE trade_outcomes (
+                market_id TEXT PRIMARY KEY,
+                confidence REAL,
+                won INTEGER,
+                pnl_estimate REAL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO trade_outcomes (market_id, confidence, won, pnl_estimate) VALUES (?, ?, ?, ?)",
+            [
+                ("HI-WIN", 0.75, 1, 3.0),
+                ("HI-LOSS", 0.72, 0, -5.0),
+                ("MID-WIN", 0.58, 1, 4.0),
+                ("LOW", 0.45, 0, -1.0),
+                # NULL confidence must be excluded from every tier.
+                ("NULL-CONF", None, 1, 9.0),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        _print_confidence_tier_breakdown(str(db_path))
+    output = output_buffer.getvalue()
+    assert "Win Rate by Confidence Tier" in output
+    assert "0.70+" in output
+    assert "0.55-0.61" in output
+    # The NULL-confidence row's PnL (9.0) must not appear in any tier total.
+    assert "9.00" not in output
+
+
+def test_confidence_tier_section_handles_missing_table(tmp_path) -> None:
+    db_path = tmp_path / "empty.db"
+    conn = sqlite3.connect(db_path)
+    conn.close()
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        _print_confidence_tier_breakdown(str(db_path))
+    assert "No trade_outcomes table found." in output_buffer.getvalue()

@@ -103,6 +103,15 @@ _STALE_REFRESH_RETRY_DELAY_SECONDS = 1.0
 _STALE_REFRESH_LENIENT_AGE_MULTIPLIER = 2.5
 _MAX_CONFIDENCE = 1.0
 _AGGRESSIVE_CONFIDENCE_SHRINKAGE_FACTOR = 0.30
+# Minimum resolved-trade samples before a family's windowed PnL is trusted to
+# mark it "profitable" for downstream loosening.
+_FAMILY_PROFITABLE_MIN_SAMPLE = 20
+# The lifetime-blend path overrides a negative short window, so it demands a
+# larger sample before it can vouch for a family in a recent drawdown.
+_FAMILY_PROFITABLE_LIFETIME_MIN_SAMPLE = 40
+# Resolved-outcome lookback used to approximate a family's lifetime PnL when
+# deciding whether a short-window drawdown should be ignored.
+_FAMILY_LIFETIME_PNL_LOOKBACK = 5000
 _INDEX_MARKET_PREFIXES = ("KXNASDAQ100U-", "KXINXU-")
 _COMMODITY_MARKET_TOKENS = (
     "GOLD",
@@ -1515,6 +1524,47 @@ def _passes_edge_threshold(
     if edge < min_edge - 1e-9:
         return False, edge, f"edge {edge:.4f} below min {min_edge:.4f}"
     return True, edge, ""
+
+
+def _direct_evidence_posterior_floor(
+    decision: TradeDecision,
+    implied_prob: float | None,
+    settings: Settings,
+    market: Market | None = None,
+) -> float | None:
+    """Posterior floor that preserves a direct-evidence model edge.
+
+    Confidence calibration only ever shrinks confidence, which can pull a
+    direct, high-evidence decision's calibrated confidence below the market
+    price and invert a genuine positive edge (the edge gate, Kelly posterior,
+    and score `edge_market` all key off the calibrated confidence). For
+    decisions backed by direct + computed + high-evidence signals with a real
+    positive model edge, floor the posterior at the model's own outcome estimate
+    (``implied_prob + edge_external``, which is outcome-aligned the same way the
+    confidence-gate override's ``model_edge`` is) so calibration cannot turn that
+    edge negative. Returns ``None`` (behavior unchanged) when the decision does
+    not qualify or inputs are missing. The floor never exceeds the existing
+    direct-evidence overconfidence ceiling, and downstream EV/score/Kelly gates
+    still apply.
+    """
+    if not settings.DIRECT_POSTERIOR_FLOOR_ENABLED:
+        return None
+    if implied_prob is None:
+        return None
+    edge_external = getattr(decision, "edge_external", None)
+    if edge_external is None or float(edge_external) <= 0.0:
+        return None
+    if _decision_evidence_basis(decision) != "direct":
+        return None
+    if str(getattr(decision, "edge_source", "") or "").strip().lower() != "computed":
+        return None
+    if float(decision.evidence_quality) < float(
+        settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY
+    ):
+        return None
+    ceiling = max(0.0, min(1.0, float(settings.MAX_GLOBAL_CONFIDENCE_DIRECT)))
+    model_estimate = float(implied_prob) + float(edge_external)
+    return max(0.0, min(ceiling, model_estimate))
 
 
 def _adjust_bet_size_for_edge(
@@ -3105,17 +3155,31 @@ def _is_confidence_override_allowed(
     settings: Settings,
     decision: TradeDecision,
     override_edge: float | None,
+    pre_calibration_confidence: float | None = None,
 ) -> tuple[bool, float, str]:
     override_min_confidence = max(
         0.0,
         min(1.0, settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE),
     )
+    # The confidence calibration shrink only ever lowers confidence, and that
+    # same shrink is already propagated into Kelly bet sizing (bet_size_pct is
+    # scaled by calibrated/raw). Gating the override floor on the post-shrink
+    # confidence therefore double-counts the shrink and locks out modest-but-
+    # real-edge trades. Evaluate the override floor against the pre-calibration
+    # confidence when available; the evidence-quality and edge bars below still
+    # enforce participation discipline.
+    confidence_for_floor = decision.confidence
+    if pre_calibration_confidence is not None:
+        confidence_for_floor = max(
+            decision.confidence,
+            float(pre_calibration_confidence),
+        )
     edge_default_allowed = (
         settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED
         and override_edge is not None
         and override_edge >= settings.CONFIDENCE_GATE_MIN_EDGE
         and decision.evidence_quality >= settings.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY
-        and decision.confidence >= override_min_confidence
+        and confidence_for_floor >= override_min_confidence
     )
     if edge_default_allowed:
         return True, override_min_confidence, "edge_default"
@@ -3136,7 +3200,7 @@ def _is_confidence_override_allowed(
         and edge_source == "computed"
         and override_edge is not None
         and abs(override_edge) >= settings.CONFIDENCE_GATE_MIN_EDGE
-        and decision.confidence >= strong_floor
+        and confidence_for_floor >= strong_floor
     )
     if strong_evidence_allowed:
         return True, strong_floor, "strong_direct_evidence"
@@ -3150,7 +3214,7 @@ def _is_confidence_override_allowed(
         and edge_source == "computed"
         and override_edge is not None
         and abs(override_edge) >= proxy_edge_min
-        and decision.confidence >= strong_floor
+        and confidence_for_floor >= strong_floor
     )
     if strong_proxy_allowed:
         return True, strong_floor, "strong_proxy_evidence"
@@ -4572,6 +4636,9 @@ def _score_kwargs(
         "historical_family_signal_enabled": settings.HISTORICAL_FAMILY_SIGNAL_ENABLED,
         "historical_family_signal_score_scale": settings.HISTORICAL_FAMILY_SCORE_SCALE,
         "historical_family_size_scale_max": settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX,
+        "historical_family_size_scale_max_negative": (
+            settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE
+        ),
         "historical_prefix_pnl_per_trade": historical_prefix_pnl_per_trade,
         "historical_prefix_sample_size": historical_prefix_sample_size,
         "source_match_class": source_match_class,
@@ -4605,15 +4672,30 @@ def _family_context_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "historical_family_high_conf_losses": candidate.get(
             "historical_family_high_conf_losses"
         ),
+        "lifetime_family_pnl_total": candidate.get("lifetime_family_pnl_total"),
+        "lifetime_family_sample_size": candidate.get("lifetime_family_sample_size"),
     }
 
 
 def _family_is_profitable_from_context(context: dict[str, Any] | None) -> bool:
     if not context:
         return False
+    windowed_pnl = float(context.get("historical_family_pnl_total", 0.0) or 0.0)
+    windowed_samples = int(context.get("historical_family_sample_size", 0) or 0)
+    if windowed_pnl > 0.0 and windowed_samples >= _FAMILY_PROFITABLE_MIN_SAMPLE:
+        return True
+    # A profitable family can still print a negative short (30-day) window during
+    # a normal drawdown. Recognize it as profitable for loosening when the
+    # broader lifetime sample is solidly positive AND the recent drawdown has not
+    # erased the lifetime gains. This is intentionally conservative: a family that
+    # is net-negative over its lifetime (or whose recent losses exceed lifetime
+    # profit) is NOT treated as profitable.
+    lifetime_pnl = float(context.get("lifetime_family_pnl_total", 0.0) or 0.0)
+    lifetime_samples = int(context.get("lifetime_family_sample_size", 0) or 0)
     return (
-        float(context.get("historical_family_pnl_total", 0.0) or 0.0) > 0.0
-        and int(context.get("historical_family_sample_size", 0) or 0) >= 20
+        lifetime_pnl > 0.0
+        and lifetime_samples >= _FAMILY_PROFITABLE_LIFETIME_MIN_SAMPLE
+        and windowed_pnl >= -lifetime_pnl
     )
 
 
@@ -7240,6 +7322,7 @@ def main(max_cycles: int | None = None) -> None:
             analysis_candidates: list[dict[str, Any]] = []
             fallback_family_rate_cache: dict[str, tuple[float, int]] = {}
             historical_family_outcome_snapshot: dict[str, dict[str, float | int]] = {}
+            historical_family_lifetime_snapshot: dict[str, dict[str, float | int]] = {}
             historical_family_signal_snapshot: dict[str, dict[str, float | int]] = {}
             historical_prefix_stats: dict[str, Any] = {}
             historical_short_prefix_stats: dict[str, Any] = {}
@@ -7257,6 +7340,17 @@ def main(max_cycles: int | None = None) -> None:
                     data={"error": str(exc)},
                 )
                 historical_family_outcome_snapshot = {}
+            try:
+                historical_family_lifetime_snapshot = state_manager.get_family_outcome_snapshot(
+                    lookback=_FAMILY_LIFETIME_PNL_LOOKBACK,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Historical family lifetime snapshot lookup failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
+                historical_family_lifetime_snapshot = {}
             try:
                 historical_family_signal_snapshot = state_manager.get_family_signal_snapshot(
                     lookback=max(100, settings.HISTORICAL_FAMILY_MIN_SAMPLES * 20),
@@ -7986,6 +8080,15 @@ def main(max_cycles: int | None = None) -> None:
                 historical_family_high_conf_losses = int(
                     historical_family_signal_stats.get("high_conf_losses", 0) or 0
                 )
+                lifetime_family_stats = (
+                    historical_family_lifetime_snapshot.get(family_name) or {}
+                )
+                lifetime_family_pnl_total = float(
+                    lifetime_family_stats.get("pnl_total", 0.0) or 0.0
+                )
+                lifetime_family_sample_size = int(
+                    lifetime_family_stats.get("sample_size", 0) or 0
+                )
                 historical_gate_allowed, historical_gate_reason, historical_gate_metrics = (
                     _evaluate_historical_gate(
                         market_id=market.id,
@@ -8680,6 +8783,8 @@ def main(max_cycles: int | None = None) -> None:
                         "historical_family_win_rate": historical_family_win_rate,
                         "historical_family_deployed_usdc": historical_family_deployed_usdc,
                         "historical_family_high_conf_losses": historical_family_high_conf_losses,
+                        "lifetime_family_pnl_total": lifetime_family_pnl_total,
+                        "lifetime_family_sample_size": lifetime_family_sample_size,
                         "short_prefix_score_penalty": short_prefix_score_penalty,
                         "short_prefix_metrics": short_prefix_metrics,
                         "force_extended_research": (
@@ -10741,6 +10846,9 @@ def main(max_cycles: int | None = None) -> None:
                         settings=settings,
                         decision=decision,
                         override_edge=override_edge,
+                        pre_calibration_confidence=analysis_result.get(
+                            "confidence_before_calibration"
+                        ),
                     )
                     if not confidence_override_allowed and _is_definitive_outcome_eligible(
                         decision,
@@ -11211,12 +11319,28 @@ def main(max_cycles: int | None = None) -> None:
                     0.0,
                     float(baseline_edge_threshold - required_edge_threshold),
                 )
+                execution_posterior_floor = _direct_evidence_posterior_floor(
+                    decision_for_edge,
+                    implied_prob,
+                    settings,
+                    market=market,
+                )
+                edge_gate_confidence = decision_for_edge.confidence
+                if execution_posterior_floor is not None:
+                    edge_gate_confidence = max(
+                        decision_for_edge.confidence,
+                        execution_posterior_floor,
+                    )
+                audit_context["direct_posterior_floor_applied"] = (
+                    execution_posterior_floor is not None
+                )
+                audit_context["direct_posterior_floor_value"] = execution_posterior_floor
                 edge_ok, edge_value, edge_reason = _passes_edge_threshold(
                     implied_prob,
                     decision_for_edge,
                     settings,
                     market=market,
-                    effective_confidence_override=decision_for_edge.confidence,
+                    effective_confidence_override=edge_gate_confidence,
                 )
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
@@ -11519,6 +11643,11 @@ def main(max_cycles: int | None = None) -> None:
                         if bayesian_posterior_applied is not None
                         else effective_confidence
                     )
+                    if execution_posterior_floor is not None:
+                        posterior_for_kelly = max(
+                            posterior_for_kelly,
+                            execution_posterior_floor,
+                        )
                     kelly_raw_value = kelly_fraction(
                         posterior=posterior_for_kelly,
                         market_price=implied_prob,
@@ -11581,6 +11710,7 @@ def main(max_cycles: int | None = None) -> None:
                     lmsr_price=lmsr_execution_price,
                     inefficiency_signal=ineff_signal,
                     kelly_raw=kelly_raw_value,
+                    edge_market_confidence_override=execution_posterior_floor,
                     **_score_kwargs(
                         settings=settings,
                         repeated_analysis_count=(state.analysis_count if state is not None else 0),
@@ -11948,6 +12078,11 @@ def main(max_cycles: int | None = None) -> None:
                             if bayesian_posterior_applied is not None
                             else effective_confidence
                         )
+                        if execution_posterior_floor is not None:
+                            posterior_for_kelly = max(
+                                posterior_for_kelly,
+                                execution_posterior_floor,
+                            )
                     if kelly_fraction_value is None:
                         kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
                     min_edge_for_kelly = _edge_threshold_for_market(

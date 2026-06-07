@@ -2426,3 +2426,150 @@ def test_generic_family_loss_drag_stronger_for_established_samples() -> None:
     )
     assert large_sample.historical_family_signal < small_sample.historical_family_signal
 
+
+def _losing_family_score(size_scale_max_negative: float):
+    market = Market(
+        id="KXGENERIC-SIZE",
+        question="Generic loser sizing",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        bet_size_pct=0.2,
+        reasoning="Proxy signal",
+        edge_external=0.08,
+        edge_source="computed",
+        evidence_quality=0.55,
+        evidence_basis="proxy",
+    )
+    return compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.50,
+        market_family="generic",
+        historical_family_pnl_total=-50.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.45,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_size_scale_max=0.35,
+        historical_family_size_scale_max_negative=size_scale_max_negative,
+    )
+
+
+def test_negative_size_scale_hardens_loser_downsizing() -> None:
+    symmetric = _losing_family_score(0.35)
+    asymmetric = _losing_family_score(0.50)
+    assert symmetric.historical_family_signal < 0.0
+    assert asymmetric.historical_family_size_multiplier < symmetric.historical_family_size_multiplier
+    assert asymmetric.historical_family_size_multiplier >= 1.0 - 0.50
+    assert asymmetric.historical_family_size_multiplier < 1.0
+
+
+def test_edge_market_confidence_override_preserves_positive_edge() -> None:
+    market = Market(
+        id="KXHIGH-OVERRIDE",
+        question="Direct evidence market",
+        outcomes=[MarketOutcome(name="YES", price=0.66), MarketOutcome(name="NO", price=0.34)],
+        liquidity_usdc=600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    # Calibration crushed confidence to 0.545; real direct model edge is +0.22.
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.545,
+        bet_size_pct=0.3,
+        reasoning="direct settlement-aligned read",
+        edge_source="computed",
+        edge_external=0.22,
+        evidence_quality=1.0,
+        evidence_basis="direct",
+    )
+    without_override = compute_final_score(
+        market, decision, implied_prob_market=0.66, evidence_basis_class="direct"
+    )
+    with_override = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.66,
+        evidence_basis_class="direct",
+        edge_market_confidence_override=0.88,
+    )
+    assert without_override.edge_market == pytest.approx(0.545 - 0.66)
+    assert without_override.edge_market < 0
+    assert with_override.edge_market == pytest.approx(0.88 - 0.66)
+    assert with_override.final_score > without_override.final_score
+
+
+def test_edge_market_confidence_override_never_lowers_confidence() -> None:
+    market = Market(
+        id="KXHIGH-NOOP",
+        question="Direct evidence market",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_source="computed",
+        edge_external=0.10,
+        evidence_quality=0.8,
+    )
+    # Override below the decision confidence must not lower edge_market.
+    result = compute_final_score(
+        market, decision, implied_prob_market=0.50, edge_market_confidence_override=0.55
+    )
+    assert result.edge_market == pytest.approx(0.70 - 0.50)
+
+
+def test_negative_size_scale_leaves_winner_unchanged() -> None:
+    market = Market(
+        id="KXMLB-SIZE",
+        question="Sports winner sizing",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.60,
+        bet_size_pct=0.2,
+        reasoning="Computed edge",
+        edge_external=0.10,
+        edge_source="computed",
+        evidence_quality=0.65,
+        evidence_basis="proxy",
+    )
+    kwargs = dict(
+        implied_prob_market=0.50,
+        market_family="sports",
+        historical_family_pnl_total=40.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.58,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_size_scale_max=0.35,
+    )
+    low_negative = compute_final_score(
+        market, decision, historical_family_size_scale_max_negative=0.35, **kwargs
+    )
+    high_negative = compute_final_score(
+        market, decision, historical_family_size_scale_max_negative=0.50, **kwargs
+    )
+    assert low_negative.historical_family_signal > 0.0
+    assert low_negative.historical_family_size_multiplier > 1.0
+    assert (
+        high_negative.historical_family_size_multiplier
+        == pytest.approx(low_negative.historical_family_size_multiplier)
+    )
+

@@ -4517,5 +4517,53 @@ class TestAdaptiveResearchBandSettings(unittest.TestCase):
         self.assertFalse(s.PRE_ANALYSIS_OPPORTUNITY_RESEARCH_BAND_ADAPTIVE_ENABLED)
 
 
+def test_family_profitable_uses_positive_short_window() -> None:
+    context = {
+        "historical_family_pnl_total": 15.0,
+        "historical_family_sample_size": 25,
+    }
+    assert main_module._family_is_profitable_from_context(context) is True
+
+
+def test_family_profitable_blend_recognizes_lifetime_through_minor_drawdown() -> None:
+    context = {
+        "historical_family_pnl_total": -20.0,
+        "historical_family_sample_size": 25,
+        "lifetime_family_pnl_total": 120.0,
+        "lifetime_family_sample_size": 80,
+    }
+    assert main_module._family_is_profitable_from_context(context) is True
+
+
+def test_family_profitable_blend_rejects_severe_recent_drawdown() -> None:
+    context = {
+        "historical_family_pnl_total": -130.0,
+        "historical_family_sample_size": 25,
+        "lifetime_family_pnl_total": 120.0,
+        "lifetime_family_sample_size": 80,
+    }
+    assert main_module._family_is_profitable_from_context(context) is False
+
+
+def test_family_profitable_blend_requires_lifetime_sample() -> None:
+    context = {
+        "historical_family_pnl_total": -5.0,
+        "historical_family_sample_size": 25,
+        "lifetime_family_pnl_total": 50.0,
+        "lifetime_family_sample_size": 10,
+    }
+    assert main_module._family_is_profitable_from_context(context) is False
+
+
+def test_family_profitable_rejects_negative_lifetime() -> None:
+    context = {
+        "historical_family_pnl_total": -77.0,
+        "historical_family_sample_size": 80,
+        "lifetime_family_pnl_total": -50.0,
+        "lifetime_family_sample_size": 120,
+    }
+    assert main_module._family_is_profitable_from_context(context) is False
+
+
 if __name__ == "__main__":
     unittest.main()

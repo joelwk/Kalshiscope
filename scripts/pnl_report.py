@@ -36,6 +36,20 @@ CONVERSION_FUNNEL_HEADER = (
     f"{'Conv':>7} {'PnL':>12}"
 )
 CONVERSION_FUNNEL_LOOKBACK_DAYS = 7
+CONFIDENCE_TIER_HEADER = (
+    f"{'Tier':<12} {'Trades':>7} {'Wins':>6} {'Losses':>7} "
+    f"{'WinRate':>8} {'TotalPnL':>12} {'AvgPnL':>12}"
+)
+# Confidence bands bracket the decision-relevant thresholds: the overconfident
+# high band (>=0.62), the modest-confidence override pocket (0.55-0.61), and the
+# sub-floor bands. Bands are contiguous and cover [0.0, 1.01).
+CONFIDENCE_TIER_BANDS: tuple[tuple[str, float, float], ...] = (
+    ("0.70+", 0.70, 1.01),
+    ("0.62-0.69", 0.62, 0.70),
+    ("0.55-0.61", 0.55, 0.62),
+    ("0.50-0.54", 0.50, 0.55),
+    ("<0.50", 0.0, 0.50),
+)
 
 
 @dataclass(frozen=True)
@@ -565,6 +579,79 @@ def _print_conversion_funnel(db_path: str, *, lookback_days: int = CONVERSION_FU
         conn.close()
 
 
+def _confidence_tier_label(confidence: float) -> str | None:
+    for label, lower, upper in CONFIDENCE_TIER_BANDS:
+        if lower <= confidence < upper:
+            return label
+    return None
+
+
+def _print_confidence_tier_breakdown(db_path: str) -> None:
+    """Win rate and PnL by decision-confidence band from resolution outcomes.
+
+    This surfaces calibration quality: a high band whose realized win rate sits
+    below its stated confidence is overconfident, and a modest band that wins is
+    a pocket the confidence floor may be wrongly excluding.
+    """
+    _print_section("Win Rate by Confidence Tier (resolution outcomes)")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        table_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trade_outcomes'"
+        ).fetchone()
+        if table_row is None:
+            print("No trade_outcomes table found.")
+            return
+        rows = conn.execute(
+            """
+            SELECT confidence, won, pnl_estimate
+            FROM trade_outcomes
+            WHERE won IN (0, 1) AND confidence IS NOT NULL
+            """
+        ).fetchall()
+        if not rows:
+            print("No resolved trade outcomes with confidence available.")
+            return
+
+        buckets: dict[str, dict[str, float]] = {
+            label: {"trades": 0.0, "wins": 0.0, "losses": 0.0, "pnl": 0.0}
+            for label, _, _ in CONFIDENCE_TIER_BANDS
+        }
+        for row in rows:
+            confidence = _coerce_float(row["confidence"])
+            if confidence is None:
+                continue
+            label = _confidence_tier_label(confidence)
+            if label is None:
+                continue
+            bucket = buckets[label]
+            bucket["trades"] += 1.0
+            if row["won"] == 1:
+                bucket["wins"] += 1.0
+            else:
+                bucket["losses"] += 1.0
+            bucket["pnl"] += float(row["pnl_estimate"] or 0.0)
+
+        print(CONFIDENCE_TIER_HEADER)
+        print("-" * len(CONFIDENCE_TIER_HEADER))
+        for label, _, _ in CONFIDENCE_TIER_BANDS:
+            bucket = buckets[label]
+            trades = int(bucket["trades"])
+            wins = int(bucket["wins"])
+            losses = int(bucket["losses"])
+            decided = wins + losses
+            win_rate = (wins / decided) if decided > 0 else 0.0
+            pnl_total = float(bucket["pnl"])
+            avg_pnl = pnl_total / trades if trades > 0 else 0.0
+            print(
+                f"{label:<12} {trades:>7} {wins:>6} {losses:>7} "
+                f"{win_rate:>7.1%} {pnl_total:>12,.2f} {avg_pnl:>12,.2f}"
+            )
+    finally:
+        conn.close()
+
+
 def _print_category_breakdown(rows: list[sqlite3.Row]) -> None:
     _print_section("PnL by Category")
     if not rows:
@@ -833,6 +920,7 @@ def main() -> None:
         _print_total_realized_pnl(report_rows, state_manager)
         _print_daily_run_history(report_rows, rolling_days=max(1, args.rolling_days))
         _print_category_breakdown(report_rows)
+        _print_confidence_tier_breakdown(args.db)
         _print_conversion_funnel(args.db)
         _print_monthly_breakdown(report_rows)
         _print_open_positions(open_positions, live_api_available=live_api_available)

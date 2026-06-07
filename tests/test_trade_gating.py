@@ -9,6 +9,7 @@ from main import (
     _adjust_bet_size_for_edge,
     _apply_definitive_outcome_floors,
     _build_execution_audit,
+    _direct_evidence_posterior_floor,
     _effective_score_gate_threshold,
     _extract_winning_outcome,
     _filter_markets,
@@ -345,6 +346,191 @@ def test_confidence_override_allows_when_floor_and_thresholds_met() -> None:
     )
     assert allowed is True
     assert override_path == "edge_default"
+
+
+def test_confidence_override_uses_pre_calibration_confidence() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.08,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.65,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.48,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.70,
+    )
+    blocked, _, blocked_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+    )
+    assert blocked is False
+    assert blocked_path == "none"
+
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+        pre_calibration_confidence=0.58,
+    )
+    assert allowed is True
+    assert override_path == "edge_default"
+
+
+def test_confidence_override_pre_calibration_still_enforces_evidence_quality() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.08,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.65,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.48,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.60,
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+        pre_calibration_confidence=0.62,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def test_confidence_override_pre_calibration_still_enforces_edge() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.08,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.65,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.48,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.90,
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.05,
+        pre_calibration_confidence=0.62,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def _direct_decision(
+    *,
+    confidence: float = 0.60,
+    edge_external: float | None = 0.13,
+    evidence_quality: float = 0.85,
+    evidence_basis: str = "direct",
+    edge_source: str = "computed",
+) -> TradeDecision:
+    return TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=confidence,
+        bet_size_pct=0.5,
+        reasoning="direct settlement-aligned read",
+        edge_source=edge_source,
+        edge_external=edge_external,
+        evidence_quality=evidence_quality,
+        evidence_basis=evidence_basis,
+    )
+
+
+def _floor_settings(**overrides) -> Settings:
+    base = dict(
+        DIRECT_POSTERIOR_FLOOR_ENABLED=True,
+        DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=0.80,
+        MAX_GLOBAL_CONFIDENCE_DIRECT=0.89,
+        MIN_EDGE=0.08,
+        MAX_REASONABLE_EDGE=0.40,
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_direct_posterior_floor_reconstructs_model_estimate() -> None:
+    settings = _floor_settings()
+    floor = _direct_evidence_posterior_floor(_direct_decision(), 0.67, settings)
+    assert floor == pytest.approx(0.80)
+
+
+def test_direct_posterior_floor_capped_at_direct_ceiling() -> None:
+    settings = _floor_settings()
+    # implied 0.66 + edge 0.30 = 0.96 model estimate, capped at 0.89.
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(edge_external=0.30), 0.66, settings
+    )
+    assert floor == pytest.approx(0.89)
+
+
+def test_direct_posterior_floor_none_for_proxy_or_low_eq_or_nonpositive_edge() -> None:
+    settings = _floor_settings()
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(evidence_basis="proxy"), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(evidence_quality=0.70), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(edge_external=0.0), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(edge_source="fallback"), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(_direct_decision(), None, settings) is None
+
+
+def test_direct_posterior_floor_disabled_returns_none() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_ENABLED=False)
+    assert _direct_evidence_posterior_floor(_direct_decision(), 0.67, settings) is None
+
+
+def test_direct_posterior_floor_unblocks_edge_gate_after_calibration_inversion() -> None:
+    settings = _floor_settings()
+    market = Market(
+        id="KXAAA-FLOOR",
+        question="Direct evidence generic market",
+        outcomes=[MarketOutcome(name="YES", price=0.67), MarketOutcome(name="NO", price=0.33)],
+        liquidity_usdc=600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    # Calibration crushed confidence to 0.60; raw model edge is +0.13.
+    decision = _direct_decision(confidence=0.60, edge_external=0.13)
+    floor = _direct_evidence_posterior_floor(decision, 0.67, settings, market=market)
+    assert floor == pytest.approx(0.80)
+
+    # Without the floor the calibrated confidence yields a negative market edge.
+    blocked_ok, blocked_edge, _ = _passes_edge_threshold(
+        0.67, decision, settings, market=market,
+        effective_confidence_override=decision.confidence,
+    )
+    assert blocked_ok is False
+    assert blocked_edge is not None and blocked_edge < 0
+
+    # With the floor applied the real positive edge clears the gate.
+    ok, edge, reason = _passes_edge_threshold(
+        0.67, decision, settings, market=market,
+        effective_confidence_override=max(decision.confidence, floor),
+    )
+    assert ok is True
+    assert edge == pytest.approx(0.13)
+    assert reason == ""
 
 
 def test_effective_score_gate_threshold_uses_weather_direct_threshold() -> None:

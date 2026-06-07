@@ -103,6 +103,7 @@ def compute_final_score(
     lmsr_price: float | None = None,
     inefficiency_signal: float | None = None,
     kelly_raw: float | None = None,
+    edge_market_confidence_override: float | None = None,
     is_weather_market: bool = False,
     weather_score_penalty: float = 0.0,
     low_info_penalty_threshold: float = 0.55,
@@ -143,6 +144,7 @@ def compute_final_score(
     historical_family_signal_enabled: bool = True,
     historical_family_signal_score_scale: float = 0.06,
     historical_family_size_scale_max: float = 0.25,
+    historical_family_size_scale_max_negative: float = 0.25,
     now: datetime | None = None,
     evidence_basis_class: str = "",
     edge_source: str = "",
@@ -167,7 +169,16 @@ def compute_final_score(
     now = now or datetime.now(timezone.utc)
     edge_market = 0.0
     if implied_prob_market is not None:
-        edge_market = decision.confidence - implied_prob_market
+        # When a direct-evidence posterior floor is supplied, use it (never below
+        # the model's own confidence) so calibration shrink cannot invert a real
+        # positive edge into a negative market edge at the score gate, matching
+        # the edge gate and Kelly sizing.
+        edge_market_confidence = decision.confidence
+        if edge_market_confidence_override is not None:
+            edge_market_confidence = max(
+                decision.confidence, float(edge_market_confidence_override)
+            )
+        edge_market = edge_market_confidence - implied_prob_market
 
     edge_external = decision.edge_external or 0.0
     evidence_quality = max(0.0, min(1.0, decision.evidence_quality))
@@ -572,10 +583,23 @@ def compute_final_score(
         ):
             historical_family_score_adjustment = 0.0
         size_scale = max(0.0, min(1.0, float(historical_family_size_scale_max)))
-        historical_family_size_multiplier = max(
-            1.0 - size_scale,
-            min(1.0 + size_scale, 1.0 + (historical_family_signal * size_scale)),
+        # Losing families get steeper downsizing authority than winners get
+        # upsizing: oversizing a persistent loser is the dominant drawdown risk,
+        # while inflating a thin winner adds risk for little proven edge.
+        negative_size_scale = max(
+            size_scale,
+            min(1.0, float(historical_family_size_scale_max_negative)),
         )
+        if historical_family_signal < 0.0:
+            historical_family_size_multiplier = max(
+                1.0 - negative_size_scale,
+                1.0 + (historical_family_signal * negative_size_scale),
+            )
+        else:
+            historical_family_size_multiplier = min(
+                1.0 + size_scale,
+                1.0 + (historical_family_signal * size_scale),
+            )
         historical_family_bonus = max(0.0, historical_family_score_adjustment)
     elif (
         historical_family_pnl_total is not None

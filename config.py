@@ -24,6 +24,13 @@ class Settings:
     CONFIDENCE_GATE_MIN_EDGE: float = 0.08
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
     CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
+    # Direct-evidence posterior floor: for direct + computed + high-evidence
+    # decisions, floor the posterior used by the edge gate, Kelly sizing, and the
+    # score gate at the model's own outcome estimate (implied + edge_external) so
+    # confidence calibration cannot invert a genuine positive edge into a
+    # negative market edge. Bounded by MAX_GLOBAL_CONFIDENCE_DIRECT.
+    DIRECT_POSTERIOR_FLOOR_ENABLED: bool = True
+    DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY: float = 0.80
     MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.55
     SPORTS_MIN_EVIDENCE_QUALITY: float = 0.55
     MIN_LIQUIDITY_USDC: float = 15.0
@@ -651,6 +658,12 @@ class Settings:
     HISTORICAL_FAMILY_SIGNAL_ENABLED: bool = True
     HISTORICAL_FAMILY_SCORE_SCALE: float = 0.06
     HISTORICAL_FAMILY_SIZE_SCALE_MAX: float = 0.25
+    # Downward size authority for families with a negative historical signal.
+    # Kept >= HISTORICAL_FAMILY_SIZE_SCALE_MAX so persistent losers can be
+    # shrunk more aggressively than winners are inflated (oversizing a losing
+    # family is the dominant drawdown risk). Defaults to the symmetric value;
+    # raise it in .env to harden the de-risk.
+    HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE: float = 0.25
     HISTORICAL_SHORT_PREFIX_LEN: int = 5
     HISTORICAL_SHORT_PREFIX_MIN_SAMPLES: int = 3
     HISTORICAL_SHORT_PREFIX_PNL_CUTOFF: float = -5.0
@@ -922,6 +935,14 @@ def load_settings() -> Settings:
         CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=_read_env_float(
             "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE",
             Settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE,
+        ),
+        DIRECT_POSTERIOR_FLOOR_ENABLED=_read_env_bool(
+            "DIRECT_POSTERIOR_FLOOR_ENABLED",
+            Settings.DIRECT_POSTERIOR_FLOOR_ENABLED,
+        ),
+        DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY",
+            Settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY,
         ),
         MIN_EVIDENCE_QUALITY_FOR_TRADE=_read_env_float(
             "MIN_EVIDENCE_QUALITY_FOR_TRADE",
@@ -1897,6 +1918,10 @@ def load_settings() -> Settings:
         HISTORICAL_FAMILY_SIZE_SCALE_MAX=_read_env_float(
             "HISTORICAL_FAMILY_SIZE_SCALE_MAX",
             Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX,
+        ),
+        HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE=_read_env_float(
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE",
+            Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE,
         ),
         HISTORICAL_SHORT_PREFIX_LEN=_read_env_int(
             "HISTORICAL_SHORT_PREFIX_LEN",
