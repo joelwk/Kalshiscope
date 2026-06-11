@@ -31,6 +31,14 @@ class Settings:
     # negative market edge. Bounded by MAX_GLOBAL_CONFIDENCE_DIRECT.
     DIRECT_POSTERIOR_FLOOR_ENABLED: bool = True
     DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY: float = 0.80
+    # Scope guard for numeric-strike price markets (commodity/index/crypto
+    # -T<strike> tickers): a live quote confirms the CURRENT value, not the
+    # settlement value, so the floor only applies when settlement is within
+    # this many hours (or the decision passes definitive validation). Weather
+    # keeps the floor: forecasts predict the settlement quantity itself.
+    # June 2026 evidence: floored commodity strikes placed 3-4h out ran a 52%
+    # realized win rate at ~0.57 entries. Set to 0 to disable the scope guard.
+    DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE: float = 1.5
     MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.55
     SPORTS_MIN_EVIDENCE_QUALITY: float = 0.55
     MIN_LIQUIDITY_USDC: float = 15.0
@@ -946,6 +954,10 @@ def load_settings() -> Settings:
         DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=_read_env_float(
             "DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY",
             Settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY,
+        ),
+        DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=_read_env_float(
+            "DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE",
+            Settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE,
         ),
         MIN_EVIDENCE_QUALITY_FOR_TRADE=_read_env_float(
             "MIN_EVIDENCE_QUALITY_FOR_TRADE",

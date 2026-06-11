@@ -45,6 +45,11 @@ _KALSHI_RETRYABLE_STATUS_CODES = (502, 503, 504)
 _KALSHI_RETRY_ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
 _MARKETS_PAGE_MAX_ATTEMPTS = 3
 _MARKETS_PAGE_RETRY_DELAY_SECONDS = 0.5
+# Order submissions hit transient 429s during bursty cycles; a rate-limited
+# request was never accepted, so resubmitting the identical payload (same
+# client_order_id) is safe and recovers fully-validated trades.
+_ORDER_RATE_LIMIT_MAX_RETRIES = 2
+_ORDER_RATE_LIMIT_BACKOFF_SECONDS = 1.0
 _TICKER_CONTEXT_MAX_LEN = 200
 _TICKER_CITY_MAP = {
     "AUS": "Austin",
@@ -502,30 +507,55 @@ class KalshiClient:
         else:
             payload["no_price"] = price_cents
 
-        try:
-            response = self._request("POST", "/portfolio/orders", json=payload)
-        except requests.exceptions.HTTPError as exc:
-            response_text = ""
-            if exc.response is not None:
-                response_text = exc.response.text.lower()
-                logger.error(
-                    "Order rejected by Kalshi: market=%s status=%s payload=%s body=%s",
-                    order.market_id,
-                    exc.response.status_code,
-                    payload,
-                    exc.response.text,
-                    data={
-                        "market_id": order.market_id,
-                        "status_code": exc.response.status_code,
-                        "payload": payload,
-                        "response_body": exc.response.text,
-                    },
+        max_attempts = 1 + max(0, _ORDER_RATE_LIMIT_MAX_RETRIES)
+        response = None
+        for attempt in range(max_attempts):
+            try:
+                response = self._request("POST", "/portfolio/orders", json=payload)
+                break
+            except requests.exceptions.HTTPError as exc:
+                status_code = (
+                    exc.response.status_code if exc.response is not None else None
                 )
-            if "insufficient" in response_text and "balance" in response_text:
-                raise InsufficientBalanceError("Insufficient balance on Kalshi account") from exc
-            if "market_closed" in response_text or "market closed" in response_text:
-                raise MarketClosedError("Market closed before order submission") from exc
-            raise
+                if status_code == 429 and attempt + 1 < max_attempts:
+                    delay = _ORDER_RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1)
+                    logger.warning(
+                        "Order rate-limited (429), retrying in %.1fs: market=%s attempt=%d/%d",
+                        delay,
+                        order.market_id,
+                        attempt + 1,
+                        max_attempts,
+                        data={
+                            "market_id": order.market_id,
+                            "status_code": status_code,
+                            "retry_attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "retry_delay_seconds": delay,
+                        },
+                    )
+                    time.sleep(delay)
+                    continue
+                response_text = ""
+                if exc.response is not None:
+                    response_text = exc.response.text.lower()
+                    logger.error(
+                        "Order rejected by Kalshi: market=%s status=%s payload=%s body=%s",
+                        order.market_id,
+                        exc.response.status_code,
+                        payload,
+                        exc.response.text,
+                        data={
+                            "market_id": order.market_id,
+                            "status_code": exc.response.status_code,
+                            "payload": payload,
+                            "response_body": exc.response.text,
+                        },
+                    )
+                if "insufficient" in response_text and "balance" in response_text:
+                    raise InsufficientBalanceError("Insufficient balance on Kalshi account") from exc
+                if "market_closed" in response_text or "market closed" in response_text:
+                    raise MarketClosedError("Market closed before order submission") from exc
+                raise
 
         response_data = response.json()
         response_order = response_data.get("order", response_data) if isinstance(response_data, dict) else {}

@@ -546,6 +546,74 @@ class TestKalshiClient(unittest.TestCase):
             with self.assertRaises(MarketClosedError):
                 client.submit_order(order, market=market)
 
+    def _rate_limit_error(self) -> requests.exceptions.HTTPError:
+        response = _DummyHttpResponse(
+            '{"error":{"code":"too_many_requests","message":"too many requests"}}',
+            status_code=429,
+        )
+        return requests.exceptions.HTTPError("429 Too Many Requests", response=response)
+
+    def test_submit_order_retries_rate_limit_with_same_payload(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-8",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-8",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        success = _DummyResponse({"order": {"order_id": "ord-8", "status": "resting"}})
+
+        with patch("kalshi_client.time.sleep") as sleep_mock:
+            with patch.object(
+                client,
+                "_request",
+                side_effect=[self._rate_limit_error(), success],
+            ) as req_mock:
+                response = client.submit_order(order, market=market)
+
+        self.assertEqual(response.id, "ord-8")
+        self.assertEqual(req_mock.call_count, 2)
+        first_payload = req_mock.call_args_list[0].kwargs["json"]
+        second_payload = req_mock.call_args_list[1].kwargs["json"]
+        # Idempotent retry: a 429 was never accepted, so the identical
+        # client_order_id must be reused.
+        self.assertEqual(first_payload, second_payload)
+        sleep_mock.assert_called_once()
+
+    def test_submit_order_rate_limit_exhausts_retries_and_raises(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-9",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-9",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+
+        with patch("kalshi_client.time.sleep"):
+            with patch.object(
+                client,
+                "_request",
+                side_effect=[
+                    self._rate_limit_error(),
+                    self._rate_limit_error(),
+                    self._rate_limit_error(),
+                ],
+            ) as req_mock:
+                with self.assertRaises(requests.exceptions.HTTPError):
+                    client.submit_order(order, market=market)
+
+        self.assertEqual(req_mock.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

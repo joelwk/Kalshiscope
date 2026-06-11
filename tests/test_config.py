@@ -226,15 +226,20 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(
             config.Settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY, 0.80
         )
+        self.assertEqual(
+            config.Settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE, 1.5
+        )
         env = {
             **self._required_env(),
             "DIRECT_POSTERIOR_FLOOR_ENABLED": "false",
             "DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY": "0.90",
+            "DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE": "3.0",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertFalse(settings.DIRECT_POSTERIOR_FLOOR_ENABLED)
         self.assertEqual(settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY, 0.90)
+        self.assertEqual(settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE, 3.0)
 
     def test_historical_family_negative_size_scale_default_and_override(self) -> None:
         self.assertEqual(

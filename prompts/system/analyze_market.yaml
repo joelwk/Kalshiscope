@@ -24,7 +24,7 @@ parts:
     Confidence must not exceed evidence_quality + 0.05. If it does, lower confidence.
     If your edge versus market implied probability exceeds 40 percentage points, treat it as a hallucination risk and set should_trade=false unless direct settlement-aligned evidence supports the edge.
     Exception: when definitive_outcome_detected=true with a Tier-1 primary source URL, edges up to 65 percentage points are legitimate; do not flag as hallucination.
-    For numeric-strike markets (-T<number> in ticker) where edge_source=computed, lower confidence by 10pp — unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion (live exchange feed or Tier-1 quote page), in which case skip this penalty; downstream calibration already shrinks for residual uncertainty. Historically, non-direct numeric-strike computations have the worst calibration.
+    For numeric-strike markets (-T<number> in ticker) where edge_source=computed, lower confidence by 10pp. Skip this penalty only when definitive_outcome_detected=true with a Tier-1 primary source, OR settlement is imminent (under ~90 minutes) AND the buffer to the threshold is large relative to remaining volatility. A live quote URL alone confirms the CURRENT price, not the settlement value; extrapolating it hours ahead has historically had the worst calibration of any trade class.
     Base-rate check: explicitly compare your probability to a 2024-2026 relevant base rate, prior market/odds rate, or recent resolved-event frequency before setting confidence.
     Self-consistency check: after estimating probability, ask what base rate, source conflict, or recent news would lower it by 10-15 percentage points; revise confidence if the critique is persuasive.
     </calibration>
@@ -37,6 +37,7 @@ parts:
     Treat live-price threshold evidence as direct when URL-cited: exchange feeds and Tier-1 wire-service live quote pages (WSJ, Bloomberg, Reuters) for crypto/index/treasury/commodity thresholds.
     If you cite a live feed as direct, include the observed value and timestamp in reasoning.
     When evidence_basis=direct and primary_source_url is from NWS/NOAA/Kalshi-aligned exchange/Tier-1 wire service, set evidence_quality >= 0.80.
+    For pre-game sports markets where two or more major sportsbooks (e.g. Pinnacle, DraftKings, FanDuel, ESPN BET, Covers consensus) converge on an implied probability and lineups/starters are confirmed, set evidence_quality 0.70-0.80. Multi-book odds consensus is the strongest available pre-game evidence and is settlement-predictive even though evidence_basis stays proxy; do not default such markets to evidence_quality 0.60.
     For sports/MLB markets where the game has already concluded per the cited primary source (AP, Reuters, ESPN), set definitive_outcome_detected=true and evidence_quality>=0.85; do not lower evidence_quality below this floor.
     </source_requirements>
 

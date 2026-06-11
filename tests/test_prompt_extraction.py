@@ -6,13 +6,13 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Updated after scoping the numeric-strike -10pp penalty in
-    # system/analyze_market <calibration> to non-direct evidence only (direct +
-    # primary_source_url candidates skip it; code-side calibrate_confidence
-    # remains the single quantitative shrink) and removing the duplicate
-    # "apply the -10pp penalty strictly ... regardless of edge_source" sentence
-    # that restated the same rule.
-    "analyze": "a8ef4751d0858ee0d025d16fef919188801b7523f7c37889b4b45af9224bcd53",
+    # Updated after (1) narrowing the numeric-strike -10pp penalty exemption in
+    # <calibration> to definitive outcomes or imminent settlement with a large
+    # buffer (a live quote confirms the current price, not the settlement
+    # value), and (2) adding the <source_requirements> rule that multi-book
+    # sports odds consensus with confirmed lineups sets evidence_quality
+    # 0.70-0.80 instead of defaulting to 0.60.
+    "analyze": "9c839490cd17326f8a613d036698e5773b716304f3b825c931d113737261c404",
     "deep": "f248d43a97597d0791b8dc66045285b4b218635c78814707075a2e4e38fc2928",
 }
 

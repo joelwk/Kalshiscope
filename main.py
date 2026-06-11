@@ -1558,6 +1558,50 @@ def _passes_edge_threshold(
     return True, edge, ""
 
 
+_PRICE_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+$", re.IGNORECASE)
+
+
+def _hours_to_market_close(market: Market | None) -> float | None:
+    if market is None or market.close_time is None:
+        return None
+    close_time = market.close_time
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=timezone.utc)
+    return (close_time - datetime.now(timezone.utc)).total_seconds() / 3600.0
+
+
+def _posterior_floor_scope_allows(
+    decision: TradeDecision,
+    market: Market | None,
+    settings: Settings,
+) -> bool:
+    """Scope guard: the floor's premise must hold for the market type.
+
+    On numeric-strike price markets (commodity/index/crypto ``-T<strike>``
+    tickers) a live quote is direct evidence of the CURRENT value, not the
+    settlement value, so flooring the posterior at ``implied + edge`` lets a
+    non-predictive observation bypass calibration (June 2026: floored
+    commodity strikes placed 3-4h before settlement ran a 52% realized win
+    rate at ~0.57 entries). Keep the floor only when settlement is close
+    enough for the observation to carry or the decision passes definitive
+    validation. Weather keeps the floor unconditionally: NWS forecasts
+    predict the settlement quantity itself.
+    """
+    if market is None:
+        return True
+    if not _PRICE_STRIKE_TICKER_PATTERN.search((market.id or "").strip()):
+        return True
+    if market_family(market) == "weather":
+        return True
+    max_hours = float(settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE)
+    if max_hours <= 0:
+        return True
+    if _is_definitive_validated(decision, settings, market=market):
+        return True
+    hours_to_close = _hours_to_market_close(market)
+    return hours_to_close is not None and hours_to_close <= max_hours
+
+
 def _direct_evidence_posterior_floor(
     decision: TradeDecision,
     implied_prob: float | None,
@@ -1575,9 +1619,10 @@ def _direct_evidence_posterior_floor(
     (``implied_prob + edge_external``, which is outcome-aligned the same way the
     confidence-gate override's ``model_edge`` is) so calibration cannot turn that
     edge negative. Returns ``None`` (behavior unchanged) when the decision does
-    not qualify or inputs are missing. The floor never exceeds the existing
-    direct-evidence overconfidence ceiling, and downstream EV/score/Kelly gates
-    still apply.
+    not qualify, inputs are missing, or ``_posterior_floor_scope_allows``
+    rejects the market type (non-predictive live-quote evidence). The floor
+    never exceeds the existing direct-evidence overconfidence ceiling, and
+    downstream EV/score/Kelly gates still apply.
     """
     if not settings.DIRECT_POSTERIOR_FLOOR_ENABLED:
         return None
@@ -1593,6 +1638,19 @@ def _direct_evidence_posterior_floor(
     if float(decision.evidence_quality) < float(
         settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY
     ):
+        return None
+    if not _posterior_floor_scope_allows(decision, market, settings):
+        logger.debug(
+            "Direct posterior floor scope-suppressed: market=%s hours_to_close=%s",
+            getattr(market, "id", None),
+            _hours_to_market_close(market),
+            data={
+                "market_id": getattr(market, "id", None),
+                "direct_posterior_floor_scope_suppressed": True,
+                "hours_to_close": _hours_to_market_close(market),
+                "max_hours_to_close": settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE,
+            },
+        )
         return None
     ceiling = max(0.0, min(1.0, float(settings.MAX_GLOBAL_CONFIDENCE_DIRECT)))
     model_estimate = float(implied_prob) + float(edge_external)
@@ -6753,6 +6811,24 @@ def main(max_cycles: int | None = None) -> None:
                     exc,
                     data={"error": str(exc)},
                 )
+            if (
+                settings.KELLY_SIZING_ENABLED
+                and cycle_bankroll is not None
+                and cycle_bankroll < settings.KELLY_MIN_BANKROLL_USDC
+            ):
+                # Once per cycle, not per market: this silent flip to
+                # edge-scaling has previously gone unnoticed for days.
+                logger.warning(
+                    "Kelly sizing disabled for this cycle: bankroll $%.2f below "
+                    "KELLY_MIN_BANKROLL_USDC $%.2f; falling back to edge scaling",
+                    cycle_bankroll,
+                    settings.KELLY_MIN_BANKROLL_USDC,
+                    data={
+                        "cycle_bankroll": cycle_bankroll,
+                        "kelly_min_bankroll_usdc": settings.KELLY_MIN_BANKROLL_USDC,
+                        "kelly_bankroll_guard_engaged": True,
+                    },
+                )
             cycle_trade_day = datetime.now(timezone.utc).date()
             if cycle_trade_day != current_trade_day:
                 current_trade_day = cycle_trade_day
@@ -11467,6 +11543,13 @@ def main(max_cycles: int | None = None) -> None:
                     execution_posterior_floor is not None
                 )
                 audit_context["direct_posterior_floor_value"] = execution_posterior_floor
+                if execution_posterior_floor is None and not _posterior_floor_scope_allows(
+                    decision_for_edge, market, settings
+                ):
+                    audit_context["direct_posterior_floor_scope_suppressed"] = True
+                    audit_context["direct_posterior_floor_hours_to_close"] = (
+                        _hours_to_market_close(market)
+                    )
                 edge_ok, edge_value, edge_reason = _passes_edge_threshold(
                     implied_prob,
                     decision_for_edge,

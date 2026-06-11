@@ -533,6 +533,98 @@ def test_direct_posterior_floor_unblocks_edge_gate_after_calibration_inversion()
     assert reason == ""
 
 
+def _price_strike_market(
+    market_id: str,
+    *,
+    hours_to_close: float,
+    question: str = "Will the gold close price be above the strike today?",
+) -> Market:
+    return Market(
+        id=market_id,
+        question=question,
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=400.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=hours_to_close),
+    )
+
+
+def test_direct_posterior_floor_scope_suppressed_for_far_numeric_strike() -> None:
+    # A live quote hours before settlement is not predictive; no floor.
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market("KXGOLDD-26JUN1017-T4157", hours_to_close=4.0)
+    assert (
+        _direct_evidence_posterior_floor(_direct_decision(), 0.55, settings, market=market)
+        is None
+    )
+
+
+def test_direct_posterior_floor_kept_for_near_settlement_numeric_strike() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market("KXGOLDD-26JUN1017-T4157", hours_to_close=0.5)
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_kept_for_weather_numeric_strike() -> None:
+    # NWS forecasts predict the settlement quantity; weather keeps the floor.
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market(
+        "KXLOWTCHI-26JUN10-T72",
+        hours_to_close=10.0,
+        question="Will the low temperature in Chicago be 72F or below today?",
+    )
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_scope_guard_disabled_with_zero_max_hours() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=0.0)
+    market = _price_strike_market("KXGOLDD-26JUN1017-T4157", hours_to_close=6.0)
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_unaffected_for_non_strike_ticker() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market(
+        "KXAAAGASD-26JUN11-4.140",
+        hours_to_close=8.0,
+        question="Will average gas prices be above $4.14?",
+    )
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_scope_suppressed_when_close_time_missing() -> None:
+    # Proximity cannot be verified without close_time; treat as out of scope.
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = Market(
+        id="KXGOLDD-26JUN1017-T4157",
+        question="Will the gold close price be above the strike today?",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=400.0,
+        close_time=None,
+    )
+    assert (
+        _direct_evidence_posterior_floor(_direct_decision(), 0.55, settings, market=market)
+        is None
+    )
+
+
 def test_effective_score_gate_threshold_uses_weather_direct_threshold() -> None:
     settings = Settings(
         SCORE_GATE_THRESHOLD=0.25,

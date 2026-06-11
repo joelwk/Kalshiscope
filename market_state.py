@@ -2077,6 +2077,13 @@ class MarketStateManager:
         ):
             priority = (priority if priority is not None else 0.0) + 0.08
             signals_present = True
+        gate_name = str(entry.get("gate_name") or "").strip().lower()
+        if gate_name == "conviction_repair":
+            # Repair passes already found strong edge/evidence but produced no
+            # executable decision; these are the highest-value retry candidates
+            # in the queue (June 2026: 197 parked with zero prioritized drains).
+            priority = (priority if priority is not None else 0.0) + 0.15
+            signals_present = True
         if MarketStateManager.is_repeated_low_yield_research_entry(entry):
             if priority is None:
                 return 0.20

@@ -5,6 +5,8 @@ import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from market_state import MarketStateManager
 
 
@@ -527,5 +529,36 @@ def test_estimate_research_entry_priority_promotes_extended_cooldown_near_thresh
 
     assert priority is not None
     assert priority >= 0.47
+
+
+def test_estimate_research_entry_priority_boosts_conviction_repair_entries() -> None:
+    base_entry = {
+        "threshold_gap": 0.10,
+        "last_decision_json": '{"audit": {"research_priority": 0.30}}',
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    repair_priority = MarketStateManager.estimate_research_entry_priority(
+        {**base_entry, "gate_name": "conviction_repair"}
+    )
+
+    assert base_priority is not None and repair_priority is not None
+    assert repair_priority == pytest.approx(base_priority + 0.15)
+
+
+def test_estimate_research_entry_priority_conviction_repair_signal_alone_is_sufficient() -> None:
+    # Repair entries are persisted with threshold_gap=0.0 and a full decision
+    # audit; even without other signals the gate alone must clear the drain
+    # priority floor (0.40) so parked repairs get retried.
+    priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "gate_name": "conviction_repair",
+            "reason": "conviction_repair_no_trade",
+            "threshold_gap": 0.0,
+            "last_decision_json": '{"audit": {"pre_analysis_score": 0.30}}',
+        }
+    )
+
+    assert priority is not None
+    assert priority >= 0.40
 
 
