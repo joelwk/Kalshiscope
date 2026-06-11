@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -1408,6 +1408,38 @@ def _daily_expectancy_ev_block_reason(
     return None
 
 
+def _satellite_recap_bet(
+    *,
+    bet_pct: float,
+    satellite_cap_pct: float | None,
+    min_bet_floor_applied: bool,
+    max_bet_usdc: float,
+    min_bet_usdc: float,
+) -> tuple[float, float] | None:
+    """Clamp a satellite bet back to its cap instead of hard-skipping it.
+
+    Sizing recomputation after the upstream satellite cap (Kelly resize, edge
+    scaling) can push ``bet_pct`` back above the cap; that branch previously
+    skipped execution-eligible candidates outright. Re-clamping preserves the
+    identical risk ceiling while letting the trade participate. A floored bet
+    is still allowed to exceed the cap, matching the original guard's
+    min-bet-floor precedence. Returns ``(clamped_pct, clamped_amount)`` or
+    ``None`` when no re-clamp is needed.
+    """
+    if satellite_cap_pct is None or min_bet_floor_applied:
+        return None
+    if bet_pct <= satellite_cap_pct + 1e-9:
+        return None
+    clamped_amount = max(
+        _calculate_bet(max_bet_usdc, satellite_cap_pct),
+        min_bet_usdc,
+    )
+    clamped_pct = (
+        (clamped_amount / max_bet_usdc) if max_bet_usdc > 0 else satellite_cap_pct
+    )
+    return clamped_pct, clamped_amount
+
+
 def _edge_threshold_for_market(
     implied_prob: float,
     settings: Settings,
@@ -1565,6 +1597,31 @@ def _direct_evidence_posterior_floor(
     ceiling = max(0.0, min(1.0, float(settings.MAX_GLOBAL_CONFIDENCE_DIRECT)))
     model_estimate = float(implied_prob) + float(edge_external)
     return max(0.0, min(ceiling, model_estimate))
+
+
+def _posterior_for_lmsr_signal(
+    *,
+    bayesian_posterior_applied: float | None,
+    effective_confidence: float,
+    execution_posterior_floor: float | None,
+) -> float:
+    """Outcome posterior used for the LMSR mispricing signal.
+
+    Mirrors the Kelly posterior selection: calibrated confidence is squeezed
+    into the same 0.50-0.70 band as typical market prices, so comparing it to
+    the LMSR execution price yields a near-zero signal regardless of the
+    model's actual probability estimate. Applying the direct-evidence
+    posterior floor keeps the signal aligned with the same posterior the edge
+    gate and Kelly sizing already use.
+    """
+    posterior = (
+        bayesian_posterior_applied
+        if bayesian_posterior_applied is not None
+        else effective_confidence
+    )
+    if execution_posterior_floor is not None:
+        posterior = max(posterior, execution_posterior_floor)
+    return posterior
 
 
 def _adjust_bet_size_for_edge(
@@ -3711,6 +3768,48 @@ def _daily_drawdown_cap_reached(
     if daily_balance_delta is None:
         return False
     return max(0.0, -float(daily_balance_delta)) >= max_daily_drawdown_usdc
+
+
+def _daily_drawdown_basis_usdc(
+    *,
+    state_manager: MarketStateManager,
+    trade_day: date,
+    day_start_balance: float | None,
+    current_balance: float | None,
+) -> tuple[float | None, str]:
+    """Signed daily PnL for the drawdown gates, plus its basis label.
+
+    Prefers realized PnL attributed to positions entered today: a balance
+    delta also swings on settlements of weeks-old positions and on
+    mark-to-market noise, which froze full analysis cycles for losses that
+    had nothing to do with today's decisions. The attributed basis is also
+    restart-safe because it is derived from the database rather than an
+    in-memory day-start balance. Falls back to the balance delta when the
+    attribution query fails.
+    """
+    day_start = datetime.combine(
+        trade_day,
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    try:
+        return (
+            state_manager.get_attributed_daily_realized_pnl(day_start),
+            "attributed_realized",
+        )
+    except Exception as exc:
+        logger.debug(
+            "Attributed daily PnL lookup failed; falling back to balance delta: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+    return (
+        _daily_balance_delta_usdc(
+            day_start_balance=day_start_balance,
+            current_balance=current_balance,
+        ),
+        "balance_delta",
+    )
 
 
 def _estimate_api_cost_usd(
@@ -6524,6 +6623,8 @@ def main(max_cycles: int | None = None) -> None:
     daily_expectancy_exposure_count = 0
     daily_projected_expected_value_usdc = 0.0
     daily_start_balance: float | None = None
+    # Per-market daily cap on conviction-repair deep passes (Grok cost bound).
+    conviction_repair_attempt_days: dict[str, date] = {}
     cumulative_api_cost_estimate_usd = 0.0
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
@@ -6659,6 +6760,7 @@ def main(max_cycles: int | None = None) -> None:
                 daily_expectancy_exposure_count = 0
                 daily_projected_expected_value_usdc = 0.0
                 daily_start_balance = cycle_bankroll
+                conviction_repair_attempt_days.clear()
             elif daily_start_balance is None and cycle_bankroll is not None:
                 daily_start_balance = cycle_bankroll
             try:
@@ -8916,7 +9018,9 @@ def main(max_cycles: int | None = None) -> None:
                 and analysis_candidates
                 and settings.MAX_DAILY_DRAWDOWN_USDC > 0
             ):
-                preflight_balance_delta = _daily_balance_delta_usdc(
+                preflight_balance_delta, preflight_drawdown_basis = _daily_drawdown_basis_usdc(
+                    state_manager=state_manager,
+                    trade_day=current_trade_day,
                     day_start_balance=daily_start_balance,
                     current_balance=last_known_portfolio_value,
                 )
@@ -9009,6 +9113,7 @@ def main(max_cycles: int | None = None) -> None:
                             market_judgment_available=False,
                             skip_due_to=_skip_due_to_for_reason(_drawdown_reason),
                             daily_drawdown_usdc=round(preflight_drawdown, 2),
+                            daily_drawdown_basis=preflight_drawdown_basis,
                             max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
                             **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                             **drawdown_counterfactuals,
@@ -9037,14 +9142,16 @@ def main(max_cycles: int | None = None) -> None:
                         )
                         daily_drawdown_preflight_blocked_count += 1
                     logger.warning(
-                        "Daily drawdown preflight engaged: drawdown=$%.2f cap=$%.2f; "
+                        "Daily drawdown preflight engaged: drawdown=$%.2f cap=$%.2f basis=%s; "
                         "routed %d candidate(s) to research_queue (MONITOR_ONLY) and skipped Grok",
                         preflight_drawdown,
                         settings.MAX_DAILY_DRAWDOWN_USDC,
+                        preflight_drawdown_basis,
                         daily_drawdown_preflight_blocked_count,
                         data={
                             "daily_drawdown_preflight_engaged": True,
                             "daily_drawdown_usdc": round(preflight_drawdown, 2),
+                            "daily_drawdown_basis": preflight_drawdown_basis,
                             "max_daily_drawdown_usdc": settings.MAX_DAILY_DRAWDOWN_USDC,
                             "daily_drawdown_preflight_blocked_count": (
                                 daily_drawdown_preflight_blocked_count
@@ -10355,7 +10462,32 @@ def main(max_cycles: int | None = None) -> None:
                     "conviction_repair_candidate_like"
                 ) or conviction_repair_diagnostics.get("conviction_repair_triggerable"):
                     audit_context.update(conviction_repair_diagnostics)
+                if (
+                    conviction_repair_reason is not None
+                    and conviction_repair_attempt_days.get(market.id)
+                    == current_trade_day
+                ):
+                    # One repair deep pass per market per day keeps the widened
+                    # eligibility (CONVICTION_REPAIR_MIN_EDGE 0.12) cost-bounded.
+                    audit_context.update(
+                        {
+                            "conviction_repair_daily_cap_hit": True,
+                            "conviction_repair_reason_capped": conviction_repair_reason,
+                        }
+                    )
+                    logger.debug(
+                        "Conviction repair daily cap hit: market=%s reason=%s",
+                        market.id,
+                        conviction_repair_reason,
+                        data={
+                            "market_id": market.id,
+                            "conviction_repair_reason": conviction_repair_reason,
+                            "conviction_repair_daily_cap_hit": True,
+                        },
+                    )
+                    conviction_repair_reason = None
                 if conviction_repair_reason is not None:
+                    conviction_repair_attempt_days[market.id] = current_trade_day
                     positive_edge_for_repair, market_edge_for_repair = _decision_positive_edge(
                         decision=decision,
                         market=market,
@@ -11690,10 +11822,10 @@ def main(max_cycles: int | None = None) -> None:
                         settings=settings,
                     )
                     if lmsr_execution_price is not None:
-                        posterior_for_signal = (
-                            bayesian_posterior_applied
-                            if bayesian_posterior_applied is not None
-                            else effective_confidence
+                        posterior_for_signal = _posterior_for_lmsr_signal(
+                            bayesian_posterior_applied=bayesian_posterior_applied,
+                            effective_confidence=effective_confidence,
+                            execution_posterior_floor=execution_posterior_floor,
                         )
                         try:
                             ineff_signal = lmsr_inefficiency_signal(
@@ -12242,10 +12374,10 @@ def main(max_cycles: int | None = None) -> None:
                         settings=settings,
                     )
                     if lmsr_execution_price is not None:
-                        posterior_for_signal = (
-                            bayesian_posterior_applied
-                            if bayesian_posterior_applied is not None
-                            else effective_confidence
+                        posterior_for_signal = _posterior_for_lmsr_signal(
+                            bayesian_posterior_applied=bayesian_posterior_applied,
+                            effective_confidence=effective_confidence,
+                            execution_posterior_floor=execution_posterior_floor,
                         )
                         try:
                             ineff_signal = lmsr_inefficiency_signal(
@@ -12627,41 +12759,38 @@ def main(max_cycles: int | None = None) -> None:
                         daily_expectancy_block_reason,
                     )
                     continue
-                if (
-                    getattr(settings, "DAILY_EXPECTANCY_ENABLED", True)
-                    and opportunity_role == "satellite"
-                    and satellite_cap_pct is not None
-                    and bet_pct > satellite_cap_pct + 1e-9
-                    and not min_bet_floor_applied
+                if getattr(settings, "DAILY_EXPECTANCY_ENABLED", True) and (
+                    opportunity_role == "satellite"
                 ):
-                    trades_skipped_edge += 1
-                    _record_should_trade_blocked("daily_expectancy_satellite_cap_blocked")
-                    _record_rejection_reason(
-                        rejection_breakdown,
-                        "daily_expectancy_satellite_cap_blocked",
+                    satellite_recap = _satellite_recap_bet(
+                        bet_pct=bet_pct,
+                        satellite_cap_pct=satellite_cap_pct,
+                        min_bet_floor_applied=min_bet_floor_applied,
+                        max_bet_usdc=settings.MAX_BET_USDC,
+                        min_bet_usdc=settings.MIN_BET_USDC,
                     )
-                    log_trade_decision(
-                        market_id=market.id,
-                        question=market.question,
-                        decision=decision_for_edge.model_copy(
-                            update={"bet_size_pct": bet_pct}
-                        ).model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="post_daily_expectancy",
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="daily_expectancy_satellite_cap_blocked",
-                            bet_amount_usdc=bet_amount,
-                            min_bet_floor_applied=min_bet_floor_applied,
-                            **audit_context,
-                        ),
-                    )
-                    _record_terminal_outcome(
-                        state_manager,
-                        market.id,
-                        "daily_expectancy_satellite_cap_blocked",
-                    )
-                    continue
+                    if satellite_recap is not None:
+                        audit_context["satellite_recap_applied"] = True
+                        audit_context["satellite_recap_original_bet_pct"] = bet_pct
+                        audit_context["satellite_recap_original_bet_amount_usdc"] = (
+                            bet_amount
+                        )
+                        bet_pct, bet_amount = satellite_recap
+                        logger.info(
+                            "Satellite cap re-clamp: market=%s bet resized to $%.2f "
+                            "(pct=%.3f, cap=%.3f); proceeding at capped size",
+                            market.id,
+                            bet_amount,
+                            bet_pct,
+                            satellite_cap_pct,
+                            data={
+                                "market_id": market.id,
+                                "satellite_recap_applied": True,
+                                "satellite_cap_pct": satellite_cap_pct,
+                                "bet_amount_usdc": bet_amount,
+                                "bet_pct": bet_pct,
+                            },
+                        )
                 # Skip order placement if in analysis-only mode (insufficient balance)
                 if analysis_only_mode:
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
@@ -13314,7 +13443,9 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     _record_terminal_outcome(state_manager, market.id, "daily_limit_reached")
                     continue
-                daily_balance_delta = _daily_balance_delta_usdc(
+                daily_balance_delta, daily_drawdown_basis = _daily_drawdown_basis_usdc(
+                    state_manager=state_manager,
+                    trade_day=current_trade_day,
                     day_start_balance=daily_start_balance,
                     current_balance=last_known_portfolio_value,
                 )
@@ -13344,6 +13475,7 @@ def main(max_cycles: int | None = None) -> None:
                             final_action="skip",
                             final_reason="daily_drawdown_limit",
                             daily_drawdown_usdc=daily_drawdown,
+                            daily_drawdown_basis=daily_drawdown_basis,
                             max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
                             **audit_context,
                         ),

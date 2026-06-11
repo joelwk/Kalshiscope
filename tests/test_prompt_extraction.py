@@ -6,12 +6,13 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Updated after reinforcing primary_source_url emission for settlement-aligned
-    # evidence in system/analyze_market <source_requirements> and the
-    # shared_output_rules self-check (post-update review: trades only fire on
-    # direct evidence, but settlement-aligned markets were demoted to proxy for a
-    # missing URL). shared_output_rules is shared, so the deep hash moves too.
-    "analyze": "b83948bd7afc18b8fc1a734abd8312d94188cfcbb5686f234ad357a29ac7eb38",
+    # Updated after scoping the numeric-strike -10pp penalty in
+    # system/analyze_market <calibration> to non-direct evidence only (direct +
+    # primary_source_url candidates skip it; code-side calibrate_confidence
+    # remains the single quantitative shrink) and removing the duplicate
+    # "apply the -10pp penalty strictly ... regardless of edge_source" sentence
+    # that restated the same rule.
+    "analyze": "a8ef4751d0858ee0d025d16fef919188801b7523f7c37889b4b45af9224bcd53",
     "deep": "f248d43a97597d0791b8dc66045285b4b218635c78814707075a2e4e38fc2928",
 }
 

@@ -503,7 +503,10 @@ class Settings:
     EDGE_REPAIR_ENABLED: bool = True
     EDGE_BAND_CALIBRATION_ENABLED: bool = True
     CONVICTION_REPAIR_ENABLED: bool = True
-    CONVICTION_REPAIR_MIN_EDGE: float = 0.20
+    # Aligned with the execution edge baseline (MIN_EDGE-tier) so repair
+    # eligibility matches the standard actually used to execute; 0.20 parked
+    # hundreds of repairable decisions as edge_below_repair_min.
+    CONVICTION_REPAIR_MIN_EDGE: float = 0.12
     CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY: float = 0.90
     CONVICTION_REPAIR_SCORE_GAP_MAX: float = 0.08
     CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR: float = 0.0

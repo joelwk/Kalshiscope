@@ -872,3 +872,87 @@ def test_backfill_outcomes_from_settlements(tmp_path) -> None:
         assert updated_again == 0
     finally:
         manager.close()
+
+
+def test_attributed_daily_realized_pnl_excludes_legacy_entries(tmp_path) -> None:
+    """Drawdown attribution: only settlements of same-window entries count."""
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        manager.record_trade(
+            "m-today-loss",
+            OrderResponse(id="o-today-loss", raw={"outcome": "YES"}),
+            5.0,
+            outcome="YES",
+        )
+        manager.record_trade(
+            "m-today-win",
+            OrderResponse(id="o-today-win", raw={"outcome": "YES"}),
+            5.0,
+            outcome="YES",
+        )
+        manager.record_trade(
+            "m-legacy",
+            OrderResponse(id="o-legacy", raw={"outcome": "YES"}),
+            5.0,
+            outcome="YES",
+        )
+        legacy_entry_time = (day_start - timedelta(days=20)).isoformat()
+        manager._conn.execute(
+            "UPDATE trade_log SET timestamp = ? WHERE market_id = 'm-legacy'",
+            (legacy_entry_time,),
+        )
+
+        manager.record_exchange_settlement(
+            settlement_id="s-today-loss",
+            market_id="m-today-loss",
+            winning_outcome="NO",
+            predicted_outcome="YES",
+            pnl_realized=-4.5,
+            contracts=10,
+            avg_price=0.45,
+            settled_at=now,
+            raw={},
+        )
+        manager.record_exchange_settlement(
+            settlement_id="s-today-win",
+            market_id="m-today-win",
+            winning_outcome="YES",
+            predicted_outcome="YES",
+            pnl_realized=2.0,
+            contracts=5,
+            avg_price=0.60,
+            settled_at=now,
+            raw={},
+        )
+        # Legacy position (entered 20 days ago) settling today must not count.
+        manager.record_exchange_settlement(
+            settlement_id="s-legacy",
+            market_id="m-legacy",
+            winning_outcome="NO",
+            predicted_outcome="YES",
+            pnl_realized=-8.25,
+            contracts=20,
+            avg_price=0.41,
+            settled_at=now,
+            raw={},
+        )
+        # Settlement for a market never traded locally must not count either.
+        manager.record_exchange_settlement(
+            settlement_id="s-untraded",
+            market_id="m-untraded",
+            winning_outcome="NO",
+            predicted_outcome="YES",
+            pnl_realized=-3.0,
+            contracts=6,
+            avg_price=0.50,
+            settled_at=now,
+            raw={},
+        )
+
+        attributed = manager.get_attributed_daily_realized_pnl(day_start)
+        assert round(attributed, 2) == -2.5
+    finally:
+        manager.close()

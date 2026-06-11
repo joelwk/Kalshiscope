@@ -1549,6 +1549,35 @@ class MarketStateManager:
             return 0.0
         return float(row["pnl_total"] or 0.0)
 
+    def get_attributed_daily_realized_pnl(self, since: datetime) -> float:
+        """Realized PnL since *since*, restricted to markets entered since *since*.
+
+        Daily risk gates need today's decision quality, not settlement timing:
+        positions opened on earlier days can settle in a batch today and would
+        otherwise dominate a balance-delta drawdown measure. Only settlements
+        whose market also has a trade_log entry inside the window count.
+        """
+        since_utc = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
+        since_iso = since_utc.astimezone(timezone.utc).isoformat()
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(s.pnl_realized), 0.0) AS pnl_total
+            FROM exchange_settlements s
+            WHERE s.settled_at IS NOT NULL
+              AND s.settled_at >= ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM trade_log t
+                  WHERE t.market_id = s.market_id
+                    AND t.timestamp >= ?
+              )
+            """,
+            (since_iso, since_iso),
+        ).fetchone()
+        if not row:
+            return 0.0
+        return float(row["pnl_total"] or 0.0)
+
     def get_prefix_pnl_stats(self, prefix: str) -> dict[str, float | int]:
         """Aggregate settlement PnL for markets whose id starts with *prefix*.
 

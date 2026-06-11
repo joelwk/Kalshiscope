@@ -19,12 +19,12 @@ parts:
     </evidence_classification>
 
     <calibration>
-    Historical calibration (May 2026): 0.80-0.89 wins at 59.8% (+$36.52, n=107) vs 0.90+ at 43.5% (-$23.99, n=46). Commodity threshold markets (-T<number>) are the primary source of calibration drift — apply the -10pp penalty strictly on these regardless of edge_source. Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
+    Historical calibration (May 2026): 0.80-0.89 wins at 59.8% (+$36.52, n=107) vs 0.90+ at 43.5% (-$23.99, n=46). Commodity threshold markets (-T<number>) are the primary source of calibration drift. Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
     Use confidence >0.89 only for direct definitive evidence with a primary_source_url explicitly relevant to settlement criteria.
     Confidence must not exceed evidence_quality + 0.05. If it does, lower confidence.
     If your edge versus market implied probability exceeds 40 percentage points, treat it as a hallucination risk and set should_trade=false unless direct settlement-aligned evidence supports the edge.
     Exception: when definitive_outcome_detected=true with a Tier-1 primary source URL, edges up to 65 percentage points are legitimate; do not flag as hallucination.
-    For numeric-strike markets (-T<number> in ticker) where edge_source=computed, lower confidence by 10pp regardless of how confident the computation feels — historically these have the worst calibration.
+    For numeric-strike markets (-T<number> in ticker) where edge_source=computed, lower confidence by 10pp — unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion (live exchange feed or Tier-1 quote page), in which case skip this penalty; downstream calibration already shrinks for residual uncertainty. Historically, non-direct numeric-strike computations have the worst calibration.
     Base-rate check: explicitly compare your probability to a 2024-2026 relevant base rate, prior market/odds rate, or recent resolved-event frequency before setting confidence.
     Self-consistency check: after estimating probability, ask what base rate, source conflict, or recent news would lower it by 10-15 percentage points; revise confidence if the critique is persuasive.
     </calibration>

@@ -2,7 +2,7 @@ import unittest
 import inspect
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import main as main_module
@@ -33,8 +33,11 @@ from main import (
     _compute_next_wakeup_seconds,
     _conviction_repair_reason,
     _daily_balance_delta_usdc,
+    _daily_drawdown_basis_usdc,
     _daily_drawdown_cap_reached,
     _daily_expectancy_ev_block_reason,
+    _posterior_for_lmsr_signal,
+    _satellite_recap_bet,
     _daily_trade_cap_reached,
     _daily_expectancy_role,
     _dry_streak_sleep_seconds,
@@ -1961,21 +1964,30 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=1), ("primary_target", None))
         self.assertEqual(_daily_expectancy_role(settings=settings, daily_exposure_count=2), ("satellite", 0.25))
 
-    def test_satellite_cap_block_respects_min_bet_floor(self) -> None:
+    def test_satellite_cap_recap_respects_min_bet_floor(self) -> None:
         # A satellite bet that only exceeds the cap because the min-bet floor
-        # raised it to MIN_BET must NOT be blocked (it executes at min bet);
-        # the block still fires for genuinely over-cap bets.
-        import main as main_module
-
-        source = inspect.getsource(main_module)
-        self.assertRegex(
-            source,
-            re.compile(
-                r'opportunity_role == "satellite"[\s\S]{0,200}'
-                r"bet_pct > satellite_cap_pct \+ 1e-9[\s\S]{0,80}"
-                r"and not min_bet_floor_applied"
-            ),
+        # raised it to MIN_BET must NOT be resized (it executes at min bet);
+        # genuinely over-cap bets are re-clamped to the cap instead of being
+        # terminally blocked.
+        self.assertIsNone(
+            _satellite_recap_bet(
+                bet_pct=0.417,
+                satellite_cap_pct=0.25,
+                min_bet_floor_applied=True,
+                max_bet_usdc=50.0,
+                min_bet_usdc=5.0,
+            )
         )
+        recap = _satellite_recap_bet(
+            bet_pct=0.417,
+            satellite_cap_pct=0.25,
+            min_bet_floor_applied=False,
+            max_bet_usdc=50.0,
+            min_bet_usdc=5.0,
+        )
+        self.assertIsNotNone(recap)
+        _, clamped_amount = recap
+        self.assertAlmostEqual(clamped_amount, 12.5)
 
     def test_satellite_cap_executable_above_min_bet_when_configured(self) -> None:
         # Invariant: the recommended satellite cap (raised to 0.45) x MAX_BET
@@ -4563,6 +4575,251 @@ def test_family_profitable_rejects_negative_lifetime() -> None:
         "lifetime_family_sample_size": 120,
     }
     assert main_module._family_is_profitable_from_context(context) is False
+
+
+class TestLmsrSignalPosterior(unittest.TestCase):
+    """LMSR mispricing signal must use the same posterior as the edge gate."""
+
+    def test_direct_floor_lifts_posterior(self) -> None:
+        self.assertAlmostEqual(
+            _posterior_for_lmsr_signal(
+                bayesian_posterior_applied=None,
+                effective_confidence=0.70,
+                execution_posterior_floor=0.88,
+            ),
+            0.88,
+        )
+
+    def test_without_floor_uses_bayesian_then_confidence(self) -> None:
+        self.assertAlmostEqual(
+            _posterior_for_lmsr_signal(
+                bayesian_posterior_applied=0.63,
+                effective_confidence=0.70,
+                execution_posterior_floor=None,
+            ),
+            0.63,
+        )
+        self.assertAlmostEqual(
+            _posterior_for_lmsr_signal(
+                bayesian_posterior_applied=None,
+                effective_confidence=0.70,
+                execution_posterior_floor=None,
+            ),
+            0.70,
+        )
+
+    def test_floored_posterior_unblocks_real_mispricing(self) -> None:
+        # Regression for KXWTI-26JUN0814-T89.99: model prob 0.925 / floor 0.88
+        # at LMSR price 0.69 was blocked because the signal used calibrated
+        # confidence (0.70), yielding |0.0099| < 0.03 min inefficiency.
+        from lmsr import inefficiency_signal
+
+        lmsr_price = 0.690003352383589
+        old_signal = inefficiency_signal(0.70, lmsr_price)
+        self.assertLess(abs(old_signal), 0.03)
+
+        posterior = _posterior_for_lmsr_signal(
+            bayesian_posterior_applied=None,
+            effective_confidence=0.70,
+            execution_posterior_floor=0.88,
+        )
+        new_signal = inefficiency_signal(posterior, lmsr_price)
+        self.assertGreaterEqual(abs(new_signal), 0.03)
+
+
+class TestDailyDrawdownBasis(unittest.TestCase):
+    """Drawdown gates should measure today's entries, not legacy settlements."""
+
+    class _StubStateManager:
+        def __init__(self, value: float | None = None, error: bool = False) -> None:
+            self.value = value
+            self.error = error
+            self.last_since: datetime | None = None
+
+        def get_attributed_daily_realized_pnl(self, since: datetime) -> float:
+            self.last_since = since
+            if self.error:
+                raise RuntimeError("db unavailable")
+            return float(self.value or 0.0)
+
+    def test_prefers_attributed_realized_pnl(self) -> None:
+        stub = self._StubStateManager(value=-12.5)
+        delta, basis = _daily_drawdown_basis_usdc(
+            state_manager=stub,
+            trade_day=date(2026, 6, 9),
+            day_start_balance=100.0,
+            current_balance=50.0,
+        )
+        self.assertEqual(basis, "attributed_realized")
+        self.assertAlmostEqual(delta, -12.5)
+        self.assertEqual(stub.last_since, datetime(2026, 6, 9, tzinfo=timezone.utc))
+        self.assertTrue(
+            _daily_drawdown_cap_reached(
+                daily_balance_delta=delta,
+                max_daily_drawdown_usdc=10.0,
+            )
+        )
+
+    def test_falls_back_to_balance_delta_on_query_failure(self) -> None:
+        stub = self._StubStateManager(error=True)
+        delta, basis = _daily_drawdown_basis_usdc(
+            state_manager=stub,
+            trade_day=date(2026, 6, 9),
+            day_start_balance=100.0,
+            current_balance=50.0,
+        )
+        self.assertEqual(basis, "balance_delta")
+        self.assertAlmostEqual(delta, -50.0)
+
+    def test_legacy_settlement_losses_do_not_trip_cap(self) -> None:
+        # Balance fell $24.21 from legacy April/May settlements, but today's
+        # entries realized zero loss: the gate must stay open.
+        stub = self._StubStateManager(value=0.0)
+        delta, _basis = _daily_drawdown_basis_usdc(
+            state_manager=stub,
+            trade_day=date(2026, 6, 9),
+            day_start_balance=80.0,
+            current_balance=55.79,
+        )
+        self.assertFalse(
+            _daily_drawdown_cap_reached(
+                daily_balance_delta=delta,
+                max_daily_drawdown_usdc=15.0,
+            )
+        )
+
+
+class TestSatelliteRecapBet(unittest.TestCase):
+    """Satellite cap should resize, not hard-skip, execution-eligible bets."""
+
+    def test_clamps_bet_back_to_cap(self) -> None:
+        recap = _satellite_recap_bet(
+            bet_pct=0.417,
+            satellite_cap_pct=0.25,
+            min_bet_floor_applied=False,
+            max_bet_usdc=50.0,
+            min_bet_usdc=1.0,
+        )
+        self.assertIsNotNone(recap)
+        clamped_pct, clamped_amount = recap
+        self.assertAlmostEqual(clamped_pct, 0.25)
+        self.assertAlmostEqual(clamped_amount, 12.5)
+
+    def test_recap_amount_never_drops_below_min_bet(self) -> None:
+        recap = _satellite_recap_bet(
+            bet_pct=0.90,
+            satellite_cap_pct=0.05,
+            min_bet_floor_applied=False,
+            max_bet_usdc=50.0,
+            min_bet_usdc=5.0,
+        )
+        self.assertIsNotNone(recap)
+        clamped_pct, clamped_amount = recap
+        self.assertAlmostEqual(clamped_amount, 5.0)
+        self.assertAlmostEqual(clamped_pct, 0.10)
+
+    def test_no_recap_when_under_cap_or_uncapped(self) -> None:
+        self.assertIsNone(
+            _satellite_recap_bet(
+                bet_pct=0.20,
+                satellite_cap_pct=0.25,
+                min_bet_floor_applied=False,
+                max_bet_usdc=50.0,
+                min_bet_usdc=1.0,
+            )
+        )
+        self.assertIsNone(
+            _satellite_recap_bet(
+                bet_pct=0.90,
+                satellite_cap_pct=None,
+                min_bet_floor_applied=False,
+                max_bet_usdc=50.0,
+                min_bet_usdc=1.0,
+            )
+        )
+
+
+class TestConvictionRepairEdgeEligibility(unittest.TestCase):
+    """Repair eligibility aligned with the execution edge standard (0.12)."""
+
+    def test_mid_band_edge_now_triggers_repair(self) -> None:
+        market = Market(
+            id="KXGOLDD-26JUN0917-T4252",
+            question="Will the gold close price be above 4252?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=800.0,
+            resolution_criteria="Official close",
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.68,
+            bet_size_pct=0.0,
+            reasoning="Edge present but conviction held back.",
+            edge_external=0.14,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=0.95,
+            primary_source_url="https://www.wsj.com/market-data/quotes/futures/GC00",
+            source_match_class="settlement_aligned",
+        )
+        diagnostics: dict[str, object] = {}
+
+        reason = _conviction_repair_reason(
+            decision=decision,
+            market=market,
+            settings=Settings(),
+            score_result=None,
+            score_threshold=None,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(reason, "conviction_repair_no_trade_contradiction")
+        self.assertTrue(diagnostics["conviction_repair_triggerable"])
+
+    def test_edge_below_new_min_still_misses(self) -> None:
+        market = Market(
+            id="KXGOLDD-26JUN0917-T4252",
+            question="Will the gold close price be above 4252?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=800.0,
+            resolution_criteria="Official close",
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.60,
+            bet_size_pct=0.0,
+            reasoning="Edge too small for repair.",
+            edge_external=0.08,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=0.95,
+            primary_source_url="https://www.wsj.com/market-data/quotes/futures/GC00",
+            source_match_class="settlement_aligned",
+        )
+        diagnostics: dict[str, object] = {}
+
+        self.assertIsNone(
+            _conviction_repair_reason(
+                decision=decision,
+                market=market,
+                settings=Settings(),
+                score_result=None,
+                score_threshold=None,
+                diagnostics=diagnostics,
+            )
+        )
+        self.assertEqual(
+            diagnostics["conviction_repair_missed_reason"],
+            "edge_below_repair_min",
+        )
 
 
 if __name__ == "__main__":

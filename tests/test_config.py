@@ -364,7 +364,7 @@ class TestConfig(unittest.TestCase):
             "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.05",
             "CONVICTION_REPAIR_ENABLED=true",
-            "CONVICTION_REPAIR_MIN_EDGE=0.20",
+            "CONVICTION_REPAIR_MIN_EDGE=0.12",
             "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
             "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
             "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
@@ -657,7 +657,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.EDGE_REPAIR_ENABLED)
         self.assertTrue(settings.EDGE_BAND_CALIBRATION_ENABLED)
         self.assertTrue(settings.CONVICTION_REPAIR_ENABLED)
-        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.20)
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.12)
         self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.90)
         self.assertEqual(settings.CONVICTION_REPAIR_SCORE_GAP_MAX, 0.08)
         self.assertEqual(settings.CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR, 0.0)
