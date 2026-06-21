@@ -39,6 +39,12 @@ _MARKET_FALLBACK_YES_PRICE_CENTS = 97
 _MARKET_FALLBACK_NO_PRICE_CENTS = 3
 _ORDER_SUBMISSION_MIN_PRICE = 0.03
 _ORDER_SUBMISSION_MAX_PRICE = 0.97
+# Create-Order-V2 endpoint: YES-book single-side orders (the legacy
+# ``/portfolio/orders`` POST is deprecated and now returns HTTP 410).
+_V2_ORDER_PATH = "/portfolio/events/orders"
+_BOOK_SIDE_BID = "bid"
+_BOOK_SIDE_ASK = "ask"
+_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 _KALSHI_RETRY_TOTAL = 3
 _KALSHI_RETRY_BACKOFF_FACTOR = 0.5
 _KALSHI_RETRYABLE_STATUS_CODES = (502, 503, 504)
@@ -93,12 +99,18 @@ class KalshiClient:
         order_price_improvement_cents: int = 0,
         default_time_in_force: str = _DEFAULT_LIMIT_TIME_IN_FORCE,
         max_fetch_pages: int | None = 10,
+        min_bet_usdc: float = 0.0,
+        max_bet_usdc: float = 0.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key_id = api_key_id
         self.timeout_sec = timeout_sec
         self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
         self.default_time_in_force = _normalize_time_in_force(default_time_in_force)
+        # Honor the configured stake floor/ceiling when integer-contract rounding
+        # would otherwise push the spend below MIN_BET_USDC. 0 disables the guard.
+        self.min_bet_usdc = max(0.0, float(min_bet_usdc))
+        self.max_bet_usdc = max(0.0, float(max_bet_usdc))
         self.max_fetch_pages = (
             None if max_fetch_pages is None or int(max_fetch_pages) <= 0
             else max(1, int(max_fetch_pages))
@@ -477,14 +489,36 @@ class KalshiClient:
                 f"[{_ORDER_SUBMISSION_MIN_PRICE:.2f}, {_ORDER_SUBMISSION_MAX_PRICE:.2f}]"
             )
         count = max(1, int(order.amount_usdc / price))
+        # Integer-contract truncation can drop the actual spend below the
+        # configured MIN_BET_USDC floor (e.g. $2.00 / $0.59 -> 3 contracts =
+        # $1.77). Bump one contract to honor the floor when it stays within the
+        # MAX_BET_USDC ceiling.
+        if not is_market_order and self.min_bet_usdc > 0 and count * price < self.min_bet_usdc:
+            bumped_count = count + 1
+            if self.max_bet_usdc <= 0 or bumped_count * price <= self.max_bet_usdc:
+                count = bumped_count
         price_cents = int(round(price * _ONE_HUNDRED))
         price_cents = max(1, min(99, price_cents))
+
+        # Create-Order-V2 quotes everything on the YES book: ``bid`` buys YES
+        # (or sells NO) and ``ask`` sells YES (or buys NO). The order price is
+        # the YES-equivalent price - the chosen-outcome price for YES, or its
+        # complement for NO, because buying NO at ``p`` is selling YES at
+        # ``1 - p``.
+        book_side = (
+            _BOOK_SIDE_BID if (side == "yes") == (action == "buy") else _BOOK_SIDE_ASK
+        )
         if is_market_order:
-            price_cents = (
+            # A marketable order crosses the spread, so it needs an aggressive
+            # high bid or low ask on the YES book to guarantee the fill. The
+            # direction (not the chosen outcome) decides which extreme applies.
+            yes_price_cents = (
                 _MARKET_FALLBACK_YES_PRICE_CENTS
-                if side == "yes"
+                if book_side == _BOOK_SIDE_BID
                 else _MARKET_FALLBACK_NO_PRICE_CENTS
             )
+        else:
+            yes_price_cents = price_cents if side == "yes" else _ONE_HUNDRED - price_cents
 
         payload = {
             "ticker": order.market_id,
@@ -492,26 +526,22 @@ class KalshiClient:
                 order.market_id or "",
                 suffix=retry_suffix,
             ),
-            "type": "market" if is_market_order else "limit",
+            "side": book_side,
+            "count": str(count),
+            "price": f"{yes_price_cents / _ONE_HUNDRED:.4f}",
             "time_in_force": (
                 _MARKET_TIME_IN_FORCE
                 if is_market_order
                 else _normalize_time_in_force(order.time_in_force or self.default_time_in_force)
             ),
-            "action": action,
-            "side": side,
-            "count": count,
+            "self_trade_prevention_type": _SELF_TRADE_PREVENTION_TYPE,
         }
-        if side == "yes":
-            payload["yes_price"] = price_cents
-        else:
-            payload["no_price"] = price_cents
 
         max_attempts = 1 + max(0, _ORDER_RATE_LIMIT_MAX_RETRIES)
         response = None
         for attempt in range(max_attempts):
             try:
-                response = self._request("POST", "/portfolio/orders", json=payload)
+                response = self._request("POST", _V2_ORDER_PATH, json=payload)
                 break
             except requests.exceptions.HTTPError as exc:
                 status_code = (
@@ -558,17 +588,40 @@ class KalshiClient:
                 raise
 
         response_data = response.json()
-        response_order = response_data.get("order", response_data) if isinstance(response_data, dict) else {}
+        if not isinstance(response_data, dict):
+            response_data = {}
+        response_order = response_data.get("order")
+        if not isinstance(response_order, dict):
+            response_order = response_data
         order_id = (
             response_order.get("order_id")
             or response_order.get("id")
             or response_data.get("order_id")
             or response_data.get("id")
         )
-        status = response_order.get("status") or response_data.get("status")
+        # Create-Order-V2 returns a flat body (order_id, fill_count,
+        # remaining_count) with no ``status`` field, so the fill state is
+        # derived from ``fill_count``. The execution loop only retries/flags an
+        # order as unfilled when the exchange reports a cancel with zero fills,
+        # so an unfilled resting limit must report ``resting`` (not canceled).
+        fill_count = _coerce_fill_count(response_order, response_data)
+        explicit_status = response_order.get("status") or response_data.get("status")
+        if explicit_status:
+            status = str(explicit_status)
+        elif fill_count >= count:
+            status = "executed"
+        elif fill_count <= 0.0:
+            status = (
+                "canceled"
+                if payload["time_in_force"] in {"fill_or_kill", "immediate_or_cancel"}
+                else "resting"
+            )
+        else:
+            status = "partially_filled"
         response_data["client_price"] = price
         response_data["client_qty_shares"] = count
         response_data["client_amount_usdc"] = order.amount_usdc
+        response_data["status"] = status
         return OrderResponse(
             id=str(order_id) if order_id else None,
             status=status,
@@ -590,6 +643,27 @@ def _to_kalshi_side(outcome: str) -> str:
     if normalized in {"no", "false", "0"}:
         return "no"
     return "yes"
+
+
+def _coerce_fill_count(*sources: dict[str, Any]) -> float:
+    """Return the filled-contract count from a Create-Order-V2 response body.
+
+    V2 reports counts as fixed-point strings (e.g. ``"2.00"``); the candidate
+    keys mirror ``main._extract_order_fill_count`` so the execution loop and the
+    client agree on whether an order filled.
+    """
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("fill_count_fp", "fill_count", "filled_count"):
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
 
 
 def _resolve_order_price(

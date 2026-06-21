@@ -100,6 +100,11 @@ class Settings:
     MAX_REASONABLE_EDGE: float = 0.40
     NON_SPORTS_REQUIRES_DIRECT_EVIDENCE: bool = True
     NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL: bool = True
+    # Families with a universal canonical settlement source are exempt from the
+    # per-market primary_source_url requirement for direct evidence: sports
+    # (ESPN/league sites) and weather (NWS/NOAA). Other non-sports markets still
+    # require a settlement-grade primary_source_url to qualify as direct.
+    PRIMARY_SOURCE_URL_EXEMPT_FAMILIES: tuple[str, ...] = ("sports", "weather")
     MAX_SPEECH_CONFIDENCE: float = 0.65
 
     # Filtering
@@ -483,6 +488,12 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
+    # Generic is the catch-all family (speech/album/photo-count/macro/etc). A
+    # 15-cycle review found it dominated analysis (~48% of slots) yet was
+    # majority absence-only (no findable settlement data) and produced 0 fills.
+    # A positive value caps generic candidates per cycle so freed slots flow to
+    # direct-evidence families. 0 (default) preserves legacy behavior (no cap).
+    MAX_GENERIC_CANDIDATES_PER_CYCLE: int = 0
     MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
@@ -506,6 +517,11 @@ class Settings:
     GROK_SELF_CONSISTENCY_ENABLED: bool = True
     GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD: float = 400.0
     GROK_SELF_CONSISTENCY_EDGE_THRESHOLD: float = 0.15
+    # When > 0, the second self-consistency pass only runs for the top-N
+    # candidates by pre-analysis score each cycle (the markets most likely to
+    # trade), sharply cutting Grok API cost. 0 keeps self-consistency eligible
+    # for every analyzed candidate.
+    GROK_SELF_CONSISTENCY_TOP_CANDIDATES: int = 0
     GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE: float = 0.3
     GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE: float = 0.7
     EDGE_REPAIR_ENABLED: bool = True
@@ -689,6 +705,11 @@ class Settings:
     STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY: float = 0.85
     STRONG_EVIDENCE_PROXY_MIN_EVIDENCE_QUALITY: float = 0.95
     STRONG_EVIDENCE_PROXY_MIN_EDGE: float = 0.20
+    # Proxy markets whose market edge clears this bar bypass the preview/proxy
+    # validation blocks in grok_client. The downstream edge gate and per-family
+    # size multiplier still apply, so historically weak families are sized down
+    # rather than hard-blocked at validation. Set to 1.0 to disable.
+    PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE: float = 0.15
     GROK_PROXY_CONFIDENCE_CAP: float = 0.78
     GROK_LOW_INFO_CONFIDENCE_CAP: float = 0.70
     GROK_FALLBACK_MIN_EVIDENCE_QUALITY: float = 0.45
@@ -1091,6 +1112,10 @@ def load_settings() -> Settings:
             "NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL",
             Settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL,
         ),
+        PRIMARY_SOURCE_URL_EXEMPT_FAMILIES=_read_env_csv(
+            "PRIMARY_SOURCE_URL_EXEMPT_FAMILIES",
+            Settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES,
+        ),
         MIN_LIQUIDITY_USDC=_read_env_float(
             "MIN_LIQUIDITY_USDC", Settings.MIN_LIQUIDITY_USDC
         ),
@@ -1420,6 +1445,10 @@ def load_settings() -> Settings:
             "MAX_SPORTS_CANDIDATES_PER_CYCLE",
             Settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
         ),
+        MAX_GENERIC_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_GENERIC_CANDIDATES_PER_CYCLE",
+            Settings.MAX_GENERIC_CANDIDATES_PER_CYCLE,
+        ),
         MAX_TRADES_PER_CYCLE=_read_env_int(
             "MAX_TRADES_PER_CYCLE",
             Settings.MAX_TRADES_PER_CYCLE,
@@ -1483,6 +1512,10 @@ def load_settings() -> Settings:
         GROK_SELF_CONSISTENCY_EDGE_THRESHOLD=_read_env_float(
             "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD",
             Settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD,
+        ),
+        GROK_SELF_CONSISTENCY_TOP_CANDIDATES=_read_env_int(
+            "GROK_SELF_CONSISTENCY_TOP_CANDIDATES",
+            Settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES,
         ),
         GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE=_read_env_float(
             "GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE",
@@ -1993,6 +2026,10 @@ def load_settings() -> Settings:
         STRONG_EVIDENCE_PROXY_MIN_EDGE=_read_env_float(
             "STRONG_EVIDENCE_PROXY_MIN_EDGE",
             Settings.STRONG_EVIDENCE_PROXY_MIN_EDGE,
+        ),
+        PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=_read_env_float(
+            "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE",
+            Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE,
         ),
         GROK_PROXY_CONFIDENCE_CAP=_read_env_float(
             "GROK_PROXY_CONFIDENCE_CAP",

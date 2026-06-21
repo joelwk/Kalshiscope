@@ -832,17 +832,18 @@ class TestMainUtils(unittest.TestCase):
         self.assertGreater(coinflip_bd["pre_score_coinflip_penalty"], 0.0)
 
     def test_pre_analysis_opportunity_score_rewards_direct_evidence_family(self) -> None:
-        """Families with reliable direct settlement evidence (music) get a
-        selection affinity nudge so analysis slots favor tradeable edge."""
+        """Families with reliable direct settlement evidence (weather, via
+        NWS/NOAA) get a selection affinity nudge so analysis slots favor
+        tradeable edge."""
         settings = Settings()
         market = Market(
-            id="KXALBUMSTREAMS-26JUN06-1M",
-            question="Will the album exceed 1,000,000 Spotify streams this week?",
-            category="music",
+            id="KXHIGHDEN-26JUN20-B89.5",
+            question="Will the high temperature in Denver be 89-90F on Jun 20?",
+            category="weather",
             liquidity_usdc=800.0,
             outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
             close_time=datetime.now(timezone.utc) + timedelta(hours=20),
-            resolution_criteria="Per Luminate weekly streaming data",
+            resolution_criteria="Per NWS/NOAA daily high temperature",
         )
         _, breakdown = _pre_analysis_opportunity_score(
             market,
@@ -1519,6 +1520,58 @@ class TestMainUtils(unittest.TestCase):
                 market=market,
                 settings=Settings(),
             )
+        )
+
+    def test_conviction_repair_exempts_weather_from_missing_primary_source(self) -> None:
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.74,
+            bet_size_pct=0.0,
+            reasoning="Direct NWS observed daily high; no URL attached.",
+            edge_external=0.24,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=0.93,
+            source_match_class="settlement_aligned",
+        )
+        weather_market = Market(
+            id="KXHIGHDEN-26JUN20-B89.5",
+            question="Will the Denver daily high settle in the 89-90F bin?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.48), MarketOutcome(name="NO", price=0.52)],
+            liquidity_usdc=800.0,
+        )
+        generic_market = Market(
+            id="KXGENERIC-B1",
+            question="Will a generic outcome happen?",
+            outcomes=[MarketOutcome(name="YES", price=0.48), MarketOutcome(name="NO", price=0.52)],
+            liquidity_usdc=800.0,
+        )
+        # Weather is exempt: it is not rejected for a missing primary_source_url
+        # and proceeds to the no-trade-contradiction repair path.
+        weather_reason = _conviction_repair_reason(
+            decision=decision,
+            market=weather_market,
+            settings=Settings(),
+            score_result=None,
+            score_threshold=None,
+        )
+        self.assertEqual(weather_reason, "conviction_repair_no_trade_contradiction")
+        # Generic still requires the URL.
+        generic_diag: dict[str, object] = {}
+        generic_reason = _conviction_repair_reason(
+            decision=decision,
+            market=generic_market,
+            settings=Settings(),
+            score_result=None,
+            score_threshold=None,
+            diagnostics=generic_diag,
+        )
+        self.assertIsNone(generic_reason)
+        self.assertEqual(
+            generic_diag.get("conviction_repair_missed_reason"),
+            "non_sports_missing_primary_source",
         )
 
     def test_parallel_attempt_limit_does_not_add_failure_buffer(self) -> None:
@@ -2492,6 +2545,43 @@ class TestMainUtils(unittest.TestCase):
         self.assertNotIn("m2", capped_ids)
         self.assertIn("sp1", capped_ids)
         self.assertNotIn("sp2", capped_ids)
+
+    def test_cap_analysis_candidates_limits_generic_candidates(self) -> None:
+        candidates = [
+            {"market": Market(id="g1", question="Quarterly metric question one", category="business")},
+            {"market": Market(id="w1", question="High temperature in Denver", category="weather")},
+            {"market": Market(id="g2", question="Quarterly metric question two", category="business")},
+            {"market": Market(id="c1", question="Bitcoin price above 50000", category="crypto")},
+            {"market": Market(id="g3", question="Quarterly metric question three", category="business")},
+            {"market": Market(id="g4", question="Quarterly metric question four", category="business")},
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=5,
+            max_generic_candidates_per_cycle=2,
+        )
+        capped_ids = [item["market"].id for item in capped]
+        generic_selected = [mid for mid in capped_ids if mid.startswith("g")]
+        # Generic is capped at 2; the freed slots stay with direct-evidence
+        # families (weather/crypto), which are not generic-capped.
+        self.assertEqual(len(generic_selected), 2)
+        self.assertIn("w1", capped_ids)
+        self.assertIn("c1", capped_ids)
+
+    def test_cap_analysis_candidates_generic_cap_none_keeps_legacy_behavior(self) -> None:
+        candidates = [
+            {"market": Market(id="g1", question="Quarterly metric question one", category="business")},
+            {"market": Market(id="g2", question="Quarterly metric question two", category="business")},
+            {"market": Market(id="g3", question="Quarterly metric question three", category="business")},
+            {"market": Market(id="w1", question="High temperature in Denver", category="weather")},
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=3,
+            max_generic_candidates_per_cycle=None,
+        )
+        # No generic cap: the top 3 by rank are kept regardless of family.
+        self.assertEqual(len(capped), 3)
 
     def test_cap_analysis_candidates_prefers_lower_non_actionable_streak(self) -> None:
         candidates = [
@@ -4819,6 +4909,41 @@ class TestConvictionRepairEdgeEligibility(unittest.TestCase):
         self.assertEqual(
             diagnostics["conviction_repair_missed_reason"],
             "edge_below_repair_min",
+        )
+
+
+class SelfConsistencyGatingTest(unittest.TestCase):
+    def _candidate(self, market_id: str, score: float) -> dict:
+        return {
+            "market": Market(
+                id=market_id,
+                question="q",
+                outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+            ),
+            "pre_analysis_score": score,
+        }
+
+    def test_selects_top_n_by_pre_analysis_score(self) -> None:
+        candidates = [
+            self._candidate("a", 0.9),
+            self._candidate("b", 0.4),
+            self._candidate("c", 0.7),
+        ]
+
+        class _Settings:
+            GROK_SELF_CONSISTENCY_TOP_CANDIDATES = 2
+
+        allowed = main_module._self_consistency_allowed_market_ids(candidates, _Settings())
+        self.assertEqual(allowed, {"a", "c"})
+
+    def test_zero_top_candidates_disables_gating(self) -> None:
+        candidates = [self._candidate("a", 0.9), self._candidate("b", 0.4)]
+
+        class _Settings:
+            GROK_SELF_CONSISTENCY_TOP_CANDIDATES = 0
+
+        self.assertIsNone(
+            main_module._self_consistency_allowed_market_ids(candidates, _Settings())
         )
 
 

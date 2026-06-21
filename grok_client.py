@@ -911,7 +911,9 @@ class GrokClient:
             if market_implied is not None
             else None
         )
-        primary_source_required_for_direct = profile_name != "sports"
+        primary_source_required_for_direct = (
+            profile_name not in active_settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES
+        )
         primary_source_is_settlement_grade = self._primary_source_is_settlement_grade(
             primary_source_url,
             active_settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
@@ -1049,6 +1051,27 @@ class GrokClient:
             and source_match_class == "settlement_aligned"
             and evidence_quality >= _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE
         )
+        # A proxy market with a strong market edge and non-trivial evidence
+        # quality is allowed past the preview/proxy validation blocks below.
+        # EV protection is preserved downstream: the adaptive edge gate and the
+        # per-family size multiplier still apply, so historically weak families
+        # are sized down rather than hard-blocked here.
+        proxy_high_edge_participation_min = max(
+            0.0,
+            float(
+                getattr(
+                    active_settings,
+                    "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE",
+                    Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE,
+                )
+            ),
+        )
+        strong_proxy_edge_override = (
+            evidence_basis_class == "proxy"
+            and market_edge is not None
+            and market_edge >= proxy_high_edge_participation_min
+            and evidence_quality >= _LOW_QUALITY_EVIDENCE_THRESHOLD
+        )
 
         should_trade = decision.should_trade
         gate_reasons: list[str] = []
@@ -1083,6 +1106,7 @@ class GrokClient:
             if (
                 source_match_class == "preview_or_proxy"
                 and edge_source in {"fallback", "none"}
+                and not strong_proxy_edge_override
             ):
                 should_trade = False
                 gate_reasons.append("preview_proxy_without_direct_source")
@@ -1090,9 +1114,29 @@ class GrokClient:
                 edge_source in {"fallback", "none"}
                 and evidence_quality < fallback_min_evidence_quality
                 and not direct_fallback_gate_override
+                and not strong_proxy_edge_override
             ):
                 should_trade = False
                 gate_reasons.append("fallback_edge_without_verifiable_signal")
+            if (
+                strong_proxy_edge_override
+                and should_trade
+                and source_match_class == "preview_or_proxy"
+            ):
+                logger.debug(
+                    "Proxy high-edge participation override applied: market=%s edge=%.4f eq=%.2f min=%.4f",
+                    market.id,
+                    market_edge if market_edge is not None else 0.0,
+                    evidence_quality,
+                    proxy_high_edge_participation_min,
+                    data={
+                        "market_id": market.id,
+                        "market_edge": market_edge,
+                        "evidence_quality": evidence_quality,
+                        "proxy_high_edge_participation_min": proxy_high_edge_participation_min,
+                        "edge_source": edge_source,
+                    },
+                )
 
         gate_status = "allow" if should_trade else "block"
         reason_code = ",".join(gate_reasons) if gate_reasons else "ok"
@@ -1494,8 +1538,11 @@ class GrokClient:
         decision: TradeDecision,
         *,
         deep: bool,
+        allow_self_consistency: bool = True,
     ) -> bool:
         if deep or not bool(getattr(self.settings, "GROK_SELF_CONSISTENCY_ENABLED", True)):
+            return False
+        if not allow_self_consistency:
             return False
         liquidity = float(market.liquidity_usdc or 0.0)
         liquidity_threshold = max(
@@ -1783,6 +1830,7 @@ class GrokClient:
         previous_analysis: TradeDecision | None,
         deep: bool,
         family_is_profitable: bool = False,
+        allow_self_consistency: bool = True,
     ) -> TradeDecision:
         self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
@@ -1952,7 +2000,12 @@ class GrokClient:
                 f"Grok analysis budget exhausted for market {market.id}"
             ) from last_error
 
-        if self._should_run_self_consistency(market, first_decision, deep=deep):
+        if self._should_run_self_consistency(
+            market,
+            first_decision,
+            deep=deep,
+            allow_self_consistency=allow_self_consistency,
+        ):
             budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
             if budget_remaining_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0:
                 try:
@@ -2324,6 +2377,7 @@ class GrokClient:
         previous_analysis: TradeDecision | None = None,
         *,
         family_is_profitable: bool = False,
+        allow_self_consistency: bool = True,
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
@@ -2331,6 +2385,7 @@ class GrokClient:
             previous_analysis=previous_analysis,
             deep=False,
             family_is_profitable=family_is_profitable,
+            allow_self_consistency=allow_self_consistency,
         )
 
     def analyze_market_deep(

@@ -316,6 +316,7 @@ class TestConfig(unittest.TestCase):
             "FALLBACK_EDGE_MIN_EDGE=0.30",
             "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=0.90",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE=0.34",
+            "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=0.15",
             "MAX_REASONABLE_EDGE=0.40",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
@@ -778,6 +779,41 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.90)
+
+    def test_proxy_high_edge_participation_min_edge_env_override(self) -> None:
+        self.assertEqual(config.Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE, 0.15)
+        env = {
+            **self._required_env(),
+            "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE": "0.22",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE, 0.22)
+
+    def test_self_consistency_top_candidates_env_override(self) -> None:
+        self.assertEqual(config.Settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES, 0)
+        env = {
+            **self._required_env(),
+            "GROK_SELF_CONSISTENCY_TOP_CANDIDATES": "3",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES, 3)
+
+    def test_primary_source_url_exempt_families_env_override(self) -> None:
+        self.assertEqual(
+            config.Settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES, ("sports", "weather")
+        )
+        env = {
+            **self._required_env(),
+            "PRIMARY_SOURCE_URL_EXEMPT_FAMILIES": "sports,weather,crypto",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            tuple(settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES),
+            ("sports", "weather", "crypto"),
+        )
 
     def test_grok_stream_timeout_seconds_weather_env_override(self) -> None:
         env = {

@@ -1111,15 +1111,15 @@ class TestGrokClient(unittest.TestCase):
         decision = TradeDecision(
             should_trade=True,
             outcome="YES",
-            confidence=0.66,
+            confidence=0.62,
             bet_size_pct=0.3,
             reasoning=(
                 "Reuters preview notes the matchup and probable starters. "
-                "No external odds found. Implied prob: unknown. My prob: 66%. Edge: 16%."
+                "No external odds found. Implied prob: unknown. My prob: 62%. Edge: 12%."
             ),
             implied_prob_external=None,
-            my_prob=0.66,
-            edge_external=0.16,
+            my_prob=0.62,
+            edge_external=0.12,
             edge_source="fallback",
             evidence_quality=0.10,
         )
@@ -1137,6 +1137,74 @@ class TestGrokClient(unittest.TestCase):
             "preview_or_proxy_source",
         )
         self.assertLessEqual(validated.evidence_quality, 0.50)
+        # Edge (0.12) is below the high-edge proxy participation floor (0.15),
+        # so a no-direct-source preview remains blocked.
+        self.assertFalse(validated.should_trade)
+
+    def test_validate_and_enrich_allows_high_edge_proxy_via_override(self) -> None:
+        market = Market(
+            id="m9-highedge",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the matchup and probable starters. "
+                "No external odds found. Implied prob: unknown. My prob: 70%. Edge: 20%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.70,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        # Proxy + fallback edge would normally be blocked, but a market edge at
+        # or above the participation floor (0.15) lets it pass validation so the
+        # downstream edge gate and family sizing can size it.
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertTrue(validated.should_trade)
+
+    def test_validate_and_enrich_blocks_high_edge_proxy_below_floor(self) -> None:
+        market = Market(
+            id="m9-lowedge",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.60,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the matchup and probable starters. "
+                "No external odds found. Implied prob: unknown. My prob: 60%. Edge: 10%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.60,
+            edge_external=0.10,
+            edge_source="fallback",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        # Edge (0.10) is below the participation floor (0.15), so the proxy block
+        # still applies even though evidence quality clears the cap.
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
         self.assertFalse(validated.should_trade)
 
     def test_validate_and_enrich_prefers_computed_edge_over_reasoning_text(self) -> None:
@@ -1400,6 +1468,40 @@ class TestGrokClient(unittest.TestCase):
         self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
         self.assertEqual(validated.evidence_basis, "proxy")
+
+    def test_weather_profile_exempt_from_primary_source_url_requirement(self) -> None:
+        # Same decision under two profiles isolates the exemption. The reasoning
+        # is reused from the generic suppression test above (it classifies as
+        # direct), so the only difference is profile_name.
+        market = Market(
+            id="KXHIGHDEN-26JUN20-B89.5",
+            question="Will the Denver daily high settle in the 89-90F bin?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning="Final score in official recap from Reuters confirms settlement outcome.",
+            implied_prob_external=None,
+            my_prob=0.85,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        weather = client._validate_and_enrich_decision(market, decision, profile_name="weather")
+        generic = client._validate_and_enrich_decision(market, decision, profile_name="generic")
+        # Weather has a universal NWS settlement source -> exempt: stays direct,
+        # not suppressed for a missing URL. Generic still requires the URL.
+        self.assertEqual(weather.evidence_basis, "direct")
+        self.assertNotEqual(
+            weather.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+        self.assertEqual(generic.evidence_basis, "proxy")
 
     def test_validate_and_enrich_caps_proxy_evidence_quality(self) -> None:
         market = Market(
@@ -1901,6 +2003,48 @@ class TestQuotaExhaustedClassification(unittest.TestCase):
         self.assertEqual(
             validated.evidence_quality_floor_applied,
             "convergent_evidence_floor",
+        )
+
+
+class SelfConsistencyShouldRunTest(unittest.TestCase):
+    def _market(self) -> Market:
+        return Market(
+            id="m-sc",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=5000.0,
+        )
+
+    def _decision(self) -> TradeDecision:
+        return TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.3,
+            reasoning="x",
+            implied_prob_external=0.45,
+            my_prob=0.70,
+            edge_external=0.25,
+        )
+
+    def test_allow_flag_gates_self_consistency(self) -> None:
+        client = GrokClient(api_key="x")
+        market = self._market()
+        decision = self._decision()
+        # High liquidity clears the threshold, so it runs when allowed.
+        self.assertTrue(
+            client._should_run_self_consistency(
+                market, decision, deep=False, allow_self_consistency=True
+            )
+        )
+        # Gated out for non-top candidates regardless of thresholds.
+        self.assertFalse(
+            client._should_run_self_consistency(
+                market, decision, deep=False, allow_self_consistency=False
+            )
         )
 
 

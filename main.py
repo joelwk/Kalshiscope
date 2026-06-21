@@ -243,15 +243,16 @@ _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS = 0.03
 _PRE_ANALYSIS_POSITIVE_FAMILY_PNL_BONUS = 0.02
 _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
 # Nudge selection toward families where settlement-aligned DIRECT evidence is
-# reliably obtainable (Billboard/Luminate, Netflix/box-office, NWS/NOAA). The
-# score engine rewards direct evidence and lightly penalizes proxy, so analysis
-# slots spent here are far more likely to clear the gates and trade. Sports is
-# intentionally excluded: it has direct sources but is efficiently priced, and
-# it is throttled separately via MAX_SPORTS_CANDIDATES_PER_CYCLE.
+# reliably obtainable AND actually converts to fills. Calibrated from a 15-cycle
+# review: weather (NWS/NOAA daily highs/lows) was the only family to produce a
+# fill, so it leads. Music was 81% absence-only in practice (no findable
+# settlement data within the analysis window) and is dropped. Entertainment
+# finds evidence but has not converted to trades, so it keeps only a small nudge.
+# Sports is excluded: direct sources but efficiently priced; it is throttled
+# separately via MAX_SPORTS_CANDIDATES_PER_CYCLE.
 _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY = {
-    "music": 0.08,
-    "entertainment": 0.08,
-    "weather": 0.05,
+    "weather": 0.12,
+    "entertainment": 0.03,
 }
 # Minimum non-actionable streak before a never-traded market with a recent
 # fallback edge is benched as high-churn. Raised 3 -> 5 in the 10-cycle review:
@@ -1208,7 +1209,10 @@ def _conviction_repair_reason(
     ):
         _miss("insufficient_source_alignment")
         return None
-    if market_family(market) != "sports" and not has_primary_source:
+    if (
+        market_family(market) not in settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES
+        and not has_primary_source
+    ):
         _miss("non_sports_missing_primary_source")
         return None
     if not decision.should_trade and not decision.abstain:
@@ -3047,6 +3051,7 @@ def _log_settings_summary(settings) -> None:
             "max_speech_candidates_per_cycle": settings.MAX_SPEECH_CANDIDATES_PER_CYCLE,
             "max_music_candidates_per_cycle": settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
             "max_sports_candidates_per_cycle": settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
+            "max_generic_candidates_per_cycle": settings.MAX_GENERIC_CANDIDATES_PER_CYCLE,
             "weather_min_evidence_quality": settings.WEATHER_MIN_EVIDENCE_QUALITY,
             "direct_source_min_evidence_quality_sports": settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS,
             "weather_fallback_edge_min_edge": settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
@@ -5178,6 +5183,32 @@ def _get_or_create_worker_grok_client(
     return client
 
 
+def _self_consistency_allowed_market_ids(
+    analysis_candidates: list[dict[str, Any]],
+    settings: Settings,
+) -> set[str] | None:
+    """Market IDs eligible for the self-consistency second pass this cycle.
+
+    Returns ``None`` when gating is disabled (every candidate eligible). When
+    ``GROK_SELF_CONSISTENCY_TOP_CANDIDATES`` is positive, only the top-N
+    candidates by pre-analysis score qualify, so the costly second pass is spent
+    on the markets most likely to trade.
+    """
+    top_n = max(0, int(getattr(settings, "GROK_SELF_CONSISTENCY_TOP_CANDIDATES", 0) or 0))
+    if top_n <= 0:
+        return None
+    ranked = sorted(
+        analysis_candidates,
+        key=lambda candidate: float(candidate.get("pre_analysis_score") or 0.0),
+        reverse=True,
+    )
+    return {
+        candidate["market"].id
+        for candidate in ranked[:top_n]
+        if candidate.get("market") is not None
+    }
+
+
 def _analyze_market_candidate_via_thread_local_client(
     market: Market,
     state: MarketState | None,
@@ -5189,6 +5220,7 @@ def _analyze_market_candidate_via_thread_local_client(
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
     family_context: dict[str, Any] | None = None,
+    allow_self_consistency: bool = True,
 ) -> dict[str, Any]:
     """Worker entry point that reuses one GrokClient per worker thread."""
     grok_client = _get_or_create_worker_grok_client(settings, provider)
@@ -5203,6 +5235,7 @@ def _analyze_market_candidate_via_thread_local_client(
         force_extended_research=force_extended_research,
         research_queue_context=research_queue_context,
         family_context=family_context,
+        allow_self_consistency=allow_self_consistency,
     )
 
 
@@ -5217,6 +5250,7 @@ def _analyze_market_candidate_for_worker(
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
     family_context: dict[str, Any] | None = None,
+    allow_self_consistency: bool = True,
 ) -> dict[str, Any]:
     """Worker-safe wrapper that restores cycle correlation context."""
     if correlation_id:
@@ -5231,6 +5265,7 @@ def _analyze_market_candidate_for_worker(
         force_extended_research=force_extended_research,
         research_queue_context=research_queue_context,
         family_context=family_context,
+        allow_self_consistency=allow_self_consistency,
     )
 
 
@@ -5768,6 +5803,7 @@ def _cap_analysis_candidates(
     max_speech_candidates_per_cycle: int | None = None,
     max_music_candidates_per_cycle: int | None = None,
     max_sports_candidates_per_cycle: int | None = None,
+    max_generic_candidates_per_cycle: int | None = None,
     pre_scores: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply a hard cap using global risk-adjusted rank, then family caps."""
@@ -5879,6 +5915,7 @@ def _cap_analysis_candidates(
     selected_speech_count = 0
     selected_music_count = 0
     selected_sports_count = 0
+    selected_generic_count = 0
     for _, candidate in sorted(ranked_candidates, key=lambda item: item[0]):
         if len(selected) >= max_markets_per_cycle:
             break
@@ -5916,6 +5953,12 @@ def _cap_analysis_candidates(
             and selected_sports_count >= max_sports_candidates_per_cycle
         ):
             continue
+        if (
+            family == "generic"
+            and max_generic_candidates_per_cycle is not None
+            and selected_generic_count >= max_generic_candidates_per_cycle
+        ):
+            continue
         selected.append(candidate)
         if family == "weather":
             selected_weather_count += 1
@@ -5927,6 +5970,8 @@ def _cap_analysis_candidates(
             selected_music_count += 1
         elif family == "sports":
             selected_sports_count += 1
+        elif family == "generic":
+            selected_generic_count += 1
     if len(selected) < max_markets_per_cycle and invalid_candidates:
         selected.extend(invalid_candidates[: max_markets_per_cycle - len(selected)])
     return selected
@@ -6161,6 +6206,7 @@ def _analyze_market_candidate(
     force_extended_research: bool = False,
     research_queue_context: dict[str, Any] | None = None,
     family_context: dict[str, Any] | None = None,
+    allow_self_consistency: bool = True,
 ) -> dict[str, Any]:
     """Run analysis/refinement/guardrails for a market candidate."""
     previous_analysis = _build_previous_analysis(anchor_analysis)
@@ -6179,6 +6225,7 @@ def _analyze_market_candidate(
             search_config=search_config,
             previous_analysis=previous_analysis,
             family_is_profitable=family_is_profitable,
+            allow_self_consistency=allow_self_consistency,
         )
     except Exception as exc:
         error_text = str(exc)
@@ -6654,6 +6701,8 @@ def main(max_cycles: int | None = None) -> None:
         order_price_improvement_cents=settings.ORDER_PRICE_IMPROVEMENT_CENTS,
         default_time_in_force=settings.ORDER_DEFAULT_TIF,
         max_fetch_pages=settings.KALSHI_MAX_FETCH_PAGES,
+        min_bet_usdc=settings.MIN_BET_USDC,
+        max_bet_usdc=settings.MAX_BET_USDC,
     )
     logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
 
@@ -9038,6 +9087,11 @@ def main(max_cycles: int | None = None) -> None:
                 if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
                 else None
             )
+            generic_candidate_cap = (
+                settings.MAX_GENERIC_CANDIDATES_PER_CYCLE
+                if settings.MAX_GENERIC_CANDIDATES_PER_CYCLE > 0
+                else None
+            )
             analysis_candidates = _cap_analysis_candidates(
                 analysis_candidates,
                 analysis_candidate_attempt_limit,
@@ -9046,6 +9100,7 @@ def main(max_cycles: int | None = None) -> None:
                 max_speech_candidates_per_cycle=settings.MAX_SPEECH_CANDIDATES_PER_CYCLE,
                 max_music_candidates_per_cycle=settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
                 max_sports_candidates_per_cycle=sports_candidate_cap,
+                max_generic_candidates_per_cycle=generic_candidate_cap,
                 pre_scores=pre_analysis_scores,
             )
             selected_family_distribution = _analysis_candidate_family_counts(
@@ -9427,6 +9482,9 @@ def main(max_cycles: int | None = None) -> None:
                     # the thread-local cache is rebuilt with the current
                     # settings/provider on first use of each worker thread.
                     reset_worker_grok_client_cache()
+                    self_consistency_allowed_ids = _self_consistency_allowed_market_ids(
+                        analysis_candidates, settings
+                    )
                     with ThreadPoolExecutor(max_workers=analysis_worker_count) as executor:
                         parallel_analysis_used = True
                         future_to_market = {}
@@ -9443,6 +9501,10 @@ def main(max_cycles: int | None = None) -> None:
                                 bool(candidate.get("force_extended_research")),
                                 candidate.get("research_queue_drain_entry"),
                                 _family_context_from_candidate(candidate),
+                                allow_self_consistency=(
+                                    self_consistency_allowed_ids is None
+                                    or candidate["market"].id in self_consistency_allowed_ids
+                                ),
                             )
                             future_to_market[future] = candidate["market"]
 
@@ -9572,6 +9634,9 @@ def main(max_cycles: int | None = None) -> None:
             if not parallel_analysis_used:
                 successful_analysis_count = 0
                 consecutive_xai_failures = 0
+                self_consistency_allowed_ids = _self_consistency_allowed_market_ids(
+                    analysis_candidates, settings
+                )
                 for candidate_index, candidate in enumerate(analysis_candidates):
                     if successful_analysis_count >= settings.MAX_MARKETS_PER_CYCLE:
                         break
@@ -9591,6 +9656,10 @@ def main(max_cycles: int | None = None) -> None:
                                 "research_queue_drain_entry"
                             ),
                             family_context=_family_context_from_candidate(candidate),
+                            allow_self_consistency=(
+                                self_consistency_allowed_ids is None
+                                or market.id in self_consistency_allowed_ids
+                            ),
                         )
                         analysis_results[market.id] = result
                         if result.get("analysis_failed"):
@@ -10967,7 +11036,7 @@ def main(max_cycles: int | None = None) -> None:
                 if (
                     decision.should_trade
                     and settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL
-                    and market_family_name != "sports"
+                    and market_family_name not in settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES
                     and not str(getattr(decision, "primary_source_url", "") or "").strip()
                 ):
                     trades_skipped_no_trade += 1

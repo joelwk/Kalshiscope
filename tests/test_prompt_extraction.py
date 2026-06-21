@@ -33,8 +33,8 @@ EXPECTED_MARKET_PROMPT_HASHES = {
     "speech_mention:deep_true": "fc8ce1fca9f8854d8306d649b2857f4714014b66671ce598ce0986a5fc97de37",
     "sports:deep_false": "fe0dbbd28b8b597cad72470437da79ae7dc19f8f516e998feb7d85d2196c6234",
     "sports:deep_true": "124db8a8dfd3c057d7699b6d2b8477fa7388935f171010ccaff1490f00a93909",
-    "weather:deep_false": "bca33a890b34d265e75899905e63dc40d364c8442791b3982070d6ce008a65d2",
-    "weather:deep_true": "e6cda107427fcc000b420a4161ca3ebfa7f64aad1f25d9940349d6dee753cbd6",
+    "weather:deep_false": "92fe64542878cfe332d8143e002f4f4aab08b012a212ac980033f66c28a6cfd4",
+    "weather:deep_true": "9acb10ac4dfef3cd7074c4d261bab5dd9cacbd139360ad0b6623891857f73aee",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
