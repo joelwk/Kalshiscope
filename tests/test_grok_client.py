@@ -1503,6 +1503,114 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertEqual(generic.evidence_basis, "proxy")
 
+    def test_commodity_with_allowlisted_settlement_url_counts_as_direct(self) -> None:
+        # Core unblock: once a commodity market cites a reachable settlement-grade
+        # URL (cmegroup.com), settlement-aligned evidence counts as direct and the
+        # floor is not suppressed -- the same path weather already enjoys.
+        market = Market(
+            id="KXSILVERD-26JUN2217-T66.25",
+            question="Will the silver close price be above 66.25 on Jun 26?",
+            category="commodities",
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Official CME front-month settlement price shows silver spot price "
+                "at 67.10 as of the 1:30 PM ET COMEX close (observed value with "
+                "timestamp), above the 66.25 threshold."
+            ),
+            implied_prob_external=0.45,
+            my_prob=0.80,
+            edge_external=0.35,
+            edge_source="computed",
+            likelihood_ratio=20.0,
+            evidence_quality=0.10,
+            primary_source_url="https://www.cmegroup.com/markets/metals/precious/silver.quotes.html",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market, decision, profile_name="commodity"
+        )
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertNotEqual(
+            validated.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+
+    def test_commodity_without_allowlisted_url_still_suppressed(self) -> None:
+        # Safety preserved: an aggregator URL (not settlement-grade) is still
+        # rejected, so the fix does not loosen the evidence gate.
+        market = Market(
+            id="KXSILVERD-26JUN2217-T66.25",
+            question="Will the silver close price be above 66.25 on Jun 26?",
+            category="commodities",
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Official CME front-month settlement price shows silver spot price "
+                "at 67.10 as of the 1:30 PM ET COMEX close (observed value with "
+                "timestamp), above the 66.25 threshold."
+            ),
+            implied_prob_external=0.45,
+            my_prob=0.80,
+            edge_external=0.35,
+            edge_source="computed",
+            likelihood_ratio=20.0,
+            evidence_quality=0.10,
+            primary_source_url="https://www.investing.com/commodities/silver",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market, decision, profile_name="commodity"
+        )
+        self.assertEqual(
+            validated.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+
+    def test_crypto_with_allowlisted_exchange_url_counts_as_direct(self) -> None:
+        market = Market(
+            id="KXETHD-26JUN2217-T1739.99",
+            question="Will ETH close above 1739.99 on Jun 22 17:00?",
+            category="crypto",
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Coinbase exchange spot price shows ETH at 1750 as of 17:00 UTC "
+                "(observed value with timestamp); settlement confirms above threshold."
+            ),
+            implied_prob_external=0.45,
+            my_prob=0.80,
+            edge_external=0.35,
+            edge_source="computed",
+            likelihood_ratio=20.0,
+            evidence_quality=0.10,
+            primary_source_url="https://www.coinbase.com/price/ethereum",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market, decision, profile_name="crypto"
+        )
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertNotEqual(
+            validated.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+
     def test_validate_and_enrich_caps_proxy_evidence_quality(self) -> None:
         market = Market(
             id="m-proxy-cap",

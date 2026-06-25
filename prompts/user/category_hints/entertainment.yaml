@@ -2,3 +2,7 @@ name: user/category_hints/entertainment
 description: Guidance for Netflix, box office, app-rank, and entertainment ranking markets.
 content: >-
   Entertainment guidance: prioritize settlement-aligned ranking sources such as Netflix Top 10/Tudum, FlixPatrol, Box Office Mojo, The Numbers, and official platform charts; distinguish direct published rankings from entertainment news, forecasts, reviews, and social chatter.
+
+  Settlement sources: rankings resolve on the official published chart for the settlement period. Always populate the primary_source_url field with the exact official ranking page you relied on (for example a top10.netflix.com / netflix.com Top 10 page or a boxofficemojo.com gross/ranking page) showing the published values and the period they cover; these are settlement-grade and let the analysis count as direct evidence. Industry news, forecasts, reviews, and social chatter are proxy-tier and cannot satisfy direct evidence.
+
+  Publish lag: official rankings are released on a delay (for example Netflix Top 10 publishes weekly on Tuesdays). If the official ranking covering the market's settlement period is not yet published, treat the market as proxy/absence_only and abstain rather than trading on a preview, projection, or partial-week estimate.

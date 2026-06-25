@@ -2,3 +2,7 @@ name: user/category_hints/crypto
 description: Crypto-specific research guidance.
 content: >-
   Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, spot price feeds, and time-sensitive catalysts over rumor accounts. Compare threshold probabilities against 2024-2026 realized volatility, recent intraday move distributions, and current buffer-to-threshold before setting confidence.
+
+  Settlement sources: daily and range price markets resolve on a major-exchange spot or index close. Always populate the primary_source_url field with the exact exchange quote page you relied on (for example a coinbase.com, kraken.com, or binance.com spot-price page, or a coindesk.com index page) showing the observed price and timestamp; these are settlement-grade and let the analysis count as direct evidence. Aggregators, chart sites, on-chain dashboards, and social posts (coingecko, tradingview, glassnode, etc.) are proxy-tier and cannot satisfy direct evidence regardless of URL presence.
+
+  If you cannot cite a settlement-grade exchange URL with the observed price and timestamp, set evidence_basis=proxy and evidence_quality <= 0.60 — do not award higher EQ or direct evidence without it.

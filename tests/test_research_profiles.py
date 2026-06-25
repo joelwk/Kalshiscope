@@ -348,6 +348,42 @@ def test_is_commodity_market_detects_gold() -> None:
     assert is_commodity_market(market) is True
 
 
+def test_profile_for_market_commodity_routes_to_commodity_profile() -> None:
+    """Commodities classify under the generic taxonomy family but must route to
+    the dedicated commodity search profile so the model can reach (and cite) the
+    CME/ICE/EIA settlement pages required for direct evidence. Without this they
+    inherited GENERIC news-wire domains and were blocked as
+    missing_primary_source_url (weather-only sourcing regression)."""
+    settings = Settings()
+    market = Market(
+        id="KXSILVERD-26JUN2217-T66.25",
+        question="Will the silver close price be above 66.25 on Jun 26?",
+        category="commodities",
+    )
+    # Taxonomy family is unchanged (no scoring/penalty impact)...
+    assert market_family(market) == "generic"
+    # ...but the search profile is the commodity one.
+    profile = profile_for_market(settings, market)
+    assert profile.name == "commodity"
+    assert "cmegroup.com" in profile.domains
+    assert "theice.com" in profile.domains
+
+
+def test_commodity_search_config_reaches_exchange_settlement_domains() -> None:
+    """The trimmed (top SEARCH_PROFILE_MAX_DOMAINS) searchable set for a commodity
+    market includes the exchange settlement page, so a cited URL can satisfy the
+    settlement-grade primary_source_url requirement."""
+    settings = Settings()
+    market = Market(
+        id="KXCOPPERW-26JUN2617-T6.35",
+        question="Will the copper close price be above 6.35 USD/Lbs on June 26?",
+        category="commodities",
+    )
+    search_config = build_market_search_config(settings, market)
+    assert search_config.profile_name == "commodity"
+    assert "cmegroup.com" in search_config.allowed_domains
+
+
 def test_dynamic_lookback_short_horizon() -> None:
     now = datetime.now(timezone.utc)
     settings = Settings(

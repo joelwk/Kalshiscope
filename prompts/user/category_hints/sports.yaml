@@ -2,3 +2,11 @@ name: user/category_hints/sports
 description: Sports-specific research guidance.
 content: >-
   Sports guidance: prioritize current injury reports, lineup/rotation news, schedule fatigue, home-away splits, and credible odds consensus. Anchor probability against 2024-2026 team/player/market base rates when available, then adjust for today's confirmed news and price movement.
+
+  Verify game status first: confirm whether the game is scheduled, in-progress, final, or postponed/suspended via the league schedule or a live score source before computing any edge. Postponed, suspended, or canceled games accrue no stats, so player-stat and many result props resolve NO; cite the schedule/status page and treat that as the settlement fact rather than abstaining for "no box score found".
+
+  Settled or in-progress markets are direct evidence: cite the official box score or result page (espn.com, mlb.com, nba.com, nfl.com, nhl.com, ncaa.com, or espncricinfo.com for cricket/KBO) as primary_source_url and quote the specific stat line or score with its timestamp. A box score that explicitly matches the market's settlement criteria sets evidence_basis=direct.
+
+  Pre-game markets get their edge from odds, not base rates: read a current line from a sportsbook/consensus source (covers.com, oddsshark.com, pinnacle.com), convert it to an implied probability, and populate implied_prob_external and edge_external (my_prob - implied_prob_external) so edge_source resolves to computed instead of none. Multi-book odds consensus with confirmed lineups is settlement-predictive proxy evidence and may set evidence_quality 0.70-0.80.
+
+  Principled abstention: if neither a citable odds line nor an official result/box score exists (for example a sparsely-covered KBO spread with no published consensus), set evidence_basis=proxy, keep evidence_quality <= 0.55, and abstain — do not trade on stale or multi-year-old base rates alone. Name the missing source (current sportsbook line, confirmed starters, or official box score) so the market can be re-researched.

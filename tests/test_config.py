@@ -424,6 +424,54 @@ class TestConfig(unittest.TestCase):
             ("Netflix", "flixpatrol"),
         )
 
+    def test_commodity_profile_settings_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "COMMODITY_ALLOWED_DOMAINS": "cmegroup.com,theice.com",
+            "COMMODITY_ALLOWED_X_HANDLES": "CMEGroup,EIAgov",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.COMMODITY_ALLOWED_DOMAINS,
+            ("cmegroup.com", "theice.com"),
+        )
+        self.assertEqual(
+            settings.COMMODITY_ALLOWED_X_HANDLES,
+            ("CMEGroup", "EIAgov"),
+        )
+
+    def test_commodity_profile_defaults_lead_with_settlement_grade(self) -> None:
+        # The first SEARCH_PROFILE_MAX_DOMAINS entries are the searchable set, so
+        # they must be reachable settlement-grade venues for commodity markets to
+        # cite a direct-evidence primary_source_url.
+        first_five = config.Settings.COMMODITY_ALLOWED_DOMAINS[
+            : config.Settings.SEARCH_PROFILE_MAX_DOMAINS
+        ]
+        self.assertIn("cmegroup.com", first_five)
+        self.assertIn("theice.com", first_five)
+        self.assertIn("eia.gov", first_five)
+        for domain in first_five:
+            self.assertIn(
+                domain, config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+            )
+
+    def test_crypto_defaults_lead_with_settlement_grade_exchanges(self) -> None:
+        first_five = config.Settings.CRYPTO_ALLOWED_DOMAINS[
+            : config.Settings.SEARCH_PROFILE_MAX_DOMAINS
+        ]
+        for exchange in ("coinbase.com", "kraken.com", "binance.com", "coindesk.com"):
+            self.assertIn(exchange, first_five)
+            self.assertIn(
+                exchange, config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+            )
+
+    def test_index_settlement_source_is_allowlisted_and_searchable(self) -> None:
+        self.assertIn(
+            "nasdaq.com", config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+        )
+        self.assertIn("nasdaq.com", config.Settings.GENERIC_ALLOWED_DOMAINS)
+
     def test_build_search_config(self) -> None:
         env = {
             **self._required_env(),

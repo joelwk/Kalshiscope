@@ -438,10 +438,11 @@ def _direct_decision(
     evidence_quality: float = 0.85,
     evidence_basis: str = "direct",
     edge_source: str = "computed",
+    outcome: str = "YES",
 ) -> TradeDecision:
     return TradeDecision(
         should_trade=True,
-        outcome="YES",
+        outcome=outcome,
         confidence=confidence,
         bet_size_pct=0.5,
         reasoning="direct settlement-aligned read",
@@ -468,6 +469,24 @@ def test_direct_posterior_floor_reconstructs_model_estimate() -> None:
     settings = _floor_settings()
     floor = _direct_evidence_posterior_floor(_direct_decision(), 0.67, settings)
     assert floor == pytest.approx(0.80)
+
+
+def test_direct_posterior_floor_outcome_aware_for_no_bets() -> None:
+    settings = _floor_settings()
+    # NO bet: edge_external is stored YES-side (-0.18), so the chosen (NO) edge is
+    # +0.18. implied_prob here is the chosen-outcome (NO) price 0.65, so the model
+    # NO posterior is floored at 0.65 + 0.18 = 0.83.
+    decision = _direct_decision(edge_external=-0.18, outcome="NO")
+    floor = _direct_evidence_posterior_floor(decision, 0.65, settings)
+    assert floor == pytest.approx(0.83)
+
+
+def test_direct_posterior_floor_none_when_no_bet_lacks_chosen_edge() -> None:
+    settings = _floor_settings()
+    # NO bet whose YES-side edge is positive => the model actually favors YES, not
+    # the NO call. The chosen (NO) edge is negative, so the floor must not fire.
+    decision = _direct_decision(edge_external=0.10, outcome="NO")
+    assert _direct_evidence_posterior_floor(decision, 0.65, settings) is None
 
 
 def test_direct_posterior_floor_capped_at_direct_ceiling() -> None:

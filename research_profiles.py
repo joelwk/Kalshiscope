@@ -263,6 +263,16 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
             domains=settings.ENTERTAINMENT_ALLOWED_DOMAINS,
             x_handles=settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
         )
+    # Commodities and indices fall into the "generic" family but settle on
+    # exchange data; route them to the commodity search profile so the model can
+    # reach (and cite) the CME/ICE/EIA settlement pages required for direct
+    # evidence. Mirrors the commodity special-casing in _category_research_hint.
+    if is_commodity_market(market):
+        return ResearchProfile(
+            name="commodity",
+            domains=settings.COMMODITY_ALLOWED_DOMAINS,
+            x_handles=settings.COMMODITY_ALLOWED_X_HANDLES,
+        )
     return ResearchProfile(
         name="generic",
         domains=settings.GENERIC_ALLOWED_DOMAINS,

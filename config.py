@@ -201,6 +201,7 @@ class Settings:
         "bea.gov",
         "federalreserve.gov",
         "sec.gov",
+        "nasdaq.com",
         "weather.gov",
         "noaa.gov",
         "wsj.com",
@@ -261,14 +262,18 @@ class Settings:
         "WTA",
         "atptour",
     )
+    # Ordered so the first SEARCH_PROFILE_MAX_DOMAINS entries are settlement-grade
+    # exchanges (in SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS); analytics/news sites that
+    # cannot satisfy a direct-evidence primary_source_url follow as fallback.
     CRYPTO_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "coinbase.com",
+        "kraken.com",
+        "binance.com",
         "coindesk.com",
         "cointelegraph.com",
         "theblock.co",
         "decrypt.co",
         "messari.io",
-        "coinbase.com",
-        "kraken.com",
     )
     CRYPTO_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "coinbase",
@@ -356,6 +361,7 @@ class Settings:
         "reuters.com",
         "apnews.com",
         "wsj.com",
+        "nasdaq.com",
         "ft.com",
         "economist.com",
     )
@@ -386,6 +392,29 @@ class Settings:
         "Variety",
         "THR",
         "DEADLINE",
+    )
+    # Commodity/index markets classify as the "generic" family but settle on
+    # exchange data, so they need a dedicated search profile whose first
+    # SEARCH_PROFILE_MAX_DOMAINS entries are reachable settlement-grade pages
+    # (CME/ICE/EIA + Tier-1 wires). Without this they inherit GENERIC_ALLOWED_DOMAINS
+    # (news wires) and can never cite the exchange settlement URL the commodities
+    # prompt requires, so direct evidence is impossible and edges are suppressed.
+    COMMODITY_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "cmegroup.com",
+        "theice.com",
+        "eia.gov",
+        "wsj.com",
+        "bloomberg.com",
+        "reuters.com",
+        "apnews.com",
+    )
+    COMMODITY_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "CMEGroup",
+        "EIAgov",
+        "Reuters",
+        "ReutersBiz",
+        "business",
+        "WSJmarkets",
     )
 
     # Kalshi
@@ -1290,6 +1319,12 @@ def load_settings() -> Settings:
         ENTERTAINMENT_ALLOWED_X_HANDLES=_read_env_csv(
             "ENTERTAINMENT_ALLOWED_X_HANDLES",
             Settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
+        ),
+        COMMODITY_ALLOWED_DOMAINS=_read_env_csv(
+            "COMMODITY_ALLOWED_DOMAINS", Settings.COMMODITY_ALLOWED_DOMAINS
+        ),
+        COMMODITY_ALLOWED_X_HANDLES=_read_env_csv(
+            "COMMODITY_ALLOWED_X_HANDLES", Settings.COMMODITY_ALLOWED_X_HANDLES
         ),
         KALSHI_API_BASE_URL=_read_env_str(
             "KALSHI_API_BASE_URL", Settings.KALSHI_API_BASE_URL

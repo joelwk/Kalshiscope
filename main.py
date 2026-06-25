@@ -1620,9 +1620,9 @@ def _direct_evidence_posterior_floor(
     and score `edge_market` all key off the calibrated confidence). For
     decisions backed by direct + computed + high-evidence signals with a real
     positive model edge, floor the posterior at the model's own outcome estimate
-    (``implied_prob + edge_external``, which is outcome-aligned the same way the
-    confidence-gate override's ``model_edge`` is) so calibration cannot turn that
-    edge negative. Returns ``None`` (behavior unchanged) when the decision does
+    (``implied_prob + chosen_edge``, where ``chosen_edge`` is the chosen outcome's
+    edge: ``+edge_external`` for YES and ``-edge_external`` for NO) so calibration
+    cannot turn that edge negative. Returns ``None`` (behavior unchanged) when the decision does
     not qualify, inputs are missing, or ``_posterior_floor_scope_allows``
     rejects the market type (non-predictive live-quote evidence). The floor
     never exceeds the existing direct-evidence overconfidence ceiling, and
@@ -1633,7 +1633,18 @@ def _direct_evidence_posterior_floor(
     if implied_prob is None:
         return None
     edge_external = getattr(decision, "edge_external", None)
-    if edge_external is None or float(edge_external) <= 0.0:
+    if edge_external is None:
+        return None
+    # ``edge_external`` is stored YES-side (my_prob_YES - implied_YES) while the
+    # ``implied_prob`` passed here is the CHOSEN-outcome price. The chosen
+    # outcome's edge is therefore +edge_external for a YES bet and -edge_external
+    # for a NO bet. Flipping it for NO is what lets a direct, high-evidence NO read
+    # (e.g. a weather "max < X" call) keep its model posterior; without it the
+    # floor never fired for NO bets and calibration-crushed confidence drove the
+    # edge gate, silently blocking them.
+    outcome_is_no = str(getattr(decision, "outcome", "") or "").strip().upper() == "NO"
+    chosen_edge = -float(edge_external) if outcome_is_no else float(edge_external)
+    if chosen_edge <= 0.0:
         return None
     if _decision_evidence_basis(decision) != "direct":
         return None
@@ -1657,7 +1668,7 @@ def _direct_evidence_posterior_floor(
         )
         return None
     ceiling = max(0.0, min(1.0, float(settings.MAX_GLOBAL_CONFIDENCE_DIRECT)))
-    model_estimate = float(implied_prob) + float(edge_external)
+    model_estimate = float(implied_prob) + chosen_edge
     return max(0.0, min(ceiling, model_estimate))
 
 
@@ -6015,10 +6026,14 @@ def _effective_research_queue_drain_quota(
     configured_quota: int,
     sustained_zero_yield: bool,
 ) -> int:
-    """Keep queue re-analysis diagnostic during a proven execution drought."""
+    """Keep queue re-analysis active (but bounded) during a proven execution drought.
+
+    During a zero-execution drought the queue is the only path back to trades, so
+    cap drain to a small probe count rather than a single diagnostic probe.
+    """
     quota = max(0, int(configured_quota))
     if sustained_zero_yield:
-        return min(quota, 1)
+        return min(quota, 2)
     return quota
 
 

@@ -74,7 +74,8 @@ _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL = re.compile(
     r"game (?:completed|concluded|final)|weather\.gov|nws|noaa|asos|metar|"
     r"observation|observed|official station|exchange bulletin|confirmed outcome|"
     r"threshold (?:already )?(?:met|exceeded)|live quote|quote page|spot price|"
-    r"current spot|current price|observed value|timestamp)",
+    r"current spot|current price|observed value|timestamp|official close|"
+    r"official settlement|front-month|comex)",
     re.IGNORECASE,
 )
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
@@ -118,6 +119,9 @@ _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "resolved",
     "settlement",
     "exchange",
+    "spot price",
+    "front-month",
+    "comex",
 )
 _MAX_MODEL_RESPONSE_LOG_CHARS = 500
 _ANALYSIS_MAX_ATTEMPTS = 3

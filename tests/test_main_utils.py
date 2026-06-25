@@ -1342,7 +1342,7 @@ class TestMainUtils(unittest.TestCase):
                 configured_quota=8,
                 sustained_zero_yield=True,
             ),
-            1,
+            2,
         )
         self.assertEqual(
             _effective_research_queue_drain_quota(
