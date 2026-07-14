@@ -5,7 +5,85 @@ import sqlite3
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 
-from analytics import run
+from analytics import _infer_market_family, run
+
+
+def test_infer_market_family_uses_question_and_category() -> None:
+    """Ticker-only text misclassifies edge cases that need question/category."""
+    assert _infer_market_family(market_id="1c") == "generic"
+    assert (
+        _infer_market_family(
+            market_id="1c",
+            question="Who wins this matchup?",
+            category="ncaa tournament",
+        )
+        == "sports"
+    )
+    assert (
+        _infer_market_family(
+            market_id="1b",
+            question="Olympics Ice Hockey FINAL: Canada vs USA",
+            category="",
+        )
+        == "sports"
+    )
+
+
+def test_analytics_family_pnl_joins_markets_metadata(tmp_path) -> None:
+    """Family P&L must classify via market_id + question + category like gates."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE trade_outcomes (
+                market_id TEXT,
+                confidence REAL,
+                implied_prob REAL,
+                won INTEGER,
+                resolution_state TEXT,
+                amount_usdc REAL,
+                pnl_estimate REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE markets (
+                id TEXT PRIMARY KEY,
+                question TEXT,
+                category TEXT,
+                last_terminal_outcome TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO markets (id, question, category, last_terminal_outcome)
+            VALUES ('1c', 'Who wins this matchup?', 'ncaa tournament', 'resolved')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO trade_outcomes (
+                market_id, confidence, implied_prob, won,
+                resolution_state, amount_usdc, pnl_estimate
+            )
+            VALUES ('1c', 0.80, 0.55, 1, 'resolved_valid', 5.0, 2.0)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        run(str(db_path))
+    output = output_buffer.getvalue()
+
+    assert "Resolved P&L by market family:" in output
+    assert "sports:" in output
+    assert "generic:" not in output
 
 
 def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:

@@ -1071,7 +1071,19 @@ def _edge_repair_reason(
     if missing_structured_probability and edge_source in {"none", "fallback"}:
         return "missing_structured_probability"
     definitive = _is_definitive_outcome_eligible(decision, settings, market=market)
-    if _decision_has_near_binary_structured_probability(decision) and not definitive:
+    evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
+    # Sportsbook-style computed odds on sports are settlement-predictive proxy;
+    # do not demote them via near-binary / high-edge repair triggers.
+    sports_computed_odds_exempt = (
+        market_family(market) == "sports"
+        and edge_source == "computed"
+        and evidence_quality >= 0.60
+    )
+    if (
+        _decision_has_near_binary_structured_probability(decision)
+        and not definitive
+        and not sports_computed_odds_exempt
+    ):
         return "near_binary_without_definitive_evidence"
     confidence_for_edge = (
         decision.raw_confidence
@@ -1088,6 +1100,7 @@ def _edge_repair_reason(
         and edge_value is not None
         and abs(float(edge_value)) > 0.35
         and not definitive
+        and not sports_computed_odds_exempt
     ):
         return "high_edge_without_definitive_evidence"
     return None
@@ -1543,6 +1556,7 @@ _NWS_NOAA_HOST_MARKERS = ("weather.gov", "noaa.gov")
 _MICHIGAN_SPORTS_JURISDICTION_MARKER = (
     "michigan_residents_are_not_currently_allowed_to_open_positions_in_sports"
 )
+_SPORTS_JURISDICTION_RUNTIME_FLAG = "sports_jurisdiction_blocked"
 _WEATHER_HIGH_EQ_REASONABLE_EDGE_MIN = 0.85
 
 
@@ -6893,6 +6907,19 @@ def main(max_cycles: int | None = None) -> None:
             backfilled,
             data={"backfilled_outcomes": backfilled},
         )
+    neutralized_sports_calib = state_manager.neutralize_pathological_online_calibration(
+        family="sports",
+    )
+    if neutralized_sports_calib:
+        logger.warning(
+            "Neutralized %d pathological sports online-calibration buckets",
+            neutralized_sports_calib,
+            data={
+                "family": "sports",
+                "neutralized_buckets": neutralized_sports_calib,
+                "neutral_win_rate": 0.50,
+            },
+        )
     scheduler = MarketScheduler(
         reanalysis_cooldown_hours=settings.REANALYSIS_COOLDOWN_HOURS,
         urgent_days_before_close=settings.URGENT_REANALYSIS_DAYS_BEFORE_CLOSE,
@@ -6960,9 +6987,21 @@ def main(max_cycles: int | None = None) -> None:
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
-    # Session-scoped soft-hold: after a Michigan sports jurisdiction 403, keep
-    # analyzing sports for learning but skip live/dry-run order submission.
-    sports_jurisdiction_blocked = False
+    # Session-scoped soft-hold: after a Michigan sports jurisdiction 403, skip
+    # live/dry-run sports order submission. Persisted so restarts do not
+    # re-burn Grok sports slots until the hold is cleared.
+    sports_jurisdiction_blocked = (
+        str(state_manager.get_runtime_flag(_SPORTS_JURISDICTION_RUNTIME_FLAG) or "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"}
+    )
+    if sports_jurisdiction_blocked:
+        logger.warning(
+            "Restored persisted sports jurisdiction soft-hold; "
+            "sports deep analysis capped at zero this session",
+            data={"sports_jurisdiction_blocked": True},
+        )
 
     while True:
         cycle_count += 1
@@ -9295,6 +9334,103 @@ def main(max_cycles: int | None = None) -> None:
             available_family_distribution = _analysis_candidate_family_counts(
                 analysis_candidates
             )
+            if sports_jurisdiction_blocked and analysis_candidates:
+                jurisdiction_held_sports: list[dict[str, Any]] = []
+                remaining_analysis_candidates: list[dict[str, Any]] = []
+                for candidate in analysis_candidates:
+                    held_market = candidate.get("market")
+                    if (
+                        isinstance(held_market, Market)
+                        and market_family(held_market) == "sports"
+                    ):
+                        jurisdiction_held_sports.append(candidate)
+                    else:
+                        remaining_analysis_candidates.append(candidate)
+                if jurisdiction_held_sports:
+                    analysis_candidates = remaining_analysis_candidates
+                    original_analysis_candidates_count = len(analysis_candidates)
+                    available_family_distribution = _analysis_candidate_family_counts(
+                        analysis_candidates
+                    )
+                    _jurisdiction_reason = "jurisdiction_sports_analysis_held"
+                    monitor_tier_str = str(ParticipationTier.MONITOR_ONLY)
+                    jurisdiction_why = (
+                        "Michigan sports jurisdiction soft-hold is active; "
+                        "markets stay eligible but skip Grok deep analysis "
+                        "until the hold clears."
+                    )
+                    for candidate in jurisdiction_held_sports:
+                        held_market = candidate.get("market")
+                        if not isinstance(held_market, Market):
+                            continue
+                        default_outcome = (
+                            held_market.outcomes[0].name
+                            if held_market.outcomes
+                            else "YES"
+                        )
+                        held_decision = TradeDecision(
+                            should_trade=False,
+                            outcome=default_outcome,
+                            confidence=0.50,
+                            bet_size_pct=0.0,
+                            reasoning=(
+                                f"[MonitorOnly reason={_jurisdiction_reason}] "
+                                f"{jurisdiction_why}"
+                            ),
+                            edge_source="none",
+                            evidence_basis="absence_only",
+                            evidence_quality=0.0,
+                            abstain=True,
+                        )
+                        held_rq_pos: int | None = None
+                        if settings.RESEARCH_QUEUE_ENABLED:
+                            held_rq_pos = _enqueue_research_candidate(
+                                market=held_market,
+                                decision=held_decision,
+                                reason=_jurisdiction_reason,
+                                gate_name="jurisdiction_sports_hold",
+                                threshold_gap=0.0,
+                                participation_tier=monitor_tier_str,
+                                why_not_execution_eligible=jurisdiction_why,
+                                what_to_learn_next=(
+                                    "Resume sports deep analysis after jurisdiction "
+                                    "soft-hold clears; keep monitoring odds/results."
+                                ),
+                                decision_origin="synthetic_research_queue",
+                            )
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            _jurisdiction_reason,
+                        )
+                        _record_rejection_reason(
+                            participation_tier_breakdown,
+                            monitor_tier_str,
+                        )
+                        log_trade_decision(
+                            market_id=held_market.id,
+                            question=held_market.question,
+                            decision=held_decision.model_dump(),
+                            execution_audit=_build_execution_audit(
+                                decision_terminal=False,
+                                final_action="research_queued",
+                                final_reason=_jurisdiction_reason,
+                                market_family="sports",
+                                pre_analysis_score=candidate.get("pre_analysis_score"),
+                                research_queue_position=held_rq_pos,
+                                participation_tier=monitor_tier_str,
+                                sports_jurisdiction_blocked=True,
+                            ),
+                        )
+                    logger.warning(
+                        "Held %d sports candidates from deep analysis under "
+                        "jurisdiction soft-hold",
+                        len(jurisdiction_held_sports),
+                        data={
+                            "sports_jurisdiction_blocked": True,
+                            "sports_held_count": len(jurisdiction_held_sports),
+                            "analysis_candidates_remaining": len(analysis_candidates),
+                        },
+                    )
             pre_analysis_scores = {
                 str(getattr(candidate.get("market"), "id", "")): float(
                     candidate.get("pre_analysis_score") or 0.0
@@ -9322,9 +9458,13 @@ def main(max_cycles: int | None = None) -> None:
                 parallel_analysis_enabled=bool(settings.PARALLEL_ANALYSIS_ENABLED),
             )
             sports_candidate_cap = (
-                settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
-                if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
-                else None
+                0
+                if sports_jurisdiction_blocked
+                else (
+                    settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
+                    if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
+                    else None
+                )
             )
             generic_candidate_cap = (
                 settings.MAX_GENERIC_CANDIDATES_PER_CYCLE
@@ -11866,6 +12006,16 @@ def main(max_cycles: int | None = None) -> None:
                     market=market,
                     effective_confidence_override=edge_gate_confidence,
                 )
+                if (
+                    decision_for_edge.should_trade
+                    and edge_value is not None
+                    and float(edge_value) <= 0.0
+                ):
+                    decision_for_edge = decision_for_edge.model_copy(
+                        update={"should_trade": False, "bet_size_pct": 0.0}
+                    )
+                    edge_ok = False
+                    edge_reason = "nonpositive_chosen_side_edge"
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
                 audit_context["gate_edge_required_baseline"] = baseline_edge_threshold
@@ -11906,11 +12056,12 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 if not edge_ok:
                     trades_skipped_edge += 1
-                    edge_block_reason = (
-                        "weather_underdog_blocked"
-                        if edge_reason == "weather_underdog_blocked"
-                        else "edge_gate_blocked"
-                    )
+                    if edge_reason == "nonpositive_chosen_side_edge":
+                        edge_block_reason = "nonpositive_chosen_side_edge"
+                    elif edge_reason == "weather_underdog_blocked":
+                        edge_block_reason = "weather_underdog_blocked"
+                    else:
+                        edge_block_reason = "edge_gate_blocked"
                     _record_should_trade_blocked(edge_block_reason)
                     _record_rejection_reason(rejection_breakdown, edge_block_reason)
                     if edge_reason == "non_sports_needs_direct_evidence":
@@ -11924,6 +12075,8 @@ def main(max_cycles: int | None = None) -> None:
                             "edge_above_reasonable_max",
                         )
                     elif edge_reason == "weather_underdog_blocked":
+                        pass
+                    elif edge_reason == "nonpositive_chosen_side_edge":
                         pass
                     elif "below min" in edge_reason:
                         _record_rejection_reason(
@@ -11939,13 +12092,19 @@ def main(max_cycles: int | None = None) -> None:
                         0.0,
                         float(required_edge_threshold - float(edge_value or 0.0)),
                     )
-                    queue_for_research = _should_queue_research_for_blocked_trade(
-                        settings=settings,
-                        decision=decision_for_edge,
-                        evidence_basis=evidence_basis,
-                        gate_name="edge",
-                        threshold_gap=edge_shortfall,
-                        edge_reason=edge_reason,
+                    # Non-positive chosen-side edge is not a research gap — skip
+                    # rather than parking in the research queue.
+                    queue_for_research = (
+                        False
+                        if edge_reason == "nonpositive_chosen_side_edge"
+                        else _should_queue_research_for_blocked_trade(
+                            settings=settings,
+                            decision=decision_for_edge,
+                            evidence_basis=evidence_basis,
+                            gate_name="edge",
+                            threshold_gap=edge_shortfall,
+                            edge_reason=edge_reason,
+                        )
                     )
                     research_reason = (
                         edge_reason
@@ -14112,6 +14271,17 @@ def main(max_cycles: int | None = None) -> None:
                         order_failure_reason = "jurisdiction_sports_blocked"
                         if not sports_jurisdiction_blocked:
                             sports_jurisdiction_blocked = True
+                            try:
+                                state_manager.set_runtime_flag(
+                                    _SPORTS_JURISDICTION_RUNTIME_FLAG,
+                                    "1",
+                                )
+                            except Exception as flag_exc:
+                                logger.warning(
+                                    "Failed to persist sports jurisdiction soft-hold: %s",
+                                    flag_exc,
+                                    data={"error": str(flag_exc)},
+                                )
                             logger.warning(
                                 "Session sports jurisdiction soft-hold enabled after "
                                 "Michigan sports order rejection: market=%s",
@@ -14120,6 +14290,7 @@ def main(max_cycles: int | None = None) -> None:
                                     "market_id": market.id,
                                     "sports_jurisdiction_blocked": True,
                                     "market_family": market_family_name,
+                                    "persisted": True,
                                 },
                             )
                     if (

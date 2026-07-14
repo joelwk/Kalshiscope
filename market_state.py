@@ -259,6 +259,15 @@ class MarketStateManager:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rq_last_seen ON research_queue_entries (last_seen)"
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_flags (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             self._run_migrations()
             self._backfill_resolution_state()
 
@@ -1478,6 +1487,84 @@ class MarketStateManager:
                 )
                 changed = True
         return changed
+
+    def get_runtime_flag(self, key: str) -> str | None:
+        """Return a persisted runtime flag value, or None if unset."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return None
+        row = self._conn.execute(
+            "SELECT value FROM runtime_flags WHERE key = ?",
+            (normalized_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def set_runtime_flag(self, key: str, value: str) -> None:
+        """Persist a runtime flag across bot restarts."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            raise ValueError("runtime flag key must be non-empty")
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO runtime_flags (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_key, str(value), timestamp),
+            )
+
+    def clear_runtime_flag(self, key: str) -> bool:
+        """Delete a runtime flag. Returns True when a row was removed."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return False
+        with self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM runtime_flags WHERE key = ?",
+                (normalized_key,),
+            )
+        return int(cursor.rowcount or 0) > 0
+
+    def neutralize_pathological_online_calibration(
+        self,
+        *,
+        family: str,
+        win_rate_floor: float = 0.01,
+        win_rate_ceiling: float = 0.99,
+        min_samples: int = 30,
+        neutral_win_rate: float = 0.50,
+    ) -> int:
+        """Reset extreme online calibration buckets toward a neutral prior.
+
+        Pathological entries (e.g. sports@0.7 with ~0% WR at high sample count)
+        otherwise permanently crush confidence via historical shrink.
+        """
+        family_key = str(family or "").strip().lower()
+        if not family_key:
+            return 0
+        floor = max(0.0, min(1.0, float(win_rate_floor)))
+        ceiling = max(floor, min(1.0, float(win_rate_ceiling)))
+        sample_floor = max(1, int(min_samples))
+        neutral = max(0.0, min(1.0, float(neutral_win_rate)))
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE confidence_calibration_online
+                SET win_rate = ?, updated_at = ?
+                WHERE family = ?
+                  AND sample_size >= ?
+                  AND (win_rate < ? OR win_rate > ?)
+                """,
+                (neutral, timestamp, family_key, sample_floor, floor, ceiling),
+            )
+        return int(cursor.rowcount or 0)
 
     def record_online_confidence_calibration_from_trade(
         self,

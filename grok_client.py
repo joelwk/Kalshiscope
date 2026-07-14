@@ -211,6 +211,8 @@ def _extract_first_url_from_text(text: str) -> str | None:
 
 _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
     "rst_stream",
+    "stream removed",
+    "grpc_status:2",
     "statuscode.unavailable",
     "unavailable",
     "connection reset",
@@ -219,6 +221,9 @@ _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
     "broken pipe",
     "eof occurred",
 )
+# Empty responses at 17-27s in production were still upstream blips; allow one
+# retry via max_attempts even when the attempt exceeded the fast-fail window.
+_EMPTY_RESPONSE_RETRY_MAX_MS = 30_000
 
 
 def _is_transport_reset_error(exc: Exception) -> bool:
@@ -241,22 +246,22 @@ def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
     """Classify transient failures that should be retried.
 
     Timeout-class errors (gRPC DEADLINE_EXCEEDED and our own stream timeout)
-    and transport-layer resets (RST_STREAM / UNAVAILABLE) are always retriable
-    regardless of duration, since they indicate an interrupted stream rather
-    than a content failure.
+    and transport-layer resets (RST_STREAM / Stream removed / UNAVAILABLE) are
+    always retriable regardless of duration, since they indicate an interrupted
+    stream rather than a content failure.
 
-    A fast "Empty response from Grok" (sub-_SLOW_FAILURE_THRESHOLD_MS) is
-    treated as transient: a stream that finishes in single-digit seconds with
-    zero content is far more consistent with an upstream blip than a real
-    content failure. Slow empty responses still fall through to the slow-
-    failure short-circuit so we don't burn budget retrying genuine outages.
+    "Empty response from Grok" is treated as transient up to
+    ``_EMPTY_RESPONSE_RETRY_MAX_MS`` (covers the observed 17-27s empty blips);
+    slower empties still fall through to the slow-failure short-circuit so we
+    do not burn budget retrying genuine outages. Retry count remains bounded
+    by ``max_attempts``.
     """
     if _is_timeout_class_error(exc) or _is_transport_reset_error(exc):
         return True
     error_text = str(exc).lower()
     if (
         "empty response from grok" in error_text
-        and duration_ms < _SLOW_FAILURE_THRESHOLD_MS
+        and duration_ms < _EMPTY_RESPONSE_RETRY_MAX_MS
     ):
         return True
     if duration_ms >= _SLOW_FAILURE_THRESHOLD_MS:
@@ -1098,6 +1103,9 @@ class GrokClient:
             if market_edge is None:
                 should_trade = False
                 gate_reasons.append("missing_market_implied")
+            elif market_edge <= 0.0:
+                should_trade = False
+                gate_reasons.append("nonpositive_chosen_side_edge")
             elif market_edge < _MIN_MARKET_EDGE_FOR_TRADE:
                 should_trade = False
                 gate_reasons.append("market_edge_below_min")

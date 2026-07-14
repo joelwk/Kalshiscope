@@ -156,7 +156,7 @@ def test_bootstrap_logs_kalshi_auth_passed_when_check_succeeds(
     from bootstrap_checks import KALSHI_AUTH_PASSED
 
     class _Client:
-        def get_portfolio_balance(self):
+        def get_balance(self):
             return 100.0
 
     cert_file = tmp_path / "cacert.pem"

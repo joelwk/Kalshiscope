@@ -338,7 +338,7 @@ class TestConfig(unittest.TestCase):
             "COMMODITY_MIN_EDGE=0.22",
             "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=0.15",
             "GENERIC_PROXY_HIGH_EDGE_MIN=0.18",
-            "EXTENDED_RESEARCH_COOLDOWN_CYCLES=5",
+            "EXTENDED_RESEARCH_COOLDOWN_CYCLES=3",
             "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES=2",
             "MAX_REASONABLE_EDGE=0.40",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
@@ -800,7 +800,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_PNL_CUTOFF, -5.0)
         self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_SCORE_PENALTY, 0.10)
         self.assertEqual(settings.EXTENDED_RESEARCH_AFTER_STREAK, 2)
-        self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 5)
+        self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 3)
         self.assertEqual(settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES, 2)
         self.assertEqual(settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.18)
         self.assertEqual(settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST, 2.0)

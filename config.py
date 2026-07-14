@@ -807,7 +807,7 @@ class Settings:
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS: int = 4
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN: int = 8
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
-    EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
+    EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 3
     # Near-miss / research_queued after extended research uses a shorter cooldown
     # so soft candidates re-enter the normal analysis pool sooner than hard skips.
     EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES: int = 2

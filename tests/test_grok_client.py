@@ -96,21 +96,30 @@ class TestGrokClient(unittest.TestCase):
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=20_000.0))
 
     def test_fast_empty_response_from_grok_is_retriable(self) -> None:
-        """A sub-_SLOW_FAILURE_THRESHOLD_MS empty response is treated as
-        upstream blip and retried (fix 5b). The 4707ms duration in the
-        recent error log is the canonical case."""
+        """Empty responses under _EMPTY_RESPONSE_RETRY_MAX_MS are upstream blips."""
         err = ValueError("Empty response from Grok")
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=4707.46))
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=14_999.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=21_519.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=29_999.0))
 
     def test_slow_empty_response_from_grok_stays_non_retriable(self) -> None:
-        """A slow empty response (>= _SLOW_FAILURE_THRESHOLD_MS) still falls
-        through to the slow-failure short-circuit so we don't burn budget on
-        genuine outages masquerading as empty streams."""
+        """Empty responses at/above _EMPTY_RESPONSE_RETRY_MAX_MS stay non-retriable."""
         err = ValueError("Empty response from Grok")
-        self.assertFalse(_is_retriable_grok_error(err, duration_ms=15_000.0))
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=30_000.0))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_grpc_stream_removed_is_retriable_even_when_slow(self) -> None:
+        err = RuntimeError(
+            '<_MultiThreadedRendezvous of RPC that terminated with:\n'
+            '\tstatus = StatusCode.UNKNOWN\n'
+            '\tdetails = "Stream removed"\n'
+            '\tdebug_error_string = "UNKNOWN:Error received from peer  '
+            '{grpc_message:"Stream removed", grpc_status:2}"\n>'
+        )
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=391.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=60_000.0))
 
     def test_grpc_deadline_exceeded_is_retriable_regardless_of_duration(self) -> None:
         err = RuntimeError(

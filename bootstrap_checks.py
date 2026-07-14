@@ -60,9 +60,9 @@ def _check_tls_cert_bundle() -> None:
 
 
 def _check_kalshi_auth(kalshi_client: object) -> str:
-    get_balance = getattr(kalshi_client, "get_portfolio_balance", None)
+    get_balance = getattr(kalshi_client, "get_balance", None)
     if get_balance is None:
-        logger.debug("Kalshi client has no get_portfolio_balance; skipping auth check")
+        logger.debug("Kalshi client has no get_balance; skipping auth check")
         return KALSHI_AUTH_NOT_APPLICABLE
     try:
         balance = get_balance()

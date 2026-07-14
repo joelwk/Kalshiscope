@@ -2003,6 +2003,87 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertFalse(_is_michigan_sports_jurisdiction_error("insufficient balance"))
 
+    def test_edge_repair_skips_sports_computed_odds_near_binary(self) -> None:
+        from main import _edge_repair_reason
+
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            EDGE_BAND_CALIBRATION_ENABLED=True,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXMLBGAME-26JUL10LADSF-LAD",
+            question="Will the Dodgers win?",
+            category="sports",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.96,
+            my_prob=0.96,
+            probability_yes=0.96,
+            bet_size_pct=0.2,
+            reasoning="sportsbook consensus edge",
+            edge_source="computed",
+            edge_external=0.41,
+            evidence_basis="proxy",
+            evidence_quality=0.72,
+        )
+        self.assertIsNone(
+            _edge_repair_reason(
+                decision=decision,
+                market=market,
+                settings=settings,
+                implied_prob=0.55,
+            )
+        )
+
+    def test_edge_repair_still_flags_non_sports_high_edge(self) -> None:
+        from main import _edge_repair_reason
+
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            EDGE_BAND_CALIBRATION_ENABLED=True,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXWTI-26JUL13-T70",
+            question="Will WTI be above $70?",
+            category="economics",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning="commodity proxy",
+            edge_source="computed",
+            edge_external=0.40,
+            evidence_basis="proxy",
+            evidence_quality=0.70,
+        )
+        self.assertEqual(
+            _edge_repair_reason(
+                decision=decision,
+                market=market,
+                settings=settings,
+                implied_prob=0.40,
+            ),
+            "high_edge_without_definitive_evidence",
+        )
+
     def test_order_exception_error_text_includes_kalshi_body(self) -> None:
         import requests
         from main import _order_exception_error_text

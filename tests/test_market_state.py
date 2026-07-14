@@ -412,7 +412,60 @@ def test_record_resolution_can_update_online_calibration(tmp_path) -> None:
         manager.close()
 
 
-def test_record_resolution_idempotent(tmp_path) -> None:
+def test_runtime_flags_persist_across_manager_instances(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime_flags.db")
+    manager = MarketStateManager(db_path)
+    try:
+        assert manager.get_runtime_flag("sports_jurisdiction_blocked") is None
+        manager.set_runtime_flag("sports_jurisdiction_blocked", "1")
+        assert manager.get_runtime_flag("sports_jurisdiction_blocked") == "1"
+    finally:
+        manager.close()
+
+    restored = MarketStateManager(db_path)
+    try:
+        assert restored.get_runtime_flag("sports_jurisdiction_blocked") == "1"
+        assert restored.clear_runtime_flag("sports_jurisdiction_blocked") is True
+        assert restored.get_runtime_flag("sports_jurisdiction_blocked") is None
+    finally:
+        restored.close()
+
+
+def test_neutralize_pathological_online_calibration(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "calib.db"))
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        manager._conn.execute(
+            """
+            INSERT INTO confidence_calibration_online
+                (family, bucket, win_rate, sample_size, updated_at)
+            VALUES
+                ('sports', 0.7, 0.0, 500, ?),
+                ('sports', 0.5, 1.0, 52, ?),
+                ('sports', 0.6, 0.55, 40, ?),
+                ('crypto', 0.7, 0.0, 500, ?)
+            """,
+            (now, now, now, now),
+        )
+        manager._conn.commit()
+        changed = manager.neutralize_pathological_online_calibration(family="sports")
+        assert changed == 2
+        rows = {
+            float(row["bucket"]): float(row["win_rate"])
+            for row in manager._conn.execute(
+                "SELECT bucket, win_rate FROM confidence_calibration_online WHERE family = 'sports'"
+            ).fetchall()
+        }
+        assert rows[0.7] == 0.50
+        assert rows[0.5] == 0.50
+        assert rows[0.6] == 0.55
+        crypto = manager._conn.execute(
+            "SELECT win_rate FROM confidence_calibration_online WHERE family = 'crypto' AND bucket = 0.7"
+        ).fetchone()
+        assert float(crypto["win_rate"]) == 0.0
+    finally:
+        manager.close()
+
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:
         market_id = "m5"
