@@ -1070,6 +1070,21 @@ class GrokClient:
                 )
             ),
         )
+        if profile_name == "generic":
+            generic_proxy_min = max(
+                0.0,
+                float(
+                    getattr(
+                        active_settings,
+                        "GENERIC_PROXY_HIGH_EDGE_MIN",
+                        Settings.GENERIC_PROXY_HIGH_EDGE_MIN,
+                    )
+                ),
+            )
+            proxy_high_edge_participation_min = max(
+                proxy_high_edge_participation_min,
+                generic_proxy_min,
+            )
         strong_proxy_edge_override = (
             evidence_basis_class == "proxy"
             and market_edge is not None

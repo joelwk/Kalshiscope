@@ -8,3 +8,5 @@ content: >-
   Before setting confidence above 0.65: cite the specific sentence or data point from the primary source that addresses the settlement criterion. If you cannot identify one sentence, evidence_basis is proxy or absence_only — lower confidence accordingly.
 
   Use a 2024-2026 comparable-event base rate from resolved Kalshi markets or public polling before adjusting for fresh evidence. Name the base rate explicitly in reasoning. If no base rate is available, cap confidence at 0.60 and require edge_market >= 0.12 before recommending should_trade=true.
+
+  Prefer Kelly-sized small bets only when primary_source_url is populated with a settlement-aligned source; otherwise keep should_trade=false and treat the case as source repair.

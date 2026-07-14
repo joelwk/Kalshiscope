@@ -585,6 +585,9 @@ class KalshiClient:
                     raise InsufficientBalanceError("Insufficient balance on Kalshi account") from exc
                 if "market_closed" in response_text or "market closed" in response_text:
                     raise MarketClosedError("Market closed before order submission") from exc
+                # Preserve response body for callers (jurisdiction soft-hold, etc.).
+                # HTTPError's default str() is only "403 Client Error: Forbidden for url".
+                setattr(exc, "_kalshi_response_body", exc.response.text if exc.response is not None else "")
                 raise
 
         response_data = response.json()

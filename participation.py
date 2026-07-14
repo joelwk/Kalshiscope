@@ -519,6 +519,7 @@ def classify_participation(
                 "refreshed_edge_gate_blocked",
                 "score_gate_blocked",
                 "score_gate_critical_rejection",
+                "weather_underdog_blocked",
             }
             weak_confidence_reasons = {"confidence_below_min"}
             terminal_reasons = {

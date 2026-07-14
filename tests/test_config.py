@@ -171,6 +171,11 @@ class TestConfig(unittest.TestCase):
             "WEATHER_MIN_EVIDENCE_QUALITY": "0.72",
             "SPORTS_MIN_EVIDENCE_QUALITY": "0.61",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE": "0.18",
+            "WEATHER_BLOCK_UNDERDOG_ENTRIES": "false",
+            "WEATHER_POSTERIOR_FLOOR_MAX_EDGE": "0.15",
+            "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK": "0.25",
+            "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER": "0.40",
+            "COMMODITY_MIN_EDGE": "0.25",
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS": "0.59",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE": "2",
             "KELLY_FRACTION_WEATHER": "0.45",
@@ -186,6 +191,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.72)
         self.assertEqual(settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.61)
         self.assertEqual(settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.18)
+        self.assertFalse(settings.WEATHER_BLOCK_UNDERDOG_ENTRIES)
+        self.assertEqual(settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE, 0.15)
+        self.assertEqual(settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK, 0.25)
+        self.assertEqual(settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER, 0.40)
+        self.assertEqual(settings.COMMODITY_MIN_EDGE, 0.25)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS, 0.59)
         self.assertEqual(settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.KELLY_FRACTION_WEATHER, 0.45)
@@ -197,6 +207,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
         self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
+        self.assertTrue(config.Settings.WEATHER_BLOCK_UNDERDOG_ENTRIES)
+        self.assertEqual(config.Settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE, 0.20)
+        self.assertEqual(config.Settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK, 0.20)
+        self.assertEqual(config.Settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER, 0.50)
+        self.assertEqual(config.Settings.COMMODITY_MIN_EDGE, 0.22)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.30)
         self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
@@ -316,7 +331,15 @@ class TestConfig(unittest.TestCase):
             "FALLBACK_EDGE_MIN_EDGE=0.30",
             "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=0.90",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE=0.34",
+            "WEATHER_BLOCK_UNDERDOG_ENTRIES=true",
+            "WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20",
+            "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=0.20",
+            "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=0.50",
+            "COMMODITY_MIN_EDGE=0.22",
             "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=0.15",
+            "GENERIC_PROXY_HIGH_EDGE_MIN=0.18",
+            "EXTENDED_RESEARCH_COOLDOWN_CYCLES=5",
+            "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES=2",
             "MAX_REASONABLE_EDGE=0.40",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
@@ -777,6 +800,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_SCORE_PENALTY, 0.10)
         self.assertEqual(settings.EXTENDED_RESEARCH_AFTER_STREAK, 2)
         self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 5)
+        self.assertEqual(settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES, 2)
+        self.assertEqual(settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.18)
         self.assertEqual(settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST, 2.0)
         self.assertEqual(settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY, 0.04)
         self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
@@ -830,13 +855,18 @@ class TestConfig(unittest.TestCase):
 
     def test_proxy_high_edge_participation_min_edge_env_override(self) -> None:
         self.assertEqual(config.Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.18)
         env = {
             **self._required_env(),
             "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE": "0.22",
+            "GENERIC_PROXY_HIGH_EDGE_MIN": "0.25",
+            "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES": "3",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE, 0.22)
+        self.assertEqual(settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.25)
+        self.assertEqual(settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES, 3)
 
     def test_self_consistency_top_candidates_env_override(self) -> None:
         self.assertEqual(config.Settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES, 0)

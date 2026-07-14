@@ -1908,6 +1908,164 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(edge or 0.0, 0.02, places=6)
         self.assertIn("below min", reason)
 
+    def test_passes_refreshed_edge_guard_uses_confidence_override(self) -> None:
+        market = Market(
+            id="m-refresh-floor",
+            question="Will high temp exceed 93?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.60),
+                MarketOutcome(name="NO", price=0.40),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.545,
+            bet_size_pct=0.4,
+            reasoning="calibrated down",
+            edge_source="computed",
+            edge_external=0.13,
+            evidence_basis="direct",
+            evidence_quality=0.90,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=30.3&lon=-97.7",
+        )
+        settings = Settings(
+            MIN_EDGE=0.05,
+            WEATHER_MIN_EDGE=0.05,
+            NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+            MAX_REASONABLE_EDGE=0.40,
+            DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50,
+            DIRECT_POSTERIOR_FLOOR_ENABLED=True,
+            DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=0.80,
+        )
+        # Without an explicit override the guard recomputes the posterior floor
+        # (parity with the primary edge gate) and clears the threshold.
+        ok_auto, _, edge_auto, reason_auto = _passes_refreshed_edge_guard(
+            market, decision, settings
+        )
+        self.assertTrue(ok_auto, reason_auto)
+        self.assertAlmostEqual(edge_auto or 0.0, 0.13, places=6)
+        # An explicit low override that ignores the floor still fails.
+        ok_low, _, edge_low, reason_low = _passes_refreshed_edge_guard(
+            market,
+            decision,
+            settings,
+            effective_confidence_override=0.545,
+        )
+        self.assertFalse(ok_low)
+        self.assertIn("below min", reason_low)
+        self.assertAlmostEqual(edge_low or 0.0, -0.055, places=6)
+        # Explicit floored override matches the auto path.
+        ok_floored, _, edge_floored, reason_floored = _passes_refreshed_edge_guard(
+            market,
+            decision,
+            settings,
+            effective_confidence_override=0.73,
+        )
+        self.assertTrue(ok_floored, reason_floored)
+        self.assertAlmostEqual(edge_floored or 0.0, 0.13, places=6)
+
+    def test_research_queue_context_text_includes_prior_fields_and_repair_action(self) -> None:
+        from main import _research_queue_context_text
+
+        text = _research_queue_context_text(
+            {
+                "reason": "edge_gate_blocked",
+                "what_to_learn_next": "Find NWS URL",
+                "gate_name": "edge_gate",
+                "last_decision": {
+                    "confidence": 0.72,
+                    "edge_market": 0.08,
+                    "evidence_basis": "proxy",
+                    "edge_source": "computed",
+                    "evidence_quality": 0.70,
+                    "primary_source_url": "",
+                },
+            }
+        )
+        self.assertIsNotNone(text)
+        assert text is not None
+        self.assertIn("prior_confidence=0.72", text)
+        self.assertIn("prior_edge_market=0.08", text)
+        self.assertIn("prior_evidence_basis=proxy", text)
+        self.assertIn("prior_primary_source_url=missing", text)
+        self.assertIn("repair_action=", text)
+        self.assertIn("should_trade=true", text)
+
+    def test_is_michigan_sports_jurisdiction_error(self) -> None:
+        from main import _is_michigan_sports_jurisdiction_error
+
+        self.assertTrue(
+            _is_michigan_sports_jurisdiction_error(
+                "403 body=Michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports"
+            )
+        )
+        self.assertFalse(_is_michigan_sports_jurisdiction_error("insufficient balance"))
+
+    def test_order_exception_error_text_includes_kalshi_body(self) -> None:
+        import requests
+        from main import _order_exception_error_text
+
+        response = requests.models.Response()
+        response.status_code = 403
+        response._content = (
+            b'{"error":{"code":"michigan_residents_are_not_currently_'
+            b'allowed_to_open_positions_in_Sports"}}'
+        )
+        exc = requests.exceptions.HTTPError(
+            "403 Client Error: Forbidden for url: https://api.example/orders",
+            response=response,
+        )
+        setattr(
+            exc,
+            "_kalshi_response_body",
+            "michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports",
+        )
+        text = _order_exception_error_text(exc)
+        self.assertIn("403 Client Error", text)
+        self.assertIn("michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports", text)
+        from main import _is_michigan_sports_jurisdiction_error
+
+        self.assertTrue(_is_michigan_sports_jurisdiction_error(text))
+
+    def test_kelly_fraction_shrinks_on_weather_calibration_gap(self) -> None:
+        from main import _kelly_fraction_for_decision
+
+        settings = Settings(
+            KELLY_FRACTION_DEFAULT=0.30,
+            KELLY_FRACTION_WEATHER=0.50,
+            KELLY_FRACTION_SHORT_HORIZON_HOURS=0,
+            WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=0.20,
+            WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=0.50,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXHIGHNY-26JUL12-T88",
+            question="Will the high temperature in NYC be above 88°F?",
+            category="weather",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.55,
+            raw_confidence=0.90,
+            bet_size_pct=0.3,
+            reasoning="calibration gap",
+        )
+        # Base weather Kelly = 0.30 * 0.50 = 0.15; gap 0.35 >= 0.20 => * 0.50 = 0.075
+        self.assertAlmostEqual(
+            _kelly_fraction_for_decision(market, settings, decision, 0.55),
+            0.075,
+        )
+        small_gap = decision.model_copy(update={"raw_confidence": 0.60})
+        self.assertAlmostEqual(
+            _kelly_fraction_for_decision(market, settings, small_gap, 0.55),
+            0.15,
+        )
+
     def test_filter_markets(self) -> None:
         markets = [
             Market(id="1", question="Q1", liquidity_usdc=50, category="sports"),

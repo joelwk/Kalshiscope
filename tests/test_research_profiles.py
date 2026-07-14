@@ -348,6 +348,24 @@ def test_is_commodity_market_detects_gold() -> None:
     assert is_commodity_market(market) is True
 
 
+def test_is_commodity_market_detects_wti_ticker() -> None:
+    market = Market(
+        id="KXWTI-26JUL12-T70.00",
+        question="Will the close price be above 70?",
+        category="finance",
+    )
+    assert is_commodity_market(market) is True
+
+
+def test_is_commodity_market_detects_natgas_keyword() -> None:
+    market = Market(
+        id="KXNG-26JUL12-T3.5",
+        question="Will natural gas settle above 3.5?",
+        category="finance",
+    )
+    assert is_commodity_market(market) is True
+
+
 def test_profile_for_market_commodity_routes_to_commodity_profile() -> None:
     """Commodities classify under the generic taxonomy family but must route to
     the dedicated commodity search profile so the model can reach (and cite) the

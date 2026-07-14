@@ -18,31 +18,32 @@ EXPECTED_SYSTEM_PROMPT_HASHES = {
 
 EXPECTED_MARKET_PROMPT_HASHES = {
     "commodities:deep_false": "38564eb54eb00390a2bb02dfa18c8ed60625a088f21d7abcc965630bb0c79c2c",
-    "commodities:deep_true": "90eabefb8d2025d4089f347302b56f611632509f6b912ffcf086b1a6e82d2430",
+    "commodities:deep_true": "95eab83d85cb3e9e97767c24fb42ff46b18df16922583d3660c7950bee10604b",
     # Updated after strengthening the crypto category hint to mandate citing a
     # settlement-grade exchange primary_source_url (coinbase/kraken/binance/coindesk)
     # with observed price + timestamp, with a proxy/EQ<=0.60 fallback otherwise.
     "crypto:deep_false": "4a457de1ea76123e23e244ccb2aec58060374417e27f71f8086c1b0ce6b1a924",
-    "crypto:deep_true": "b836e26a9452f4aeaf1c0da1fd7684c53fe4cda39ebd1609de1d5f27c01f99df",
-    "generic:deep_false": "6cab3e34150bab0aaaf4c9728669c6396115bee98f8585f333540d309ed30eb8",
-    "generic:deep_true": "b66efa020191233efaf6c1daaebc17b32cb8db4efeffbb6d5908c0a3ea95a4da",
+    "crypto:deep_true": "1f75a5b3077f51e50a129539bebf90ffb68e1ab7782fbb7e98bcdff4e5f05c59",
+    # Updated after generic Kelly-sized primary_source_url guidance + deep repair action.
+    "generic:deep_false": "d3995e5c78d3897e5f0f8ddd15c27a895561c6725d89a5719e2854715d4de408",
+    "generic:deep_true": "ecbf5dae59abb14e83045379801c387dca74ae93c0a6012c397717f0e8c6297d",
     "music:deep_false": "968f3ef54858161afcd2655f8dea85473b064c4b4d5f5ef7827bcc7978510fb9",
-    "music:deep_true": "d290e7604e2ce963b03e52083a20fb76e3d5406fe8b422d256bdb6fb60a2ad2a",
+    "music:deep_true": "bb33bd8da46a20fe17c99b55bf0ae862469af338ed1fbd0b9da626df2395f4a0",
     "politics:deep_false": "2da431f1b2f58ea7ec490d1b74246e70afdde90665eb9b6af000dc151fcf2e98",
-    "politics:deep_true": "8528ae8d3b1103e97800d54225082205c954048c30c693272ea3374997abedf5",
+    "politics:deep_true": "a967d860bf3249ac32f3d81be7490db8c32eadf5bc5338492bbbdbf9001e46fc",
     "speech:deep_false": "7450e4fe419e6e9a4e5e0dadd4ef5ae360d298e00dc5d9eb1b17bcb1500dfe88",
-    "speech:deep_true": "bdd23e00194f0ef062c403bd7c2273a7c867f3b24b463158baf30ec2e2ba463a",
+    "speech:deep_true": "56973b67e880179b655bd4d5c15602cbfa6e5734cf0b6099abe905da1c6495f5",
     "speech_mention:deep_false": "d9d6c65ce7d55646a15eb1531e0cc3c5b5a8c7a3e2509e05a73229da11edc5bd",
-    "speech_mention:deep_true": "fc8ce1fca9f8854d8306d649b2857f4714014b66671ce598ce0986a5fc97de37",
+    "speech_mention:deep_true": "34425bd0d839cb1169a5515bb3b4338920b5087e5719d7078abe0126060ca345",
     # Updated after enriching the sports category hint to mirror weather/commodity:
     # verify game status first, cite an official box-score/result primary_source_url
     # for settled props (direct evidence), ground pre-game edges in a cited sportsbook
     # line via implied_prob_external/edge_external (edge_source=computed not none), and
     # abstain at evidence_quality<=0.55 when neither odds nor result is citable.
     "sports:deep_false": "6cff1ee05267b41dbc01f54c2e0ab9a1a59a0102a1be2e705a5f3a8dacc6fe49",
-    "sports:deep_true": "4a2215552bad55c1b14d31b111bf2b714f45376d27932fcd438edaf065bbebc7",
+    "sports:deep_true": "993907e82201a379557dbcea2e45d468eaa8eb2203ef0306e195b28c297b7509",
     "weather:deep_false": "92fe64542878cfe332d8143e002f4f4aab08b012a212ac980033f66c28a6cfd4",
-    "weather:deep_true": "9acb10ac4dfef3cd7074c4d261bab5dd9cacbd139360ad0b6623891857f73aee",
+    "weather:deep_true": "896949a82feef4e02f339a16e475881d805f5989502689cf4647279bce526dd0",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {

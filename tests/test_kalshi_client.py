@@ -651,6 +651,34 @@ class TestKalshiClient(unittest.TestCase):
             with self.assertRaises(MarketClosedError):
                 client.submit_order(order, market=market)
 
+    def test_submit_order_attaches_response_body_on_http_error(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-MI",
+            question="Sports question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-MI",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        body = (
+            '{"error":{"code":"michigan_residents_are_not_currently_'
+            'allowed_to_open_positions_in_Sports"}}'
+        )
+        response = _DummyHttpResponse(body, status_code=403)
+        http_error = requests.exceptions.HTTPError(
+            "403 Client Error: Forbidden for url: https://api.example/orders",
+            response=response,
+        )
+
+        with patch.object(client, "_request", side_effect=http_error):
+            with self.assertRaises(requests.exceptions.HTTPError) as raised:
+                client.submit_order(order, market=market)
+        self.assertEqual(getattr(raised.exception, "_kalshi_response_body", None), body)
+
     def _rate_limit_error(self) -> requests.exceptions.HTTPError:
         response = _DummyHttpResponse(
             '{"error":{"code":"too_many_requests","message":"too many requests"}}',

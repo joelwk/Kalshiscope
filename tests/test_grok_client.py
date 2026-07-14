@@ -1207,6 +1207,56 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.source_match_class, "preview_or_proxy")
         self.assertFalse(validated.should_trade)
 
+    def test_validate_and_enrich_generic_requires_higher_proxy_edge(self) -> None:
+        market = Market(
+            id="KXGENERIC-TEST",
+            question="Will the Fed cut rates?",
+            category="economics",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        # Mirror the sports high-edge proxy fixture so source_match_class is
+        # preview_or_proxy and the strong_proxy_edge_override path is exercised.
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the meeting outlook and probable path. "
+                "No external odds found. Implied prob: unknown. My prob: 66%. Edge: 16%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.66,
+            edge_external=0.16,
+            edge_source="fallback",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        # 0.16 clears the global 0.15 floor but not GENERIC_PROXY_HIGH_EDGE_MIN=0.18.
+        blocked = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertEqual(blocked.source_match_class, "preview_or_proxy")
+        self.assertFalse(blocked.should_trade)
+        allowed = client._validate_and_enrich_decision(
+            market,
+            decision.model_copy(
+                update={
+                    "confidence": 0.70,
+                    "my_prob": 0.70,
+                    "edge_external": 0.20,
+                    "reasoning": (
+                        "Reuters preview notes the meeting outlook and probable path. "
+                        "No external odds found. Implied prob: unknown. My prob: 70%. Edge: 20%."
+                    ),
+                }
+            ),
+            profile_name="generic",
+        )
+        self.assertTrue(allowed.should_trade)
+
     def test_validate_and_enrich_prefers_computed_edge_over_reasoning_text(self) -> None:
         market = Market(
             id="m10",

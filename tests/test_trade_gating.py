@@ -515,6 +515,243 @@ def test_direct_posterior_floor_none_for_proxy_or_low_eq_or_nonpositive_edge() -
     assert _direct_evidence_posterior_floor(_direct_decision(), None, settings) is None
 
 
+def test_direct_posterior_floor_weather_nws_proxy_applies() -> None:
+    settings = _floor_settings()
+    market = Market(
+        id="KXHIGHAUS-26JUL10-B93.5",
+        question="Will the high temperature in Austin be above 93.5°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.545,
+        bet_size_pct=0.4,
+        reasoning="NWS forecast",
+        edge_source="computed",
+        edge_external=0.13,
+        evidence_basis="proxy",
+        evidence_quality=0.90,
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=30.3&lon=-97.7",
+    )
+    floor = _direct_evidence_posterior_floor(decision, 0.55, settings, market=market)
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_skips_weather_underdog() -> None:
+    settings = _floor_settings(WEATHER_BLOCK_UNDERDOG_ENTRIES=True)
+    market = Market(
+        id="KXHIGHMIA-26JUL11-T88",
+        question="Will the high temperature in Miami be above 88°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.28),
+            MarketOutcome(name="NO", price=0.72),
+        ],
+    )
+    decision = _direct_decision(edge_external=0.18, evidence_quality=0.90)
+    assert _direct_evidence_posterior_floor(decision, 0.28, settings, market=market) is None
+
+
+def test_direct_posterior_floor_caps_weather_edge() -> None:
+    settings = _floor_settings(WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20)
+    market = Market(
+        id="KXHIGHMIA-26JUL11-T92",
+        question="Will the high temperature in Miami be above 92°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.60),
+            MarketOutcome(name="NO", price=0.40),
+        ],
+    )
+    # Raw computed edge 0.35 would floor at 0.95; weather cap keeps preserved edge ≤ 0.20.
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(edge_external=0.35, evidence_quality=0.90),
+        0.60,
+        settings,
+        market=market,
+    )
+    assert floor == pytest.approx(0.80)
+
+
+def test_weather_underdog_blocked_at_edge_gate() -> None:
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        WEATHER_MIN_EDGE=0.05,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        MAX_REASONABLE_EDGE=0.40,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHCHI-26JUL11-T85",
+        question="Will the high temperature in Chicago be above 85°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.32),
+            MarketOutcome(name="NO", price=0.68),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.55,
+        raw_confidence=0.55,
+        bet_size_pct=0.3,
+        reasoning="NWS underdog",
+        evidence_basis="direct",
+        evidence_quality=0.90,
+        edge_source="computed",
+        my_prob=0.55,
+    )
+    ok, edge, reason = _passes_edge_threshold(0.32, decision, settings, market=market)
+    assert ok is False
+    assert reason == "weather_underdog_blocked"
+    assert edge == pytest.approx(0.23)
+
+
+def test_weather_favorite_still_passes_edge_gate() -> None:
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        WEATHER_MIN_EDGE=0.05,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        MAX_REASONABLE_EDGE=0.40,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHCHI-26JUL11-T78",
+        question="Will the high temperature in Chicago be above 78°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.62),
+            MarketOutcome(name="NO", price=0.38),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.78,
+        raw_confidence=0.78,
+        bet_size_pct=0.3,
+        reasoning="NWS favorite",
+        evidence_basis="direct",
+        evidence_quality=0.90,
+        edge_source="computed",
+        my_prob=0.78,
+    )
+    ok, edge, reason = _passes_edge_threshold(0.62, decision, settings, market=market)
+    assert ok is True
+    assert reason == ""
+    assert edge == pytest.approx(0.16)
+
+
+def test_commodity_min_edge_raises_threshold() -> None:
+    from main import _edge_threshold_for_market
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        COMMODITY_MIN_EDGE=0.22,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXWTI-26JUL12-T70.00",
+        question="Will WTI settle above 70?",
+        category="finance",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    assert _edge_threshold_for_market(0.55, settings, "computed", market=market) == pytest.approx(
+        0.22
+    )
+
+
+def test_direct_posterior_floor_weather_proxy_without_nws_url_is_none() -> None:
+    settings = _floor_settings()
+    market = Market(
+        id="KXHIGHAUS-26JUL10-B93.5",
+        question="Will the high temperature in Austin be above 93.5°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.545,
+        bet_size_pct=0.4,
+        reasoning="weather.com forecast",
+        edge_source="computed",
+        edge_external=0.13,
+        evidence_basis="proxy",
+        evidence_quality=0.90,
+        primary_source_url="https://www.weather.com/weather/today/l/Austin",
+    )
+    assert _direct_evidence_posterior_floor(decision, 0.55, settings, market=market) is None
+
+
+def test_edge_gate_allows_weather_high_eq_edge_above_generic_max() -> None:
+    """High-EQ NWS weather may use DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX (favorites)."""
+    settings = Settings(
+        MIN_EDGE=0.05,
+        WEATHER_MIN_EDGE=0.05,
+        MAX_REASONABLE_EDGE=0.40,
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        LOW_PRICE_THRESHOLD=0.50,
+    )
+    market = Market(
+        id="KXHIGHTDAL-26JUL10-B98.5",
+        question="Will the high temperature in Dallas be above 98.5°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.97,
+        bet_size_pct=0.5,
+        reasoning="NWS direct",
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=0.90,
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=32.8&lon=-96.8",
+    )
+    ok, edge, reason = _passes_edge_threshold(
+        0.55,
+        decision,
+        settings,
+        market=market,
+        effective_confidence_override=0.97,
+    )
+    assert ok is True, reason
+    assert edge == pytest.approx(0.42)
+
+
 def test_direct_posterior_floor_disabled_returns_none() -> None:
     settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_ENABLED=False)
     assert _direct_evidence_posterior_floor(_direct_decision(), 0.67, settings) is None

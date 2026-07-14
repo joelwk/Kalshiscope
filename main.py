@@ -70,7 +70,12 @@ from models import (
 )
 from kalshi_client import KalshiClient
 from refinement import RefinementStrategy
-from research_profiles import build_market_search_config, market_category_flags, market_family
+from research_profiles import (
+    build_market_search_config,
+    is_commodity_market,
+    market_category_flags,
+    market_family,
+)
 from bootstrap_checks import BootstrapError, run_bootstrap_checks
 from score_engine import calibrate_confidence, compute_final_score, score_breakdown_explanation
 from xai_provider import XAIProvider
@@ -1286,11 +1291,49 @@ def _research_queue_context_text(context: dict[str, Any] | None) -> str | None:
     gate_name = str(context.get("gate_name") or "").strip()
     if gate_name:
         parts.append(f"gate_name={gate_name}")
+    prior_decision = context.get("last_decision") or context.get("prior_decision")
+    if not isinstance(prior_decision, dict):
+        last_decision_json = context.get("last_decision_json")
+        if isinstance(last_decision_json, dict):
+            prior_decision = last_decision_json
+        elif isinstance(last_decision_json, str) and last_decision_json.strip():
+            try:
+                parsed = json.loads(last_decision_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                prior_decision = parsed
+    if isinstance(prior_decision, dict):
+        for field_name in (
+            "confidence",
+            "edge_market",
+            "evidence_basis",
+            "edge_source",
+            "evidence_quality",
+        ):
+            value = prior_decision.get(field_name)
+            if value is None and field_name == "edge_market":
+                value = context.get("edge_market")
+            if value is None:
+                continue
+            parts.append(f"prior_{field_name}={value}")
+        primary_source_url = str(prior_decision.get("primary_source_url") or "").strip()
+        parts.append(
+            "prior_primary_source_url="
+            + ("populated" if primary_source_url else "missing")
+        )
+    elif context.get("edge_market") is not None:
+        parts.append(f"prior_edge_market={context.get('edge_market')}")
     if not parts:
         return None
     parts.append(
         "repair_goal=compute probability_yes, market-implied probability, "
         "edge_market, base rate, counter-evidence, and explain what is already priced in"
+    )
+    parts.append(
+        "repair_action=If you can now cite a settlement-aligned primary URL and "
+        "positive edge_market, set should_trade=true with a Kelly-sized bet_size_pct; "
+        "do not default to no-trade solely because the prior cycle abstained"
     )
     return "Research queue repair target: " + "; ".join(parts)
 
@@ -1471,6 +1514,12 @@ def _edge_threshold_for_market(
     is_weather_market = market is not None and market_family(market) == "weather"
     if is_weather_market and not definitive_outcome_eligible:
         min_edge = max(min_edge, settings.WEATHER_MIN_EDGE)
+    if (
+        market is not None
+        and is_commodity_market(market)
+        and not definitive_outcome_eligible
+    ):
+        min_edge = max(min_edge, float(settings.COMMODITY_MIN_EDGE))
     if not definitive_outcome_eligible:
         low_price_multiplier = max(0.0, float(settings.LOW_PRICE_MIN_EDGE_MULTIPLIER))
         if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
@@ -1488,6 +1537,72 @@ def _edge_threshold_for_market(
                 settings.WEATHER_FALLBACK_EDGE_MIN_EDGE * fallback_multiplier,
             )
     return min_edge
+
+
+_NWS_NOAA_HOST_MARKERS = ("weather.gov", "noaa.gov")
+_MICHIGAN_SPORTS_JURISDICTION_MARKER = (
+    "michigan_residents_are_not_currently_allowed_to_open_positions_in_sports"
+)
+_WEATHER_HIGH_EQ_REASONABLE_EDGE_MIN = 0.85
+
+
+def _is_nws_noaa_primary_source_url(url: str) -> bool:
+    """True when primary_source_url is an NWS/NOAA authority host."""
+    normalized_url = str(url or "").strip().lower()
+    if not normalized_url:
+        return False
+    parsed = urlparse(normalized_url)
+    host = (parsed.netloc or "").split("@")[-1].split(":")[0].lower()
+    if not host:
+        return False
+    return any(
+        host == marker or host.endswith(f".{marker}") for marker in _NWS_NOAA_HOST_MARKERS
+    )
+
+
+def _is_michigan_sports_jurisdiction_error(error_text: str) -> bool:
+    return _MICHIGAN_SPORTS_JURISDICTION_MARKER in str(error_text or "").lower()
+
+
+def _order_exception_error_text(exc: BaseException) -> str:
+    """Compose order-failure text including Kalshi response body when present.
+
+    ``requests.HTTPError`` only stringifies as ``403 Client Error: Forbidden for
+    url: ...``; the Michigan sports jurisdiction message lives on
+    ``exc.response.text``. Soft-hold detection must see that body.
+    """
+    parts = [str(exc)]
+    body = getattr(exc, "_kalshi_response_body", None)
+    if not body:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                body = response.text
+            except Exception:
+                body = None
+    if body:
+        parts.append(str(body))
+    return "\n".join(parts)
+
+
+def _is_high_eq_weather_nws_edge(
+    decision: TradeDecision,
+    market: Market | None,
+) -> bool:
+    """Weather + high EQ + NWS/NOAA (or direct) — eligible for wider reasonable-edge cap."""
+    if market is None or market_family(market) != "weather":
+        return False
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return False
+    if evidence_quality < _WEATHER_HIGH_EQ_REASONABLE_EDGE_MIN:
+        return False
+    if _decision_evidence_basis(decision) == "direct":
+        return True
+    return _is_nws_noaa_primary_source_url(
+        str(getattr(decision, "primary_source_url", "") or "")
+    )
 
 
 def _passes_edge_threshold(
@@ -1532,9 +1647,12 @@ def _passes_edge_threshold(
         settings,
         market=market,
     )
+    use_elevated_reasonable_max = (
+        is_definitive_validated or _is_high_eq_weather_nws_edge(decision, market)
+    )
     max_reasonable_edge = (
         max(0.0, min(1.0, float(settings.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX)))
-        if is_definitive_validated
+        if use_elevated_reasonable_max
         else max(0.0, min(1.0, float(settings.MAX_REASONABLE_EDGE)))
     )
     if abs(edge) > max_reasonable_edge + 1e-9 and not is_definitive_validated:
@@ -1550,6 +1668,16 @@ def _passes_edge_threshold(
         evidence_basis = _decision_evidence_basis(decision)
         if evidence_basis != "direct":
             return False, edge, "non_sports_needs_direct_evidence"
+    # Weather underdogs (chosen-outcome implied < 0.50) have historically poor
+    # realized WR; keep them analyzable but do not execute.
+    if (
+        market is not None
+        and settings.WEATHER_BLOCK_UNDERDOG_ENTRIES
+        and market_family(market) == "weather"
+        and not is_definitive_validated
+        and implied_prob < float(settings.LOW_PRICE_THRESHOLD)
+    ):
+        return False, edge, "weather_underdog_blocked"
     min_edge = _edge_threshold_for_market(
         implied_prob,
         settings,
@@ -1646,13 +1774,44 @@ def _direct_evidence_posterior_floor(
     chosen_edge = -float(edge_external) if outcome_is_no else float(edge_external)
     if chosen_edge <= 0.0:
         return None
-    if _decision_evidence_basis(decision) != "direct":
+    # Do not floor weather underdog entries — historically weak and now blocked
+    # at the edge gate; flooring would only fight that discipline.
+    if (
+        market is not None
+        and settings.WEATHER_BLOCK_UNDERDOG_ENTRIES
+        and market_family(market) == "weather"
+        and float(implied_prob) < float(settings.LOW_PRICE_THRESHOLD)
+    ):
         return None
+    # Cap preserved weather edge so floor cannot resurrect extreme raw claims.
+    if (
+        market is not None
+        and market_family(market) == "weather"
+        and float(settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE) > 0.0
+    ):
+        chosen_edge = min(chosen_edge, float(settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE))
     if str(getattr(decision, "edge_source", "") or "").strip().lower() != "computed":
         return None
-    if float(decision.evidence_quality) < float(
-        settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY
-    ):
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return None
+    if evidence_quality < float(settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY):
+        return None
+    evidence_basis = _decision_evidence_basis(decision)
+    is_direct = evidence_basis == "direct"
+    # Weather NWS/NOAA reads are settlement-predictive even when the model
+    # classifies evidence_basis as proxy (missing URL upgrade). Allow the floor
+    # so calibration cannot invert a computed positive edge on those markets.
+    is_weather_nws_proxy = (
+        not is_direct
+        and market is not None
+        and market_family(market) == "weather"
+        and _is_nws_noaa_primary_source_url(
+            str(getattr(decision, "primary_source_url", "") or "")
+        )
+    )
+    if not is_direct and not is_weather_nws_proxy:
         return None
     if not _posterior_floor_scope_allows(decision, market, settings):
         logger.debug(
@@ -2129,6 +2288,8 @@ def _should_queue_research_for_blocked_trade(
     if gate_name == "evidence":
         return normalized_gap <= _RESEARCH_QUEUE_EVIDENCE_GAP_MAX
     if gate_name == "edge":
+        if str(edge_reason or "") == "weather_underdog_blocked":
+            return False
         if str(edge_reason or "") in {
             "edge_above_reasonable_max",
             "missing_structured_probability",
@@ -2270,6 +2431,33 @@ def _kelly_fraction_for_market_horizon(market: Market, settings: Settings) -> fl
     if is_weather_market:
         return max(0.0, min(1.0, base_fraction * weather_multiplier))
     return base_fraction
+
+
+def _kelly_fraction_for_decision(
+    market: Market,
+    settings: Settings,
+    decision: TradeDecision,
+    effective_confidence: float,
+) -> float:
+    """Horizon Kelly fraction with weather calibration-gap shrink.
+
+    When raw confidence was crushed by calibration (large raw−cal gap), weather
+    sizing is halved so floored posteriors cannot deploy full Kelly.
+    """
+    fraction = _kelly_fraction_for_market_horizon(market, settings)
+    if market_family(market) != "weather":
+        return fraction
+    raw_confidence = getattr(decision, "raw_confidence", None)
+    if raw_confidence is None:
+        return fraction
+    try:
+        gap = float(raw_confidence) - float(effective_confidence)
+    except (TypeError, ValueError):
+        return fraction
+    gap_threshold = float(settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK)
+    if gap_threshold > 0.0 and gap >= gap_threshold:
+        fraction *= max(0.0, float(settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER))
+    return max(0.0, min(1.0, fraction))
 
 
 def _sizing_mode_label(kelly_enabled: bool) -> str:
@@ -5061,13 +5249,34 @@ def _passes_refreshed_edge_guard(
     market: Market,
     decision: TradeDecision,
     settings: Settings,
+    effective_confidence_override: float | None = None,
 ) -> tuple[bool, float | None, float | None, str]:
+    """Re-check edge after a market refresh using the same posterior as the primary gate.
+
+    When ``effective_confidence_override`` is omitted, recompute the direct-evidence
+    posterior floor so refreshed checks stay coherent with calibration-fix logic.
+    """
     implied_prob = _get_implied_probability(market, decision.outcome)
+    edge_gate_confidence = effective_confidence_override
+    if edge_gate_confidence is None:
+        execution_posterior_floor = _direct_evidence_posterior_floor(
+            decision,
+            implied_prob,
+            settings,
+            market=market,
+        )
+        edge_gate_confidence = float(decision.confidence)
+        if execution_posterior_floor is not None:
+            edge_gate_confidence = max(
+                float(decision.confidence),
+                float(execution_posterior_floor),
+            )
     edge_ok, edge_value, edge_reason = _passes_edge_threshold(
         implied_prob,
         decision,
         settings,
         market=market,
+        effective_confidence_override=edge_gate_confidence,
     )
     return edge_ok, implied_prob, edge_value, edge_reason
 
@@ -6751,6 +6960,9 @@ def main(max_cycles: int | None = None) -> None:
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
+    # Session-scoped soft-hold: after a Michigan sports jurisdiction 403, keep
+    # analyzing sports for learning but skip live/dry-run order submission.
+    sports_jurisdiction_blocked = False
 
     while True:
         cycle_count += 1
@@ -7348,15 +7560,26 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 if market_id in extended_research_market_ids:
                     next_eligible_cycle: int | None = None
-                    cooldown_cycles = max(
-                        0,
-                        int(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES),
-                    )
+                    if normalized_final_action == "research_queued":
+                        cooldown_cycles = max(
+                            0,
+                            int(settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES),
+                        )
+                    elif normalized_final_action == "skip":
+                        cooldown_cycles = max(
+                            0,
+                            int(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES),
+                        )
+                    else:
+                        cooldown_cycles = 0
                     if normalized_final_action in {"skip", "research_queued"}:
                         if cooldown_cycles > 0:
                             next_eligible_cycle = cycle_count + cooldown_cycles
                             audit_payload["extended_research_next_eligible_cycle"] = (
                                 next_eligible_cycle
+                            )
+                            audit_payload["extended_research_cooldown_cycles"] = (
+                                cooldown_cycles
                             )
                     elif normalized_final_action in {"order_attempt", "order_submitted", "dry_run"}:
                         next_eligible_cycle = 0
@@ -11627,6 +11850,7 @@ def main(max_cycles: int | None = None) -> None:
                     execution_posterior_floor is not None
                 )
                 audit_context["direct_posterior_floor_value"] = execution_posterior_floor
+                audit_context["edge_gate_confidence"] = edge_gate_confidence
                 if execution_posterior_floor is None and not _posterior_floor_scope_allows(
                     decision_for_edge, market, settings
                 ):
@@ -11681,8 +11905,13 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 if not edge_ok:
                     trades_skipped_edge += 1
-                    _record_should_trade_blocked("edge_gate_blocked")
-                    _record_rejection_reason(rejection_breakdown, "edge_gate_blocked")
+                    edge_block_reason = (
+                        "weather_underdog_blocked"
+                        if edge_reason == "weather_underdog_blocked"
+                        else "edge_gate_blocked"
+                    )
+                    _record_should_trade_blocked(edge_block_reason)
+                    _record_rejection_reason(rejection_breakdown, edge_block_reason)
                     if edge_reason == "non_sports_needs_direct_evidence":
                         _record_rejection_reason(
                             rejection_breakdown,
@@ -11693,6 +11922,8 @@ def main(max_cycles: int | None = None) -> None:
                             rejection_breakdown,
                             "edge_above_reasonable_max",
                         )
+                    elif edge_reason == "weather_underdog_blocked":
+                        pass
                     elif "below min" in edge_reason:
                         _record_rejection_reason(
                             rejection_breakdown,
@@ -11723,11 +11954,11 @@ def main(max_cycles: int | None = None) -> None:
                             "edge_above_reasonable_max",
                             "missing_structured_probability",
                         }
-                        else "edge_gate_blocked"
+                        else edge_block_reason
                     )
                     final_action = "research_queued" if queue_for_research else "skip"
                     final_outcome_reason = (
-                        "research_queued" if queue_for_research else "edge_gate_blocked"
+                        "research_queued" if queue_for_research else edge_block_reason
                     )
                     research_queue_position: int | None = None
                     if queue_for_research:
@@ -11747,7 +11978,9 @@ def main(max_cycles: int | None = None) -> None:
                         execution_audit=_build_execution_audit(
                             decision_terminal=not queue_for_research,
                             final_action=final_action,
-                            final_reason=research_reason if queue_for_research else "edge_gate_blocked",
+                            final_reason=(
+                                research_reason if queue_for_research else edge_block_reason
+                            ),
                             gate_edge_required=required_edge_threshold,
                             gate_edge_actual=edge_value,
                             gate_edge_reason=edge_reason,
@@ -11768,7 +12001,7 @@ def main(max_cycles: int | None = None) -> None:
                         data={
                             "market_id": market.id,
                             "final_action": final_action,
-                            "final_reason": "edge_gate_blocked",
+                            "final_reason": edge_block_reason,
                             "implied_prob": implied_prob,
                             "entry_price": entry_price,
                             "confidence": decision_for_edge.confidence,
@@ -11951,7 +12184,12 @@ def main(max_cycles: int | None = None) -> None:
                         posterior=posterior_for_kelly,
                         market_price=implied_prob,
                     )
-                    kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
+                    kelly_fraction_value = _kelly_fraction_for_decision(
+                        market,
+                        settings,
+                        decision_for_edge,
+                        effective_confidence,
+                    )
 
                 score_gate_score_source = "runtime_recomputed"
                 short_prefix_score_penalty = float(
@@ -12383,7 +12621,12 @@ def main(max_cycles: int | None = None) -> None:
                                 execution_posterior_floor,
                             )
                     if kelly_fraction_value is None:
-                        kelly_fraction_value = _kelly_fraction_for_market_horizon(market, settings)
+                        kelly_fraction_value = _kelly_fraction_for_decision(
+                            market,
+                            settings,
+                            decision_for_edge,
+                            effective_confidence,
+                        )
                     min_edge_for_kelly = _edge_threshold_for_market(
                         implied_prob,
                         settings,
@@ -13007,6 +13250,51 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     continue
 
+                if (
+                    sports_jurisdiction_blocked
+                    and market_family_name == "sports"
+                ):
+                    logger.warning(
+                        "SKIP [%s] sports order held: session jurisdiction soft-hold "
+                        "(Michigan sports positions blocked)",
+                        market.id,
+                        data={
+                            "market_id": market.id,
+                            "final_reason": "jurisdiction_sports_blocked",
+                            "market_family": market_family_name,
+                            "sports_jurisdiction_blocked": True,
+                        },
+                    )
+                    trades_skipped_position += 1
+                    _record_should_trade_blocked("jurisdiction_sports_blocked")
+                    _record_rejection_reason(
+                        rejection_breakdown,
+                        "jurisdiction_sports_blocked",
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="pre_order_submission_jurisdiction",
+                            decision_terminal=True,
+                            final_action="monitor_only",
+                            final_reason="jurisdiction_sports_blocked",
+                            bet_amount_usdc=bet_amount,
+                            participation_tier=ParticipationTier.MONITOR_ONLY,
+                            participation_decision="jurisdiction_sports_blocked",
+                            **audit_context,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "jurisdiction_sports_blocked",
+                    )
+                    continue
+
                 if settings.DRY_RUN:
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
                     logger.info(
@@ -13191,6 +13479,7 @@ def main(max_cycles: int | None = None) -> None:
                         active_market,
                         decision_for_edge,
                         settings,
+                        effective_confidence_override=edge_gate_confidence,
                     )
                     audit_context["edge_market"] = refreshed_edge_value
                     if not refreshed_edge_ok:
@@ -13811,13 +14100,27 @@ def main(max_cycles: int | None = None) -> None:
                     _record_terminal_outcome(state_manager, market.id, "market_closed")
                     continue
                 except Exception as order_exc:
-                    error_msg = str(order_exc)
+                    error_msg = _order_exception_error_text(order_exc)
                     normalized_order_error = error_msg.lower()
                     order_failure_reason = "order_submission_failed"
                     if "invalid parameters" in normalized_order_error:
                         order_failure_reason = "order_submission_invalid_parameters"
                     elif "timeinforce" in normalized_order_error or "time_in_force" in normalized_order_error:
                         order_failure_reason = "order_submission_invalid_time_in_force"
+                    elif _is_michigan_sports_jurisdiction_error(error_msg):
+                        order_failure_reason = "jurisdiction_sports_blocked"
+                        if not sports_jurisdiction_blocked:
+                            sports_jurisdiction_blocked = True
+                            logger.warning(
+                                "Session sports jurisdiction soft-hold enabled after "
+                                "Michigan sports order rejection: market=%s",
+                                market.id,
+                                data={
+                                    "market_id": market.id,
+                                    "sports_jurisdiction_blocked": True,
+                                    "market_family": market_family_name,
+                                },
+                            )
                     if (
                         "Could not map outcome" in error_msg
                         and not market_outcome_mismatch_counted

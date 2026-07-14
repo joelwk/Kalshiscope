@@ -78,6 +78,18 @@ class Settings:
     FALLBACK_EDGE_MIN_EDGE_MULTIPLIER: float = 0.90
     WEATHER_MIN_EDGE: float = 0.14
     WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.34
+    # Block weather entries when the chosen-outcome market price is an underdog
+    # (< LOW_PRICE_THRESHOLD). Lifetime weather underdog WR ~32% / large negative PnL.
+    WEATHER_BLOCK_UNDERDOG_ENTRIES: bool = True
+    # Cap the edge preserved by the weather posterior floor so extreme raw claims
+    # cannot be fully resurrected after calibration shrink.
+    WEATHER_POSTERIOR_FLOOR_MAX_EDGE: float = 0.20
+    # When raw−calibrated confidence gap is large, shrink weather Kelly sizing.
+    WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK: float = 0.20
+    WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER: float = 0.50
+    # Commodity futures (WTI/NATGAS/BRENT/etc.) historically underperform; raise
+    # the edge bar without hard-blocking analysis eligibility.
+    COMMODITY_MIN_EDGE: float = 0.22
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
@@ -739,6 +751,9 @@ class Settings:
     # size multiplier still apply, so historically weak families are sized down
     # rather than hard-blocked at validation. Set to 1.0 to disable.
     PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE: float = 0.15
+    # Generic family historically underperforms on proxy evidence; require a
+    # higher market edge before the proxy high-edge participation override fires.
+    GENERIC_PROXY_HIGH_EDGE_MIN: float = 0.18
     GROK_PROXY_CONFIDENCE_CAP: float = 0.78
     GROK_LOW_INFO_CONFIDENCE_CAP: float = 0.70
     GROK_FALLBACK_MIN_EVIDENCE_QUALITY: float = 0.45
@@ -790,6 +805,9 @@ class Settings:
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN: int = 8
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
     EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
+    # Near-miss / research_queued after extended research uses a shorter cooldown
+    # so soft candidates re-enter the normal analysis pool sooner than hard skips.
+    EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES: int = 2
     DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR: float = 0.80
     # Edge cap for definitive-outcome and high-quality direct settled markets.
     # Raised from 0.40 to 0.50 alongside the MAX_REASONABLE_EDGE bump so the
@@ -1090,6 +1108,25 @@ def load_settings() -> Settings:
         WEATHER_FALLBACK_EDGE_MIN_EDGE=_read_env_float(
             "WEATHER_FALLBACK_EDGE_MIN_EDGE",
             Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
+        ),
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=_read_env_bool(
+            "WEATHER_BLOCK_UNDERDOG_ENTRIES",
+            Settings.WEATHER_BLOCK_UNDERDOG_ENTRIES,
+        ),
+        WEATHER_POSTERIOR_FLOOR_MAX_EDGE=_read_env_float(
+            "WEATHER_POSTERIOR_FLOOR_MAX_EDGE",
+            Settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE,
+        ),
+        WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=_read_env_float(
+            "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK",
+            Settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK,
+        ),
+        WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=_read_env_float(
+            "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER",
+            Settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER,
+        ),
+        COMMODITY_MIN_EDGE=_read_env_float(
+            "COMMODITY_MIN_EDGE", Settings.COMMODITY_MIN_EDGE
         ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE
@@ -2066,6 +2103,10 @@ def load_settings() -> Settings:
             "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE",
             Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE,
         ),
+        GENERIC_PROXY_HIGH_EDGE_MIN=_read_env_float(
+            "GENERIC_PROXY_HIGH_EDGE_MIN",
+            Settings.GENERIC_PROXY_HIGH_EDGE_MIN,
+        ),
         GROK_PROXY_CONFIDENCE_CAP=_read_env_float(
             "GROK_PROXY_CONFIDENCE_CAP",
             Settings.GROK_PROXY_CONFIDENCE_CAP,
@@ -2203,6 +2244,10 @@ def load_settings() -> Settings:
         EXTENDED_RESEARCH_COOLDOWN_CYCLES=_read_env_int(
             "EXTENDED_RESEARCH_COOLDOWN_CYCLES",
             Settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES,
+        ),
+        EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES=_read_env_int(
+            "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES",
+            Settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES,
         ),
         DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR=_read_env_float(
             "DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR",
