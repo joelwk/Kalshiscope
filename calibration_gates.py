@@ -220,6 +220,7 @@ def evaluate_market_tiered(
     family_min_samples: int = 12,
     family_pnl_cutoff: float = -12.0,
     family_win_rate_cutoff: float = 0.40,
+    family_shrunk_pnl_cutoff: float = -0.50,
 ) -> EvaluateMarketResult:
     """Tiered market evaluation using Wilson lower-bound and Bayesian PnL shrinkage."""
     normalized_market_id = str(market_id or "").strip().upper()
@@ -382,7 +383,7 @@ def evaluate_market_tiered(
                 and family_snapshot.pnl_total <= float(family_pnl_cutoff)
                 and family_snapshot.win_rate <= float(family_win_rate_cutoff)
                 and wlb_fam <= float(family_win_rate_cutoff)
-                and shrunk_pnl_fam <= float(prefix_shrunk_pnl_cutoff)
+                and shrunk_pnl_fam <= float(family_shrunk_pnl_cutoff)
             ):
                 return EvaluateMarketResult(
                     tier=GateTier.HARD_DENY,
@@ -428,6 +429,7 @@ def evaluate_market(
     family_min_samples: int = 12,
     family_pnl_cutoff: float = -12.0,
     family_win_rate_cutoff: float = 0.40,
+    family_shrunk_pnl_cutoff: float = -0.50,
 ) -> tuple[bool, str | None, dict[str, Any]]:
     """Backward-compatible wrapper returning (allowed, reason, metrics) tuple.
 
@@ -454,6 +456,7 @@ def evaluate_market(
         family_min_samples=family_min_samples,
         family_pnl_cutoff=family_pnl_cutoff,
         family_win_rate_cutoff=family_win_rate_cutoff,
+        family_shrunk_pnl_cutoff=family_shrunk_pnl_cutoff,
     )
     enriched_metrics = dict(result.metrics)
     enriched_metrics["historical_gate_tier"] = result.tier

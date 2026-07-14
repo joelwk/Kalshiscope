@@ -108,3 +108,61 @@ def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:
     assert "volume_amplifier_discount=0.0100" in output
     assert "Kelly dynamic fraction >0.50: 1/2 (50.0%)" in output
     assert "Should-trade block rate by family" in output
+
+
+def test_analytics_skips_malformed_cycle_payload_json(tmp_path) -> None:
+    """Malformed cycle payloads must not crash quota-paused counting."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE trade_outcomes (
+                confidence REAL,
+                implied_prob REAL,
+                won INTEGER,
+                resolution_state TEXT,
+                amount_usdc REAL,
+                pnl_estimate REAL
+            )
+            """
+        )
+        conn.execute("CREATE TABLE markets (last_terminal_outcome TEXT)")
+        conn.execute(
+            """
+            CREATE TABLE decision_receipts (
+                audit_json TEXT,
+                decision_json TEXT,
+                timestamp TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE cycle_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO cycle_receipts (payload_json)
+            VALUES
+                ('not-valid-json{{{'),
+                ('{"api_tokens_consumed":100,"api_cost_estimate_usd":0.01,"order_attempts":0,"decisions_made":1,"xai_quota_paused":true}'),
+                ('{"api_tokens_consumed":50,"api_cost_estimate_usd":0.005,"order_attempts":0,"decisions_made":1}')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        run(str(db_path))
+    output = output_buffer.getvalue()
+
+    assert "Cycle API/score-gate summary" in output
+    assert "cycles=2" in output
+    assert "xai_quota_paused_cycles=1" in output

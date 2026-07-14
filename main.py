@@ -8354,6 +8354,7 @@ def main(max_cycles: int | None = None) -> None:
                     family_min_samples=settings.HISTORICAL_FAMILY_MIN_SAMPLES,
                     family_pnl_cutoff=settings.HISTORICAL_FAMILY_PNL_CUTOFF,
                     family_win_rate_cutoff=settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
+                    family_shrunk_pnl_cutoff=settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF,
                 )
 
             def _evaluate_short_prefix_score_penalty(

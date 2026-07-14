@@ -723,6 +723,9 @@ class Settings:
     HISTORICAL_FAMILY_MIN_SAMPLES: int = 12
     HISTORICAL_FAMILY_PNL_CUTOFF: float = -12.0
     HISTORICAL_FAMILY_WIN_RATE_CUTOFF: float = 0.40
+    # Per-trade Bayesian-shrunk PnL cutoff for family hard-deny (distinct from
+    # HISTORICAL_TICKER_PREFIX_SHRUNK_PNL_CUTOFF so family/prefix bars can diverge).
+    HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF: float = -0.50
     HISTORICAL_FAMILY_SIGNAL_ENABLED: bool = True
     HISTORICAL_FAMILY_SCORE_SCALE: float = 0.06
     HISTORICAL_FAMILY_SIZE_SCALE_MAX: float = 0.25
@@ -2026,6 +2029,10 @@ def load_settings() -> Settings:
         HISTORICAL_FAMILY_WIN_RATE_CUTOFF=_read_env_float(
             "HISTORICAL_FAMILY_WIN_RATE_CUTOFF",
             Settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
+        ),
+        HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF=_read_env_float(
+            "HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF",
+            Settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF,
         ),
         HISTORICAL_FAMILY_SIGNAL_ENABLED=_read_env_bool(
             "HISTORICAL_FAMILY_SIGNAL_ENABLED",

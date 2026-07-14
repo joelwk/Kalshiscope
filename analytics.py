@@ -512,6 +512,7 @@ def run(db_path: str) -> None:
             total_score_gate_blocked = 0
             total_decisions = 0
             evidence_basis_counts: dict[str, int] = defaultdict(int)
+            quota_paused_cycles = 0
             for row in cycle_rows:
                 payload_raw = row["payload_json"]
                 if not payload_raw:
@@ -527,6 +528,8 @@ def run(db_path: str) -> None:
                 total_api_cost += float(payload.get("api_cost_estimate_usd") or 0.0)
                 total_order_attempts += int(payload.get("order_attempts") or 0)
                 total_decisions += int(payload.get("decisions_made") or 0)
+                if payload.get("xai_quota_paused"):
+                    quota_paused_cycles += 1
                 rejection_breakdown = payload.get("rejection_breakdown")
                 if isinstance(rejection_breakdown, dict):
                     total_score_gate_blocked += int(
@@ -566,19 +569,8 @@ def run(db_path: str) -> None:
                     print("  evidence_basis_breakdown:")
                     for basis in sorted(evidence_basis_counts):
                         print(f"    {basis}: n={evidence_basis_counts[basis]}")
-
-            quota_paused_cycles = sum(
-                1
-                for row in cycle_rows
-                if row["payload_json"]
-                and isinstance(
-                    (lambda r: json.loads(r) if r else {})(row["payload_json"]),
-                    dict,
-                )
-                and json.loads(row["payload_json"]).get("xai_quota_paused")
-            )
-            if quota_paused_cycles > 0:
-                print(f"  xai_quota_paused_cycles={quota_paused_cycles}")
+                if quota_paused_cycles > 0:
+                    print(f"  xai_quota_paused_cycles={quota_paused_cycles}")
 
         profitable_row = conn.execute(
             """

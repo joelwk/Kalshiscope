@@ -558,9 +558,55 @@ def test_family_hard_deny_requires_wilson_lb_below_cutoff() -> None:
         family_min_samples=12,
         family_pnl_cutoff=-12.0,
         family_win_rate_cutoff=0.40,
+        family_shrunk_pnl_cutoff=-0.50,
     )
     # n=30, wins=10 (33.3%), WLB ~ 0.19 < 0.40, shrunk PnL ~ -1.0 < -0.5.
     assert result.tier == GateTier.HARD_DENY
     assert result.reason == "historical_family_pnl_block"
     assert result.wilson_win_rate_lower_bound is not None
     assert result.wilson_win_rate_lower_bound < 0.40
+
+
+def test_family_hard_deny_uses_family_shrunk_pnl_cutoff_not_prefix() -> None:
+    """Family hard-deny must compare against family_shrunk_pnl_cutoff, not the
+    prefix shrunk-PnL bar — otherwise retuning prefix cutoffs silently changes
+    family gate behavior."""
+    family_stats = {
+        "crypto": PerformanceStats(
+            sample_size=30,
+            wins=10,
+            win_rate=0.333,
+            pnl_total=-40.0,
+        )
+    }
+    # Shrunk PnL ~ -1.0: passes a loose family bar but fails a tight one.
+    loose = evaluate_market_tiered(
+        market_id="KXFAMTEST-123456-TEST",
+        family="crypto",
+        prefix_stats={},
+        family_stats=family_stats,
+        prefix_gate_enabled=False,
+        prefix_shrunk_pnl_cutoff=-0.01,  # would hard-deny if wrongly reused
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+        family_shrunk_pnl_cutoff=-2.0,
+    )
+    assert loose.tier == GateTier.NEUTRAL
+
+    tight = evaluate_market_tiered(
+        market_id="KXFAMTEST-123456-TEST",
+        family="crypto",
+        prefix_stats={},
+        family_stats=family_stats,
+        prefix_gate_enabled=False,
+        prefix_shrunk_pnl_cutoff=-10.0,  # would never hard-deny if wrongly reused
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+        family_shrunk_pnl_cutoff=-0.50,
+    )
+    assert tight.tier == GateTier.HARD_DENY
+    assert tight.reason == "historical_family_pnl_block"

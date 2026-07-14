@@ -123,6 +123,84 @@ def test_bootstrap_check_passes_when_cert_exists(monkeypatch, tmp_path) -> None:
     run_bootstrap_checks(skip_api_checks=True)
 
 
+def test_bootstrap_logs_kalshi_auth_skipped_when_api_checks_disabled(
+    monkeypatch, tmp_path
+) -> None:
+    import certifi
+    import bootstrap_checks
+    from bootstrap_checks import KALSHI_AUTH_SKIPPED
+
+    cert_file = tmp_path / "cacert.pem"
+    cert_file.write_text("dummy")
+    monkeypatch.setattr(certifi, "where", lambda: str(cert_file))
+
+    captured: list[dict] = []
+
+    def _capture(msg, *args, **kwargs):
+        if msg == "Bootstrap checks passed":
+            captured.append(kwargs.get("data") or {})
+
+    monkeypatch.setattr(bootstrap_checks.logger, "info", _capture)
+    run_bootstrap_checks(kalshi_client=object(), skip_api_checks=True)
+
+    assert captured
+    assert captured[0]["tls_ok"] is True
+    assert captured[0]["kalshi_auth"] == KALSHI_AUTH_SKIPPED
+    assert "kalshi_ok" not in captured[0]
+
+
+def test_bootstrap_logs_kalshi_auth_passed_when_check_succeeds(
+    monkeypatch, tmp_path
+) -> None:
+    import certifi
+    from bootstrap_checks import KALSHI_AUTH_PASSED
+
+    class _Client:
+        def get_portfolio_balance(self):
+            return 100.0
+
+    cert_file = tmp_path / "cacert.pem"
+    cert_file.write_text("dummy")
+    monkeypatch.setattr(certifi, "where", lambda: str(cert_file))
+
+    captured: list[dict] = []
+    import bootstrap_checks
+
+    def _capture(msg, *args, **kwargs):
+        if msg == "Bootstrap checks passed":
+            captured.append(kwargs.get("data") or {})
+
+    monkeypatch.setattr(bootstrap_checks.logger, "info", _capture)
+    run_bootstrap_checks(kalshi_client=_Client(), skip_api_checks=False)
+
+    assert captured
+    assert captured[0]["kalshi_auth"] == KALSHI_AUTH_PASSED
+
+
+def test_bootstrap_logs_kalshi_auth_not_applicable_without_client(
+    monkeypatch, tmp_path
+) -> None:
+    import certifi
+    from bootstrap_checks import KALSHI_AUTH_NOT_APPLICABLE
+
+    cert_file = tmp_path / "cacert.pem"
+    cert_file.write_text("dummy")
+    monkeypatch.setattr(certifi, "where", lambda: str(cert_file))
+
+    captured: list[dict] = []
+    import bootstrap_checks
+
+    def _capture(msg, *args, **kwargs):
+        if msg == "Bootstrap checks passed":
+            captured.append(kwargs.get("data") or {})
+
+    monkeypatch.setattr(bootstrap_checks.logger, "info", _capture)
+    run_bootstrap_checks(kalshi_client=None, skip_api_checks=False)
+
+    assert captured
+    assert captured[0]["kalshi_auth"] == KALSHI_AUTH_NOT_APPLICABLE
+
+
 def test_cycle_receipt_contains_forensic_keys(
     monkeypatch, sample_market, sample_decision, dummy_settings
 ) -> None:

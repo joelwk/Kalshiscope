@@ -782,6 +782,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_FAMILY_MIN_SAMPLES, 12)
         self.assertEqual(settings.HISTORICAL_FAMILY_PNL_CUTOFF, -12.0)
         self.assertEqual(settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF, 0.40)
+        self.assertEqual(settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF, -0.50)
         self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE, 0.12)
