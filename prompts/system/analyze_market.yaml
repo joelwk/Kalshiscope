@@ -55,6 +55,7 @@ parts:
     </market_type_rules>
 
     <trade_entry_criteria>
+    Probability polarity: my_prob and implied_prob_external are always P(YES); edge_external = my_prob - implied_prob_external on that YES scale. confidence is the probability of the chosen outcome. When outcome=NO, keep my_prob < 0.5 (do not set my_prob = confidence).
     Do not claim tradable edge from proxy-only evidence when direct settlement-aligned evidence is unavailable.
     When evidence_basis=proxy, require |edge_market| >= 0.10 versus market-implied probability (edge_external alone is insufficient); for sports markets where the proxy is bookmaker/sportsbook odds, |edge_market| >= 0.07 is sufficient because those odds are settlement-predictive.
     If edge_source=fallback or implied_prob_external is missing, cap confidence at 0.72 and require positive edge_market >= the configured fallback threshold before recommending should_trade=true.

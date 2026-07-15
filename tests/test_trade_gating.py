@@ -489,6 +489,63 @@ def test_direct_posterior_floor_none_when_no_bet_lacks_chosen_edge() -> None:
     assert _direct_evidence_posterior_floor(decision, 0.65, settings) is None
 
 
+def test_atl_shaped_yes_side_edge_unblocks_floor_after_enrichment() -> None:
+    """Regression: chosen-side NO polarity must normalize before the floor.
+
+    Live ATL log had my_prob=0.82 / edge_external=+0.29 on outcome=NO, which
+    made the YES-side floor refuse to fire. After enrichment the stored edge is
+    YES-side negative and the floor reconstructs a ~0.20 weather-capped edge.
+    """
+    from grok_client import GrokClient
+
+    settings = _floor_settings(WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20)
+    market = Market(
+        id="KXHIGHTATL-26JUL14-B85.5",
+        question="Will the maximum temperature be 85-86 on Jul 14, 2026?",
+        category="climate",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.47),
+            MarketOutcome(name="NO", price=0.53),
+        ],
+    )
+    raw = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.545,
+        raw_confidence=0.82,
+        bet_size_pct=0.4,
+        reasoning="NWS direct evidence",
+        my_prob=0.82,
+        implied_prob_external=0.53,
+        edge_external=0.29,
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43",
+    )
+    enriched = GrokClient(api_key="x")._validate_and_enrich_decision(
+        market, raw, profile_name="weather"
+    )
+    assert enriched.edge_external is not None
+    assert enriched.edge_external < 0.0
+    # Calibrated confidence left near market; floor must restore model edge.
+    floor = _direct_evidence_posterior_floor(
+        enriched, 0.53, settings, market=market
+    )
+    assert floor is not None
+    assert floor == pytest.approx(0.73, abs=0.02)
+    edge_ok, edge_value, _reason = _passes_edge_threshold(
+        0.53,
+        enriched.model_copy(update={"confidence": 0.545}),
+        settings,
+        market=market,
+        effective_confidence_override=max(0.545, floor),
+    )
+    assert edge_ok
+    assert edge_value is not None
+    assert edge_value >= 0.14
+
+
 def test_direct_posterior_floor_capped_at_direct_ceiling() -> None:
     settings = _floor_settings()
     # implied 0.66 + edge 0.30 = 0.96 model estimate, capped at 0.89.

@@ -646,6 +646,112 @@ class GrokClient:
             return max(-1.0, min(1.0, fallback_edge)), "fallback"
         return None, "none"
 
+    def _normalize_yes_side_probability_fields(
+        self,
+        market: Market,
+        *,
+        outcome: str,
+        my_prob: float | None,
+        implied: float | None,
+        confidence: float | None,
+        explicit_edge: float | None,
+        probability_yes: float | None = None,
+    ) -> tuple[float | None, float | None, float | None]:
+        """Normalize ``my_prob`` / implied / edge onto the YES probability scale.
+
+        Downstream gates (notably ``_direct_evidence_posterior_floor``) treat
+        ``edge_external`` as YES-side (``my_prob_YES - implied_YES``). Model
+        outputs and self-consistency merges sometimes store chosen-side values
+        for NO bets (``my_prob ≈ confidence``), which flips the floor's sign and
+        silently blocks otherwise-valid trades after calibration shrink.
+        """
+        normalized_outcome = self._normalize_outcome_label(outcome)
+        outcome_is_no = normalized_outcome in {"no", "false", "0"}
+        yes_outcome = self._canonical_outcome_for_market(market, "YES")
+        no_outcome = self._canonical_outcome_for_market(market, "NO")
+        yes_implied = (
+            self._market_implied_probability(market, yes_outcome)
+            if yes_outcome
+            else None
+        )
+        no_implied = (
+            self._market_implied_probability(market, no_outcome)
+            if no_outcome
+            else None
+        )
+        confidence_value = self._bounded_probability(confidence)
+        my_prob_value = self._bounded_probability(my_prob)
+        implied_value = self._bounded_probability(implied)
+        yes_prob_explicit = self._bounded_probability(probability_yes)
+
+        chosen_side_fingerprint = (
+            outcome_is_no
+            and my_prob_value is not None
+            and confidence_value is not None
+            and abs(my_prob_value - confidence_value) <= _PROB_CONSISTENCY_TOLERANCE
+        )
+
+        my_prob_yes = my_prob_value
+        if yes_prob_explicit is not None and (
+            my_prob_yes is None
+            or chosen_side_fingerprint
+            or (
+                outcome_is_no
+                and my_prob_yes is not None
+                and abs(my_prob_yes - yes_prob_explicit) > _PROB_CONSISTENCY_TOLERANCE
+                and abs((1.0 - my_prob_yes) - yes_prob_explicit)
+                <= _PROB_CONSISTENCY_TOLERANCE
+            )
+        ):
+            my_prob_yes = yes_prob_explicit
+        elif chosen_side_fingerprint and confidence_value is not None:
+            my_prob_yes = max(0.0, min(1.0, 1.0 - confidence_value))
+        elif (
+            outcome_is_no
+            and my_prob_yes is not None
+            and confidence_value is not None
+            and abs(my_prob_yes - confidence_value) <= _PROB_CONSISTENCY_TOLERANCE
+        ):
+            my_prob_yes = max(0.0, min(1.0, 1.0 - my_prob_yes))
+
+        implied_yes = implied_value
+        if chosen_side_fingerprint or (
+            outcome_is_no
+            and my_prob_value is not None
+            and my_prob_yes is not None
+            and abs(my_prob_value - (1.0 - my_prob_yes)) <= _PROB_CONSISTENCY_TOLERANCE
+        ):
+            if (
+                implied_value is not None
+                and no_implied is not None
+                and abs(implied_value - no_implied) <= _PROB_CONSISTENCY_TOLERANCE
+            ):
+                implied_yes = yes_implied
+            elif (
+                implied_value is not None
+                and yes_implied is not None
+                and abs(implied_value - yes_implied) <= _PROB_CONSISTENCY_TOLERANCE
+            ):
+                implied_yes = yes_implied
+            elif implied_value is None:
+                implied_yes = yes_implied
+
+        edge_yes: float | None = None
+        if my_prob_yes is not None and implied_yes is not None:
+            edge_yes = max(-1.0, min(1.0, my_prob_yes - implied_yes))
+        elif (
+            explicit_edge is not None
+            and chosen_side_fingerprint
+            and outcome_is_no
+            and explicit_edge > 0.0
+        ):
+            # Chosen-side positive edge on a NO call is the YES-side negation.
+            edge_yes = max(-1.0, min(1.0, -float(explicit_edge)))
+        elif explicit_edge is not None and not chosen_side_fingerprint:
+            edge_yes = max(-1.0, min(1.0, float(explicit_edge)))
+
+        return my_prob_yes, implied_yes, edge_yes
+
     @staticmethod
     def _has_verifiable_source_signal(reasoning: str) -> bool:
         normalized_reasoning = (reasoning or "").lower()
@@ -772,13 +878,40 @@ class GrokClient:
         if my_prob is None:
             my_prob = self._extract_metric_from_reasoning(decision.reasoning, _RE_MY_PROB)
 
+        # Confidence used only for chosen-side fingerprint detection; keep raw
+        # when present so post-calibration re-validation does not invent a gap.
+        confidence_basis_for_polarity = (
+            decision.raw_confidence
+            if decision.raw_confidence is not None
+            else decision.confidence
+        )
+        my_prob, implied, normalized_edge = self._normalize_yes_side_probability_fields(
+            market,
+            outcome=canonical_outcome,
+            my_prob=my_prob,
+            implied=implied,
+            confidence=confidence_basis_for_polarity,
+            explicit_edge=explicit_edge,
+            probability_yes=decision.probability_yes,
+        )
+
         edge, edge_source = self._derive_edge(
             implied=implied,
             my_prob=my_prob,
-            explicit_edge=explicit_edge,
+            explicit_edge=(
+                normalized_edge if normalized_edge is not None else explicit_edge
+            ),
             reasoning=decision.reasoning,
             market_id=market.id,
         )
+        if (
+            edge_source == "computed"
+            and normalized_edge is not None
+            and my_prob is not None
+            and implied is not None
+        ):
+            # Prefer the YES-normalized edge when both probs are YES-aligned.
+            edge = normalized_edge
 
         consistency_ok = True
         if implied is not None and my_prob is not None and edge is not None:
@@ -787,20 +920,25 @@ class GrokClient:
                 consistency_ok = False
 
         prob_consistency_ok = True
-        # Compare my_prob against the model's ORIGINAL (raw) confidence when it is
-        # available, not a value that a conservative self-consistency merge or a
-        # calibration shrink may already have pulled down. Otherwise re-validating
-        # such a decision sees an artificial my_prob-vs-confidence gap and flips an
-        # internally-consistent, real edge to no-trade. Falls back to
-        # decision.confidence for first-pass validation where raw is unset.
-        confidence_basis_for_consistency = (
-            decision.raw_confidence
-            if decision.raw_confidence is not None
-            else decision.confidence
+        # After YES-side normalization, my_prob is P(YES) while confidence remains
+        # the chosen-outcome probability. Compare against the YES-equivalent of
+        # raw/chosen confidence so legitimate NO bets are not marked inconsistent.
+        confidence_basis_for_consistency = confidence_basis_for_polarity
+        yes_equivalent_confidence = self._decision_yes_probability(
+            market,
+            decision.model_copy(
+                update={
+                    "outcome": canonical_outcome,
+                    "confidence": confidence_basis_for_consistency,
+                    "my_prob": my_prob,
+                    "probability_yes": decision.probability_yes,
+                }
+            ),
         )
         if (
             my_prob is not None
-            and abs(my_prob - confidence_basis_for_consistency) > _PROB_CONSISTENCY_TOLERANCE
+            and yes_equivalent_confidence is not None
+            and abs(my_prob - yes_equivalent_confidence) > _PROB_CONSISTENCY_TOLERANCE
         ):
             prob_consistency_ok = False
 
@@ -1629,6 +1767,11 @@ class GrokClient:
 
         merged_sources = list(dict.fromkeys([*(first.key_sources or []), *(second.key_sources or [])]))[:4]
         critique = second.self_critique or second.uncertainty_note or second.reasoning
+        yes_implied = (
+            self._market_implied_probability(market, yes_outcome)
+            if yes_outcome
+            else self._market_implied_probability(market, "YES")
+        )
         if trade_disagree or side_disagree or probability_disagree:
             repair_critique = (
                 "self_consistency_disagreement: "
@@ -1653,10 +1796,14 @@ class GrokClient:
                     "outcome": merged_outcome,
                     "confidence": conservative_confidence,
                     "probability_yes": averaged_yes,
-                    "my_prob": conservative_confidence,
-                    "implied_prob_external": self._market_implied_probability(
-                        market,
-                        merged_outcome,
+                    # Persist YES-side probability fields so the posterior floor
+                    # and edge gate see a coherent NO edge after calibration.
+                    "my_prob": averaged_yes,
+                    "implied_prob_external": yes_implied,
+                    "edge_external": (
+                        max(-1.0, min(1.0, averaged_yes - yes_implied))
+                        if yes_implied is not None
+                        else None
                     ),
                     "key_sources": merged_sources,
                     "uncertainty_note": second.uncertainty_note or first.uncertainty_note,
@@ -1682,10 +1829,12 @@ class GrokClient:
                 "outcome": merged_outcome,
                 "confidence": max(0.0, min(1.0, merged_confidence)),
                 "probability_yes": averaged_yes,
-                "my_prob": max(0.0, min(1.0, merged_confidence)),
-                "implied_prob_external": self._market_implied_probability(
-                    market,
-                    merged_outcome,
+                "my_prob": averaged_yes,
+                "implied_prob_external": yes_implied,
+                "edge_external": (
+                    max(-1.0, min(1.0, averaged_yes - yes_implied))
+                    if yes_implied is not None
+                    else None
                 ),
                 "key_sources": merged_sources,
                 "base_rate_used": (

@@ -1968,6 +1968,41 @@ class MarketStateManager:
         self._conn.commit()
         return cursor.rowcount
 
+    _JURISDICTION_SPORTS_HOLD_MARKERS = (
+        "jurisdiction_sports_hold",
+        "jurisdiction_sports_analysis_held",
+        "jurisdiction_sports_blocked",
+    )
+
+    @staticmethod
+    def is_jurisdiction_sports_hold_entry(entry: dict[str, Any]) -> bool:
+        """True when a queue row is a sports jurisdiction soft-hold parking lot.
+
+        These entries are not learning-to-execution candidates while the
+        runtime jurisdiction flag remains set; draining them wastes probe
+        slots that should go to edge/conviction near-misses.
+        """
+        gate_name = str(entry.get("gate_name") or "").strip().lower()
+        reason = str(entry.get("reason") or "").strip().lower()
+        markers = MarketStateManager._JURISDICTION_SPORTS_HOLD_MARKERS
+        if any(marker in gate_name for marker in markers):
+            return True
+        if any(marker in reason for marker in markers):
+            return True
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                payload = json.loads(decision_json)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                audit = payload.get("audit")
+                if isinstance(audit, dict):
+                    final_reason = str(audit.get("final_reason") or "").strip().lower()
+                    if any(marker in final_reason for marker in markers):
+                        return True
+        return False
+
     def get_drainable_research_entries(
         self,
         *,
@@ -1999,6 +2034,9 @@ class MarketStateManager:
         qualifying rows after pruning. Callers that need per-cycle telemetry
         on how many were skipped should call ``estimate_research_entry_priority``
         themselves; this entry point only returns the qualifying rows.
+
+        Sports jurisdiction holds are excluded from drain promotion (markets
+        remain analyzable when jurisdiction clears; this is not a family block).
         """
         now = datetime.now(timezone.utc)
         max_cutoff_iso = (
@@ -2023,7 +2061,8 @@ class MarketStateManager:
                 return []
         effective_limit = max(0, int(limit))
         fetch_limit = effective_limit
-        if min_priority is not None and effective_limit > 0:
+        # Over-fetch when post-filters (priority / jurisdiction holds) may drop rows.
+        if effective_limit > 0:
             fetch_limit = max(effective_limit, effective_limit * 4)
         where_clauses = [
             "queued_at >= ?",
@@ -2055,7 +2094,11 @@ class MarketStateManager:
         params_list.append(fetch_limit)
         params: tuple[Any, ...] = tuple(params_list)
         rows = self._conn.execute(sql, params).fetchall()
-        results = [dict(row) for row in rows]
+        results = [
+            dict(row)
+            for row in rows
+            if not MarketStateManager.is_jurisdiction_sports_hold_entry(dict(row))
+        ]
         if min_priority is None or not results:
             return results[:effective_limit] if effective_limit else results
         cutoff = float(min_priority)
@@ -2165,6 +2208,9 @@ class MarketStateManager:
             priority = (priority if priority is not None else 0.0) + 0.08
             signals_present = True
         gate_name = str(entry.get("gate_name") or "").strip().lower()
+        if MarketStateManager.is_jurisdiction_sports_hold_entry(entry):
+            # Jurisdiction soft-holds are parked, not drain candidates.
+            return 0.0
         if gate_name == "conviction_repair":
             # Repair passes already found strong edge/evidence but produced no
             # executable decision; these are the highest-value retry candidates

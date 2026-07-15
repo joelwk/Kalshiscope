@@ -562,3 +562,78 @@ def test_estimate_research_entry_priority_conviction_repair_signal_alone_is_suff
     assert priority >= 0.40
 
 
+def test_is_jurisdiction_sports_hold_entry_detects_gate_and_reason() -> None:
+    assert MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {"gate_name": "jurisdiction_sports_hold", "reason": "held"}
+    )
+    assert MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {
+            "gate_name": "research",
+            "reason": "jurisdiction_sports_analysis_held",
+        }
+    )
+    assert MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {
+            "gate_name": "other",
+            "reason": "other",
+            "last_decision_json": (
+                '{"audit": {"final_reason": "jurisdiction_sports_blocked"}}'
+            ),
+        }
+    )
+    assert not MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {"gate_name": "conviction_repair", "reason": "conviction_repair_no_trade"}
+    )
+
+
+def test_estimate_research_entry_priority_zeros_jurisdiction_sports_holds() -> None:
+    priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "gate_name": "jurisdiction_sports_hold",
+            "reason": "jurisdiction_sports_analysis_held",
+            "threshold_gap": 0.0,
+            "last_decision_json": '{"audit": {"research_priority": 0.90}}',
+        }
+    )
+    assert priority == 0.0
+
+
+def test_drainable_entries_exclude_jurisdiction_sports_holds() -> None:
+    mgr = _make_manager()
+    queued_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    for market_id, gate_name, reason in (
+        ("KXSPORTS-HOLD", "jurisdiction_sports_hold", "jurisdiction_sports_analysis_held"),
+        ("KXWEATHER-NEAR", "edge_gate", "edge_gate_blocked"),
+    ):
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id,
+                "c1",
+                queued_at,
+                gate_name,
+                reason,
+                0.02,
+                None,
+                queued_at,
+                None,
+                '{"audit": {"research_priority": 0.80}}',
+            ),
+        )
+    mgr._conn.commit()
+
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=5,
+    )
+    drained_ids = [entry["market_id"] for entry in drainable]
+    assert "KXSPORTS-HOLD" not in drained_ids
+    assert "KXWEATHER-NEAR" in drained_ids
+

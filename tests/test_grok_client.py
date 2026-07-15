@@ -574,6 +574,92 @@ class TestGrokClient(unittest.TestCase):
         self.assertTrue(decision.abstain)
         self.assertIn("self_consistency_disagreement", decision.reasoning)
         self.assertIn("deep repair required", decision.self_critique or "")
+        # Disagreement merge must still persist YES-side polarity fields.
+        self.assertAlmostEqual(decision.probability_yes or 0.0, 0.58, places=2)
+        self.assertAlmostEqual(decision.my_prob or 0.0, 0.58, places=2)
+        self.assertAlmostEqual(decision.implied_prob_external or 0.0, 0.55, places=2)
+
+    def test_self_consistency_no_agreement_stores_yes_side_my_prob(self) -> None:
+        market = Market(
+            id="m-self-consistency-no",
+            question="Will the high be 85-86?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.47),
+                MarketOutcome(name="NO", price=0.53),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "NO", "confidence": 0.78, '
+            '"probability_yes": 0.22, "my_prob": 0.22, "bet_size_pct": 0.5, '
+            '"reasoning": "NWS favors below bin. Implied YES 47%, my YES 22%.", '
+            '"evidence_quality": 0.9, "primary_source_url": '
+            '"https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43", '
+            '"evidence_basis": "direct", "edge_source": "computed"}'
+        )
+        second = (
+            '{"should_trade": true, "outcome": "NO", "confidence": 0.82, '
+            '"probability_yes": 0.18, "my_prob": 0.18, "bet_size_pct": 0.5, '
+            '"reasoning": "NWS still favors below bin after counter-check.", '
+            '"evidence_quality": 0.9, "primary_source_url": '
+            '"https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43", '
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"self_critique": "Humidity residual uncertainty."}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, second])
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(decision.outcome, "NO")
+        self.assertAlmostEqual(decision.probability_yes or 0.0, 0.20, places=2)
+        # Must store P(YES), not chosen-side confidence (~0.80).
+        self.assertAlmostEqual(decision.my_prob or 0.0, 0.20, places=2)
+        self.assertAlmostEqual(decision.implied_prob_external or 0.0, 0.47, places=2)
+        self.assertLess(decision.edge_external or 0.0, 0.0)
+
+    def test_validate_and_enrich_normalizes_chosen_side_no_to_yes_side(self) -> None:
+        market = Market(
+            id="KXHIGHTATL-26JUL14-B85.5",
+            question="Will the maximum temperature be 85-86 on Jul 14, 2026?",
+            category="climate",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.47),
+                MarketOutcome(name="NO", price=0.53),
+            ],
+        )
+        # ATL-shaped bug: model stored chosen-side my_prob=confidence with
+        # positive edge_external on a NO call.
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.82,
+            raw_confidence=0.82,
+            bet_size_pct=0.4,
+            reasoning=(
+                "NWS forecast.weather.gov as of Jul 14 favors high below 85. "
+                "Implied NO 53%, my NO 82%, edge 29%."
+            ),
+            my_prob=0.82,
+            implied_prob_external=0.53,
+            edge_external=0.29,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=1.0,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertAlmostEqual(validated.my_prob or 0.0, 0.18, places=2)
+        self.assertAlmostEqual(validated.implied_prob_external or 0.0, 0.47, places=2)
+        self.assertAlmostEqual(validated.edge_external or 0.0, -0.29, places=2)
+        self.assertTrue(validated.should_trade)
 
     def test_self_consistency_skips_second_pass_below_thresholds(self) -> None:
         market = Market(
