@@ -77,6 +77,7 @@ class Settings:
     FALLBACK_EDGE_MIN_EDGE: float = 0.30
     FALLBACK_EDGE_MIN_EDGE_MULTIPLIER: float = 0.90
     WEATHER_MIN_EDGE: float = 0.14
+    WEATHER_HIGH_EQ_EDGE_MULTIPLIER: float = 0.85
     WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.34
     # Block weather entries when the chosen-outcome market price is an underdog
     # (< LOW_PRICE_THRESHOLD). Lifetime weather underdog WR ~32% / large negative PnL.
@@ -626,7 +627,7 @@ class Settings:
     SCORE_EXTREME_CONFIDENCE_PENALTY_BASE: float = 0.08
     MENTION_MARKET_SCORE_PENALTY: float = 0.10
     WEATHER_SCORE_PENALTY: float = 0.12
-    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.80
+    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.65
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER: float = 0.72
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS: float = 0.65
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT: float = 0.75
@@ -1107,6 +1108,10 @@ def load_settings() -> Settings:
         ),
         WEATHER_MIN_EDGE=_read_env_float(
             "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
+        ),
+        WEATHER_HIGH_EQ_EDGE_MULTIPLIER=_read_env_float(
+            "WEATHER_HIGH_EQ_EDGE_MULTIPLIER",
+            Settings.WEATHER_HIGH_EQ_EDGE_MULTIPLIER,
         ),
         WEATHER_FALLBACK_EDGE_MIN_EDGE=_read_env_float(
             "WEATHER_FALLBACK_EDGE_MIN_EDGE",

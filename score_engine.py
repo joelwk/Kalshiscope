@@ -205,7 +205,10 @@ def compute_final_score(
         bayesian_component = max(0.0, bayesian_component_weight) * (bayesian_posterior - 0.5)
     inefficiency_component = 0.0
     if inefficiency_signal is not None:
-        inefficiency_component = max(0.0, inefficiency_component_weight) * abs(inefficiency_signal)
+        chosen_side_inefficiency = max(0.0, float(inefficiency_signal))
+        inefficiency_component = (
+            max(0.0, inefficiency_component_weight) * chosen_side_inefficiency
+        )
     kelly_component = 0.0
     if kelly_raw is not None:
         kelly_component = max(0.0, kelly_component_weight) * max(0.0, min(1.0, kelly_raw))

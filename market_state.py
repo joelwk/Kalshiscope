@@ -1976,11 +1976,11 @@ class MarketStateManager:
 
     @staticmethod
     def is_jurisdiction_sports_hold_entry(entry: dict[str, Any]) -> bool:
-        """True when a queue row is a sports jurisdiction soft-hold parking lot.
+        """True when a queue row is a legacy sports jurisdiction parking entry.
 
-        These entries are not learning-to-execution candidates while the
-        runtime jurisdiction flag remains set; draining them wastes probe
-        slots that should go to edge/conviction near-misses.
+        New runs keep jurisdiction errors order-scoped, but historical rows must
+        remain excluded so they cannot waste probe slots intended for
+        edge/conviction near-misses.
         """
         gate_name = str(entry.get("gate_name") or "").strip().lower()
         reason = str(entry.get("reason") or "").strip().lower()
@@ -2003,6 +2003,35 @@ class MarketStateManager:
                         return True
         return False
 
+    _SOFT_RESEARCH_DRAIN_PLACEHOLDER_MARKERS = (
+        "soft_research",
+        "pre_analysis_score_soft_research",
+        "pre_analysis_score_far_below_min",
+        "pre_analysis_score_below_min",
+    )
+
+    @staticmethod
+    def is_soft_research_drain_placeholder(entry: dict[str, Any]) -> bool:
+        """True for pre-analysis soft-research placeholders that starve drain.
+
+        Soft-research rows dominate the queue by age. When priority filtering is
+        active they should not consume the over-fetch window ahead of edge /
+        conviction near-misses (score-promotion still resurfaces soft-research).
+        """
+        if MarketStateManager.is_repeated_low_yield_research_entry(entry):
+            return True
+        gate_name = str(entry.get("gate_name") or "").strip().lower()
+        reason = str(entry.get("reason") or "").strip().lower()
+        markers = MarketStateManager._SOFT_RESEARCH_DRAIN_PLACEHOLDER_MARKERS
+        if any(marker in gate_name for marker in markers):
+            return True
+        if any(marker in reason for marker in markers):
+            return True
+        # Movement-score soft band uses gate_name=pre_analysis_movement_score.
+        if "pre_analysis" in gate_name and "soft_research" in reason:
+            return True
+        return False
+
     def get_drainable_research_entries(
         self,
         *,
@@ -2020,9 +2049,12 @@ class MarketStateManager:
         candidate list, already-traded markets, or recently-resolved markets) so
         we don't double-promote. ``included_market_ids`` optionally restricts
         drain candidates to the current filtered market set, preventing stale
-        queue rows from consuming the over-fetch pool. Results are ordered
-        oldest-first to give the longest-waiting entries a turn before fresher
-        ones.
+        queue rows from consuming the over-fetch pool.
+
+        When ``min_priority`` is set, soft-research / pre-analysis placeholders
+        are excluded from the candidate set and remaining rows are ranked by
+        estimated priority (desc) then age (oldest first) so aged soft-research
+        cannot starve edge/conviction near-misses in the over-fetch window.
 
         ``min_priority`` (optional) filters out entries whose proxied priority is
         below the cutoff. Priority is read from
@@ -2030,13 +2062,12 @@ class MarketStateManager:
         .pre_analysis_score`` when present, otherwise ``1.0 - threshold_gap``.
         Entries without enough metadata to estimate a priority are kept (treated
         as "unknown" rather than penalized). When the filter is active the
-        function over-fetches so the oldest-first ordering still yields enough
+        function over-fetches so priority ranking still yields enough
         qualifying rows after pruning. Callers that need per-cycle telemetry
         on how many were skipped should call ``estimate_research_entry_priority``
         themselves; this entry point only returns the qualifying rows.
 
-        Sports jurisdiction holds are excluded from drain promotion (markets
-        remain analyzable when jurisdiction clears; this is not a family block).
+        Legacy sports jurisdiction holds are excluded from drain promotion.
         """
         now = datetime.now(timezone.utc)
         max_cutoff_iso = (
@@ -2061,9 +2092,11 @@ class MarketStateManager:
                 return []
         effective_limit = max(0, int(limit))
         fetch_limit = effective_limit
-        # Over-fetch when post-filters (priority / jurisdiction holds) may drop rows.
+        # Over-fetch when post-filters (priority / jurisdiction / soft-research)
+        # may drop rows. Fetch a wider window so priority ranking can surface
+        # high-value near-misses buried behind aged soft-research.
         if effective_limit > 0:
-            fetch_limit = max(effective_limit, effective_limit * 4)
+            fetch_limit = max(effective_limit, effective_limit * 8)
         where_clauses = [
             "queued_at >= ?",
             "queued_at <= ?",
@@ -2082,6 +2115,17 @@ class MarketStateManager:
             placeholders = ",".join("?" * len(excluded))
             where_clauses.append(f"market_id NOT IN ({placeholders})")
             params_list.extend(excluded)
+        # When priority filtering is active, exclude soft-research placeholders
+        # in SQL so they cannot fill the over-fetch window.
+        if min_priority is not None:
+            soft_markers = MarketStateManager._SOFT_RESEARCH_DRAIN_PLACEHOLDER_MARKERS
+            soft_clauses = []
+            for marker in soft_markers:
+                soft_clauses.append("lower(coalesce(gate_name, '')) NOT LIKE ?")
+                params_list.append(f"%{marker}%")
+                soft_clauses.append("lower(coalesce(reason, '')) NOT LIKE ?")
+                params_list.append(f"%{marker}%")
+            where_clauses.append("(" + " AND ".join(soft_clauses) + ")")
         sql = f"""
             SELECT market_id, cycle_id, queued_at, gate_name, reason,
                    threshold_gap, what_to_learn_next, last_seen, expires_at,
@@ -2098,12 +2142,29 @@ class MarketStateManager:
             dict(row)
             for row in rows
             if not MarketStateManager.is_jurisdiction_sports_hold_entry(dict(row))
+            and not (
+                min_priority is not None
+                and MarketStateManager.is_soft_research_drain_placeholder(dict(row))
+            )
         ]
-        if min_priority is None or not results:
+        if not results:
+            return []
+        if min_priority is None:
             return results[:effective_limit] if effective_limit else results
+
         cutoff = float(min_priority)
+
+        def _drain_rank_key(entry: dict[str, Any]) -> tuple[float, str]:
+            priority = self.estimate_research_entry_priority(entry)
+            # Unknown priority ranks as admissible (0.0 sort key inverted via
+            # treating None as meeting cutoff and sorting just below cutoff).
+            rank_priority = float(cutoff) if priority is None else float(priority)
+            queued_at = str(entry.get("queued_at") or "")
+            return (-rank_priority, queued_at)
+
+        ranked = sorted(results, key=_drain_rank_key)
         filtered: list[dict[str, Any]] = []
-        for entry in results:
+        for entry in ranked:
             priority = self.estimate_research_entry_priority(entry)
             if priority is None or priority >= cutoff:
                 filtered.append(entry)
@@ -2209,12 +2270,25 @@ class MarketStateManager:
             signals_present = True
         gate_name = str(entry.get("gate_name") or "").strip().lower()
         if MarketStateManager.is_jurisdiction_sports_hold_entry(entry):
-            # Jurisdiction soft-holds are parked, not drain candidates.
+            # Legacy jurisdiction parking rows are not drain candidates.
             return 0.0
         if gate_name == "conviction_repair":
             # Repair passes already found strong edge/evidence but produced no
             # executable decision; these are the highest-value retry candidates
             # in the queue (June 2026: 197 parked with zero prioritized drains).
+            priority = (priority if priority is not None else 0.0) + 0.15
+            signals_present = True
+        # Edge near-misses within 3pp of the gate are high-value drain targets
+        # (Jul 2026: weather EQ=1.0 setups parked at 0.12 vs 0.14 WEATHER_MIN_EDGE).
+        _EDGE_NEAR_MISS_MARKERS = (
+            "edge_gate_blocked",
+            "edge_below_min",
+            "edge below min",
+            "weather_evidence_quality_below_min",
+        )
+        if any(marker in reason_text for marker in _EDGE_NEAR_MISS_MARKERS) and (
+            isinstance(threshold_gap, (int, float)) and float(threshold_gap) <= 0.03
+        ):
             priority = (priority if priority is not None else 0.0) + 0.15
             signals_present = True
         if MarketStateManager.is_repeated_low_yield_research_entry(entry):

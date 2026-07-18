@@ -38,6 +38,32 @@ _RE_LOW_INFORMATION = re.compile(
     r"(?:evidence|information|data))",
     re.IGNORECASE,
 )
+_RE_MISSING_CURRENT_SOURCE = re.compile(
+    r"(?:"
+    r"no (?:current |direct |settlement[- ]aligned |official )?"
+    r"(?:nws |noaa |asos |metar |station )?"
+    r"(?:point |daily )?"
+    r"(?:source|report|summary|observation|observed (?:value|maximum|minimum)|"
+    r"forecast|quote|price)[^.]{0,80}"
+    r"(?:found|available|released|published)"
+    r"|(?:source|report|summary|observation|observed (?:value|maximum|minimum)|"
+    r"forecast|quote|price)[^.]{0,80}"
+    r"(?:is |was )?(?:still )?"
+    r"(?:missing|pending|unavailable|not (?:yet )?available)"
+    r"|missing (?:a |the )?(?:primary|direct|settlement[- ]aligned|official)"
+    r"(?: source| url| report| summary)?"
+    r"|search(?:es)? (?:returned|found) (?:only )?(?:unrelated|outdated|no )"
+    r"|no [^.]{0,120}(?:settlement|official|current|exact)[^.]{0,120}"
+    r"(?:published|available|found|supports?)"
+    r"|no [^.]{0,160}(?:settlement[- ]aligned|official)[^.]{0,160}\byet\b"
+    r"|(?:settlement[- ]aligned|official|current|exact)[^.]{0,120}"
+    r"(?:not (?:yet )?(?:published|available|found)|"
+    r"(?:is |was )?(?:missing|unavailable|pending))"
+    r"|evidence (?:is )?(?:absent|missing)"
+    r"|absence of (?:settlement|direct|current)"
+    r")",
+    re.IGNORECASE,
+)
 _RE_PREVIEW_OR_PROXY_SOURCE = re.compile(
     r"\b(preview|probable|probables|projected|projection|expected|matchup|form|"
     r"pre-game|pregame|lineup preview|odds preview|scheduled)\b",
@@ -790,8 +816,12 @@ class GrokClient:
         has_verifiable_signal: bool,
         low_information: bool,
         source_match_class: str = "",
+        explicit_evidence_basis: str = "",
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
+        normalized_explicit_basis = str(explicit_evidence_basis or "").strip().lower()
+        if low_information or normalized_explicit_basis == "absence_only":
+            return "absence_only"
         has_absence_signal = any(
             token in normalized_reasoning
             for token in (
@@ -944,8 +974,13 @@ class GrokClient:
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
         primary_source_url = self._extract_primary_source_url(decision)
+        explicit_evidence_basis = str(decision.evidence_basis or "").strip().lower()
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
-        low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
+        low_information = bool(
+            _RE_LOW_INFORMATION.search(decision.reasoning or "")
+            or _RE_MISSING_CURRENT_SOURCE.search(decision.reasoning or "")
+            or explicit_evidence_basis == "absence_only"
+        )
         source_text_for_validation = " ".join(
             part
             for part in (
@@ -1017,6 +1052,7 @@ class GrokClient:
             has_verifiable_signal=has_verifiable_signal,
             low_information=low_information,
             source_match_class=source_match_class,
+            explicit_evidence_basis=explicit_evidence_basis,
         )
         active_settings = self.settings or Settings()
         proxy_confidence_cap = max(0.0, min(1.0, active_settings.GROK_PROXY_CONFIDENCE_CAP))
@@ -1073,7 +1109,10 @@ class GrokClient:
             evidence_basis_class = "proxy"
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
-        if active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED:
+        if (
+            active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED
+            and not low_information
+        ):
             settlement_aligned = source_match_class == "settlement_aligned"
             convergent_signals = sum(
                 [

@@ -6,9 +6,11 @@ from config import Settings
 from main import (
     _cap_analysis_candidates,
     _effective_score_gate_threshold,
+    _order_lifecycle_metrics,
     _pre_analysis_opportunity_score,
+    _sizing_audit_fields,
 )
-from models import Market, MarketOutcome, MarketState, TradeDecision
+from models import Market, MarketOutcome, MarketState, OrderResponse, TradeDecision
 from participation import ParticipationTier, classify_participation
 from score_engine import compute_final_score
 
@@ -247,6 +249,94 @@ def test_execution_funnel_source_confirmed_path_rejects_proxy_without_primary_so
     )
     assert score.source_confirmed_edge is False
     assert "non_positive_market_edge" in score.rejection_reasons
+
+
+def test_order_lifecycle_metrics_distinguish_execution_partial_and_resting() -> None:
+    executed = _order_lifecycle_metrics(
+        OrderResponse(
+            id="executed",
+            status="executed",
+            raw={
+                "fill_count": "4.00",
+                "client_qty_shares": 4,
+                "client_price": 0.61,
+            },
+        ),
+        submitted_amount_usdc=2.0,
+    )
+    partial = _order_lifecycle_metrics(
+        OrderResponse(
+            id="partial",
+            status="partially_filled",
+            raw={
+                "fill_count": "1.00",
+                "client_qty_shares": 6,
+                "client_price": 0.39,
+            },
+        ),
+        submitted_amount_usdc=2.0,
+    )
+    resting = _order_lifecycle_metrics(
+        OrderResponse(
+            id="resting",
+            status="resting",
+            raw={
+                "fill_count": "0.00",
+                "client_qty_shares": 3,
+                "client_price": 0.77,
+            },
+        ),
+        submitted_amount_usdc=2.0,
+    )
+
+    assert executed.fully_filled is True
+    assert executed.partially_filled is False
+    assert executed.resting_unfilled is False
+    assert executed.filled_notional_usdc == 2.44
+
+    assert partial.fully_filled is False
+    assert partial.partially_filled is True
+    assert partial.resting_unfilled is False
+    assert partial.filled_notional_usdc == 0.39
+
+    assert resting.fully_filled is False
+    assert resting.partially_filled is False
+    assert resting.resting_unfilled is True
+    assert resting.filled_notional_usdc == 0.0
+
+
+def test_sizing_audit_fields_include_kelly_lmsr_and_floor_context() -> None:
+    payload = _sizing_audit_fields(
+        sizing_mode="kelly",
+        raw_bet_amount_usdc=1.75,
+        bet_amount_usdc=2.0,
+        min_bet_floor_applied=True,
+        kelly_sub_floor_skipped=False,
+        kelly_min_bet_policy_applied="fallback_edge_scaling",
+        kelly_raw=0.50,
+        kelly_fraction_value=0.30,
+        posterior_for_kelly=0.89,
+        min_edge_for_kelly=0.08,
+        kelly_effective_fraction=0.20,
+        historical_family_size_multiplier=0.55,
+        lmsr_execution_price=0.61,
+        lmsr_inefficiency_signal=0.28,
+        expected_value_usdc=0.90,
+    )
+
+    assert payload["sizing_mode"] == "kelly"
+    assert payload["raw_bet_amount_usdc"] == 1.75
+    assert payload["bet_amount_usdc"] == 2.0
+    assert payload["min_bet_floor_applied"] is True
+    assert payload["kelly_min_bet_policy_applied"] == "fallback_edge_scaling"
+    assert payload["kelly_raw"] == 0.50
+    assert payload["kelly_fraction_value"] == 0.30
+    assert payload["posterior_for_kelly"] == 0.89
+    assert payload["kelly_effective_fraction"] == 0.20
+    assert payload["historical_family_size_multiplier"] == 0.55
+    assert payload["lmsr_execution_price"] == 0.61
+    assert payload["lmsr_inefficiency_signal"] == 0.28
+    assert payload["expected_value_usdc"] == 0.90
 
 
 # ---------------------------------------------------------------------------

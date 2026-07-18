@@ -637,3 +637,108 @@ def test_drainable_entries_exclude_jurisdiction_sports_holds() -> None:
     assert "KXSPORTS-HOLD" not in drained_ids
     assert "KXWEATHER-NEAR" in drained_ids
 
+
+def test_is_soft_research_drain_placeholder_detects_soft_research_reasons() -> None:
+    assert MarketStateManager.is_soft_research_drain_placeholder(
+        {
+            "gate_name": "pre_analysis_movement_score",
+            "reason": "pre_analysis_score_soft_research",
+        }
+    )
+    assert MarketStateManager.is_soft_research_drain_placeholder(
+        {
+            "gate_name": "pre_analysis",
+            "reason": "pre_analysis_score_far_below_min",
+        }
+    )
+    assert not MarketStateManager.is_soft_research_drain_placeholder(
+        {
+            "gate_name": "edge_gate",
+            "reason": "edge_gate_blocked",
+            "threshold_gap": 0.02,
+            "last_decision_json": (
+                '{"should_trade": true, "confidence": 0.70, '
+                '"evidence_quality": 1.0, "edge_source": "computed", '
+                '"evidence_basis": "direct"}'
+            ),
+        }
+    )
+
+
+def test_estimate_research_entry_priority_boosts_edge_near_miss() -> None:
+    base_entry = {
+        "threshold_gap": 0.02,
+        "last_decision_json": '{"audit": {"research_priority": 0.30}}',
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    near_miss_priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            **base_entry,
+            "gate_name": "edge",
+            "reason": "edge_gate_blocked",
+        }
+    )
+
+    assert base_priority is not None and near_miss_priority is not None
+    assert near_miss_priority == pytest.approx(base_priority + 0.15)
+
+
+def test_drainable_entries_exclude_soft_research_when_min_priority_set() -> None:
+    mgr = _make_manager()
+    older = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+    newer = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    soft_rows = [
+        (
+            f"KXSOFT-{idx}",
+            "pre_analysis_movement_score",
+            "pre_analysis_score_soft_research",
+            older,
+            0.05,
+            '{"audit": {"research_priority": 0.20}}',
+        )
+        for idx in range(12)
+    ]
+    soft_rows.append(
+        (
+            "KXEDGE-NEAR",
+            "edge_gate",
+            "edge_gate_blocked",
+            newer,
+            0.02,
+            '{"audit": {"research_priority": 0.45, "evidence_quality": 1.0}}',
+        )
+    )
+    for market_id, gate_name, reason, queued_at, gap, decision_json in soft_rows:
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id,
+                "c1",
+                queued_at,
+                gate_name,
+                reason,
+                gap,
+                None,
+                queued_at,
+                None,
+                decision_json,
+            ),
+        )
+    mgr._conn.commit()
+
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=3,
+        min_priority=0.40,
+    )
+    drained_ids = [entry["market_id"] for entry in drainable]
+    assert "KXEDGE-NEAR" in drained_ids
+    assert all(not mid.startswith("KXSOFT-") for mid in drained_ids)
+

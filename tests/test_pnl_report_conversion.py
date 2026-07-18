@@ -80,6 +80,22 @@ def test_conversion_funnel_section_renders(tmp_path) -> None:
         )
         conn.execute(
             """
+            INSERT INTO decision_receipts (
+                market_id, timestamp, decision_json, audit_json, final_action, final_reason
+            )
+            VALUES (
+                'SPORT-HELD',
+                ?,
+                '{"should_trade": false, "prompt_tokens": null}',
+                '{"market_family":"sports","synthetic_decision": false}',
+                'research_queued',
+                'jurisdiction_sports_analysis_held'
+            )
+            """,
+            (recent,),
+        )
+        conn.execute(
+            """
             INSERT INTO exchange_settlements (
                 settlement_id, market_id, won, pnl_realized, contracts, avg_price,
                 settled_at, raw_json
@@ -98,6 +114,8 @@ def test_conversion_funnel_section_renders(tmp_path) -> None:
     output = output_buffer.getvalue()
     assert "Analyzed -> Executed Conversion" in output
     assert "sports" in output
+    sports_line = next(line for line in output.splitlines() if line.startswith("sports"))
+    assert int(sports_line.split()[1]) == 1
 
 
 def test_confidence_tier_label_bands_are_contiguous() -> None:

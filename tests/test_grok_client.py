@@ -1648,6 +1648,173 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertEqual(generic.evidence_basis, "proxy")
 
+    def test_weather_missing_current_source_is_not_upgraded_by_source_keywords(self) -> None:
+        market = Market(
+            id="KXLOWTSATX-26JUL17-T77",
+            question="Will the minimum temperature be above 77F in San Antonio?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.74),
+                MarketOutcome(name="NO", price=0.26),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.52,
+            probability_yes=0.48,
+            bet_size_pct=0.0,
+            reasoning=(
+                "No NWS point forecast or station observation was found for the "
+                "current settlement day. The official climatological report is "
+                "pending. evidence_basis=absence_only; missing primary source."
+            ),
+            implied_prob_external=0.74,
+            my_prob=0.48,
+            edge_external=-0.26,
+            edge_source="computed",
+            evidence_basis="absence_only",
+            evidence_quality=0.0,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.source_match_class, "missing_or_absence_only")
+        self.assertEqual(validated.evidence_basis, "absence_only")
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+        self.assertFalse(validated.should_trade)
+
+    def test_weather_outdated_observation_url_does_not_override_current_data_gap(self) -> None:
+        market = Market(
+            id="KXHIGHTSEA-26JUL17-B74.5",
+            question="Will Seattle's maximum temperature be 74-75F?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.33),
+                MarketOutcome(name="NO", price=0.67),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.53,
+            probability_yes=0.53,
+            bet_size_pct=0.0,
+            reasoning=(
+                "No current NWS daily summary or observed maximum is available "
+                "yet. The cited station page only contains prior-day observations, "
+                "so the settlement-aligned source is still missing."
+            ),
+            key_sources=[
+                "https://tgftp.nws.noaa.gov/weather/current/KSEA.html (prior day)"
+            ],
+            implied_prob_external=0.33,
+            my_prob=0.53,
+            edge_external=0.20,
+            edge_source="computed",
+            evidence_basis="absence_only",
+            primary_source_url=(
+                "https://tgftp.nws.noaa.gov/weather/current/KSEA.html"
+            ),
+            evidence_quality=0.0,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.source_match_class, "missing_or_absence_only")
+        self.assertEqual(validated.evidence_basis, "absence_only")
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+        self.assertIsNone(validated.evidence_quality_floor_applied)
+
+    def test_weather_current_observation_with_url_remains_direct(self) -> None:
+        market = Market(
+            id="KXLOWTDEN-26JUL17-B64.5",
+            question="Will Denver's minimum temperature be 64-65F?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.39),
+                MarketOutcome(name="NO", price=0.61),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.81,
+            probability_yes=0.10,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Current NWS KDEN ASOS observations show today's daily minimum "
+                "was 66F at 05:53 MDT, above the bin. The observed value and "
+                "timestamp directly resolve the settlement criterion."
+            ),
+            implied_prob_external=0.39,
+            my_prob=0.10,
+            edge_external=-0.29,
+            edge_source="computed",
+            evidence_basis="direct",
+            primary_source_url=(
+                "https://forecast.weather.gov/data/obhistory/KDEN.html"
+            ),
+            evidence_quality=0.90,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertGreaterEqual(validated.evidence_quality, 0.75)
+
+    def test_unpublished_settlement_chart_overrides_direct_keyword_match(self) -> None:
+        market = Market(
+            id="KXNETFLIXTOPVIEWSMOVIE-26JUL20-12",
+            question="Will the top Netflix movie exceed 12M views?",
+            category="entertainment",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.50,
+            bet_size_pct=0.0,
+            reasoning=(
+                "No official Netflix Top 10 chart for the settlement period has "
+                "been published yet. The current chart covers the prior week, so "
+                "direct settlement data is unavailable."
+            ),
+            implied_prob_external=0.55,
+            my_prob=0.50,
+            edge_external=-0.05,
+            edge_source="computed",
+            evidence_basis="direct",
+            primary_source_url="https://www.netflix.com/tudum/top10",
+            evidence_quality=0.0,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="entertainment",
+        )
+
+        self.assertEqual(validated.source_match_class, "missing_or_absence_only")
+        self.assertEqual(validated.evidence_basis, "absence_only")
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+
     def test_commodity_with_allowlisted_settlement_url_counts_as_direct(self) -> None:
         # Core unblock: once a commodity market cites a reachable settlement-grade
         # URL (cmegroup.com), settlement-aligned evidence counts as direct and the

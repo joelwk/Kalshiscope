@@ -531,6 +531,7 @@ def _print_conversion_funnel(db_path: str, *, lookback_days: int = CONVERSION_FU
             FROM decision_receipts d
             WHERE d.timestamp >= ?
               AND COALESCE(json_extract(d.audit_json, '$.synthetic_decision'), 0) != 1
+              AND COALESCE(d.final_reason, '') != 'jurisdiction_sports_analysis_held'
             GROUP BY market_family
             ORDER BY analyzed DESC
             """,

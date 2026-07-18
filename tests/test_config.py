@@ -203,9 +203,10 @@ class TestConfig(unittest.TestCase):
     def test_weather_profitability_defaults_are_conservative(self) -> None:
         self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.65)
         self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
-        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.80)
+        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.65)
         self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
+        self.assertEqual(config.Settings.WEATHER_HIGH_EQ_EDGE_MULTIPLIER, 0.85)
         self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
         self.assertTrue(config.Settings.WEATHER_BLOCK_UNDERDOG_ENTRIES)
         self.assertEqual(config.Settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE, 0.20)
@@ -330,6 +331,8 @@ class TestConfig(unittest.TestCase):
             "LOW_PRICE_MIN_EDGE_MULTIPLIER=0.85",
             "FALLBACK_EDGE_MIN_EDGE=0.30",
             "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=0.90",
+            "WEATHER_MIN_EDGE=0.14",
+            "WEATHER_HIGH_EQ_EDGE_MULTIPLIER=0.85",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE=0.34",
             "WEATHER_BLOCK_UNDERDOG_ENTRIES=true",
             "WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20",

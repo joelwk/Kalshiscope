@@ -744,10 +744,12 @@ def _extract_order_cancel_reason(order_response: Any) -> str | None:
     return None
 
 
-def _extract_order_fill_count(order_response: Any) -> float | None:
+def _extract_order_numeric_field(
+    order_response: Any,
+    candidate_keys: tuple[str, ...],
+) -> float | None:
     if order_response is None or not isinstance(order_response, dict):
         return None
-    candidate_keys = ("fill_count_fp", "fill_count", "filled_count")
     for key in candidate_keys:
         value = order_response.get(key)
         if value is None:
@@ -767,6 +769,89 @@ def _extract_order_fill_count(order_response: Any) -> float | None:
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def _extract_order_fill_count(order_response: Any) -> float | None:
+    return _extract_order_numeric_field(
+        order_response,
+        ("fill_count_fp", "fill_count", "filled_count"),
+    )
+
+
+@dataclass(frozen=True)
+class OrderLifecycleMetrics:
+    status: str
+    fill_count: float
+    requested_count: float | None
+    filled_notional_usdc: float
+    fully_filled: bool
+    partially_filled: bool
+    resting_unfilled: bool
+
+
+def _order_lifecycle_metrics(
+    order_response: Any,
+    *,
+    submitted_amount_usdc: float,
+) -> OrderLifecycleMetrics:
+    status = str(getattr(order_response, "status", "") or "").strip().lower()
+    raw = getattr(order_response, "raw", None)
+    raw_payload = raw if isinstance(raw, dict) else {}
+    fill_count = max(0.0, float(_extract_order_fill_count(raw_payload) or 0.0))
+    requested_count = _extract_order_numeric_field(
+        raw_payload,
+        ("client_qty_shares", "count", "requested_count"),
+    )
+    if requested_count is not None:
+        requested_count = max(0.0, float(requested_count))
+
+    fully_filled = status in {"executed", "filled"}
+    if requested_count and fill_count >= requested_count - 1e-9:
+        fully_filled = True
+    partially_filled = fill_count > 0.0 and not fully_filled
+    resting_unfilled = (
+        fill_count <= 0.0
+        and status in {"accepted", "open", "pending", "resting"}
+    )
+
+    client_price = _extract_order_numeric_field(
+        raw_payload,
+        ("client_price", "price"),
+    )
+    if fill_count > 0.0 and client_price is not None and client_price > 0.0:
+        filled_notional_usdc = fill_count * float(client_price)
+    elif fully_filled:
+        filled_notional_usdc = max(0.0, float(submitted_amount_usdc))
+    else:
+        filled_notional_usdc = 0.0
+
+    return OrderLifecycleMetrics(
+        status=status,
+        fill_count=fill_count,
+        requested_count=requested_count,
+        filled_notional_usdc=round(filled_notional_usdc, 6),
+        fully_filled=fully_filled,
+        partially_filled=partially_filled,
+        resting_unfilled=resting_unfilled,
+    )
+
+
+def _execution_family_stats_bucket(
+    execution_family_stats: dict[str, dict[str, float]],
+    family_name: str,
+) -> dict[str, float]:
+    return execution_family_stats.setdefault(
+        family_name,
+        {
+            "order_attempts": 0.0,
+            "orders_filled": 0.0,
+            "orders_partially_filled": 0.0,
+            "orders_resting_unfilled": 0.0,
+            "orders_canceled_unfilled": 0.0,
+            "usd_submitted": 0.0,
+            "usd_deployed": 0.0,
+        },
+    )
 
 
 def _collapse_event_ladders(
@@ -1506,6 +1591,7 @@ def _edge_threshold_for_market(
     edge_source: str | None = None,
     market: Market | None = None,
     definitive_outcome_eligible: bool = False,
+    decision: TradeDecision | None = None,
 ) -> float:
     """Effective minimum edge threshold for the edge gate.
 
@@ -1514,6 +1600,10 @@ def _edge_threshold_for_market(
     LOW_PRICE_MIN_EDGE bumps are bypassed — those bumps exist because of
     uncertain pricing, but a settled-game read against a whitelisted
     source has ground-truth pricing semantics.
+
+    High-EQ NWS/direct weather decisions may apply
+    ``WEATHER_HIGH_EQ_EDGE_MULTIPLIER`` to the weather floor so near-misses
+    at ~0.12 vs 0.14 are executable without lowering the low-EQ floor.
     """
     min_edge = settings.MIN_EDGE
     if market is not None and not definitive_outcome_eligible:
@@ -1526,7 +1616,17 @@ def _edge_threshold_for_market(
             min_edge *= max(0.0, float(settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER))
     is_weather_market = market is not None and market_family(market) == "weather"
     if is_weather_market and not definitive_outcome_eligible:
-        min_edge = max(min_edge, settings.WEATHER_MIN_EDGE)
+        weather_floor = float(settings.WEATHER_MIN_EDGE)
+        if decision is not None and _is_high_eq_weather_nws_edge(decision, market):
+            multiplier = max(
+                0.0,
+                min(1.0, float(settings.WEATHER_HIGH_EQ_EDGE_MULTIPLIER)),
+            )
+            weather_floor = max(
+                float(settings.MIN_EDGE),
+                weather_floor * multiplier,
+            )
+        min_edge = max(min_edge, weather_floor)
     if (
         market is not None
         and is_commodity_market(market)
@@ -1556,7 +1656,6 @@ _NWS_NOAA_HOST_MARKERS = ("weather.gov", "noaa.gov")
 _MICHIGAN_SPORTS_JURISDICTION_MARKER = (
     "michigan_residents_are_not_currently_allowed_to_open_positions_in_sports"
 )
-_SPORTS_JURISDICTION_RUNTIME_FLAG = "sports_jurisdiction_blocked"
 _WEATHER_HIGH_EQ_REASONABLE_EDGE_MIN = 0.85
 
 
@@ -1698,6 +1797,7 @@ def _passes_edge_threshold(
         decision.edge_source,
         market=market,
         definitive_outcome_eligible=is_definitive,
+        decision=decision,
     )
     if edge < min_edge - 1e-9:
         return False, edge, f"edge {edge:.4f} below min {min_edge:.4f}"
@@ -1870,6 +1970,16 @@ def _posterior_for_lmsr_signal(
     return posterior
 
 
+def _passes_lmsr_inefficiency_threshold(
+    inefficiency_signal: float | None,
+    minimum_inefficiency: float,
+) -> bool:
+    if inefficiency_signal is None:
+        return True
+    required_signal = max(0.0, float(minimum_inefficiency))
+    return float(inefficiency_signal) >= required_signal - 1e-9
+
+
 def _adjust_bet_size_for_edge(
     decision: TradeDecision,
     implied_prob: float | None,
@@ -1884,6 +1994,7 @@ def _adjust_bet_size_for_edge(
         settings,
         decision.edge_source,
         market=market,
+        decision=decision,
     )
     edge_over = edge - min_edge
     if edge_over <= 0:
@@ -2476,6 +2587,44 @@ def _kelly_fraction_for_decision(
 
 def _sizing_mode_label(kelly_enabled: bool) -> str:
     return "kelly" if kelly_enabled else "edge_scaling"
+
+
+def _sizing_audit_fields(
+    *,
+    sizing_mode: str,
+    raw_bet_amount_usdc: float,
+    bet_amount_usdc: float,
+    min_bet_floor_applied: bool,
+    kelly_sub_floor_skipped: bool,
+    kelly_min_bet_policy_applied: str,
+    kelly_raw: float | None,
+    kelly_fraction_value: float | None,
+    posterior_for_kelly: float | None,
+    min_edge_for_kelly: float | None,
+    kelly_effective_fraction: float | None,
+    historical_family_size_multiplier: float,
+    lmsr_execution_price: float | None,
+    lmsr_inefficiency_signal: float | None,
+    expected_value_usdc: float | None,
+) -> dict[str, Any]:
+    return {
+        "sizing_mode": sizing_mode,
+        "raw_bet_amount_usdc": raw_bet_amount_usdc,
+        "bet_amount_usdc": bet_amount_usdc,
+        "min_bet_floor_applied": min_bet_floor_applied,
+        "kelly_sub_floor_skipped": kelly_sub_floor_skipped,
+        "kelly_min_bet_policy": kelly_min_bet_policy_applied,
+        "kelly_min_bet_policy_applied": kelly_min_bet_policy_applied,
+        "kelly_raw": kelly_raw,
+        "kelly_fraction_value": kelly_fraction_value,
+        "posterior_for_kelly": posterior_for_kelly,
+        "min_edge_for_kelly": min_edge_for_kelly,
+        "kelly_effective_fraction": kelly_effective_fraction,
+        "historical_family_size_multiplier": historical_family_size_multiplier,
+        "lmsr_execution_price": lmsr_execution_price,
+        "lmsr_inefficiency_signal": lmsr_inefficiency_signal,
+        "expected_value_usdc": expected_value_usdc,
+    }
 
 
 def _zero_bet_skip_message(sizing_mode: str) -> str:
@@ -6987,21 +7136,6 @@ def main(max_cycles: int | None = None) -> None:
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
-    # Session-scoped soft-hold: after a Michigan sports jurisdiction 403, skip
-    # live/dry-run sports order submission. Persisted so restarts do not
-    # re-burn Grok sports slots until the hold is cleared.
-    sports_jurisdiction_blocked = (
-        str(state_manager.get_runtime_flag(_SPORTS_JURISDICTION_RUNTIME_FLAG) or "")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"}
-    )
-    if sports_jurisdiction_blocked:
-        logger.warning(
-            "Restored persisted sports jurisdiction soft-hold; "
-            "sports deep analysis capped at zero this session",
-            data={"sports_jurisdiction_blocked": True},
-        )
 
     while True:
         cycle_count += 1
@@ -7280,7 +7414,10 @@ def main(max_cycles: int | None = None) -> None:
 
             trades_attempted = 0
             trades_filled = 0
+            trades_partially_filled = 0
+            trades_resting_unfilled = 0
             trades_canceled_unfilled = 0
+            total_usd_submitted = 0.0
             total_usd_deployed = 0.0
             trades_skipped_confidence = 0
             trades_skipped_balance = 0
@@ -9334,103 +9471,6 @@ def main(max_cycles: int | None = None) -> None:
             available_family_distribution = _analysis_candidate_family_counts(
                 analysis_candidates
             )
-            if sports_jurisdiction_blocked and analysis_candidates:
-                jurisdiction_held_sports: list[dict[str, Any]] = []
-                remaining_analysis_candidates: list[dict[str, Any]] = []
-                for candidate in analysis_candidates:
-                    held_market = candidate.get("market")
-                    if (
-                        isinstance(held_market, Market)
-                        and market_family(held_market) == "sports"
-                    ):
-                        jurisdiction_held_sports.append(candidate)
-                    else:
-                        remaining_analysis_candidates.append(candidate)
-                if jurisdiction_held_sports:
-                    analysis_candidates = remaining_analysis_candidates
-                    original_analysis_candidates_count = len(analysis_candidates)
-                    available_family_distribution = _analysis_candidate_family_counts(
-                        analysis_candidates
-                    )
-                    _jurisdiction_reason = "jurisdiction_sports_analysis_held"
-                    monitor_tier_str = str(ParticipationTier.MONITOR_ONLY)
-                    jurisdiction_why = (
-                        "Michigan sports jurisdiction soft-hold is active; "
-                        "markets stay eligible but skip Grok deep analysis "
-                        "until the hold clears."
-                    )
-                    for candidate in jurisdiction_held_sports:
-                        held_market = candidate.get("market")
-                        if not isinstance(held_market, Market):
-                            continue
-                        default_outcome = (
-                            held_market.outcomes[0].name
-                            if held_market.outcomes
-                            else "YES"
-                        )
-                        held_decision = TradeDecision(
-                            should_trade=False,
-                            outcome=default_outcome,
-                            confidence=0.50,
-                            bet_size_pct=0.0,
-                            reasoning=(
-                                f"[MonitorOnly reason={_jurisdiction_reason}] "
-                                f"{jurisdiction_why}"
-                            ),
-                            edge_source="none",
-                            evidence_basis="absence_only",
-                            evidence_quality=0.0,
-                            abstain=True,
-                        )
-                        held_rq_pos: int | None = None
-                        if settings.RESEARCH_QUEUE_ENABLED:
-                            held_rq_pos = _enqueue_research_candidate(
-                                market=held_market,
-                                decision=held_decision,
-                                reason=_jurisdiction_reason,
-                                gate_name="jurisdiction_sports_hold",
-                                threshold_gap=0.0,
-                                participation_tier=monitor_tier_str,
-                                why_not_execution_eligible=jurisdiction_why,
-                                what_to_learn_next=(
-                                    "Resume sports deep analysis after jurisdiction "
-                                    "soft-hold clears; keep monitoring odds/results."
-                                ),
-                                decision_origin="synthetic_research_queue",
-                            )
-                        _record_rejection_reason(
-                            rejection_breakdown,
-                            _jurisdiction_reason,
-                        )
-                        _record_rejection_reason(
-                            participation_tier_breakdown,
-                            monitor_tier_str,
-                        )
-                        log_trade_decision(
-                            market_id=held_market.id,
-                            question=held_market.question,
-                            decision=held_decision.model_dump(),
-                            execution_audit=_build_execution_audit(
-                                decision_terminal=False,
-                                final_action="research_queued",
-                                final_reason=_jurisdiction_reason,
-                                market_family="sports",
-                                pre_analysis_score=candidate.get("pre_analysis_score"),
-                                research_queue_position=held_rq_pos,
-                                participation_tier=monitor_tier_str,
-                                sports_jurisdiction_blocked=True,
-                            ),
-                        )
-                    logger.warning(
-                        "Held %d sports candidates from deep analysis under "
-                        "jurisdiction soft-hold",
-                        len(jurisdiction_held_sports),
-                        data={
-                            "sports_jurisdiction_blocked": True,
-                            "sports_held_count": len(jurisdiction_held_sports),
-                            "analysis_candidates_remaining": len(analysis_candidates),
-                        },
-                    )
             pre_analysis_scores = {
                 str(getattr(candidate.get("market"), "id", "")): float(
                     candidate.get("pre_analysis_score") or 0.0
@@ -9458,13 +9498,9 @@ def main(max_cycles: int | None = None) -> None:
                 parallel_analysis_enabled=bool(settings.PARALLEL_ANALYSIS_ENABLED),
             )
             sports_candidate_cap = (
-                0
-                if sports_jurisdiction_blocked
-                else (
-                    settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
-                    if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
-                    else None
-                )
+                settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
+                if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
+                else None
             )
             generic_candidate_cap = (
                 settings.MAX_GENERIC_CANDIDATES_PER_CYCLE
@@ -11959,6 +11995,7 @@ def main(max_cycles: int | None = None) -> None:
                     implied_prob,
                     settings,
                     market=market,
+                    decision=decision_for_edge,
                 )
                 baseline_edge_threshold = _edge_threshold_for_market(
                     implied_prob,
@@ -12791,6 +12828,7 @@ def main(max_cycles: int | None = None) -> None:
                         implied_prob,
                         settings,
                         market=market,
+                        decision=decision_for_edge,
                     )
                     adjusted_bet_pct = kelly_bet_pct(
                         posterior=posterior_for_kelly,
@@ -12956,16 +12994,17 @@ def main(max_cycles: int | None = None) -> None:
                             )
                         except ValueError:
                             ineff_signal = None
-                    if (
-                        ineff_signal is not None
-                        and abs(ineff_signal) < settings.LMSR_MIN_INEFFICIENCY
+                    if not _passes_lmsr_inefficiency_threshold(
+                        ineff_signal,
+                        settings.LMSR_MIN_INEFFICIENCY,
                     ):
                         trades_skipped_edge += 1
                         _record_should_trade_blocked("lmsr_gate_blocked")
                         _record_rejection_reason(rejection_breakdown, "lmsr_gate_blocked")
                         question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                         logger.warning(
-                            "SKIP [%s] '%s' -> LMSR inefficiency too small (|%.4f| < %.4f)",
+                            "SKIP [%s] '%s' -> LMSR chosen-side inefficiency below minimum "
+                            "(%.4f < %.4f)",
                             market.id,
                             question_short,
                             ineff_signal,
@@ -13361,6 +13400,28 @@ def main(max_cycles: int | None = None) -> None:
                                 "bet_pct": bet_pct,
                             },
                         )
+                order_audit_context = {
+                    **audit_context,
+                    **_sizing_audit_fields(
+                        sizing_mode=sizing_mode,
+                        raw_bet_amount_usdc=raw_bet_amount,
+                        bet_amount_usdc=bet_amount,
+                        min_bet_floor_applied=min_bet_floor_applied,
+                        kelly_sub_floor_skipped=kelly_sub_floor_skipped,
+                        kelly_min_bet_policy_applied=min_bet_policy_applied,
+                        kelly_raw=kelly_raw_value,
+                        kelly_fraction_value=kelly_fraction_value,
+                        posterior_for_kelly=posterior_for_kelly,
+                        min_edge_for_kelly=min_edge_for_kelly,
+                        kelly_effective_fraction=_coerce_float(
+                            audit_context.get("kelly_effective_fraction")
+                        ),
+                        historical_family_size_multiplier=family_size_multiplier,
+                        lmsr_execution_price=lmsr_execution_price,
+                        lmsr_inefficiency_signal=ineff_signal,
+                        expected_value_usdc=expected_value_usdc,
+                    ),
+                }
                 # Skip order placement if in analysis-only mode (insufficient balance)
                 if analysis_only_mode:
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
@@ -13397,61 +13458,13 @@ def main(max_cycles: int | None = None) -> None:
                             decision_terminal=True,
                             final_action="skip",
                             final_reason="analysis_only_insufficient_balance",
-                            bet_amount_usdc=bet_amount,
-                            raw_bet_amount_usdc=raw_bet_amount,
-                            min_bet_floor_applied=min_bet_floor_applied,
-                            **audit_context,
+                            **order_audit_context,
                         ),
                     )
                     _record_terminal_outcome(
                         state_manager,
                         market.id,
                         "analysis_only_insufficient_balance",
-                    )
-                    continue
-
-                if (
-                    sports_jurisdiction_blocked
-                    and market_family_name == "sports"
-                ):
-                    logger.warning(
-                        "SKIP [%s] sports order held: session jurisdiction soft-hold "
-                        "(Michigan sports positions blocked)",
-                        market.id,
-                        data={
-                            "market_id": market.id,
-                            "final_reason": "jurisdiction_sports_blocked",
-                            "market_family": market_family_name,
-                            "sports_jurisdiction_blocked": True,
-                        },
-                    )
-                    trades_skipped_position += 1
-                    _record_should_trade_blocked("jurisdiction_sports_blocked")
-                    _record_rejection_reason(
-                        rejection_breakdown,
-                        "jurisdiction_sports_blocked",
-                    )
-                    log_trade_decision(
-                        market_id=market.id,
-                        question=market.question,
-                        decision=decision_for_edge.model_copy(
-                            update={"bet_size_pct": bet_pct}
-                        ).model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="pre_order_submission_jurisdiction",
-                            decision_terminal=True,
-                            final_action="monitor_only",
-                            final_reason="jurisdiction_sports_blocked",
-                            bet_amount_usdc=bet_amount,
-                            participation_tier=ParticipationTier.MONITOR_ONLY,
-                            participation_decision="jurisdiction_sports_blocked",
-                            **audit_context,
-                        ),
-                    )
-                    _record_terminal_outcome(
-                        state_manager,
-                        market.id,
-                        "jurisdiction_sports_blocked",
                     )
                     continue
 
@@ -13488,9 +13501,10 @@ def main(max_cycles: int | None = None) -> None:
                         expected_value_usdc=expected_value_usdc,
                     )
                     audit_context["daily_expectancy_ev_credited"] = True
-                    family_stats = execution_family_stats.setdefault(
+                    order_audit_context["daily_expectancy_ev_credited"] = True
+                    family_stats = _execution_family_stats_bucket(
+                        execution_family_stats,
                         market_family_name,
-                        {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
                     )
                     family_stats["order_attempts"] += 1
                     log_trade_decision(
@@ -13504,10 +13518,7 @@ def main(max_cycles: int | None = None) -> None:
                             decision_terminal=True,
                             final_action="order_attempt",
                             final_reason="dry_run",
-                            bet_amount_usdc=bet_amount,
-                            raw_bet_amount_usdc=raw_bet_amount,
-                            min_bet_floor_applied=min_bet_floor_applied,
-                            **audit_context,
+                            **order_audit_context,
                         ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "dry_run")
@@ -14201,6 +14212,7 @@ def main(max_cycles: int | None = None) -> None:
                         _refresh_last_known_balance()
                     trades_skipped_balance += 1
                     _record_should_trade_blocked("insufficient_balance")
+                    order_audit_context["daily_expectancy_ev_credited"] = False
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -14212,9 +14224,8 @@ def main(max_cycles: int | None = None) -> None:
                             decision_terminal=True,
                             final_action="skip",
                             final_reason="insufficient_balance",
-                            bet_amount_usdc=bet_amount,
                             market_data_age_seconds=market_data_age_seconds,
-                            **audit_context,
+                            **order_audit_context,
                         ),
                     )
                     _record_terminal_outcome(state_manager, market.id, "insufficient_balance")
@@ -14234,9 +14245,10 @@ def main(max_cycles: int | None = None) -> None:
                         decision_for_edge.outcome,
                     )
                     audit_context["daily_expectancy_ev_credited"] = False
-                    family_stats = execution_family_stats.setdefault(
+                    order_audit_context["daily_expectancy_ev_credited"] = False
+                    family_stats = _execution_family_stats_bucket(
+                        execution_family_stats,
                         market_family_name,
-                        {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
                     )
                     family_stats["order_attempts"] += 1
                     log_trade_decision(
@@ -14250,10 +14262,9 @@ def main(max_cycles: int | None = None) -> None:
                             decision_terminal=True,
                             final_action="order_attempt",
                             final_reason="market_closed",
-                            bet_amount_usdc=bet_amount,
                             order_error=str(closed_exc),
                             market_data_age_seconds=market_data_age_seconds,
-                            **audit_context,
+                            **order_audit_context,
                         ),
                     )
                     _refresh_last_known_balance()
@@ -14269,30 +14280,17 @@ def main(max_cycles: int | None = None) -> None:
                         order_failure_reason = "order_submission_invalid_time_in_force"
                     elif _is_michigan_sports_jurisdiction_error(error_msg):
                         order_failure_reason = "jurisdiction_sports_blocked"
-                        if not sports_jurisdiction_blocked:
-                            sports_jurisdiction_blocked = True
-                            try:
-                                state_manager.set_runtime_flag(
-                                    _SPORTS_JURISDICTION_RUNTIME_FLAG,
-                                    "1",
-                                )
-                            except Exception as flag_exc:
-                                logger.warning(
-                                    "Failed to persist sports jurisdiction soft-hold: %s",
-                                    flag_exc,
-                                    data={"error": str(flag_exc)},
-                                )
-                            logger.warning(
-                                "Session sports jurisdiction soft-hold enabled after "
-                                "Michigan sports order rejection: market=%s",
-                                market.id,
-                                data={
-                                    "market_id": market.id,
-                                    "sports_jurisdiction_blocked": True,
-                                    "market_family": market_family_name,
-                                    "persisted": True,
-                                },
-                            )
+                        logger.warning(
+                            "Order-scoped sports jurisdiction rejection: market=%s; "
+                            "future sports markets remain analysis-eligible",
+                            market.id,
+                            data={
+                                "market_id": market.id,
+                                "market_family": market_family_name,
+                                "jurisdiction_rejection_scope": "order_only",
+                                "sports_analysis_remains_eligible": True,
+                            },
+                        )
                     if (
                         "Could not map outcome" in error_msg
                         and not market_outcome_mismatch_counted
@@ -14313,9 +14311,10 @@ def main(max_cycles: int | None = None) -> None:
                         decision_for_edge.outcome,
                     )
                     audit_context["daily_expectancy_ev_credited"] = False
-                    family_stats = execution_family_stats.setdefault(
+                    order_audit_context["daily_expectancy_ev_credited"] = False
+                    family_stats = _execution_family_stats_bucket(
+                        execution_family_stats,
                         market_family_name,
-                        {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
                     )
                     family_stats["order_attempts"] += 1
                     _record_rejection_reason(rejection_breakdown, order_failure_reason)
@@ -14339,10 +14338,9 @@ def main(max_cycles: int | None = None) -> None:
                             decision_terminal=True,
                             final_action="order_attempt",
                             final_reason=order_failure_reason,
-                            bet_amount_usdc=bet_amount,
                             order_error=error_msg,
                             market_data_age_seconds=market_data_age_seconds,
-                            **audit_context,
+                            **order_audit_context,
                         ),
                     )
                     _refresh_last_known_balance()
@@ -14356,11 +14354,13 @@ def main(max_cycles: int | None = None) -> None:
                     market.id,
                     decision_for_edge.outcome,
                 )
-                family_stats = execution_family_stats.setdefault(
+                family_stats = _execution_family_stats_bucket(
+                    execution_family_stats,
                     market_family_name,
-                    {"order_attempts": 0.0, "orders_filled": 0.0, "orders_canceled_unfilled": 0.0, "usd_deployed": 0.0},
                 )
                 family_stats["order_attempts"] += 1
+                family_stats["usd_submitted"] += bet_amount
+                total_usd_submitted += bet_amount
 
                 logger.info(
                     "Order submitted: id=%s, status=%s",
@@ -14443,6 +14443,15 @@ def main(max_cycles: int | None = None) -> None:
                             fallback_exc,
                             data={"market_id": market.id, "error": str(fallback_exc)},
                         )
+                order_lifecycle = _order_lifecycle_metrics(
+                    order_response,
+                    submitted_amount_usdc=bet_amount,
+                )
+                order_fill_count = order_lifecycle.fill_count
+                unfilled_canceled_order = (
+                    normalized_order_status in {"cancelled", "canceled"}
+                    and order_lifecycle.fill_count <= 0.0
+                )
                 final_reason = "order_submitted"
                 terminal_outcome = "order_submitted"
                 if unfilled_canceled_order:
@@ -14457,10 +14466,19 @@ def main(max_cycles: int | None = None) -> None:
                     terminal_outcome = "order_canceled_unfilled"
                     audit_context["daily_expectancy_ev_credited"] = False
                 else:
-                    trades_filled += 1
-                    total_usd_deployed += bet_amount
-                    family_stats["orders_filled"] += 1
-                    family_stats["usd_deployed"] += bet_amount
+                    if order_lifecycle.fully_filled:
+                        trades_filled += 1
+                        family_stats["orders_filled"] += 1
+                    elif order_lifecycle.partially_filled:
+                        trades_partially_filled += 1
+                        family_stats["orders_partially_filled"] += 1
+                    elif order_lifecycle.resting_unfilled:
+                        trades_resting_unfilled += 1
+                        family_stats["orders_resting_unfilled"] += 1
+                    total_usd_deployed += order_lifecycle.filled_notional_usdc
+                    family_stats["usd_deployed"] += (
+                        order_lifecycle.filled_notional_usdc
+                    )
                     state_manager.reset_fill_failure_count(market.id)
                     _credit_daily_expectancy_exposure(
                         opportunity_role=opportunity_role,
@@ -14470,6 +14488,16 @@ def main(max_cycles: int | None = None) -> None:
                     if last_known_balance is not None:
                         last_known_balance = max(0.0, float(last_known_balance) - float(bet_amount))
                 _refresh_last_known_balance()
+                final_order_audit_context = {
+                    **order_audit_context,
+                    **audit_context,
+                    "order_fully_filled": order_lifecycle.fully_filled,
+                    "order_partially_filled": order_lifecycle.partially_filled,
+                    "order_resting_unfilled": order_lifecycle.resting_unfilled,
+                    "order_requested_count": order_lifecycle.requested_count,
+                    "filled_notional_usdc": order_lifecycle.filled_notional_usdc,
+                    "submitted_notional_usdc": bet_amount,
+                }
                 log_trade_decision(
                     market_id=market.id,
                     question=market.question,
@@ -14482,7 +14510,6 @@ def main(max_cycles: int | None = None) -> None:
                         decision_terminal=True,
                         final_action="order_attempt",
                         final_reason=final_reason,
-                        bet_amount_usdc=bet_amount,
                         order_id=order_response.id,
                         order_status=order_response.status,
                         order_cancel_reason=order_cancel_reason,
@@ -14500,7 +14527,7 @@ def main(max_cycles: int | None = None) -> None:
                         ),
                         balance_after_trade=last_known_balance if not unfilled_canceled_order else None,
                         market_data_age_seconds=market_data_age_seconds,
-                        **audit_context,
+                        **final_order_audit_context,
                     ),
                 )
                 _record_terminal_outcome(state_manager, market.id, terminal_outcome)
@@ -14585,18 +14612,29 @@ def main(max_cycles: int | None = None) -> None:
                 family_name: {
                     "order_attempts": int(stats.get("order_attempts", 0)),
                     "orders_filled": int(stats.get("orders_filled", 0)),
+                    "orders_partially_filled": int(
+                        stats.get("orders_partially_filled", 0)
+                    ),
+                    "orders_resting_unfilled": int(
+                        stats.get("orders_resting_unfilled", 0)
+                    ),
                     "orders_canceled_unfilled": int(
                         stats.get("orders_canceled_unfilled", 0)
+                    ),
+                    "usd_submitted": round(
+                        float(stats.get("usd_submitted", 0.0)),
+                        2,
                     ),
                     "usd_deployed": round(float(stats.get("usd_deployed", 0.0)), 2),
                 }
                 for family_name, stats in sorted(execution_family_stats.items())
             }
+            orders_with_any_fill = trades_filled + trades_partially_filled
             cumulative_cycle_pnl_estimate = _resolved_pnl_estimate_total(state_manager)
             exchange_realized_pnl_total = state_manager.get_exchange_realized_pnl_total()
             api_cost_per_fill = (
-                round(api_cost_estimate_usd / trades_filled, 6)
-                if trades_filled > 0
+                round(api_cost_estimate_usd / orders_with_any_fill, 6)
+                if orders_with_any_fill > 0
                 else None
             )
             api_cost_per_usd_deployed = (
@@ -14814,7 +14852,11 @@ def main(max_cycles: int | None = None) -> None:
                 "order_attempted": trades_attempted,
                 "order_attempts": trades_attempted,
                 "orders_filled": trades_filled,
+                "orders_partially_filled": trades_partially_filled,
+                "orders_resting_unfilled": trades_resting_unfilled,
+                "orders_with_any_fill": orders_with_any_fill,
                 "orders_canceled_unfilled": trades_canceled_unfilled,
+                "total_usd_submitted": round(total_usd_submitted, 2),
                 "total_usd_deployed": round(total_usd_deployed, 2),
                 "projected_daily_expected_value_usdc": round(
                     cycle_projected_daily_ev_usdc,
@@ -14892,10 +14934,10 @@ def main(max_cycles: int | None = None) -> None:
                 "api_cost_per_usd_deployed": api_cost_per_usd_deployed,
                 "cumulative_api_cost_estimate_usd": round(cumulative_api_cost_estimate_usd, 6),
                 "grok_tokens_per_trade": round(
-                    (api_tokens_consumed / trades_filled),
+                    (api_tokens_consumed / orders_with_any_fill),
                     2,
                 )
-                if trades_filled > 0
+                if orders_with_any_fill > 0
                 else None,
                 "best_candidate_market_id": best_candidate_market_id,
                 "best_candidate_score": best_candidate_score,
@@ -14950,6 +14992,8 @@ def main(max_cycles: int | None = None) -> None:
                     "research_queued": research_queue_size,
                     "order_submitted": trades_attempted,
                     "orders_filled": trades_filled,
+                    "orders_partially_filled": trades_partially_filled,
+                    "orders_resting_unfilled": trades_resting_unfilled,
                 },
                 "family_trade_counts": {
                     family_name: int(stats.get("order_attempts", 0))
@@ -15218,7 +15262,11 @@ def main(max_cycles: int | None = None) -> None:
                     "source_confirmed_edge_count": source_confirmed_edge_count,
                     "order_attempts": trades_attempted,
                     "orders_filled": trades_filled,
+                    "orders_partially_filled": trades_partially_filled,
+                    "orders_resting_unfilled": trades_resting_unfilled,
+                    "orders_with_any_fill": orders_with_any_fill,
                     "orders_canceled_unfilled": trades_canceled_unfilled,
+                    "total_usd_submitted": round(total_usd_submitted, 2),
                     "total_usd_deployed": round(total_usd_deployed, 2),
                     "execution_family_breakdown": execution_family_breakdown,
                     "skipped_kelly_sub_floor": trades_skipped_kelly_sub_floor,
@@ -15286,7 +15334,11 @@ def main(max_cycles: int | None = None) -> None:
                     "decisions_made": decisions_made,
                     "order_attempts": trades_attempted,
                     "orders_filled": trades_filled,
+                    "orders_partially_filled": trades_partially_filled,
+                    "orders_resting_unfilled": trades_resting_unfilled,
+                    "orders_with_any_fill": orders_with_any_fill,
                     "orders_canceled_unfilled": trades_canceled_unfilled,
+                    "total_usd_submitted": round(total_usd_submitted, 2),
                     "total_usd_deployed": round(total_usd_deployed, 2),
                     "pre_analysis_rejection_breakdown": pre_analysis_rejection_breakdown,
                     "skipped_no_trade": trades_skipped_no_trade,

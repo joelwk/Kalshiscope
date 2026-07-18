@@ -868,6 +868,42 @@ def test_compute_final_score_uses_kelly_and_inefficiency_signals() -> None:
     assert boosted.inefficiency_component > 0
 
 
+def test_compute_final_score_does_not_reward_negative_inefficiency_signal() -> None:
+    market = Market(
+        id="m6-negative-lmsr",
+        question="Test",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=False,
+        outcome="YES",
+        confidence=0.45,
+        bet_size_pct=0.0,
+        reasoning="Chosen-side posterior is below the execution price.",
+        edge_external=-0.10,
+        evidence_quality=0.75,
+    )
+    baseline = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+    )
+    negative_signal = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        inefficiency_signal=-0.18,
+    )
+
+    assert negative_signal.inefficiency_component == 0.0
+    assert negative_signal.final_score == pytest.approx(baseline.final_score)
+
+
 def test_compute_final_score_edge_signal_component_weights() -> None:
     market = Market(
         id="m6w",

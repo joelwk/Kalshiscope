@@ -20,6 +20,7 @@ from main import (
     _is_uniform_implied_probability,
     _min_evidence_quality_for_market,
     _passes_edge_threshold,
+    _passes_lmsr_inefficiency_threshold,
     _should_suppress_hallucinated_edge_penalty,
     _sizing_mode_label,
     _zero_bet_skip_message,
@@ -70,6 +71,23 @@ def test_edge_gate_allows_when_edge_clears_threshold() -> None:
     assert ok is True
     assert round(edge, 4) == 0.06
     assert reason == ""
+
+
+@pytest.mark.parametrize(
+    ("signal", "minimum", "expected"),
+    [
+        (None, 0.03, True),
+        (0.05, 0.03, True),
+        (0.02, 0.03, False),
+        (-0.20, 0.03, False),
+    ],
+)
+def test_lmsr_gate_requires_positive_chosen_side_inefficiency(
+    signal: float | None,
+    minimum: float,
+    expected: bool,
+) -> None:
+    assert _passes_lmsr_inefficiency_threshold(signal, minimum) is expected
 
 
 def test_edge_gate_blocks_non_sports_without_direct_evidence() -> None:
@@ -739,6 +757,87 @@ def test_commodity_min_edge_raises_threshold() -> None:
     assert _edge_threshold_for_market(0.55, settings, "computed", market=market) == pytest.approx(
         0.22
     )
+
+
+def test_weather_high_eq_edge_multiplier_lowers_floor_for_nws_direct() -> None:
+    from main import _edge_threshold_for_market, _passes_edge_threshold
+
+    settings = Settings(
+        MIN_EDGE=0.08,
+        WEATHER_MIN_EDGE=0.14,
+        WEATHER_HIGH_EQ_EDGE_MULTIPLIER=0.85,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        MAX_REASONABLE_EDGE=0.40,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=False,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHTSEA-26JUL16-T69",
+        question="Will the maximum temperature be <69 on Jul 16?",
+        category="climate",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.42),
+            MarketOutcome(name="NO", price=0.58),
+        ],
+        liquidity_usdc=50.0,
+    )
+    high_eq = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.70,
+        bet_size_pct=0.2,
+        reasoning="NWS forecast supports NO",
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        edge_source="computed",
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=47.6&lon=-122.3",
+    )
+    low_eq = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.70,
+        bet_size_pct=0.2,
+        reasoning="proxy weather guess",
+        evidence_basis="proxy",
+        evidence_quality=0.60,
+        edge_source="computed",
+        primary_source_url="https://www.weather.com/weather/today/l/Seattle",
+    )
+
+    high_eq_floor = _edge_threshold_for_market(
+        0.58, settings, "computed", market=market, decision=high_eq
+    )
+    low_eq_floor = _edge_threshold_for_market(
+        0.58, settings, "computed", market=market, decision=low_eq
+    )
+    assert high_eq_floor == pytest.approx(0.14 * 0.85)
+    assert low_eq_floor == pytest.approx(0.14)
+
+    # Logged near-miss band: edge 0.12 clears high-EQ floor (~0.119), not raw 0.14.
+    ok_near, edge_near, reason_near = _passes_edge_threshold(
+        0.58,
+        high_eq.model_copy(update={"confidence": 0.70}),
+        settings,
+        market=market,
+    )
+    assert ok_near is True
+    assert edge_near == pytest.approx(0.12)
+    assert reason_near == ""
+
+    ok_low, _, reason_low = _passes_edge_threshold(
+        0.58,
+        low_eq.model_copy(update={"confidence": 0.70}),
+        settings,
+        market=market,
+    )
+    assert ok_low is False
+    assert "below min" in reason_low
 
 
 def test_direct_posterior_floor_weather_proxy_without_nws_url_is_none() -> None:

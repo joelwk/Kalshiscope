@@ -75,6 +75,42 @@ def test_bot_smoke_dry_run(
     assert dummy_kalshi.submitted is False
 
 
+def test_bot_does_not_restore_legacy_sports_jurisdiction_hold(
+    monkeypatch, sample_market, sample_decision, dummy_settings
+) -> None:
+    dummy_kalshi = DummyKalshi([sample_market])
+
+    def _unexpected_runtime_flag_read(*_args, **_kwargs):
+        raise AssertionError("legacy sports jurisdiction hold must not be restored")
+
+    monkeypatch.setattr(
+        main.MarketStateManager,
+        "get_runtime_flag",
+        _unexpected_runtime_flag_read,
+    )
+    monkeypatch.setattr(main, "load_settings", lambda: dummy_settings)
+    monkeypatch.setattr(
+        main,
+        "GrokClient",
+        lambda *args, **kwargs: DummyGrok(sample_decision),
+    )
+    monkeypatch.setattr(
+        main,
+        "KalshiClient",
+        lambda *args, **kwargs: dummy_kalshi,
+    )
+
+    def _stop_sleep(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main.time, "sleep", _stop_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    assert dummy_kalshi.submitted is False
+
+
 def test_bot_smoke_parallel_analysis_dry_run(
     monkeypatch, sample_market, sample_decision, dummy_settings
 ) -> None:

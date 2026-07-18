@@ -6,44 +6,40 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Updated after (1) narrowing the numeric-strike -10pp penalty exemption in
-    # <calibration> to definitive outcomes or imminent settlement with a large
-    # buffer (a live quote confirms the current price, not the settlement
-    # value), and (2) adding the <source_requirements> rule that multi-book
-    # sports odds consensus with confirmed lineups sets evidence_quality
-    # 0.70-0.80 instead of defaulting to 0.60.
-    "analyze": "9c839490cd17326f8a613d036698e5773b716304f3b825c931d113737261c404",
-    "deep": "f248d43a97597d0791b8dc66045285b4b218635c78814707075a2e4e38fc2928",
+    # Updated with the source-repair constraints that distinguish true
+    # absence-only gaps from exceptional, settlement-predictive proxy evidence.
+    "analyze": "8d3f47805aef707fe86cc1eb409b3510ff746ade87487554e4627c5cbe3491ca",
+    "deep": "62a1686290f1ec6907c9e976b8d964ea57a3b1c3dfce48ab06d7a5f7ffcc2fdc",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    "commodities:deep_false": "38564eb54eb00390a2bb02dfa18c8ed60625a088f21d7abcc965630bb0c79c2c",
-    "commodities:deep_true": "95eab83d85cb3e9e97767c24fb42ff46b18df16922583d3660c7950bee10604b",
+    "commodities:deep_false": "884303feb8802f1f14d64335859a2619cf9c3b78d3999f8fd89a0c864d847905",
+    "commodities:deep_true": "7dcd660e9db9341c8ab1333ec93bf58d06404b142b5bc6801f679900105b8ff0",
     # Updated after strengthening the crypto category hint to mandate citing a
     # settlement-grade exchange primary_source_url (coinbase/kraken/binance/coindesk)
     # with observed price + timestamp, with a proxy/EQ<=0.60 fallback otherwise.
-    "crypto:deep_false": "4a457de1ea76123e23e244ccb2aec58060374417e27f71f8086c1b0ce6b1a924",
-    "crypto:deep_true": "1f75a5b3077f51e50a129539bebf90ffb68e1ab7782fbb7e98bcdff4e5f05c59",
+    "crypto:deep_false": "2e9f333986ff54eef685909527684f8055257d73616434546361292ee6a9fdf5",
+    "crypto:deep_true": "ad56826839254f7f14f27df211e88ee854957e1bce2520378121e21ea9b7cfda",
     # Updated after generic Kelly-sized primary_source_url guidance + deep repair action.
-    "generic:deep_false": "d3995e5c78d3897e5f0f8ddd15c27a895561c6725d89a5719e2854715d4de408",
-    "generic:deep_true": "ecbf5dae59abb14e83045379801c387dca74ae93c0a6012c397717f0e8c6297d",
-    "music:deep_false": "968f3ef54858161afcd2655f8dea85473b064c4b4d5f5ef7827bcc7978510fb9",
-    "music:deep_true": "bb33bd8da46a20fe17c99b55bf0ae862469af338ed1fbd0b9da626df2395f4a0",
-    "politics:deep_false": "2da431f1b2f58ea7ec490d1b74246e70afdde90665eb9b6af000dc151fcf2e98",
-    "politics:deep_true": "a967d860bf3249ac32f3d81be7490db8c32eadf5bc5338492bbbdbf9001e46fc",
-    "speech:deep_false": "7450e4fe419e6e9a4e5e0dadd4ef5ae360d298e00dc5d9eb1b17bcb1500dfe88",
-    "speech:deep_true": "56973b67e880179b655bd4d5c15602cbfa6e5734cf0b6099abe905da1c6495f5",
-    "speech_mention:deep_false": "d9d6c65ce7d55646a15eb1531e0cc3c5b5a8c7a3e2509e05a73229da11edc5bd",
-    "speech_mention:deep_true": "34425bd0d839cb1169a5515bb3b4338920b5087e5719d7078abe0126060ca345",
+    "generic:deep_false": "a522cb790949ba98d08c53d328cac500d42859fd60da6ecc339f40670f70782d",
+    "generic:deep_true": "e39b5a360bb0edf42fe7738c52481574462e54b5948f9c5d1a77a0154b303d79",
+    "music:deep_false": "7ce77cea3d4926f9c16ef9b5bbf98d277ef7c7a15484cc4bfeb89778e678a224",
+    "music:deep_true": "5eda7e3f3933ee637f915c90e78479c46b6c8c4e52cc198d182fba79442e533d",
+    "politics:deep_false": "ff49040efb90df389b0a2e559f27fdc4ecab369f964ddfe4d63e27cb7704ba04",
+    "politics:deep_true": "9925ff62f85c230b9ffd6dd66d6cce5c437cd17a2ff93521bf737659dcd27fbe",
+    "speech:deep_false": "009effe58b223ee2c2f1ad8c48c2a013884068332278a679c7334ca81797666e",
+    "speech:deep_true": "3b792702363b25a47eb439119f25c728e2dd74f47a54ca93abc8f07a2b57198d",
+    "speech_mention:deep_false": "3647cbd8754753660cfac5b15d3fd98fef738e799323154d921ef1e729e2dcbe",
+    "speech_mention:deep_true": "8a8c020f9b14d4e4fec1bc397bb1132247339c9c42d66f00cb48702606de463e",
     # Updated after enriching the sports category hint to mirror weather/commodity:
     # verify game status first, cite an official box-score/result primary_source_url
     # for settled props (direct evidence), ground pre-game edges in a cited sportsbook
     # line via implied_prob_external/edge_external (edge_source=computed not none), and
     # abstain at evidence_quality<=0.55 when neither odds nor result is citable.
-    "sports:deep_false": "6cff1ee05267b41dbc01f54c2e0ab9a1a59a0102a1be2e705a5f3a8dacc6fe49",
-    "sports:deep_true": "993907e82201a379557dbcea2e45d468eaa8eb2203ef0306e195b28c297b7509",
-    "weather:deep_false": "92fe64542878cfe332d8143e002f4f4aab08b012a212ac980033f66c28a6cfd4",
-    "weather:deep_true": "896949a82feef4e02f339a16e475881d805f5989502689cf4647279bce526dd0",
+    "sports:deep_false": "98a0c68ffcf832c6fae120b58e1698eb8320a583cd280058e9277f79e65c6f66",
+    "sports:deep_true": "701747959f5943c5c659b700b19aefdba5db8b9a15eb2429a2cb5b41f4f48e07",
+    "weather:deep_false": "a44b2d561effc7cde6bf218e027228b7f8ab8e4faf5175ce3ad050da7787bf2c",
+    "weather:deep_true": "49de6f99e7599d72b3445d18d810c5c25b8c714bee2808dc71f388d80b588ff4",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -55,16 +51,16 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
     "confidence": "3993782437221b5549e1c1d527d246a5a9899919641c5bceb63a90a89d4ea137",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
-    "edge_external": "c85f0f881724bd6cb9c2626a4b3497e6540511c9dbbaef1b125b79c484ad16ad",
+    "edge_external": "af45ae57027c853dd040990e6be9dfe0b045772e14690dfc378f91ff56380e2a",
     "edge_source": "2901c6e3da6168e6b4205bf0660b22475968ecc6b946ebb1a66841b517cd2bce",
     "evidence_basis": "ff492060d94fea1e70d1623d7bc0d3c4348302c9d19dda58e233aa703ec71682",
     "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
     "evidence_quality": "476f825d5b7a15e377c7e8f53749beb0a39db6c6f965065a801ece51ff07b0b6",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",
-    "implied_prob_external": "db0b9497d1f31ef2601d3130975e4b4ea115c49758eedb266f4986410ef69765",
+    "implied_prob_external": "76bcee210033e309fd75807a13b8ec2cee01051ee4687b4d8dc70a433bf90848",
     "key_sources": "655b9b2751cca8b59fee6971dfcb2d682165d25855a5d41a9fe4684fa9ca6690",
     "likelihood_ratio": "d2f282fd76a34dec00a06dbfafac1f4760b46dbab9020d2f690e61611cb26a75",
-    "my_prob": "5abe352ec13d685677213b1120c1914090c2eb9115cd8450156de34b1c8b31d0",
+    "my_prob": "752cdbc9aba6b7fdc735e8f3c81944467b6598eba3d139041430fd03afdec0c6",
     "outcome": "7642b21e60176506e653b20b3183cc5bc0c361804028e0a8a98a697e8b65f94c",
     "primary_source_url": "6101dd4040210985d00f82c41313d2d69a513361eca215aeab2883f35387af70",
     "probability_yes": "c23e1e0ff03c759f6c24ec0a60249568a7f2d449f3e16c6a0efa03d4b8b72802",
