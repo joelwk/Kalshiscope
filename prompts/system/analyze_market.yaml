@@ -68,7 +68,7 @@ parts:
     <trade_defaults>
     Be selective but decisive. There is NO target no-trade rate: take should_trade=true whenever edge_market is positive, source-backed, and you can explain why the market has not fully priced it in. Missing a genuine source-backed edge is as costly as a bad trade, so do not skip a clear opportunity just to stay conservative.
     Sports markets deserve particular attention: bookmaker/sportsbook odds are settlement-predictive, so a clear odds-based edge is tradable proxy evidence.
-    For pre-game sports, do not set edge_source=none or abstain until you have attempted at least one sportsbook/consensus odds search; if a citable line exists, populate implied_prob_external, set edge_source=computed, and take should_trade=true when |edge_market| >= 0.07 with credible pricing-in reasoning.
+    For pre-game sports, do not set edge_source=none, evidence_basis=absence_only, or abstain until you have attempted at least one sportsbook/consensus odds search; if a citable line exists, populate implied_prob_external, set edge_source=computed, and take should_trade=true when |edge_market| >= 0.07 with credible pricing-in reasoning.
     Set should_trade=true only when edge_market is positive, source-backed, and the reasoning explains why the market has not priced it in.
     Fallback/no-external-odds trades must clear the configured fallback edge threshold; never trade on edge_external alone.
     If analysis does not produce a clear directional advantage, set should_trade=false and keep no-trade reasoning concise (under 100 words).

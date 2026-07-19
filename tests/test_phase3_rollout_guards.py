@@ -153,6 +153,39 @@ def test_resolve_min_bet_floor_skips_sub_floor_kelly_by_default() -> None:
     assert policy == "skip"
 
 
+def test_resolve_min_bet_floor_near_miss_floors_when_dynamic_allowed() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.87,
+        min_bet_usdc=2.0,
+        max_bet_usdc=12.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        dynamic_kelly_floor_allowed=True,
+        near_miss_ratio=0.85,
+    )
+    assert adjusted == 2.0
+    assert abs(adjusted_pct - (2.0 / 12.0)) < 1e-9
+    assert floor_applied is True
+    assert sub_floor_skipped is False
+    assert policy == "near_miss_floor"
+
+
+def test_resolve_min_bet_floor_deep_sub_floor_still_skips() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=0.48,
+        min_bet_usdc=2.0,
+        max_bet_usdc=12.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        dynamic_kelly_floor_allowed=False,
+        near_miss_ratio=0.85,
+    )
+    assert adjusted == 0.48
+    assert floor_applied is False
+    assert sub_floor_skipped is True
+    assert policy == "skip"
+
+
 def test_resolve_min_bet_floor_applies_floor_policy() -> None:
     adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
         bet_amount=1.25,

@@ -2651,8 +2651,54 @@ class MarketStateManager:
             "edge below min",
             "weather_evidence_quality_below_min",
         )
+        edge_near_miss_boosted = False
         if any(marker in reason_text for marker in _EDGE_NEAR_MISS_MARKERS) and (
             isinstance(threshold_gap, (int, float)) and float(threshold_gap) <= 0.03
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.15
+            signals_present = True
+            edge_near_miss_boosted = True
+        # High-score false blocks (hallucinated_edge / kelly_sub_floor / critical
+        # score reject) should outrank soft-research placeholders in drain.
+        _HIGH_SCORE_FALSE_BLOCK_MARKERS = (
+            "hallucinated_edge",
+            "kelly_sub_floor_skip",
+            "score_gate_critical_rejection",
+        )
+        final_score = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            raw_score = source.get("pre_execution_final_score")
+            if isinstance(raw_score, (int, float)):
+                final_score = float(raw_score)
+                break
+        edge_shortfall = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            raw_shortfall = source.get("edge_shortfall")
+            if isinstance(raw_shortfall, (int, float)):
+                edge_shortfall = float(raw_shortfall)
+                break
+        high_score_block = (
+            isinstance(final_score, (int, float)) and float(final_score) >= 0.50
+        )
+        tight_edge_shortfall = (
+            isinstance(edge_shortfall, (int, float)) and float(edge_shortfall) < 0.05
+        )
+        if any(marker in reason_text for marker in _HIGH_SCORE_FALSE_BLOCK_MARKERS) and (
+            high_score_block or tight_edge_shortfall
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.20
+            signals_present = True
+        elif "edge_gate_blocked" in reason_text and high_score_block:
+            priority = (priority if priority is not None else 0.0) + 0.20
+            signals_present = True
+        elif (
+            "edge_gate_blocked" in reason_text
+            and tight_edge_shortfall
+            and not edge_near_miss_boosted
         ):
             priority = (priority if priority is not None else 0.0) + 0.15
             signals_present = True

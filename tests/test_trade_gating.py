@@ -23,6 +23,8 @@ from main import (
     _passes_lmsr_inefficiency_threshold,
     _should_suppress_hallucinated_edge_penalty,
     _sizing_mode_label,
+    _sports_settlement_source_matches_market,
+    _sports_ticker_alias_tokens,
     _zero_bet_skip_message,
 )
 from models import Market, MarketOutcome, TradeDecision
@@ -1477,6 +1479,71 @@ def test_high_quality_settled_suppresses_hallucinated_edge_penalty() -> None:
             decision=decision,
             evidence_basis="direct",
             settings=settings,
+        )
+        is True
+    )
+
+
+def test_sports_ticker_alias_tokens_expand_lad_nyy() -> None:
+    aliases = _sports_ticker_alias_tokens("KXMLBF5-26JUL182008LADNYY-LAD")
+    assert "dodgers" in aliases
+    assert "yankees" in aliases
+    assert "lad" in aliases
+    assert "nyy" in aliases
+
+
+def test_abbreviated_sports_title_matches_nickname_sources() -> None:
+    """Kalshi 'Los Angeles D' titles must match MLB.com Dodgers/Yankees sources."""
+    market = Market(
+        id="KXMLBF5-26JUL182008LADNYY-LAD",
+        question=(
+            "Will Los Angeles D be the Los Angeles D vs New York Y "
+            "first 5 innings winner?"
+        ),
+        category="Sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.47),
+            MarketOutcome(name="NO", price=0.53),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.70,
+        bet_size_pct=0.5,
+        reasoning=(
+            "Game postponed (MLB.com 7/19/26); no F5 played so LAD did not win it. "
+            "Direct settlement fact from official postponement notice."
+        ),
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        raw_evidence_quality=0.95,
+        primary_source_url=(
+            "https://www.mlb.com/news/"
+            "dodgers-yankees-saturday-july-18-2026-postponed-due-to-weather"
+        ),
+        key_sources=[
+            "https://www.mlb.com/news/"
+            "dodgers-yankees-saturday-july-18-2026-postponed-due-to-weather",
+            "https://www.espn.com/mlb/game/_/gameId/401816157/dodgers-yankees",
+        ],
+        source_match_class="settlement_aligned",
+        edge_source="computed",
+        my_prob=0.02,
+        definitive_outcome_detected=False,
+    )
+    settings = Settings(
+        DIRECT_SOURCE_WHITELIST=("mlb.com", "espn.com"),
+        HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95,
+    )
+    assert _sports_settlement_source_matches_market(decision, market) is True
+    assert _is_high_quality_settled_evidence(decision, settings, market=market) is True
+    assert (
+        _should_suppress_hallucinated_edge_penalty(
+            decision=decision,
+            evidence_basis="direct",
+            settings=settings,
+            market=market,
         )
         is True
     )

@@ -863,6 +863,9 @@ class Settings:
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
     KELLY_MIN_BET_POLICY: str = "skip"  # skip|floor|fallback_edge_scaling
+    # When policy=skip and dynamic Kelly qualifies, floor bets within this
+    # fraction of MIN_BET instead of skipping (e.g. 0.85 → $1.70 of $2.00).
+    KELLY_MIN_BET_NEAR_MISS_RATIO: float = 0.85
     KELLY_MIN_BANKROLL_USDC: float = 30.0
 
     # Side-flip guardrails
@@ -2380,6 +2383,10 @@ def load_settings() -> Settings:
             "KELLY_MIN_BET_POLICY",
             Settings.KELLY_MIN_BET_POLICY,
         ),
+        KELLY_MIN_BET_NEAR_MISS_RATIO=_read_env_float(
+            "KELLY_MIN_BET_NEAR_MISS_RATIO",
+            Settings.KELLY_MIN_BET_NEAR_MISS_RATIO,
+        ),
         KELLY_MIN_BANKROLL_USDC=_read_env_float(
             "KELLY_MIN_BANKROLL_USDC",
             Settings.KELLY_MIN_BANKROLL_USDC,
@@ -2502,6 +2509,10 @@ def load_settings() -> Settings:
     kelly_min_bet_policy = settings.KELLY_MIN_BET_POLICY.strip().lower()
     if kelly_min_bet_policy not in {"skip", "floor", "fallback_edge_scaling"}:
         kelly_min_bet_policy = Settings.KELLY_MIN_BET_POLICY
+    kelly_near_miss_ratio = max(
+        0.0,
+        min(1.0, float(settings.KELLY_MIN_BET_NEAR_MISS_RATIO)),
+    )
 
     settings = Settings(
         **{
@@ -2509,6 +2520,7 @@ def load_settings() -> Settings:
             "OPPOSITE_OUTCOME_STRATEGY": strategy,
             "SCORE_GATE_MODE": score_mode,
             "KELLY_MIN_BET_POLICY": kelly_min_bet_policy,
+            "KELLY_MIN_BET_NEAR_MISS_RATIO": kelly_near_miss_ratio,
         }
     )
 

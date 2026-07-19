@@ -733,6 +733,26 @@ def test_estimate_research_entry_priority_boosts_edge_near_miss() -> None:
     assert near_miss_priority == pytest.approx(base_priority + 0.15)
 
 
+def test_estimate_research_entry_priority_boosts_high_score_hallucinated_edge() -> None:
+    base_entry = {
+        "threshold_gap": 0.0,
+        "last_decision_json": (
+            '{"audit": {"research_priority": 0.30, '
+            '"pre_execution_final_score": 0.77}}'
+        ),
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    boosted = MarketStateManager.estimate_research_entry_priority(
+        {
+            **base_entry,
+            "gate_name": "score",
+            "reason": "hallucinated_edge",
+        }
+    )
+    assert base_priority is not None and boosted is not None
+    assert boosted == pytest.approx(base_priority + 0.20)
+
+
 def test_drainable_entries_exclude_soft_research_when_min_priority_set() -> None:
     mgr = _make_manager()
     older = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()

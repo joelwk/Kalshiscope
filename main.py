@@ -166,8 +166,46 @@ _SPORTS_ENTITY_STOPWORDS = frozenset(
         "under",
         "will",
         "with",
+        "winner",
     }
 )
+# Kalshi sports titles often abbreviate nicknames ("Los Angeles D"); official
+# sources use nicknames ("Dodgers"). Map ticker team codes → searchable aliases
+# so settlement-aligned suppress paths do not false-negative.
+_SPORTS_TEAM_ALIASES: dict[str, frozenset[str]] = {
+    "ari": frozenset({"arizona", "diamondbacks", "dbacks"}),
+    "atl": frozenset({"atlanta", "braves"}),
+    "bal": frozenset({"baltimore", "orioles"}),
+    "bos": frozenset({"boston", "red", "sox"}),
+    "chc": frozenset({"chicago", "cubs"}),
+    "cws": frozenset({"chicago", "white", "sox"}),
+    "cin": frozenset({"cincinnati", "reds"}),
+    "cle": frozenset({"cleveland", "guardians"}),
+    "col": frozenset({"colorado", "rockies"}),
+    "det": frozenset({"detroit", "tigers"}),
+    "hou": frozenset({"houston", "astros"}),
+    "kc": frozenset({"kansas", "royals"}),
+    "laa": frozenset({"angels", "anaheim"}),
+    "lad": frozenset({"dodgers", "angeles", "los"}),
+    "mia": frozenset({"miami", "marlins"}),
+    "mil": frozenset({"milwaukee", "brewers"}),
+    "min": frozenset({"minnesota", "twins"}),
+    "nym": frozenset({"mets", "york"}),
+    "nyy": frozenset({"yankees", "york"}),
+    "oak": frozenset({"oakland", "athletics"}),
+    "ath": frozenset({"athletics", "oakland"}),
+    "phi": frozenset({"philadelphia", "phillies"}),
+    "pit": frozenset({"pittsburgh", "pirates"}),
+    "sd": frozenset({"san", "diego", "padres"}),
+    "sf": frozenset({"san", "francisco", "giants"}),
+    "sea": frozenset({"seattle", "mariners"}),
+    "stl": frozenset({"st", "louis", "cardinals"}),
+    "tb": frozenset({"tampa", "rays"}),
+    "tex": frozenset({"texas", "rangers"}),
+    "tor": frozenset({"toronto", "blue", "jays"}),
+    "was": frozenset({"washington", "nationals"}),
+    "wsh": frozenset({"washington", "nationals"}),
+}
 _HISTORICAL_WIN_RATE_BY_BUCKET = {
     0.7: 0.43,
     0.8: 0.50,
@@ -195,6 +233,7 @@ _MONTH_ABBREVIATIONS = {
 _KELLY_MIN_BET_POLICY_SKIP = "skip"
 _KELLY_MIN_BET_POLICY_FLOOR = "floor"
 _KELLY_MIN_BET_POLICY_FALLBACK_EDGE = "fallback_edge_scaling"
+_KELLY_MIN_BET_POLICY_NEAR_MISS_FLOOR = "near_miss_floor"
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
 _XAI_RETRIABLE_ERROR_MARKERS = (
     "statuscode.internal",
@@ -2264,6 +2303,40 @@ def _significant_market_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _sports_ticker_alias_tokens(market_id: str) -> set[str]:
+    """Expand Kalshi ticker team codes into nickname/city aliases for matching.
+
+    Handles both standalone segments (``...-LAD``) and concatenated event codes
+    (``...LADNYY-...``) so official-source nicknames can satisfy entity match
+    when the market title uses abbreviated city letters.
+    """
+    raw = str(market_id or "").upper()
+    if not raw:
+        return set()
+    aliases: set[str] = set()
+    # Prefer longer codes first so "LAA" wins over "LA"/"AA" fragments.
+    codes_by_length = sorted(_SPORTS_TEAM_ALIASES.keys(), key=len, reverse=True)
+    matched_spans: list[tuple[int, int]] = []
+
+    def _overlaps(start: int, end: int) -> bool:
+        return any(start < span_end and end > span_start for span_start, span_end in matched_spans)
+
+    for code in codes_by_length:
+        code_upper = code.upper()
+        start = 0
+        while True:
+            idx = raw.find(code_upper, start)
+            if idx < 0:
+                break
+            end = idx + len(code_upper)
+            if not _overlaps(idx, end):
+                matched_spans.append((idx, end))
+                aliases.add(code.lower())
+                aliases.update(_SPORTS_TEAM_ALIASES[code])
+            start = idx + 1
+    return aliases
+
+
 def _decision_source_text(decision: TradeDecision) -> str:
     parts = [
         str(getattr(decision, "reasoning", "") or ""),
@@ -2295,6 +2368,7 @@ def _sports_settlement_source_matches_market(
             )
         )
     )
+    tokens |= _sports_ticker_alias_tokens(str(getattr(market, "id", "") or ""))
     if not tokens:
         return True
 
@@ -2767,6 +2841,8 @@ def _resolve_min_bet_floor(
     kelly_path_active: bool,
     min_bet_policy: str,
     edge_scaling_bet_pct: float | None = None,
+    dynamic_kelly_floor_allowed: bool = False,
+    near_miss_ratio: float = 0.85,
 ) -> tuple[float, float, bool, bool, str]:
     """Resolve minimum bet handling and return amount, pct, flags, and policy."""
     max_bet_safe = max(0.0, max_bet_usdc)
@@ -2789,6 +2865,26 @@ def _resolve_min_bet_floor(
         normalized_policy = _KELLY_MIN_BET_POLICY_SKIP
 
     if normalized_policy == _KELLY_MIN_BET_POLICY_SKIP:
+        # Near-miss floor: when dynamic Kelly already qualifies and the raw
+        # Kelly size is within near_miss_ratio of MIN_BET, floor instead of
+        # skipping (e.g. $1.87 vs $2.00). Deep-sub-floor bets still skip.
+        ratio = max(0.0, min(1.0, float(near_miss_ratio)))
+        if (
+            dynamic_kelly_floor_allowed
+            and bet_amount > 0.0
+            and min_bet_usdc > 0.0
+            and ratio > 0.0
+            and bet_amount + 1e-9 >= min_bet_usdc * ratio
+        ):
+            floored_amount = min_bet_usdc
+            floored_pct = max(0.0, min(1.0, floored_amount / max_bet_safe))
+            return (
+                floored_amount,
+                floored_pct,
+                True,
+                False,
+                _KELLY_MIN_BET_POLICY_NEAR_MISS_FLOOR,
+            )
         return bet_amount, original_pct, False, True, normalized_policy
     if normalized_policy == _KELLY_MIN_BET_POLICY_FLOOR:
         floored_amount = min_bet_usdc
@@ -13658,6 +13754,8 @@ def main(max_cycles: int | None = None) -> None:
                         kelly_path_active=True,
                         min_bet_policy=settings.KELLY_MIN_BET_POLICY,
                         edge_scaling_bet_pct=edge_scaling_bet_pct,
+                        dynamic_kelly_floor_allowed=dynamic_kelly_floor_allowed,
+                        near_miss_ratio=settings.KELLY_MIN_BET_NEAR_MISS_RATIO,
                     )
                     recovered_via_fallback_edge = (
                         recovered_policy == _KELLY_MIN_BET_POLICY_FALLBACK_EDGE
@@ -13992,6 +14090,8 @@ def main(max_cycles: int | None = None) -> None:
                     kelly_path_active=kelly_path_active,
                     min_bet_policy=settings.KELLY_MIN_BET_POLICY,
                     edge_scaling_bet_pct=edge_scaling_bet_pct,
+                    dynamic_kelly_floor_allowed=dynamic_kelly_floor_allowed,
+                    near_miss_ratio=settings.KELLY_MIN_BET_NEAR_MISS_RATIO,
                 )
                 if kelly_sub_floor_skipped:
                     trades_skipped_edge += 1
