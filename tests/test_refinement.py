@@ -226,6 +226,83 @@ def test_flip_rejected_when_confidence_below_078_non_direct() -> None:
     assert FLIP_CONFIDENCE_FLOOR_NON_DIRECT == 0.78
 
 
+def test_rejected_flip_preserves_initial_probability_source_and_audit_metadata() -> None:
+    market = _market("m-flip-metadata", datetime.now(timezone.utc) + timedelta(hours=12))
+    initial = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.62,
+        probability_yes=0.38,
+        bet_size_pct=0.40,
+        reasoning="Initial direct research supports NO.",
+        key_sources=["https://example.com/primary"],
+        self_critique="The estimate remains sensitive to late news.",
+        implied_prob_external=0.65,
+        my_prob=0.38,
+        edge_external=-0.27,
+        edge_source="computed",
+        evidence_basis="proxy",
+        primary_source_url="https://example.com/primary",
+        likelihood_ratio=1.8,
+        evidence_quality=0.75,
+        raw_should_trade=True,
+        raw_outcome="NO",
+        raw_confidence=0.62,
+        raw_bet_size_pct=0.40,
+        raw_reasoning="raw initial reasoning",
+        raw_evidence_quality=0.75,
+        source_match_class="settlement_aligned",
+        prompt_tokens=100,
+        completion_tokens=20,
+        reasoning_tokens=30,
+        cached_tokens=10,
+    )
+    flipped = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.72,
+        bet_size_pct=0.50,
+        reasoning="Deep pass weakly favors YES.",
+        evidence_quality=0.60,
+        evidence_basis="proxy",
+    )
+
+    result = RefinementStrategy(market=market).perform_refinement(
+        DummyGrok([flipped]),
+        market,
+        initial,
+    )
+
+    assert result.outcome == "NO"
+    assert result.confidence == 0.57
+    assert abs(result.bet_size_pct - 0.32) < 1e-12
+    assert result.evidence_quality == 0.50
+    for field_name in (
+        "probability_yes",
+        "key_sources",
+        "self_critique",
+        "implied_prob_external",
+        "my_prob",
+        "edge_external",
+        "edge_source",
+        "evidence_basis",
+        "primary_source_url",
+        "likelihood_ratio",
+        "raw_should_trade",
+        "raw_outcome",
+        "raw_confidence",
+        "raw_bet_size_pct",
+        "raw_reasoning",
+        "raw_evidence_quality",
+        "source_match_class",
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+    ):
+        assert getattr(result, field_name) == getattr(initial, field_name)
+
+
 def test_flip_accepted_when_evidence_basis_direct_and_primary_source_url() -> None:
     """A flip with direct evidence + primary_source_url at conf >= 0.70 should be accepted."""
     market = _market("m-flip-accept", datetime.now(timezone.utc) + timedelta(hours=12))

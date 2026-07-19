@@ -67,6 +67,56 @@ def test_research_queue_times_seen_defaults_for_new_entry() -> None:
     assert entries[0]["times_seen"] == 1
 
 
+def test_research_queue_backlog_summary_separates_actionable_and_legacy_rows() -> None:
+    mgr = _make_manager()
+    mgr.record_research_queue_entry(
+        market_id="KX-ACTIONABLE",
+        cycle_id="c1",
+        gate_name="edge",
+        reason="edge_gate_blocked",
+        threshold_gap=0.02,
+    )
+    mgr.record_research_queue_entry(
+        market_id="KX-SOFT",
+        cycle_id="c1",
+        gate_name="pre_analysis_movement_score",
+        reason="pre_analysis_score_soft_research",
+        threshold_gap=0.20,
+        last_decision_json=json.dumps(
+            {
+                "confidence": 0.50,
+                "evidence_quality": 0.0,
+                "edge_source": "none",
+                "audit": {
+                    "synthetic_decision": True,
+                    "research_drain_attempts": 4,
+                },
+            }
+        ),
+    )
+    mgr._conn.execute(
+        "UPDATE research_queue_entries SET times_seen = 8 WHERE market_id = ?",
+        ("KX-SOFT",),
+    )
+    mgr.record_research_queue_entry(
+        market_id="KX-LEGACY-SPORTS",
+        cycle_id="c1",
+        gate_name="jurisdiction_sports_hold",
+        reason="jurisdiction_sports_analysis_held",
+    )
+    mgr._conn.commit()
+
+    summary = mgr.get_research_queue_backlog_summary(lookback_hours=1)
+
+    assert summary == {
+        "active_total": 3,
+        "priority_drain_candidates": 1,
+        "soft_research_placeholders": 1,
+        "repeated_low_yield": 1,
+        "legacy_jurisdiction_holds": 1,
+    }
+
+
 def test_mark_research_queue_drain_attempt_updates_audit_payload() -> None:
     mgr = _make_manager()
     attempted_at = datetime(2026, 5, 16, 20, 0, tzinfo=timezone.utc)

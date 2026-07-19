@@ -1776,6 +1776,88 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(validated.evidence_basis, "direct")
         self.assertGreaterEqual(validated.evidence_quality, 0.75)
 
+    def test_weather_forecast_explicit_proxy_is_not_upgraded_to_direct(self) -> None:
+        market = Market(
+            id="KXHIGHTSEA-26JUL18-B74.5",
+            question="Will Seattle's maximum temperature be 74-75F?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.43),
+                MarketOutcome(name="NO", price=0.57),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.68,
+            probability_yes=0.32,
+            bet_size_pct=0.0,
+            reasoning=(
+                "NWS forecasts show a high near 75-76F. Proxy evidence only; "
+                "the maximum has not been observed and the final climate report "
+                "is missing."
+            ),
+            implied_prob_external=0.43,
+            my_prob=0.32,
+            edge_external=-0.11,
+            edge_source="computed",
+            evidence_basis="proxy",
+            primary_source_url=(
+                "https://forecast.weather.gov/MapClick.php?lat=47.6062&lon=-122.3321"
+            ),
+            evidence_quality=0.65,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertLessEqual(validated.evidence_quality, 0.75)
+
+    def test_sports_pregame_props_remain_proxy(self) -> None:
+        market = Market(
+            id="KXMLBKS-26JUL181420MINCHC-MINTBRADLEY26-8",
+            question="Taj Bradley: 8+ strikeouts?",
+            category="sports",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.53),
+                MarketOutcome(name="NO", price=0.47),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.61,
+            probability_yes=0.39,
+            bet_size_pct=0.1,
+            reasoning=(
+                "Covers pregame player props and recent-start statistics imply "
+                "P(8+) near 39%. The game is scheduled but has not been played."
+            ),
+            implied_prob_external=0.53,
+            my_prob=0.39,
+            edge_external=-0.14,
+            edge_source="computed",
+            evidence_basis="proxy",
+            primary_source_url=(
+                "https://www.covers.com/sport/baseball/mlb/players/12617/taj-bradley"
+            ),
+            evidence_quality=0.60,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertLessEqual(validated.evidence_quality, 0.80)
+
     def test_unpublished_settlement_chart_overrides_direct_keyword_match(self) -> None:
         market = Market(
             id="KXNETFLIXTOPVIEWSMOVIE-26JUL20-12",

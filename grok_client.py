@@ -65,7 +65,9 @@ _RE_MISSING_CURRENT_SOURCE = re.compile(
     re.IGNORECASE,
 )
 _RE_PREVIEW_OR_PROXY_SOURCE = re.compile(
-    r"\b(preview|probable|probables|projected|projection|expected|matchup|form|"
+    r"\b(preview|probable|probables|projected|projection|"
+    r"forecast(?:s|ed|ing)?(?!\.)|"
+    r"expected|matchup|form|"
     r"pre-game|pregame|lineup preview|odds preview|scheduled)\b",
     re.IGNORECASE,
 )
@@ -817,10 +819,17 @@ class GrokClient:
         low_information: bool,
         source_match_class: str = "",
         explicit_evidence_basis: str = "",
+        definitive_or_observed: bool = False,
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
         normalized_explicit_basis = str(explicit_evidence_basis or "").strip().lower()
-        if low_information or normalized_explicit_basis == "absence_only":
+        if normalized_explicit_basis == "absence_only":
+            return "absence_only"
+        if normalized_explicit_basis == "proxy":
+            if source_match_class == "settlement_aligned" and definitive_or_observed:
+                return "direct"
+            return "proxy"
+        if low_information:
             return "absence_only"
         has_absence_signal = any(
             token in normalized_reasoning
@@ -1053,6 +1062,13 @@ class GrokClient:
             low_information=low_information,
             source_match_class=source_match_class,
             explicit_evidence_basis=explicit_evidence_basis,
+            definitive_or_observed=(
+                has_definitive_outcome_signal
+                or _weather_obs_locked_reasoning_ok(
+                    market_id=market.id or "",
+                    reasoning=decision.reasoning or "",
+                )
+            ),
         )
         active_settings = self.settings or Settings()
         proxy_confidence_cap = max(0.0, min(1.0, active_settings.GROK_PROXY_CONFIDENCE_CAP))

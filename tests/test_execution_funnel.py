@@ -7,9 +7,12 @@ from main import (
     _cap_analysis_candidates,
     _effective_score_gate_threshold,
     _order_lifecycle_metrics,
+    _persist_submitted_order_lifecycle,
     _pre_analysis_opportunity_score,
     _sizing_audit_fields,
+    _sync_exchange_fills,
 )
+from market_state import MarketStateManager
 from models import Market, MarketOutcome, MarketState, OrderResponse, TradeDecision
 from participation import ParticipationTier, classify_participation
 from score_engine import compute_final_score
@@ -123,7 +126,7 @@ def test_execution_funnel_regression_kxlowtaus_weather_direct_stays_tradeable() 
         outcome="NO",
         confidence=0.70,
         evidence_quality=1.0,
-        edge_external=0.61,
+        edge_external=-0.61,
     )
     score = compute_final_score(market=market, decision=decision, implied_prob_market=0.27)
     threshold = _effective_score_gate_threshold(
@@ -152,7 +155,7 @@ def test_execution_funnel_regression_hou3_direct_edge_stays_tradeable() -> None:
         outcome="NO",
         confidence=0.64,
         evidence_quality=0.82,
-        edge_external=0.18,
+        edge_external=-0.18,
     )
     score = compute_final_score(market=market, decision=decision, implied_prob_market=0.41)
     threshold = _effective_score_gate_threshold(
@@ -303,6 +306,80 @@ def test_order_lifecycle_metrics_distinguish_execution_partial_and_resting() -> 
     assert resting.partially_filled is False
     assert resting.resting_unfilled is True
     assert resting.filled_notional_usdc == 0.0
+
+
+def test_resting_order_is_recorded_only_after_fill_reconciliation(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    response = OrderResponse(
+        id="order-resting",
+        status="resting",
+        raw={
+            "fill_count": "0.00",
+            "client_qty_shares": 5,
+            "client_price": 0.40,
+        },
+    )
+    lifecycle = _order_lifecycle_metrics(
+        response,
+        submitted_amount_usdc=2.0,
+    )
+
+    try:
+        persisted = _persist_submitted_order_lifecycle(
+            state_manager=manager,
+            market_id="KXTEST-FILL",
+            outcome="YES",
+            order_response=response,
+            lifecycle=lifecycle,
+            submitted_amount_usdc=2.0,
+            fallback_entry_price=0.40,
+            confidence=0.70,
+            implied_prob=0.40,
+        )
+
+        assert persisted["fill_recorded"] is False
+        assert manager.get_position("KXTEST-FILL") is None
+
+        class FillClient:
+            @staticmethod
+            def get_fills(*, limit: int) -> dict:
+                assert limit == 200
+                return {
+                    "fills": [
+                        {
+                            "fill_id": "fill-a",
+                            "order_id": "order-resting",
+                            "count_fp": "2.00",
+                            "yes_price_dollars": "0.40",
+                        },
+                        {
+                            "fill_id": "fill-b",
+                            "order_id": "order-resting",
+                            "count_fp": "3.00",
+                            "yes_price_dollars": "0.40",
+                        },
+                    ]
+                }
+
+        first_sync = _sync_exchange_fills(
+            state_manager=manager,
+            kalshi_client=FillClient(),
+        )
+        duplicate_sync = _sync_exchange_fills(
+            state_manager=manager,
+            kalshi_client=FillClient(),
+        )
+
+        position = manager.get_position("KXTEST-FILL")
+        assert position is not None
+        assert position.total_amount_usdc == 2.0
+        assert position.trade_count == 1
+        assert first_sync.new_fill_events == 1
+        assert first_sync.filled_notional_usdc == 2.0
+        assert duplicate_sync.new_fill_events == 0
+        assert manager.get_pending_order("order-resting")["status"] == "filled"
+    finally:
+        manager.close()
 
 
 def test_sizing_audit_fields_include_kelly_lmsr_and_floor_context() -> None:

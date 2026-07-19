@@ -1,3 +1,4 @@
+import ast
 import unittest
 import inspect
 import json
@@ -28,6 +29,7 @@ from main import (
     _cap_analysis_candidates,
     _cap_effective_confidence_for_market,
     _calculate_bet,
+    _classify_no_trade_routing,
     _collapse_event_ladders,
     _confidence_gate_override_metrics,
     _compute_next_wakeup_seconds,
@@ -55,6 +57,7 @@ from main import (
     _fetch_markets_with_optional_server_filters,
     _filter_markets,
     _kelly_fraction_for_market_horizon,
+    _load_execution_market_snapshot,
     _log_settings_summary,
     _max_confidence_for_market,
     _min_evidence_quality_for_market,
@@ -199,6 +202,28 @@ class TestMainUtils(unittest.TestCase):
         lower = {"decision": tradeable, "pre_execution_final_score": 0.10}
         higher = {"decision": tradeable, "pre_execution_final_score": 0.30}
         self.assertGreater(_analysis_result_rank(higher), _analysis_result_rank(lower))
+
+    def test_analysis_result_rank_uses_chosen_side_external_edge_for_no(self) -> None:
+        stronger_no = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.65,
+            bet_size_pct=0.2,
+            reasoning="Stronger NO edge",
+            edge_external=-0.15,
+            evidence_quality=0.7,
+        )
+        weaker_no = stronger_no.model_copy(
+            update={
+                "reasoning": "Weaker NO edge",
+                "edge_external": -0.05,
+            }
+        )
+
+        self.assertGreater(
+            _analysis_result_rank({"decision": stronger_no}),
+            _analysis_result_rank({"decision": weaker_no}),
+        )
 
     def test_analysis_result_rank_demotes_critical_score_rejections(self) -> None:
         decision = TradeDecision(
@@ -613,6 +638,51 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(payload.get("edge_market"), 0.12)
         self.assertEqual(payload.get("edge_external"), 0.08)
         self.assertEqual(payload.get("rejection_reason"), "zero_bet_after_sizing")
+
+    def test_order_audits_do_not_duplicate_market_age_from_context(self) -> None:
+        tree = ast.parse(inspect.getsource(main_module.main))
+        duplicate_calls: list[int] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_build_execution_audit"
+            ):
+                continue
+            explicit_keys = {keyword.arg for keyword in node.keywords if keyword.arg}
+            expanded_contexts = {
+                keyword.value.id
+                for keyword in node.keywords
+                if keyword.arg is None and isinstance(keyword.value, ast.Name)
+            }
+            if (
+                "market_data_age_seconds" in explicit_keys
+                and expanded_contexts
+                & {"audit_context", "order_audit_context", "final_order_audit_context"}
+            ):
+                duplicate_calls.append(node.lineno)
+
+        self.assertEqual(duplicate_calls, [])
+
+    def test_order_failure_audit_preserves_market_age_from_context(self) -> None:
+        order_audit_context = {
+            "market_data_age_seconds": 270.84,
+            "bet_amount_usdc": 3.43,
+        }
+        try:
+            raise RuntimeError("simulated order rejection")
+        except RuntimeError:
+            payload = _build_execution_audit(
+                decision_phase="order_submission",
+                decision_terminal=True,
+                final_action="order_attempt",
+                final_reason="jurisdiction_sports_blocked",
+                order_error="403 forbidden",
+                **order_audit_context,
+            )
+
+        self.assertEqual(payload.get("market_data_age_seconds"), 270.84)
+        self.assertEqual(payload.get("final_reason"), "jurisdiction_sports_blocked")
 
     def test_build_execution_audit_prefers_canonical_over_alias_when_both_present(self) -> None:
         payload = _build_execution_audit(
@@ -2111,7 +2181,11 @@ class TestMainUtils(unittest.TestCase):
         self.assertTrue(_is_michigan_sports_jurisdiction_error(text))
 
     def test_kelly_fraction_shrinks_on_weather_calibration_gap(self) -> None:
-        from main import _kelly_fraction_for_decision
+        from kelly import kelly_bet_pct, kelly_fraction
+        from main import (
+            _dynamic_kelly_floor_allowed,
+            _kelly_fraction_for_decision,
+        )
 
         settings = Settings(
             KELLY_FRACTION_DEFAULT=0.30,
@@ -2137,15 +2211,93 @@ class TestMainUtils(unittest.TestCase):
             reasoning="calibration gap",
         )
         # Base weather Kelly = 0.30 * 0.50 = 0.15; gap 0.35 >= 0.20 => * 0.50 = 0.075
-        self.assertAlmostEqual(
-            _kelly_fraction_for_decision(market, settings, decision, 0.55),
-            0.075,
+        final_fraction = _kelly_fraction_for_decision(
+            market,
+            settings,
+            decision,
+            0.55,
         )
+        self.assertAlmostEqual(final_fraction, 0.075)
+        self.assertFalse(
+            _dynamic_kelly_floor_allowed(
+                final_fraction=final_fraction,
+                settings=settings,
+            )
+        )
+        raw_kelly = kelly_fraction(0.81, 0.69)
+        sized_pct = kelly_bet_pct(
+            posterior=0.81,
+            market_price=0.69,
+            fraction=final_fraction,
+            min_edge=0.10,
+            edge=0.12,
+            dynamic_enabled=False,
+        )
+        self.assertAlmostEqual(sized_pct / raw_kelly, 0.075)
         small_gap = decision.model_copy(update={"raw_confidence": 0.60})
         self.assertAlmostEqual(
             _kelly_fraction_for_decision(market, settings, small_gap, 0.55),
             0.15,
         )
+
+    def test_no_trade_routing_distinguishes_validation_gate_from_model_choice(
+        self,
+    ) -> None:
+        gated = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.60,
+            bet_size_pct=0.0,
+            reasoning=(
+                "[Validated eq=0.60 gate=block reason=market_edge_below_min "
+                "basis=proxy] Model initially recommended a trade."
+            ),
+        )
+        model_no_trade = gated.model_copy(
+            update={"reasoning": "Model recommends waiting for more evidence."}
+        )
+
+        gated_routing = _classify_no_trade_routing(gated)
+        model_routing = _classify_no_trade_routing(model_no_trade)
+
+        self.assertEqual(gated_routing.reason, "edge_gate_blocked")
+        self.assertEqual(gated_routing.gate_name, "edge")
+        self.assertTrue(gated_routing.research_eligible)
+        self.assertEqual(model_routing.reason, "no_trade_recommended")
+        self.assertFalse(model_routing.research_eligible)
+
+    def test_no_trade_with_material_edge_and_research_gap_is_queued(self) -> None:
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.60,
+            probability_yes=0.40,
+            bet_size_pct=0.0,
+            reasoning=(
+                "[Validated eq=0.20 gate=allow reason=ok basis=absence_only] "
+                "No settlement-aligned source was found."
+            ),
+            evidence_quality=0.20,
+            evidence_basis="absence_only",
+            edge_source="none",
+        )
+
+        routed = _classify_no_trade_routing(
+            decision,
+            market_edge=0.12,
+            research_edge_floor=0.08,
+        )
+        below_floor = _classify_no_trade_routing(
+            decision,
+            market_edge=0.04,
+            research_edge_floor=0.08,
+        )
+
+        self.assertEqual(routed.reason, "no_trade_research_gap")
+        self.assertEqual(routed.gate_name, "evidence")
+        self.assertTrue(routed.research_eligible)
+        self.assertEqual(below_floor.reason, "no_trade_recommended")
+        self.assertFalse(below_floor.research_eligible)
 
     def test_filter_markets(self) -> None:
         markets = [
@@ -3091,6 +3243,67 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(_best_orderbook_sell_price(orderbook, 1) or 0.0, 0.44)
         self.assertIsNone(_best_orderbook_sell_price(orderbook, 2))
 
+    def test_execution_snapshot_promotes_orderbook_price_before_scoring(self) -> None:
+        scheduled = Market(
+            id="KX-CANONICAL",
+            question="Will the event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.45),
+                MarketOutcome(name="NO", price=0.55),
+            ],
+        )
+        refreshed = scheduled.model_copy(
+            update={
+                "outcomes": [
+                    MarketOutcome(name="YES", price=0.50),
+                    MarketOutcome(name="NO", price=0.50),
+                ]
+            },
+            deep=True,
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning="Direct evidence",
+        )
+
+        class Client:
+            @staticmethod
+            def get_market(market_id: str) -> Market:
+                assert market_id == scheduled.id
+                return refreshed
+
+            @staticmethod
+            def get_market_orderbook(market_id: str) -> dict:
+                assert market_id == scheduled.id
+                return {
+                    "sells": [
+                        {"optionIndex": 0, "price": 0.62, "quantity": 10},
+                        {"optionIndex": 1, "price": 0.40, "quantity": 10},
+                    ]
+                }
+
+        snapshot = _load_execution_market_snapshot(
+            market=scheduled,
+            decision=decision,
+            kalshi_client=Client(),
+            settings=Settings(
+                DRY_RUN=False,
+                PRE_ORDER_MARKET_REFRESH=True,
+                ORDERBOOK_PRECHECK_ENABLED=True,
+                ORDERBOOK_PRECHECK_MIN_CONFIDENCE=0.75,
+            ),
+            market_snapshot_monotonic=None,
+        )
+
+        assert snapshot.source == "orderbook_best_sell"
+        assert snapshot.scheduled_entry_price == 0.45
+        assert snapshot.refreshed_entry_price == 0.50
+        assert snapshot.execution_entry_price == 0.62
+        assert snapshot.market.outcomes[0].price == 0.62
+
     def test_available_orderbook_sell_quantity_respects_price_limit(self) -> None:
         orderbook = {
             "sells": [
@@ -3140,7 +3353,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(data.get("kelly_fraction_default"), 0.2)
         self.assertEqual(data.get("kelly_fraction_short_horizon_hours"), 1)
         self.assertEqual(data.get("kelly_fraction_short_horizon"), 0.1)
-        self.assertEqual(data.get("kelly_min_bet_policy"), "fallback_edge_scaling")
+        self.assertEqual(data.get("kelly_min_bet_policy"), "skip")
         self.assertGreater(strict_hint_data.get("effective_min_bet_pct", 0.0), 0.0)
 
     def test_compute_next_wakeup_seconds_uses_action_aware_cooldown(self) -> None:
@@ -4619,6 +4832,11 @@ class TestSyntheticDecisionAuditFields(unittest.TestCase):
             skip_due_to="weak_pre_analysis_score",
             pre_analysis_score=0.41,
             pre_analysis_breakdown={"pre_score_market_subfamily": "generic_macro_release"},
+            edge_market=0.12,
+            edge_required=0.08,
+            score_final=0.24,
+            score_kelly_raw=0.18,
+            score_lmsr_price=0.48,
             why_not_execution_eligible="score below threshold",
             counterfactual_required_pre_analysis_score=0.55,
         )
@@ -4626,6 +4844,11 @@ class TestSyntheticDecisionAuditFields(unittest.TestCase):
         self.assertEqual(payload["audit"]["pre_analysis_score"], 0.41)
         self.assertEqual(payload["participation_tier"], audit["participation_tier"])
         self.assertEqual(payload["skip_due_to"], "weak_pre_analysis_score")
+        self.assertEqual(payload["edge_market"], 0.12)
+        self.assertEqual(payload["edge_required"], 0.08)
+        self.assertEqual(payload["score_final"], 0.24)
+        self.assertEqual(payload["score_kelly_raw"], 0.18)
+        self.assertEqual(payload["score_lmsr_price"], 0.48)
         self.assertEqual(
             payload["counterfactual_required_pre_analysis_score"],
             0.55,

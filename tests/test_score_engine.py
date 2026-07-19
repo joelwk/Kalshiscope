@@ -1454,6 +1454,68 @@ def test_compute_final_score_adds_computed_edge_bonus() -> None:
     assert score.computed_edge_bonus > 0.0
 
 
+def test_compute_final_score_does_not_bonus_negative_computed_edge() -> None:
+    market = Market(
+        id="m-negative-computed-bonus",
+        question="Computed edge must be directional",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.60),
+            MarketOutcome(name="NO", price=0.40),
+        ],
+        liquidity_usdc=800.0,
+        resolution_criteria="Settlement docs",
+    )
+    decision = TradeDecision(
+        should_trade=False,
+        outcome="YES",
+        confidence=0.52,
+        bet_size_pct=0.0,
+        reasoning="Computed estimate is below the chosen-side market price.",
+        implied_prob_external=0.60,
+        my_prob=0.52,
+        edge_external=-0.08,
+        edge_source="computed",
+        evidence_quality=0.8,
+    )
+
+    score = compute_final_score(market, decision, implied_prob_market=0.60)
+
+    assert score.edge_market < 0.0
+    assert score.computed_edge_bonus == 0.0
+
+
+def test_compute_final_score_normalizes_external_edge_for_no_outcome() -> None:
+    market = Market(
+        id="m-no-edge-polarity",
+        question="Will the pitcher record eight or more strikeouts?",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.53),
+            MarketOutcome(name="NO", price=0.47),
+        ],
+        liquidity_usdc=800.0,
+        resolution_criteria="Official box score",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.61,
+        probability_yes=0.39,
+        bet_size_pct=0.1,
+        reasoning="The YES estimate is 14 points below external YES odds.",
+        implied_prob_external=0.53,
+        my_prob=0.39,
+        edge_external=-0.14,
+        edge_source="computed",
+        evidence_quality=0.7,
+    )
+
+    score = compute_final_score(market, decision, implied_prob_market=0.47)
+
+    assert score.edge_external == -0.14
+    assert score.edge_external_chosen == 0.14
+    assert score.computed_edge_bonus > 0.0
+
+
 def test_compute_final_score_increases_repeat_penalty_for_non_actionable_streak() -> None:
     market = Market(
         id="m-repeat-streak",

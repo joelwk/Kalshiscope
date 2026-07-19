@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from market_state import MarketStateManager
 from models import OrderResponse, TradeDecision
@@ -62,6 +65,168 @@ def test_record_trade_updates_position_and_avg_confidence(tmp_path) -> None:
         manager.close()
 
 
+def test_pending_order_does_not_create_trade_or_position(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_pending_order(
+            order_id="pending-1",
+            market_id="m-pending",
+            outcome="NO",
+            submitted_amount_usdc=2.0,
+            requested_shares=5.0,
+            limit_price=0.40,
+            confidence=0.70,
+            implied_prob=0.40,
+            status="resting",
+            raw={"status": "resting"},
+        )
+
+        pending = manager.get_pending_order("pending-1")
+        assert pending is not None
+        assert pending["filled_shares"] == 0.0
+        assert manager.get_position("m-pending") is None
+        assert "m-pending" not in manager.get_traded_market_ids()
+        assert "m-pending" in manager.get_pending_market_ids()
+        assert "pending-1" in manager.get_known_order_ids()
+    finally:
+        manager.close()
+
+
+def test_pending_fill_updates_are_idempotent_and_delta_based(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_pending_order(
+            order_id="pending-2",
+            market_id="m-partial",
+            outcome="YES",
+            submitted_amount_usdc=2.5,
+            requested_shares=5.0,
+            limit_price=0.50,
+            confidence=0.75,
+            implied_prob=0.50,
+            status="resting",
+            raw={},
+        )
+
+        first = manager.apply_pending_order_fill(
+            order_id="pending-2",
+            cumulative_filled_shares=2.0,
+            fill_price=0.48,
+            status="partially_filled",
+            raw={"fill_id": "fill-1"},
+        )
+        duplicate = manager.apply_pending_order_fill(
+            order_id="pending-2",
+            cumulative_filled_shares=2.0,
+            fill_price=0.48,
+            status="partially_filled",
+            raw={"fill_id": "fill-1"},
+        )
+        final = manager.apply_pending_order_fill(
+            order_id="pending-2",
+            cumulative_filled_shares=5.0,
+            fill_price=0.49,
+            status="filled",
+            raw={"fill_id": "fill-2"},
+        )
+
+        assert first is not None
+        assert first["delta_filled_shares"] == 2.0
+        assert first["delta_filled_amount_usdc"] == 0.96
+        assert duplicate is not None
+        assert duplicate["delta_filled_shares"] == 0.0
+        assert final is not None
+        assert final["delta_filled_shares"] == 3.0
+        assert final["delta_filled_amount_usdc"] == 1.47
+        assert final["status"] == "filled"
+        assert "m-partial" not in manager.get_pending_market_ids()
+    finally:
+        manager.close()
+
+
+def test_pending_fill_rolls_back_when_trade_recording_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_pending_order(
+            order_id="pending-rollback",
+            market_id="m-rollback",
+            outcome="YES",
+            submitted_amount_usdc=2.0,
+            requested_shares=4.0,
+            limit_price=0.50,
+            confidence=0.70,
+            implied_prob=0.50,
+            status="resting",
+            raw={},
+        )
+
+        def fail_record_trade(*args, **kwargs) -> None:
+            raise RuntimeError("simulated trade persistence failure")
+
+        monkeypatch.setattr(manager, "record_trade", fail_record_trade)
+        with pytest.raises(RuntimeError, match="simulated trade persistence failure"):
+            manager.apply_pending_order_fill(
+                order_id="pending-rollback",
+                cumulative_filled_shares=4.0,
+                fill_price=0.50,
+                status="filled",
+                record_trade_order=OrderResponse(id="pending-rollback"),
+            )
+
+        pending = manager.get_pending_order("pending-rollback")
+        assert pending is not None
+        assert pending["filled_shares"] == 0.0
+        assert pending["status"] == "resting"
+        assert manager.get_position("m-rollback") is None
+    finally:
+        manager.close()
+
+
+def test_multiple_fill_deltas_for_one_order_count_as_one_trade(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_analysis("m-delta", _decision(0.8), is_refined=False)
+        order = OrderResponse(id="order-delta", raw={"outcome": "YES"})
+
+        manager.record_trade(
+            "m-delta",
+            order,
+            0.96,
+            outcome="YES",
+            entry_price=0.48,
+            shares=2.0,
+        )
+        manager.record_trade(
+            "m-delta",
+            order,
+            1.47,
+            outcome="YES",
+            entry_price=0.49,
+            shares=3.0,
+        )
+
+        position = manager.get_position("m-delta")
+        assert position is not None
+        assert position.total_amount_usdc == pytest.approx(2.43)
+        assert position.trade_count == 1
+        event = manager._conn.execute(
+            """
+            SELECT amount_usdc, shares
+            FROM trade_outcome_events
+            WHERE market_id = ? AND order_id = ?
+            """,
+            ("m-delta", "order-delta"),
+        ).fetchone()
+        assert event is not None
+        assert event["amount_usdc"] == pytest.approx(2.43)
+        assert event["shares"] == 5.0
+    finally:
+        manager.close()
+
+
 def test_get_markets_needing_reanalysis(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     try:
@@ -102,6 +267,7 @@ def test_export_to_json(tmp_path) -> None:
             "trade_log",
             "trade_outcomes",
             "trade_outcome_events",
+            "pending_orders",
             "bayesian_state",
             "cycle_receipts",
             "decision_receipts",
@@ -371,6 +537,9 @@ def test_online_confidence_calibration_ema_and_sample_cap(tmp_path) -> None:
         assert row is not None
         assert row["sample_size"] == 2
         assert round(float(row["win_rate"]), 4) == 0.5625
+        fallback = manager.load_confidence_calibration_buckets(days=30)
+        assert fallback["all"][0.8]["sample_size"] == 2
+        assert round(float(fallback["all"][0.8]["win_rate"]), 4) == 0.5625
     finally:
         manager.close()
 
@@ -402,7 +571,7 @@ def test_record_resolution_can_update_online_calibration(tmp_path) -> None:
 
         buckets = manager.load_confidence_calibration_buckets(days=30)
         assert "weather" in buckets
-        assert buckets["weather"][0.8]["sample_size"] >= 1
+        assert buckets["weather"][0.8]["sample_size"] == 1
         row = manager._conn.execute(
             "SELECT sample_size FROM confidence_calibration_online WHERE family = 'weather' AND bucket = 0.8"
         ).fetchone()
@@ -726,6 +895,20 @@ def test_record_exchange_settlement_can_update_online_calibration(tmp_path) -> N
             online_calibration_alpha=0.15,
             online_calibration_max_samples_per_bucket=500,
         )
+        manager.record_exchange_settlement(
+            settlement_id="settle-online",
+            market_id=market_id,
+            winning_outcome="YES",
+            predicted_outcome="YES",
+            pnl_realized=2.15,
+            contracts=5,
+            avg_price=0.57,
+            settled_at=datetime.now(timezone.utc),
+            raw={"market_result": "yes"},
+            online_calibration_enabled=True,
+            online_calibration_alpha=0.15,
+            online_calibration_max_samples_per_bucket=500,
+        )
 
         row = manager._conn.execute(
             "SELECT sample_size, win_rate FROM confidence_calibration_online WHERE family = 'all' AND bucket = 0.7"
@@ -733,6 +916,111 @@ def test_record_exchange_settlement_can_update_online_calibration(tmp_path) -> N
         assert row is not None
         assert row["sample_size"] == 1
         assert row["win_rate"] == 1.0
+    finally:
+        manager.close()
+
+
+def test_binary_bayesian_likelihood_migration_halves_legacy_sums_once(tmp_path) -> None:
+    db_path = str(tmp_path / "state.db")
+    manager = MarketStateManager(db_path)
+    try:
+        with manager._conn:
+            manager._conn.execute(
+                "DELETE FROM runtime_flags WHERE key = 'bayesian_lr_semantics_version'"
+            )
+            manager._conn.execute(
+                """
+                INSERT INTO bayesian_state (
+                    market_id, outcome, log_prior, log_likelihood_sum,
+                    update_count, last_updated
+                )
+                VALUES
+                    ('legacy-binary', 'YES', ?, ?, 1, ?),
+                    ('legacy-binary', 'NO', ?, ?, 1, ?)
+                """,
+                (
+                    math.log(0.5),
+                    math.log(2.0),
+                    datetime.now(timezone.utc).isoformat(),
+                    math.log(0.5),
+                    -math.log(2.0),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+    finally:
+        manager.close()
+
+    migrated = MarketStateManager(db_path)
+    try:
+        states = migrated.get_bayesian_state("legacy-binary")
+        assert states["YES"].log_likelihoods[0] == pytest.approx(0.5 * math.log(2.0))
+        assert states["NO"].log_likelihoods[0] == pytest.approx(-0.5 * math.log(2.0))
+    finally:
+        migrated.close()
+
+    reopened = MarketStateManager(db_path)
+    try:
+        states = reopened.get_bayesian_state("legacy-binary")
+        assert states["YES"].log_likelihoods[0] == pytest.approx(0.5 * math.log(2.0))
+        assert states["NO"].log_likelihoods[0] == pytest.approx(-0.5 * math.log(2.0))
+    finally:
+        reopened.close()
+
+
+def test_exchange_settlement_calibrates_once_when_resolution_arrives_later(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        market_id = "KXWTI-UNRESOLVED-FIRST"
+        now = datetime.now(timezone.utc).isoformat()
+        with manager._conn:
+            manager._conn.execute(
+                "INSERT OR REPLACE INTO markets (id, question, close_time, category) VALUES (?, ?, ?, ?)",
+                (market_id, "Will WTI settle above threshold?", "", "commodities"),
+            )
+            manager._conn.execute(
+                """
+                INSERT OR REPLACE INTO trade_outcomes (
+                    market_id, predicted_outcome, confidence, last_updated
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (market_id, "YES", 0.76, now),
+            )
+
+        common = {
+            "settlement_id": "settle-late-resolution",
+            "market_id": market_id,
+            "predicted_outcome": "YES",
+            "pnl_realized": 0.0,
+            "contracts": 5,
+            "avg_price": 0.57,
+            "settled_at": datetime.now(timezone.utc),
+            "online_calibration_enabled": True,
+        }
+        manager.record_exchange_settlement(
+            **common,
+            winning_outcome=None,
+            raw={"status": "pending"},
+        )
+        assert manager._conn.execute(
+            "SELECT COUNT(*) FROM confidence_calibration_online"
+        ).fetchone()[0] == 0
+
+        manager.record_exchange_settlement(
+            **common,
+            winning_outcome="YES",
+            raw={"market_result": "yes"},
+        )
+        manager.record_exchange_settlement(
+            **common,
+            winning_outcome="YES",
+            raw={"market_result": "yes"},
+        )
+        row = manager._conn.execute(
+            "SELECT sample_size FROM confidence_calibration_online WHERE family = 'all' AND bucket = 0.7"
+        ).fetchone()
+        assert row is not None
+        assert row["sample_size"] == 1
     finally:
         manager.close()
 

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from bayesian_engine import (
     BayesianState,
+    binary_log_updates_from_ratio,
     initial_state,
     log_likelihood_from_ratio,
     posterior_from_state,
@@ -65,6 +66,7 @@ from models import (
     MarketOutcome,
     MarketState,
     OrderRequest,
+    OrderResponse,
     Position,
     TradeDecision,
 )
@@ -77,7 +79,12 @@ from research_profiles import (
     market_family,
 )
 from bootstrap_checks import BootstrapError, run_bootstrap_checks
-from score_engine import calibrate_confidence, compute_final_score, score_breakdown_explanation
+from score_engine import (
+    calibrate_confidence,
+    chosen_side_external_edge,
+    compute_final_score,
+    score_breakdown_explanation,
+)
 from xai_provider import XAIProvider
 
 try:
@@ -783,6 +790,7 @@ class OrderLifecycleMetrics:
     status: str
     fill_count: float
     requested_count: float | None
+    fill_price: float | None
     filled_notional_usdc: float
     fully_filled: bool
     partially_filled: bool
@@ -804,20 +812,25 @@ def _order_lifecycle_metrics(
     )
     if requested_count is not None:
         requested_count = max(0.0, float(requested_count))
+    client_price = _extract_order_numeric_field(
+        raw_payload,
+        ("client_price", "price"),
+    )
 
     fully_filled = status in {"executed", "filled"}
     if requested_count and fill_count >= requested_count - 1e-9:
         fully_filled = True
+    if fully_filled and fill_count <= 0.0:
+        if requested_count is not None and requested_count > 0.0:
+            fill_count = requested_count
+        elif client_price is not None and client_price > 0.0:
+            fill_count = max(0.0, float(submitted_amount_usdc)) / client_price
     partially_filled = fill_count > 0.0 and not fully_filled
     resting_unfilled = (
         fill_count <= 0.0
         and status in {"accepted", "open", "pending", "resting"}
     )
 
-    client_price = _extract_order_numeric_field(
-        raw_payload,
-        ("client_price", "price"),
-    )
     if fill_count > 0.0 and client_price is not None and client_price > 0.0:
         filled_notional_usdc = fill_count * float(client_price)
     elif fully_filled:
@@ -829,11 +842,107 @@ def _order_lifecycle_metrics(
         status=status,
         fill_count=fill_count,
         requested_count=requested_count,
+        fill_price=client_price,
         filled_notional_usdc=round(filled_notional_usdc, 6),
         fully_filled=fully_filled,
         partially_filled=partially_filled,
         resting_unfilled=resting_unfilled,
     )
+
+
+def _persist_submitted_order_lifecycle(
+    *,
+    state_manager: MarketStateManager,
+    market_id: str,
+    outcome: str,
+    order_response: OrderResponse,
+    lifecycle: OrderLifecycleMetrics,
+    submitted_amount_usdc: float,
+    fallback_entry_price: float,
+    confidence: float,
+    implied_prob: float,
+) -> dict[str, Any]:
+    order_id = str(order_response.id or "").strip()
+    raw = order_response.raw if isinstance(order_response.raw, dict) else {}
+    fill_price = (
+        float(lifecycle.fill_price)
+        if lifecycle.fill_price is not None
+        else float(fallback_entry_price)
+    )
+    requested_shares = lifecycle.requested_count
+    if requested_shares is None and fill_price > 0.0:
+        requested_shares = float(submitted_amount_usdc) / fill_price
+    if not order_id:
+        if lifecycle.fill_count <= 0.0:
+            return {
+                "pending_order_persisted": False,
+                "fill_recorded": False,
+                "recorded_fill_shares": 0.0,
+                "recorded_fill_notional_usdc": 0.0,
+            }
+        state_manager.record_trade(
+            market_id,
+            order_response,
+            lifecycle.filled_notional_usdc,
+            outcome=outcome,
+            entry_price=fill_price,
+            implied_prob=implied_prob,
+            confidence=confidence,
+            shares=lifecycle.fill_count,
+        )
+        return {
+            "pending_order_persisted": False,
+            "fill_recorded": True,
+            "recorded_fill_shares": lifecycle.fill_count,
+            "recorded_fill_notional_usdc": lifecycle.filled_notional_usdc,
+        }
+
+    state_manager.record_pending_order(
+        order_id=order_id,
+        market_id=market_id,
+        outcome=outcome,
+        submitted_amount_usdc=submitted_amount_usdc,
+        requested_shares=requested_shares,
+        limit_price=fill_price,
+        confidence=confidence,
+        implied_prob=implied_prob,
+        status=lifecycle.status or "pending",
+        raw=raw,
+    )
+    if lifecycle.fill_count <= 0.0:
+        return {
+            "pending_order_persisted": True,
+            "fill_recorded": False,
+            "recorded_fill_shares": 0.0,
+            "recorded_fill_notional_usdc": 0.0,
+        }
+
+    fill_update = state_manager.apply_pending_order_fill(
+        order_id=order_id,
+        cumulative_filled_shares=lifecycle.fill_count,
+        fill_price=fill_price,
+        status=(
+            "filled"
+            if lifecycle.fully_filled
+            else (
+                "canceled_partially_filled"
+                if lifecycle.status in {"canceled", "cancelled"}
+                else "partially_filled"
+            )
+        ),
+        raw=raw,
+        record_trade_order=order_response,
+    )
+    if fill_update is None:
+        raise RuntimeError(f"pending order disappeared during fill update: {order_id}")
+    delta_shares = float(fill_update["delta_filled_shares"] or 0.0)
+    delta_notional = float(fill_update["delta_filled_amount_usdc"] or 0.0)
+    return {
+        "pending_order_persisted": True,
+        "fill_recorded": delta_shares > 0.0,
+        "recorded_fill_shares": delta_shares,
+        "recorded_fill_notional_usdc": delta_notional,
+    }
 
 
 def _execution_family_stats_bucket(
@@ -1179,7 +1288,7 @@ def _edge_repair_reason(
     if implied_prob is not None:
         edge_value = confidence_for_edge - implied_prob
     elif decision.edge_external is not None:
-        edge_value = decision.edge_external
+        edge_value = chosen_side_external_edge(decision)
     if (
         getattr(settings, "EDGE_BAND_CALIBRATION_ENABLED", True)
         and edge_value is not None
@@ -1202,7 +1311,14 @@ def _decision_positive_edge(
     )
     edge_candidates = [
         float(value)
-        for value in (market_edge, decision.edge_external)
+        for value in (
+            market_edge,
+            (
+                chosen_side_external_edge(decision)
+                if decision.edge_external is not None
+                else None
+            ),
+        )
         if value is not None
     ]
     if not edge_candidates:
@@ -2585,6 +2701,16 @@ def _kelly_fraction_for_decision(
     return max(0.0, min(1.0, fraction))
 
 
+def _dynamic_kelly_floor_allowed(
+    *,
+    final_fraction: float,
+    settings: Settings,
+) -> bool:
+    if not settings.KELLY_DYNAMIC_ENABLED:
+        return False
+    return float(final_fraction) >= float(settings.KELLY_FRACTION_DEFAULT) - 1e-9
+
+
 def _sizing_mode_label(kelly_enabled: bool) -> str:
     return "kelly" if kelly_enabled else "edge_scaling"
 
@@ -3405,6 +3531,7 @@ def _log_settings_summary(settings) -> None:
             "grok_self_consistency_edge_threshold": settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD,
             "categories_allowlist": settings.MARKET_CATEGORIES_ALLOWLIST,
             "categories_blocklist": settings.MARKET_CATEGORIES_BLOCKLIST,
+            "family_blocklist": settings.MARKET_FAMILY_BLOCKLIST,
             "ticker_prefix_blocklist": settings.MARKET_TICKER_BLOCKLIST_PREFIXES,
             "skip_weather_bin_markets": settings.SKIP_WEATHER_BIN_MARKETS,
             "crypto_bin_market_blocklist_enabled": settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED,
@@ -3618,13 +3745,143 @@ def _can_use_lenient_stale_refresh_fallback(
     return market_data_age_seconds <= lenient_max_age_seconds
 
 
+@dataclass(frozen=True)
+class ExecutionMarketSnapshot:
+    market: Market
+    source: str
+    scheduled_entry_price: float | None
+    refreshed_entry_price: float | None
+    execution_entry_price: float | None
+    market_data_age_seconds: float | None
+    force_refresh_for_staleness: bool
+    refresh_attempts: int
+    refresh_error: Exception | None
+    orderbook: dict[str, Any] | None
+    orderbook_option_index: int | None
+    orderbook_best_sell: float | None
+    orderbook_error: Exception | None
+
+
+def _load_execution_market_snapshot(
+    *,
+    market: Market,
+    decision: TradeDecision,
+    kalshi_client: KalshiClient,
+    settings: Settings,
+    market_snapshot_monotonic: float | None,
+) -> ExecutionMarketSnapshot:
+    active_market = market
+    scheduled_entry_price = _get_outcome_entry_price(market, decision.outcome)
+    market_data_age_seconds = None
+    if isinstance(market_snapshot_monotonic, (int, float)):
+        market_data_age_seconds = max(
+            0.0,
+            time.monotonic() - float(market_snapshot_monotonic),
+        )
+    force_refresh_for_staleness = _requires_market_refresh(
+        pre_order_market_refresh=False,
+        market_data_age_seconds=market_data_age_seconds,
+        max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
+    )
+    should_refresh = (
+        not settings.DRY_RUN
+        and _requires_market_refresh(
+            pre_order_market_refresh=settings.PRE_ORDER_MARKET_REFRESH,
+            market_data_age_seconds=market_data_age_seconds,
+            max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
+        )
+    )
+    refresh_error: Exception | None = None
+    refresh_attempts = 0
+    if should_refresh:
+        for refresh_attempt in range(2):
+            refresh_attempts = refresh_attempt + 1
+            try:
+                refreshed = kalshi_client.get_market(market.id)
+                if refreshed.outcomes:
+                    active_market = refreshed
+                refresh_error = None
+                break
+            except Exception as exc:
+                refresh_error = exc
+                if refresh_attempt == 0:
+                    time.sleep(_STALE_REFRESH_RETRY_DELAY_SECONDS)
+
+    refreshed_entry_price = _get_outcome_entry_price(
+        active_market,
+        decision.outcome,
+    )
+    orderbook: dict[str, Any] | None = None
+    orderbook_option_index: int | None = None
+    orderbook_best_sell: float | None = None
+    orderbook_error: Exception | None = None
+    if (
+        not settings.DRY_RUN
+        and settings.ORDERBOOK_PRECHECK_ENABLED
+        and decision.confidence >= settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE
+    ):
+        for idx, market_outcome in enumerate(active_market.outcomes):
+            if _outcomes_match(market_outcome.name, decision.outcome):
+                orderbook_option_index = idx
+                break
+        if orderbook_option_index is not None:
+            try:
+                fetched_orderbook = kalshi_client.get_market_orderbook(
+                    active_market.id
+                )
+                if isinstance(fetched_orderbook, dict):
+                    orderbook = fetched_orderbook
+                    orderbook_best_sell = _best_orderbook_sell_price(
+                        orderbook,
+                        orderbook_option_index,
+                    )
+                    if orderbook_best_sell is not None:
+                        _set_outcome_entry_price(
+                            active_market,
+                            decision.outcome,
+                            orderbook_best_sell,
+                        )
+            except Exception as exc:
+                orderbook_error = exc
+
+    execution_entry_price = _get_outcome_entry_price(
+        active_market,
+        decision.outcome,
+    )
+    if orderbook_best_sell is not None:
+        source = "orderbook_best_sell"
+    elif active_market is not market:
+        source = "refreshed_market"
+    else:
+        source = "scheduled_snapshot"
+    return ExecutionMarketSnapshot(
+        market=active_market,
+        source=source,
+        scheduled_entry_price=scheduled_entry_price,
+        refreshed_entry_price=refreshed_entry_price,
+        execution_entry_price=execution_entry_price,
+        market_data_age_seconds=market_data_age_seconds,
+        force_refresh_for_staleness=force_refresh_for_staleness,
+        refresh_attempts=refresh_attempts,
+        refresh_error=refresh_error,
+        orderbook=orderbook,
+        orderbook_option_index=orderbook_option_index,
+        orderbook_best_sell=orderbook_best_sell,
+        orderbook_error=orderbook_error,
+    )
+
+
 def _confidence_gate_override_metrics(
     market: Market,
     decision: TradeDecision,
 ) -> tuple[float | None, float | None]:
     implied_prob = _get_implied_probability(market, decision.outcome)
     market_edge = (decision.confidence - implied_prob) if implied_prob is not None else None
-    model_edge = decision.edge_external
+    model_edge = (
+        chosen_side_external_edge(decision)
+        if decision.edge_external is not None
+        else None
+    )
     if model_edge is not None and market_edge is not None:
         return (max(model_edge, market_edge), market_edge)
     if model_edge is not None:
@@ -4000,35 +4257,171 @@ def _sync_settlements_from_exchange(
     return imported
 
 
-def _detect_external_fills(
-    *,
-    state_manager: MarketStateManager,
-    kalshi_client: KalshiClient,
-    limit: int = 200,
-) -> int:
-    payload = kalshi_client.get_fills(limit=limit)
+@dataclass(frozen=True)
+class ExchangeFillSyncMetrics:
+    reconciled_orders: int = 0
+    new_fill_events: int = 0
+    filled_shares: float = 0.0
+    filled_notional_usdc: float = 0.0
+    external_order_count: int = 0
+
+
+def _exchange_fill_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
     rows = payload.get("fills")
     if not isinstance(rows, list):
         rows = payload.get("data")
     if not isinstance(rows, list):
-        return 0
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _exchange_fill_order_id(row: dict[str, Any]) -> str:
+    return str(
+        row.get("order_id")
+        or row.get("orderId")
+        or row.get("client_order_id")
+        or ""
+    ).strip()
+
+
+def _exchange_fill_quantity(row: dict[str, Any]) -> float:
+    quantity = _extract_order_numeric_field(
+        row,
+        ("count_fp", "count", "fill_count_fp", "fill_count", "quantity"),
+    )
+    return max(0.0, float(quantity or 0.0))
+
+
+def _exchange_fill_price(
+    row: dict[str, Any],
+    *,
+    outcome: str,
+) -> float | None:
+    normalized_outcome = str(outcome or "").strip().lower()
+    dollar_keys = (
+        f"{normalized_outcome}_price_dollars",
+        "price_dollars",
+        "fill_price_dollars",
+    )
+    price = _extract_order_numeric_field(row, dollar_keys)
+    if price is not None:
+        return max(0.0, min(1.0, float(price)))
+    cent_keys = (
+        f"{normalized_outcome}_price",
+        "price",
+        "fill_price",
+    )
+    price = _extract_order_numeric_field(row, cent_keys)
+    if price is None:
+        return None
+    normalized_price = float(price)
+    if normalized_price > 1.0:
+        normalized_price /= 100.0
+    return max(0.0, min(1.0, normalized_price))
+
+
+def _sync_exchange_fills(
+    *,
+    state_manager: MarketStateManager,
+    kalshi_client: KalshiClient,
+    limit: int = 200,
+) -> ExchangeFillSyncMetrics:
+    payload = kalshi_client.get_fills(limit=limit)
+    rows = _exchange_fill_rows(payload)
+    if not rows:
+        return ExchangeFillSyncMetrics()
     known_order_ids = state_manager.get_known_order_ids()
-    external_count = 0
+    pending_by_order_id = {
+        str(pending["order_id"]): pending
+        for pending in state_manager.get_pending_orders()
+        if pending.get("order_id")
+    }
+    external_order_ids: set[str] = set()
+    fill_aggregates: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        order_id = str(
-            row.get("order_id")
-            or row.get("orderId")
-            or row.get("id")
-            or row.get("trade_id")
-            or ""
-        ).strip()
+        order_id = _exchange_fill_order_id(row)
         if not order_id:
             continue
         if order_id not in known_order_ids:
-            external_count += 1
-    return external_count
+            external_order_ids.add(order_id)
+            continue
+        pending = pending_by_order_id.get(order_id)
+        if pending is None:
+            continue
+        quantity = _exchange_fill_quantity(row)
+        if quantity <= 0.0:
+            continue
+        price = _exchange_fill_price(
+            row,
+            outcome=str(pending.get("outcome") or ""),
+        )
+        if price is None and pending.get("limit_price") is not None:
+            price = float(pending["limit_price"])
+        aggregate = fill_aggregates.setdefault(
+            order_id,
+            {"shares": 0.0, "notional": 0.0, "rows": []},
+        )
+        aggregate["shares"] += quantity
+        if price is not None:
+            aggregate["notional"] += quantity * price
+        aggregate["rows"].append(row)
+
+    reconciled_orders = 0
+    new_fill_events = 0
+    filled_shares = 0.0
+    filled_notional_usdc = 0.0
+    for order_id, aggregate in fill_aggregates.items():
+        pending = pending_by_order_id[order_id]
+        cumulative_shares = float(aggregate["shares"] or 0.0)
+        aggregate_notional = float(aggregate["notional"] or 0.0)
+        fill_price = (
+            aggregate_notional / cumulative_shares
+            if cumulative_shares > 0.0 and aggregate_notional > 0.0
+            else pending.get("limit_price")
+        )
+        requested_shares = pending.get("requested_shares")
+        status = "partially_filled"
+        if (
+            requested_shares is not None
+            and cumulative_shares >= float(requested_shares) - 1e-9
+        ):
+            status = "filled"
+        reconciled_order = OrderResponse(
+            id=order_id,
+            status=status,
+            raw={
+                "fills": aggregate["rows"],
+                "outcome": pending["outcome"],
+            },
+        )
+        update = state_manager.apply_pending_order_fill(
+            order_id=order_id,
+            cumulative_filled_shares=cumulative_shares,
+            fill_price=float(fill_price) if fill_price is not None else None,
+            status=status,
+            raw={"fills": aggregate["rows"]},
+            record_trade_order=reconciled_order,
+        )
+        if update is None:
+            continue
+        reconciled_orders += 1
+        delta_shares = float(update["delta_filled_shares"] or 0.0)
+        delta_notional = float(update["delta_filled_amount_usdc"] or 0.0)
+        if delta_shares <= 0.0:
+            continue
+        new_fill_events += 1
+        filled_shares += delta_shares
+        filled_notional_usdc += delta_notional
+
+    return ExchangeFillSyncMetrics(
+        reconciled_orders=reconciled_orders,
+        new_fill_events=new_fill_events,
+        filled_shares=round(filled_shares, 8),
+        filled_notional_usdc=round(filled_notional_usdc, 8),
+        external_order_count=len(external_order_ids),
+    )
 
 
 def _is_coinflip_signal(decision: TradeDecision) -> bool:
@@ -4077,7 +4470,7 @@ def _analysis_result_rank(
     primary_source_rank = (
         1.0 if str(getattr(decision, "primary_source_url", "") or "").strip() else 0.0
     )
-    edge_external_rank = float(decision.edge_external or 0.0)
+    edge_external_rank = chosen_side_external_edge(decision)
     evidence_rank = max(0.0, min(1.0, decision.evidence_quality))
     confidence_rank = max(0.0, min(1.0, decision.confidence))
     return (
@@ -4798,6 +5191,13 @@ _RESEARCH_QUEUE_AUDIT_MIRROR_KEYS = frozenset(
         "research_priority",
         "research_queue_position",
         "synthetic_decision",
+        "edge_market",
+        "edge_required",
+        "score_final",
+        "score_kelly_raw",
+        "score_kelly_component",
+        "score_lmsr_price",
+        "score_lmsr_inefficiency",
     }
 )
 
@@ -4834,6 +5234,9 @@ def _score_receipt_fields(score_result: Any) -> dict[str, Any]:
         "score_final": float(getattr(score_result, "final_score", 0.0) or 0.0),
         "score_edge_market": float(getattr(score_result, "edge_market", 0.0) or 0.0),
         "score_edge_external": float(getattr(score_result, "edge_external", 0.0) or 0.0),
+        "score_edge_external_chosen": float(
+            getattr(score_result, "edge_external_chosen", 0.0) or 0.0
+        ),
         "score_evidence_quality": float(
             getattr(score_result, "evidence_quality", 0.0) or 0.0
         ),
@@ -5390,6 +5793,111 @@ def _decision_evidence_basis(decision: TradeDecision) -> str:
     if has_direct_source_signal:
         return "direct"
     return "proxy"
+
+
+@dataclass(frozen=True)
+class NoTradeRouting:
+    reason: str
+    gate_name: str | None = None
+    research_eligible: bool = False
+
+
+def _classify_no_trade_routing(
+    decision: TradeDecision,
+    *,
+    conviction_repair_triggered: bool = False,
+    market_edge: float | None = None,
+    research_edge_floor: float | None = None,
+) -> NoTradeRouting:
+    if conviction_repair_triggered:
+        return NoTradeRouting(
+            reason="conviction_repair_no_trade",
+            gate_name="conviction_repair",
+            research_eligible=True,
+        )
+    match = re.search(
+        r"\[Validated\b[^\]]*\breason=([^\s\]]+)",
+        str(decision.reasoning or ""),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return NoTradeRouting(reason="no_trade_recommended")
+    reasons = {
+        reason.strip().lower()
+        for reason in match.group(1).split(",")
+        if reason.strip()
+    }
+    routing_priority = (
+        (
+            "nonpositive_chosen_side_edge",
+            NoTradeRouting("nonpositive_chosen_side_edge", "edge", False),
+        ),
+        (
+            "missing_market_implied",
+            NoTradeRouting("missing_structured_probability", "edge", True),
+        ),
+        (
+            "low_evidence_quality",
+            NoTradeRouting("evidence_quality_below_min", "evidence", True),
+        ),
+        (
+            "absence_only_evidence",
+            NoTradeRouting("absence_only_evidence", "evidence", True),
+        ),
+        (
+            "preview_proxy_without_direct_source",
+            NoTradeRouting(
+                "preview_proxy_without_direct_source",
+                "evidence",
+                True,
+            ),
+        ),
+        (
+            "fallback_edge_without_verifiable_signal",
+            NoTradeRouting(
+                "fallback_edge_without_verifiable_signal",
+                "evidence",
+                True,
+            ),
+        ),
+        (
+            "edge_inconsistent",
+            NoTradeRouting("edge_inconsistent", "edge", True),
+        ),
+        (
+            "probability_inconsistent",
+            NoTradeRouting("probability_inconsistent", "edge", True),
+        ),
+        (
+            "market_edge_below_min",
+            NoTradeRouting("edge_gate_blocked", "edge", True),
+        ),
+    )
+    for validation_reason, routing in routing_priority:
+        if validation_reason in reasons:
+            return routing
+    # Validation can legitimately report reason=ok when the model itself
+    # declines a trade. If that decision still has a material calibrated edge
+    # but only absence/proxy evidence, retain it as a targeted research gap
+    # instead of letting the participation audit say "research-only" while the
+    # actual action silently skips it. Requiring material edge keeps the queue
+    # from absorbing every cautious model no-trade.
+    if market_edge is not None and research_edge_floor is not None:
+        evidence_basis = _decision_evidence_basis(decision)
+        edge_source = str(decision.edge_source or "").strip().lower()
+        has_research_gap = (
+            evidence_basis in {"absence_only", "proxy"}
+            or edge_source in {"", "none", "fallback"}
+        )
+        if has_research_gap and float(market_edge) >= max(
+            0.0, float(research_edge_floor)
+        ):
+            return NoTradeRouting(
+                reason="no_trade_research_gap",
+                gate_name="evidence",
+                research_eligible=True,
+            )
+    return NoTradeRouting(reason="no_trade_recommended")
 
 
 def _generic_market_subfamily(market: Market) -> str:
@@ -6746,7 +7254,11 @@ def _analyze_market_candidate(
     edge_for_refine = (
         decision.confidence - implied_prob_for_refine
         if implied_prob_for_refine is not None
-        else decision.edge_external
+        else (
+            chosen_side_external_edge(decision)
+            if decision.edge_external is not None
+            else None
+        )
     )
     pre_execution_score_for_refine: float | None = None
     score_threshold_for_refine: float | None = None
@@ -7394,23 +7906,39 @@ def main(max_cycles: int | None = None) -> None:
                             exc,
                             data={"error": str(exc)},
                         )
-                    try:
-                        external_fill_count = _detect_external_fills(
-                            state_manager=state_manager,
-                            kalshi_client=kalshi_client,
-                        )
-                        if external_fill_count > 0:
-                            logger.info(
-                                "Detected external fills not present in local trade log: count=%d",
-                                external_fill_count,
-                                data={"external_fill_count": external_fill_count},
-                            )
-                    except Exception as exc:
-                        logger.debug(
-                            "External fill detection failed: %s",
-                            exc,
-                            data={"error": str(exc)},
-                        )
+            fill_sync_metrics = ExchangeFillSyncMetrics()
+            try:
+                fill_sync_metrics = _sync_exchange_fills(
+                    state_manager=state_manager,
+                    kalshi_client=kalshi_client,
+                )
+                if (
+                    fill_sync_metrics.new_fill_events > 0
+                    or fill_sync_metrics.external_order_count > 0
+                ):
+                    logger.info(
+                        "Kalshi fill sync: new_local_fills=%d deployed=%.2f external_orders=%d",
+                        fill_sync_metrics.new_fill_events,
+                        fill_sync_metrics.filled_notional_usdc,
+                        fill_sync_metrics.external_order_count,
+                        data={
+                            "reconciled_orders": fill_sync_metrics.reconciled_orders,
+                            "new_fill_events": fill_sync_metrics.new_fill_events,
+                            "filled_shares": fill_sync_metrics.filled_shares,
+                            "filled_notional_usdc": (
+                                fill_sync_metrics.filled_notional_usdc
+                            ),
+                            "external_order_count": (
+                                fill_sync_metrics.external_order_count
+                            ),
+                        },
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Exchange fill sync failed: %s",
+                    exc,
+                    data={"error": str(exc)},
+                )
 
             trades_attempted = 0
             trades_filled = 0
@@ -7418,7 +7946,7 @@ def main(max_cycles: int | None = None) -> None:
             trades_resting_unfilled = 0
             trades_canceled_unfilled = 0
             total_usd_submitted = 0.0
-            total_usd_deployed = 0.0
+            total_usd_deployed = fill_sync_metrics.filled_notional_usdc
             trades_skipped_confidence = 0
             trades_skipped_balance = 0
             trades_skipped_no_trade = 0
@@ -7880,6 +8408,7 @@ def main(max_cycles: int | None = None) -> None:
                     "confidence": decision.confidence,
                     "evidence_quality": decision.evidence_quality,
                     "edge_external": decision.edge_external,
+                    "edge_external_chosen": chosen_side_external_edge(decision),
                     "primary_source_url": getattr(decision, "primary_source_url", None),
                     "participation_tier": participation_tier,
                     "why_not_execution_eligible": why_not_execution_eligible,
@@ -7953,9 +8482,10 @@ def main(max_cycles: int | None = None) -> None:
             traded_market_ids: set[str] = set()
             try:
                 traded_market_ids = set(state_manager.get_traded_market_ids())
+                traded_market_ids.update(state_manager.get_pending_market_ids())
             except Exception as exc:
                 logger.debug(
-                    "Failed to load traded market ids for pre-analysis funnel: %s",
+                    "Failed to load traded or pending market ids for pre-analysis funnel: %s",
                     exc,
                     data={"error": str(exc)},
                 )
@@ -10663,12 +11193,23 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 if getattr(decision, "evidence_floor_suppressed_reason", None):
                     evidence_floor_suppressed_count += 1
-                candidate_edge_value = decision.edge_external
+                candidate_edge_value = (
+                    chosen_side_external_edge(decision)
+                    if decision.edge_external is not None
+                    else None
+                )
                 if candidate_edge_value is None:
                     my_prob_value = getattr(decision, "my_prob", None)
                     implied_external_value = getattr(decision, "implied_prob_external", None)
                     if my_prob_value is not None and implied_external_value is not None:
-                        candidate_edge_value = float(my_prob_value) - float(implied_external_value)
+                        yes_edge = float(my_prob_value) - float(
+                            implied_external_value
+                        )
+                        candidate_edge_value = (
+                            -yes_edge
+                            if str(decision.outcome or "").strip().upper() == "NO"
+                            else yes_edge
+                        )
                 if candidate_edge_value is not None:
                     family_edge_samples.setdefault(market_family_name, []).append(
                         float(candidate_edge_value)
@@ -11369,47 +11910,63 @@ def main(max_cycles: int | None = None) -> None:
 
                 if not decision.should_trade:
                     trades_skipped_no_trade += 1
-                    no_trade_reason = (
-                        "conviction_repair_no_trade"
-                        if audit_context.get("conviction_repair_triggered")
-                        else "no_trade_recommended"
+                    _, routed_market_edge = _confidence_gate_override_metrics(
+                        market,
+                        decision,
                     )
+                    no_trade_routing = _classify_no_trade_routing(
+                        decision,
+                        conviction_repair_triggered=bool(
+                            audit_context.get("conviction_repair_triggered")
+                        ),
+                        market_edge=routed_market_edge,
+                        research_edge_floor=settings.MIN_EDGE,
+                    )
+                    no_trade_reason = no_trade_routing.reason
                     _record_rejection_reason(rejection_breakdown, no_trade_reason)
-                    repair_queue_position: int | None = None
-                    queue_repair_no_trade = bool(
+                    if no_trade_reason != "no_trade_recommended":
+                        _record_should_trade_blocked(no_trade_reason)
+                    no_trade_queue_position: int | None = None
+                    queue_no_trade = bool(
                         settings.RESEARCH_QUEUE_ENABLED
-                        and no_trade_reason == "conviction_repair_no_trade"
+                        and no_trade_routing.research_eligible
                     )
-                    if queue_repair_no_trade:
-                        repair_queue_position = _enqueue_research_candidate(
+                    research_gate_name = (
+                        no_trade_routing.gate_name or "model_no_trade"
+                    )
+                    learning_target = _research_learning_target(
+                        gate_name=research_gate_name,
+                        reason=no_trade_reason,
+                        market=market,
+                        decision=decision,
+                    )
+                    if queue_no_trade:
+                        audit_context["edge_market"] = routed_market_edge
+                        audit_context["edge_required"] = settings.MIN_EDGE
+                        no_trade_queue_position = _enqueue_research_candidate(
                             market=market,
                             decision=decision,
                             reason=no_trade_reason,
-                            gate_name="conviction_repair",
+                            gate_name=research_gate_name,
                             threshold_gap=0.0,
-                            edge_market=audit_context.get(
-                                "conviction_repair_market_edge"
-                            ),
+                            edge_market=routed_market_edge,
+                            edge_required=settings.MIN_EDGE,
                             participation_tier="research_only",
-                            what_to_learn_next=(
-                                "Repair pass found strong edge/evidence but no executable decision; "
-                                "monitor for a source, price, or settlement-criteria change that resolves the contradiction."
-                            ),
+                            what_to_learn_next=learning_target,
                         )
-                        audit_context["research_queue_position"] = repair_queue_position
-                        audit_context["research_gate_name"] = "conviction_repair"
+                        audit_context["research_queue_position"] = (
+                            no_trade_queue_position
+                        )
+                        audit_context["research_gate_name"] = research_gate_name
                         if settings.RESEARCH_QUEUE_PERSIST_TO_DB:
                             try:
                                 state_manager.record_research_queue_entry(
                                     market_id=market.id,
                                     cycle_id=cycle_id,
-                                    gate_name="conviction_repair",
+                                    gate_name=research_gate_name,
                                     reason=no_trade_reason,
                                     threshold_gap=0.0,
-                                    what_to_learn_next=(
-                                        "Repair pass found strong edge/evidence but no executable decision; "
-                                        "monitor for source, price, or settlement-criteria change."
-                                    ),
+                                    what_to_learn_next=learning_target,
                                     last_decision_json=_research_queue_last_decision_json(
                                         decision,
                                         _build_execution_audit(
@@ -11428,21 +11985,21 @@ def main(max_cycles: int | None = None) -> None:
                         question=market.question,
                         decision=decision.model_dump(),
                         execution_audit=_build_execution_audit(
-                            decision_terminal=not queue_repair_no_trade,
+                            decision_terminal=not queue_no_trade,
                             final_action=(
-                                "research_queued" if queue_repair_no_trade else "skip"
+                                "research_queued" if queue_no_trade else "skip"
                             ),
                             final_reason=no_trade_reason,
                             learning_hold_reason=no_trade_reason,
                             **audit_context,
                         ),
                     )
-                    if not queue_repair_no_trade:
+                    if not queue_no_trade:
                         _record_terminal_outcome(state_manager, market.id, no_trade_reason)
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
                     logger.info(
                         "%s [%s] '%s' -> %s",
-                        "RESEARCH" if queue_repair_no_trade else "SKIP",
+                        "RESEARCH" if queue_no_trade else "SKIP",
                         market.id,
                         question_short,
                         no_trade_reason,
@@ -11528,8 +12085,134 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     continue
 
+                execution_snapshot = _load_execution_market_snapshot(
+                    market=market,
+                    decision=decision,
+                    kalshi_client=kalshi_client,
+                    settings=settings,
+                    market_snapshot_monotonic=(
+                        float(market_snapshot_monotonic)
+                        if isinstance(market_snapshot_monotonic, (int, float))
+                        else None
+                    ),
+                )
+                active_market = execution_snapshot.market
+                market_data_age_seconds = (
+                    execution_snapshot.market_data_age_seconds
+                )
+                audit_context.update(
+                    {
+                        "execution_signal_version": "canonical_v1",
+                        "market_snapshot_source": execution_snapshot.source,
+                        "market_data_age_seconds": market_data_age_seconds,
+                        "scheduled_entry_price": (
+                            execution_snapshot.scheduled_entry_price
+                        ),
+                        "refreshed_entry_price": (
+                            execution_snapshot.refreshed_entry_price
+                        ),
+                        "orderbook_best_sell_price": (
+                            execution_snapshot.orderbook_best_sell
+                        ),
+                        "execution_entry_price": (
+                            execution_snapshot.execution_entry_price
+                        ),
+                        "market_refresh_attempts": (
+                            execution_snapshot.refresh_attempts
+                        ),
+                        "stale_refresh_lenient_fallback_used": False,
+                    }
+                )
+                if execution_snapshot.refresh_error is not None:
+                    if execution_snapshot.force_refresh_for_staleness:
+                        lenient_stale_refresh_allowed = (
+                            _can_use_lenient_stale_refresh_fallback(
+                                evidence_basis_class=evidence_basis,
+                                pre_execution_final_score=pre_execution_final_score,
+                                market_data_age_seconds=market_data_age_seconds,
+                                settings=settings,
+                            )
+                        )
+                        if lenient_stale_refresh_allowed:
+                            audit_context["stale_refresh_lenient_fallback_used"] = True
+                            logger.warning(
+                                "Proceeding with stale market snapshot after refresh failures: market=%s",
+                                market.id,
+                                data={
+                                    "market_id": market.id,
+                                    "error": str(execution_snapshot.refresh_error),
+                                    "market_data_age_seconds": market_data_age_seconds,
+                                    "refresh_attempts": execution_snapshot.refresh_attempts,
+                                },
+                            )
+                        else:
+                            trades_skipped_edge += 1
+                            _record_should_trade_blocked(
+                                "stale_market_data_refresh_failed"
+                            )
+                            _record_rejection_reason(
+                                rejection_breakdown,
+                                "stale_market_data_refresh_failed",
+                            )
+                            log_trade_decision(
+                                market_id=market.id,
+                                question=market.question,
+                                decision=decision.model_dump(),
+                                execution_audit=_build_execution_audit(
+                                    decision_phase="pre_execution_signal",
+                                    decision_terminal=True,
+                                    final_action="skip",
+                                    final_reason="stale_market_data_refresh_failed",
+                                    refresh_error=str(
+                                        execution_snapshot.refresh_error
+                                    ),
+                                    **audit_context,
+                                ),
+                            )
+                            _record_terminal_outcome(
+                                state_manager,
+                                market.id,
+                                "stale_market_data_refresh_failed",
+                            )
+                            continue
+                    else:
+                        logger.warning(
+                            "Execution market refresh failed open: market=%s error=%s",
+                            market.id,
+                            execution_snapshot.refresh_error,
+                            data={
+                                "market_id": market.id,
+                                "error": str(execution_snapshot.refresh_error),
+                                "refresh_attempts": execution_snapshot.refresh_attempts,
+                            },
+                        )
+                elif execution_snapshot.refresh_attempts > 0:
+                    logger.debug(
+                        "Using refreshed market snapshot for canonical execution signal: market=%s",
+                        market.id,
+                        data={
+                            "market_id": market.id,
+                            "market_snapshot_source": execution_snapshot.source,
+                            "refresh_attempts": execution_snapshot.refresh_attempts,
+                            "market_data_age_seconds": market_data_age_seconds,
+                        },
+                    )
+                if execution_snapshot.orderbook_error is not None:
+                    logger.warning(
+                        "Orderbook precheck failed open: market=%s error=%s",
+                        market.id,
+                        execution_snapshot.orderbook_error,
+                        data={
+                            "market_id": market.id,
+                            "error": str(execution_snapshot.orderbook_error),
+                        },
+                    )
+
                 if decision.confidence < settings.MIN_CONFIDENCE:
-                    override_edge, market_edge = _confidence_gate_override_metrics(market, decision)
+                    override_edge, market_edge = _confidence_gate_override_metrics(
+                        active_market,
+                        decision,
+                    )
                     (
                         confidence_override_allowed,
                         override_min_confidence,
@@ -11545,7 +12228,7 @@ def main(max_cycles: int | None = None) -> None:
                     if not confidence_override_allowed and _is_definitive_outcome_eligible(
                         decision,
                         settings,
-                        market=market,
+                        market=active_market,
                     ):
                         confidence_override_allowed = True
                         override_min_confidence = settings.MIN_CONFIDENCE
@@ -11580,6 +12263,9 @@ def main(max_cycles: int | None = None) -> None:
                                 "override_edge": override_edge,
                                 "market_edge": market_edge,
                                 "model_edge": decision.edge_external,
+                                "model_edge_chosen": (
+                                    chosen_side_external_edge(decision)
+                                ),
                                 "evidence_quality": decision.evidence_quality,
                                 "override_min_confidence": override_min_confidence,
                                 "confidence_override_path": override_path,
@@ -11622,11 +12308,18 @@ def main(max_cycles: int | None = None) -> None:
                         )
                         continue
 
-                entry_price = _get_outcome_entry_price(market, decision.outcome)
-                implied_prob = _get_implied_probability(market, decision.outcome)
+                entry_price = _get_outcome_entry_price(
+                    active_market,
+                    decision.outcome,
+                )
+                implied_prob = _get_implied_probability(
+                    active_market,
+                    decision.outcome,
+                )
                 audit_context["audit_entry_price"] = entry_price
                 audit_context["audit_implied_prob_market"] = implied_prob
                 audit_context["audit_edge_source"] = decision.edge_source
+                audit_context["execution_implied_prob_market"] = implied_prob
                 # High-edge, direct, settlement-aligned trades may bypass the hard
                 # entry-price floor: the min-edge ladder already prices low-entry
                 # risk, so the blunt floor otherwise discards legitimate cheap
@@ -11742,6 +12435,14 @@ def main(max_cycles: int | None = None) -> None:
                         if likelihood_ratio is not None and likelihood_ratio > 0:
                             log_likelihood = log_likelihood_from_ratio(likelihood_ratio)
                             is_binary_market = len(market.outcomes) == 2
+                            if is_binary_market:
+                                (
+                                    selected_log_likelihood,
+                                    alternative_log_likelihood,
+                                ) = binary_log_updates_from_ratio(likelihood_ratio)
+                            else:
+                                selected_log_likelihood = log_likelihood
+                                alternative_log_likelihood = 0.0
                             for market_outcome in market.outcomes:
                                 outcome_name = market_outcome.name
                                 state_for_outcome = bayesian_states.get(outcome_name)
@@ -11750,9 +12451,9 @@ def main(max_cycles: int | None = None) -> None:
                                     state_for_outcome = seeded_state
                                     bayesian_states[outcome_name] = seeded_state
                                 if _outcomes_match(outcome_name, canonical_outcome):
-                                    outcome_log_likelihood = log_likelihood
+                                    outcome_log_likelihood = selected_log_likelihood
                                 elif is_binary_market:
-                                    outcome_log_likelihood = -log_likelihood
+                                    outcome_log_likelihood = alternative_log_likelihood
                                 else:
                                     outcome_log_likelihood = 0.0
                                 state_manager.update_bayesian_state(
@@ -11878,7 +12579,7 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 decision_for_edge, definitive_floor_was_applied = (
                     _apply_definitive_outcome_floors(
-                        decision_for_edge, market, settings
+                        decision_for_edge, active_market, settings
                     )
                 )
                 if definitive_floor_was_applied:
@@ -11909,10 +12610,14 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 if (
                     decision_for_edge.evidence_quality
-                    < _min_evidence_quality_for_market(market, settings, decision_for_edge)
+                    < _min_evidence_quality_for_market(
+                        active_market,
+                        settings,
+                        decision_for_edge,
+                    )
                 ):
                     min_evidence_quality = _min_evidence_quality_for_market(
-                        market,
+                        active_market,
                         settings,
                         decision_for_edge,
                     )
@@ -11925,12 +12630,31 @@ def main(max_cycles: int | None = None) -> None:
                         0.0,
                         float(min_evidence_quality - float(decision_for_edge.evidence_quality)),
                     )
-                    queue_for_research = _should_queue_research_for_blocked_trade(
-                        settings=settings,
-                        decision=decision_for_edge,
-                        evidence_basis=evidence_basis,
-                        gate_name="evidence",
-                        threshold_gap=evidence_gap,
+                    evidence_queue_edge = (
+                        float(decision_for_edge.confidence) - float(implied_prob)
+                        if implied_prob is not None
+                        else None
+                    )
+                    evidence_queue_required = (
+                        _edge_threshold_for_market(
+                            implied_prob,
+                            settings,
+                            market=active_market,
+                            decision=decision_for_edge,
+                        )
+                        if implied_prob is not None
+                        else float(settings.MIN_EDGE)
+                    )
+                    queue_for_research = bool(
+                        evidence_queue_edge is not None
+                        and evidence_queue_edge > 0.0
+                        and _should_queue_research_for_blocked_trade(
+                            settings=settings,
+                            decision=decision_for_edge,
+                            evidence_basis=evidence_basis,
+                            gate_name="evidence",
+                            threshold_gap=evidence_gap,
+                        )
                     )
                     final_action = "research_queued" if queue_for_research else "skip"
                     final_outcome_reason = (
@@ -11944,6 +12668,8 @@ def main(max_cycles: int | None = None) -> None:
                             reason=evidence_rejection_reason,
                             gate_name="evidence",
                             threshold_gap=evidence_gap,
+                            edge_market=evidence_queue_edge,
+                            edge_required=evidence_queue_required,
                         )
                     if evidence_basis == "direct":
                         blocked_direct_evidence_count += 1
@@ -11953,20 +12679,49 @@ def main(max_cycles: int | None = None) -> None:
                         rejection_breakdown,
                         evidence_rejection_reason,
                     )
+                    evidence_audit = _build_execution_audit(
+                        decision_terminal=not queue_for_research,
+                        final_action=final_action,
+                        final_reason=evidence_rejection_reason,
+                        evidence_quality=decision_for_edge.evidence_quality,
+                        min_evidence_quality=min_evidence_quality,
+                        evidence_quality_gap=evidence_gap,
+                        edge_market=evidence_queue_edge,
+                        edge_required=evidence_queue_required,
+                        research_queue_position=research_queue_position,
+                        **audit_context,
+                    )
+                    if queue_for_research and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
+                        try:
+                            state_manager.record_research_queue_entry(
+                                market_id=market.id,
+                                cycle_id=cycle_id,
+                                gate_name="evidence",
+                                reason=evidence_rejection_reason,
+                                threshold_gap=evidence_gap,
+                                what_to_learn_next=_research_learning_target(
+                                    gate_name="evidence",
+                                    reason=evidence_rejection_reason,
+                                    market=market,
+                                    decision=decision_for_edge,
+                                ),
+                                last_decision_json=_research_queue_last_decision_json(
+                                    decision_for_edge,
+                                    evidence_audit,
+                                ),
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Research queue persistence failed: market=%s error=%s",
+                                market.id,
+                                exc,
+                                data={"market_id": market.id, "error": str(exc)},
+                            )
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
                         decision=decision_for_edge.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_terminal=not queue_for_research,
-                            final_action=final_action,
-                            final_reason=evidence_rejection_reason,
-                            evidence_quality=decision_for_edge.evidence_quality,
-                            min_evidence_quality=min_evidence_quality,
-                            evidence_quality_gap=evidence_gap,
-                            research_queue_position=research_queue_position,
-                            **audit_context,
-                        ),
+                        execution_audit=evidence_audit,
                     )
                     if not queue_for_research:
                         _record_terminal_outcome(
@@ -11994,7 +12749,7 @@ def main(max_cycles: int | None = None) -> None:
                 required_edge_threshold = _edge_threshold_for_market(
                     implied_prob,
                     settings,
-                    market=market,
+                    market=active_market,
                     decision=decision_for_edge,
                 )
                 baseline_edge_threshold = _edge_threshold_for_market(
@@ -12005,7 +12760,7 @@ def main(max_cycles: int | None = None) -> None:
                     definitive_outcome_eligible=_is_definitive_outcome_eligible(
                         decision_for_edge,
                         settings,
-                        market=market,
+                        market=active_market,
                     ),
                 )
                 edge_threshold_reduction = max(
@@ -12016,7 +12771,7 @@ def main(max_cycles: int | None = None) -> None:
                     decision_for_edge,
                     implied_prob,
                     settings,
-                    market=market,
+                    market=active_market,
                 )
                 edge_gate_confidence = decision_for_edge.confidence
                 if execution_posterior_floor is not None:
@@ -12024,23 +12779,33 @@ def main(max_cycles: int | None = None) -> None:
                         decision_for_edge.confidence,
                         execution_posterior_floor,
                     )
+                canonical_posterior = edge_gate_confidence
                 audit_context["direct_posterior_floor_applied"] = (
                     execution_posterior_floor is not None
                 )
                 audit_context["direct_posterior_floor_value"] = execution_posterior_floor
                 audit_context["edge_gate_confidence"] = edge_gate_confidence
+                audit_context["model_probability_chosen"] = (
+                    _decision_outcome_probability(active_market, decision)
+                )
+                audit_context["calibrated_probability_chosen"] = decision.confidence
+                audit_context["bayesian_posterior_raw"] = bayesian_posterior_raw
+                audit_context["bayesian_posterior_applied"] = (
+                    bayesian_posterior_applied
+                )
+                audit_context["canonical_posterior_chosen"] = canonical_posterior
                 if execution_posterior_floor is None and not _posterior_floor_scope_allows(
-                    decision_for_edge, market, settings
+                    decision_for_edge, active_market, settings
                 ):
                     audit_context["direct_posterior_floor_scope_suppressed"] = True
                     audit_context["direct_posterior_floor_hours_to_close"] = (
-                        _hours_to_market_close(market)
+                        _hours_to_market_close(active_market)
                     )
                 edge_ok, edge_value, edge_reason = _passes_edge_threshold(
                     implied_prob,
                     decision_for_edge,
                     settings,
-                    market=market,
+                    market=active_market,
                     effective_confidence_override=edge_gate_confidence,
                 )
                 if (
@@ -12055,6 +12820,9 @@ def main(max_cycles: int | None = None) -> None:
                     edge_reason = "nonpositive_chosen_side_edge"
                 audit_context["edge_market"] = edge_value
                 audit_context["edge_external"] = decision_for_edge.edge_external
+                audit_context["edge_external_chosen"] = (
+                    chosen_side_external_edge(decision_for_edge)
+                )
                 audit_context["gate_edge_required_baseline"] = baseline_edge_threshold
                 audit_context["gate_edge_dynamic_reduction"] = edge_threshold_reduction
                 audit_context["gate_edge_dynamic_reduction_applied"] = (
@@ -12063,7 +12831,7 @@ def main(max_cycles: int | None = None) -> None:
                 _def_validated = _is_definitive_validated(
                     decision_for_edge,
                     settings,
-                    market=market,
+                    market=active_market,
                 )
                 if _def_validated:
                     audit_context["definitive_edge_bypass_validated"] = True
@@ -12074,7 +12842,7 @@ def main(max_cycles: int | None = None) -> None:
                     "implied_prob_market": implied_prob,
                     "confidence": decision_for_edge.confidence,
                     "evidence_quality": decision_for_edge.evidence_quality,
-                    "liquidity_usdc": market.liquidity_usdc,
+                    "liquidity_usdc": active_market.liquidity_usdc,
                     "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
                     "edge_gate_pass": edge_ok,
                     "gate_edge_required": required_edge_threshold,
@@ -12295,8 +13063,11 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     continue
 
-                if _is_uniform_implied_probability(implied_prob, market.outcomes):
-                    uniform_implied = 1.0 / len(market.outcomes)
+                if _is_uniform_implied_probability(
+                    implied_prob,
+                    active_market.outcomes,
+                ):
+                    uniform_implied = 1.0 / len(active_market.outcomes)
                     trades_skipped_edge += 1
                     _record_should_trade_blocked("uniform_implied_probability")
                     _record_rejection_reason(
@@ -12324,14 +13095,16 @@ def main(max_cycles: int | None = None) -> None:
                         "SKIP [%s] '%s' -> uniform implied probability detected (%d outcomes, implied=%.3f)",
                         market.id,
                         question_short,
-                        len(market.outcomes),
+                        len(active_market.outcomes),
                         implied_prob,
                         data={
                             "market_id": market.id,
                             "final_reason": "uniform_implied_probability",
                             "implied_prob": implied_prob,
                             "uniform_implied": uniform_implied,
-                            "outcomes": [outcome.name for outcome in market.outcomes],
+                            "outcomes": [
+                                outcome.name for outcome in active_market.outcomes
+                            ],
                             "score_breakdown": score_receipt_fields,
                         },
                     )
@@ -12341,6 +13114,7 @@ def main(max_cycles: int | None = None) -> None:
                 kelly_fraction_value: float | None = None
                 posterior_for_kelly: float | None = None
                 min_edge_for_kelly: float | None = None
+                dynamic_kelly_floor_allowed = False
                 kelly_bankroll_eligible = (
                     cycle_bankroll is None or cycle_bankroll >= settings.KELLY_MIN_BANKROLL_USDC
                 )
@@ -12367,25 +13141,23 @@ def main(max_cycles: int | None = None) -> None:
                         },
                     )
                 if kelly_path_active:
-                    posterior_for_kelly = (
-                        bayesian_posterior_applied
-                        if bayesian_posterior_applied is not None
-                        else effective_confidence
-                    )
-                    if execution_posterior_floor is not None:
-                        posterior_for_kelly = max(
-                            posterior_for_kelly,
-                            execution_posterior_floor,
-                        )
+                    posterior_for_kelly = canonical_posterior
                     kelly_raw_value = kelly_fraction(
                         posterior=posterior_for_kelly,
                         market_price=implied_prob,
                     )
                     kelly_fraction_value = _kelly_fraction_for_decision(
-                        market,
+                        active_market,
                         settings,
                         decision_for_edge,
                         effective_confidence,
+                    )
+                    dynamic_kelly_floor_allowed = _dynamic_kelly_floor_allowed(
+                        final_fraction=kelly_fraction_value,
+                        settings=settings,
+                    )
+                    audit_context["kelly_dynamic_floor_allowed"] = (
+                        dynamic_kelly_floor_allowed
                     )
 
                 score_gate_score_source = "runtime_recomputed"
@@ -12397,7 +13169,7 @@ def main(max_cycles: int | None = None) -> None:
                         decision=decision_for_edge,
                         evidence_basis=evidence_basis,
                         settings=settings,
-                        market=market,
+                        market=active_market,
                     )
                 )
                 exec_pfx_stats = _get_prefix_pnl(market.id or "")
@@ -12418,40 +13190,37 @@ def main(max_cycles: int | None = None) -> None:
                 # post-sizing recompute below still drives the LMSR execution gate.
                 if settings.LMSR_ENABLED:
                     lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
-                        market=market,
+                        market=active_market,
                         decision_outcome=decision_for_edge.outcome,
                         amount_usdc=settings.MAX_BET_USDC,
                         settings=settings,
                     )
                     if lmsr_execution_price is not None:
-                        posterior_for_signal = _posterior_for_lmsr_signal(
-                            bayesian_posterior_applied=bayesian_posterior_applied,
-                            effective_confidence=effective_confidence,
-                            execution_posterior_floor=execution_posterior_floor,
-                        )
                         try:
                             ineff_signal = lmsr_inefficiency_signal(
-                                posterior_for_signal,
+                                canonical_posterior,
                                 lmsr_execution_price,
                             )
                         except ValueError:
                             ineff_signal = None
                 score_result = compute_final_score(
-                    market=market,
+                    market=active_market,
                     decision=decision_for_edge,
                     implied_prob_market=implied_prob,
-                    bayesian_posterior=bayesian_posterior_applied,
+                    bayesian_posterior=canonical_posterior,
                     lmsr_price=lmsr_execution_price,
                     inefficiency_signal=ineff_signal,
                     kelly_raw=kelly_raw_value,
-                    edge_market_confidence_override=execution_posterior_floor,
+                    edge_market_confidence_override=canonical_posterior,
                     **_score_kwargs(
                         settings=settings,
                         repeated_analysis_count=(state.analysis_count if state is not None else 0),
                         non_actionable_streak=(
                             state.non_actionable_streak if state is not None else 0
                         ),
-                        is_weather_market=(market_family(market) == "weather"),
+                        is_weather_market=(
+                            market_family(active_market) == "weather"
+                        ),
                         evidence_basis_class=evidence_basis,
                         edge_source=decision_for_edge.edge_source or "",
                         market_family=market_family_name,
@@ -12460,7 +13229,7 @@ def main(max_cycles: int | None = None) -> None:
                         definitive_outcome_eligible=_is_definitive_outcome_eligible(
                             decision_for_edge,
                             settings,
-                            market=market,
+                            market=active_market,
                         ),
                         historical_family_pnl_total=float(
                             candidate.get("historical_family_pnl_total", 0.0) or 0.0
@@ -12520,7 +13289,7 @@ def main(max_cycles: int | None = None) -> None:
                 score_mode = settings.SCORE_GATE_MODE
                 score_threshold_effective = _effective_score_gate_threshold(
                     settings=settings,
-                    market=market,
+                    market=active_market,
                     evidence_basis_class=evidence_basis,
                     evidence_quality=decision_for_edge.evidence_quality,
                     family_is_profitable=_family_is_profitable_from_context(
@@ -12540,7 +13309,7 @@ def main(max_cycles: int | None = None) -> None:
                     definitive_outcome_eligible=_is_definitive_outcome_eligible(
                         decision_for_edge,
                         settings,
-                        market=market,
+                        market=active_market,
                     ),
                 )
                 score_receipt_fields = _apply_runtime_score_receipt(
@@ -12572,6 +13341,11 @@ def main(max_cycles: int | None = None) -> None:
                         "final_score": score_result.final_score,
                         "edge_market": score_result.edge_market,
                         "edge_external": score_result.edge_external,
+                        "edge_external_chosen": (
+                            score_result.edge_external_chosen
+                        ),
+                        "market_snapshot_source": execution_snapshot.source,
+                        "execution_entry_price": entry_price,
                         "evidence_quality": score_result.evidence_quality,
                         "evidence_component": score_result.evidence_component,
                         "bayesian_component": score_result.bayesian_component,
@@ -12637,6 +13411,7 @@ def main(max_cycles: int | None = None) -> None:
                         "kelly_raw": kelly_raw_value,
                         "bayesian_posterior_raw": bayesian_posterior_raw,
                         "bayesian_posterior_applied": bayesian_posterior_applied,
+                        "canonical_posterior_chosen": canonical_posterior,
                         "bayesian_applied": bayesian_posterior_applied is not None,
                         "bayesian_update_count": bayesian_update_count,
                         "bayesian_min_updates": settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
@@ -12803,31 +13578,26 @@ def main(max_cycles: int | None = None) -> None:
                     implied_prob,
                     edge_value,
                     settings,
-                    market=market,
+                    market=active_market,
                 )
                 if kelly_path_active:
                     if posterior_for_kelly is None:
-                        posterior_for_kelly = (
-                            bayesian_posterior_applied
-                            if bayesian_posterior_applied is not None
-                            else effective_confidence
-                        )
-                        if execution_posterior_floor is not None:
-                            posterior_for_kelly = max(
-                                posterior_for_kelly,
-                                execution_posterior_floor,
-                            )
+                        posterior_for_kelly = canonical_posterior
                     if kelly_fraction_value is None:
                         kelly_fraction_value = _kelly_fraction_for_decision(
-                            market,
+                            active_market,
                             settings,
                             decision_for_edge,
                             effective_confidence,
                         )
+                        dynamic_kelly_floor_allowed = _dynamic_kelly_floor_allowed(
+                            final_fraction=kelly_fraction_value,
+                            settings=settings,
+                        )
                     min_edge_for_kelly = _edge_threshold_for_market(
                         implied_prob,
                         settings,
-                        market=market,
+                        market=active_market,
                         decision=decision_for_edge,
                     )
                     adjusted_bet_pct = kelly_bet_pct(
@@ -12836,7 +13606,7 @@ def main(max_cycles: int | None = None) -> None:
                         fraction=kelly_fraction_value,
                         min_edge=min_edge_for_kelly,
                         edge=edge_value,
-                        dynamic_enabled=settings.KELLY_DYNAMIC_ENABLED,
+                        dynamic_enabled=dynamic_kelly_floor_allowed,
                     )
                 else:
                     adjusted_bet_pct = edge_scaling_bet_pct
@@ -12968,32 +13738,10 @@ def main(max_cycles: int | None = None) -> None:
                     continue
 
                 proposed_bet_amount = _calculate_bet(settings.MAX_BET_USDC, adjusted_bet_pct)
-                # Precise post-sizing recompute of the LMSR execution price for the
-                # mispricing gate. The pre-gate computation above already fed the
-                # score; this re-derives it with the actual proposed bet amount.
-                # With the configured liquidity parameter this is a mispricing
-                # check (|posterior - market_price|); LMSR_MIN_INEFFICIENCY is kept
-                # below the edge gate so it is a light floor, not a double-block.
+                # Use the same canonical LMSR signal for scoring and gating.
+                # Recomputing it after the score gate made the receipt describe a
+                # different signal than the one that actually passed scoring.
                 if settings.LMSR_ENABLED:
-                    lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
-                        market=market,
-                        decision_outcome=decision.outcome,
-                        amount_usdc=proposed_bet_amount,
-                        settings=settings,
-                    )
-                    if lmsr_execution_price is not None:
-                        posterior_for_signal = _posterior_for_lmsr_signal(
-                            bayesian_posterior_applied=bayesian_posterior_applied,
-                            effective_confidence=effective_confidence,
-                            execution_posterior_floor=execution_posterior_floor,
-                        )
-                        try:
-                            ineff_signal = lmsr_inefficiency_signal(
-                                posterior_for_signal,
-                                lmsr_execution_price,
-                            )
-                        except ValueError:
-                            ineff_signal = None
                     if not _passes_lmsr_inefficiency_threshold(
                         ineff_signal,
                         settings.LMSR_MIN_INEFFICIENCY,
@@ -13119,7 +13867,7 @@ def main(max_cycles: int | None = None) -> None:
 
                 should_add, bet_pct, position_reason = _should_adjust_position(
                     decision_for_edge.model_copy(update={"bet_size_pct": adjusted_bet_pct}),
-                    market,
+                    active_market,
                     existing_position,
                     state,
                     settings,
@@ -13317,7 +14065,7 @@ def main(max_cycles: int | None = None) -> None:
                         },
                     )
 
-                ev_probability = _decision_outcome_probability(market, decision_for_edge)
+                ev_probability = canonical_posterior
                 expected_value_usdc = _expected_value_usdc(
                     probability=ev_probability,
                     entry_price=entry_price,
@@ -13525,196 +14273,18 @@ def main(max_cycles: int | None = None) -> None:
                     continue
 
                 question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
-                active_market = market
-                audit_context["stale_refresh_lenient_fallback_used"] = False
-                market_data_age_seconds: float | None = None
-                if isinstance(market_snapshot_monotonic, (int, float)):
-                    market_data_age_seconds = max(
-                        0.0,
-                        time.monotonic() - float(market_snapshot_monotonic),
-                    )
-                force_refresh_for_staleness = _requires_market_refresh(
-                    pre_order_market_refresh=False,
-                    market_data_age_seconds=market_data_age_seconds,
-                    max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
-                )
-                if _requires_market_refresh(
-                    pre_order_market_refresh=settings.PRE_ORDER_MARKET_REFRESH,
-                    market_data_age_seconds=market_data_age_seconds,
-                    max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
-                ):
-                    refresh_exception: Exception | None = None
-                    refresh_attempts = 0
-                    for refresh_attempt in range(2):
-                        refresh_attempts = refresh_attempt + 1
-                        try:
-                            refreshed = kalshi_client.get_market(market.id)
-                            if refreshed.outcomes:
-                                active_market = refreshed
-                            refresh_exception = None
-                            break
-                        except Exception as exc:
-                            refresh_exception = exc
-                            if refresh_attempt == 0:
-                                time.sleep(_STALE_REFRESH_RETRY_DELAY_SECONDS)
-                    if refresh_exception is None:
-                        logger.debug(
-                            "Using refreshed market snapshot for execution: market=%s",
-                            market.id,
-                            data={
-                                "market_id": market.id,
-                                "market_data_age_seconds": market_data_age_seconds,
-                                "force_refresh_for_staleness": force_refresh_for_staleness,
-                                "refresh_attempts": refresh_attempts,
-                            },
-                        )
-                    elif force_refresh_for_staleness:
-                        lenient_stale_refresh_allowed = _can_use_lenient_stale_refresh_fallback(
-                            evidence_basis_class=evidence_basis,
-                            pre_execution_final_score=pre_execution_final_score,
-                            market_data_age_seconds=market_data_age_seconds,
-                            settings=settings,
-                        )
-                        if lenient_stale_refresh_allowed:
-                            audit_context["stale_refresh_lenient_fallback_used"] = True
-                            logger.warning(
-                                "Proceeding with stale market snapshot after refresh failures: market=%s",
-                                market.id,
-                                data={
-                                    "market_id": market.id,
-                                    "error": str(refresh_exception),
-                                    "market_data_age_seconds": market_data_age_seconds,
-                                    "max_market_data_age_seconds": settings.MAX_MARKET_DATA_AGE_SECONDS,
-                                    "lenient_max_age_seconds": (
-                                        settings.MAX_MARKET_DATA_AGE_SECONDS
-                                        * _STALE_REFRESH_LENIENT_AGE_MULTIPLIER
-                                    ),
-                                    "refresh_attempts": refresh_attempts,
-                                    "evidence_basis_class": evidence_basis,
-                                    "pre_execution_final_score": pre_execution_final_score,
-                                },
-                            )
-                        else:
-                            logger.warning(
-                                "SKIP [%s] '%s' -> stale market data and refresh failed",
-                                market.id,
-                                question_short,
-                                data={
-                                    "market_id": market.id,
-                                    "error": str(refresh_exception),
-                                    "market_data_age_seconds": market_data_age_seconds,
-                                    "max_market_data_age_seconds": settings.MAX_MARKET_DATA_AGE_SECONDS,
-                                    "refresh_attempts": refresh_attempts,
-                                },
-                            )
-                            trades_skipped_edge += 1
-                            _record_should_trade_blocked("stale_market_data_refresh_failed")
-                            log_trade_decision(
-                                market_id=market.id,
-                                question=market.question,
-                                decision=decision_for_edge.model_copy(
-                                    update={"bet_size_pct": bet_pct}
-                                ).model_dump(),
-                                execution_audit=_build_execution_audit(
-                                    decision_phase="post_market_refresh",
-                                    decision_terminal=True,
-                                    final_action="skip",
-                                    final_reason="stale_market_data_refresh_failed",
-                                    market_data_age_seconds=market_data_age_seconds,
-                                    max_market_data_age_seconds=settings.MAX_MARKET_DATA_AGE_SECONDS,
-                                    refresh_attempts=refresh_attempts,
-                                    **audit_context,
-                                ),
-                            )
-                            _record_terminal_outcome(
-                                state_manager,
-                                market.id,
-                                "stale_market_data_refresh_failed",
-                            )
-                            continue
-                    else:
-                        logger.warning(
-                            "Pre-order market refresh failed; using scheduled snapshot: market=%s error=%s",
-                            market.id,
-                            refresh_exception,
-                            data={
-                                "market_id": market.id,
-                                "error": str(refresh_exception),
-                                "market_data_age_seconds": market_data_age_seconds,
-                                "refresh_attempts": refresh_attempts,
-                            },
-                        )
-                if active_market is not market:
-                    entry_price = _get_outcome_entry_price(active_market, decision.outcome)
-                    refreshed_edge_ok, implied_prob, refreshed_edge_value, refreshed_edge_reason = _passes_refreshed_edge_guard(
-                        active_market,
-                        decision_for_edge,
-                        settings,
-                        effective_confidence_override=edge_gate_confidence,
-                    )
-                    audit_context["edge_market"] = refreshed_edge_value
-                    if not refreshed_edge_ok:
-                        trades_skipped_edge += 1
-                        _record_should_trade_blocked("refreshed_edge_gate_blocked")
-                        _record_rejection_reason(
-                            rejection_breakdown,
-                            "refreshed_edge_gate_blocked",
-                        )
-                        if refreshed_edge_reason == "non_sports_needs_direct_evidence":
-                            _record_rejection_reason(
-                                rejection_breakdown,
-                                "non_sports_needs_direct",
-                            )
-                        elif refreshed_edge_reason == "edge_above_reasonable_max":
-                            _record_rejection_reason(
-                                rejection_breakdown,
-                                "edge_above_reasonable_max",
-                            )
-                        logger.warning(
-                            "SKIP [%s] '%s' -> refreshed edge gate (%s)",
-                            market.id,
-                            question_short,
-                            refreshed_edge_reason,
-                            data={
-                                "market_id": market.id,
-                                "final_reason": "refreshed_edge_gate_blocked",
-                                "implied_prob": implied_prob,
-                                "confidence": decision_for_edge.confidence,
-                                "edge": refreshed_edge_value,
-                                "score_breakdown": score_receipt_fields,
-                            },
-                        )
-                        log_trade_decision(
-                            market_id=market.id,
-                            question=market.question,
-                            decision=decision_for_edge.model_copy(
-                                update={"bet_size_pct": bet_pct}
-                            ).model_dump(),
-                            execution_audit=_build_execution_audit(
-                                decision_phase="post_market_refresh",
-                                decision_terminal=True,
-                                final_action="skip",
-                                final_reason="refreshed_edge_gate_blocked",
-                                implied_prob_market=implied_prob,
-                                **audit_context,
-                            ),
-                        )
-                        _record_terminal_outcome(state_manager, market.id, "refreshed_edge_gate_blocked")
-                        continue
+                execution_orderbook = execution_snapshot.orderbook
 
                 if (
                     settings.ORDERBOOK_PRECHECK_ENABLED
                     and decision_for_edge.confidence >= settings.ORDERBOOK_PRECHECK_MIN_CONFIDENCE
+                    and execution_orderbook is not None
                 ):
-                    option_index = None
-                    for idx, market_outcome in enumerate(active_market.outcomes):
-                        if market_outcome.name.upper() == decision.outcome.upper():
-                            option_index = idx
-                            break
+                    option_index = execution_snapshot.orderbook_option_index
                     if option_index is not None:
                         try:
-                            orderbook = kalshi_client.get_market_orderbook(active_market.id)
-                            best_sell = _best_orderbook_sell_price(orderbook, option_index)
+                            orderbook = execution_orderbook
+                            best_sell = execution_snapshot.orderbook_best_sell
                             if best_sell is not None:
                                 _set_outcome_entry_price(
                                     active_market,
@@ -13798,17 +14368,23 @@ def main(max_cycles: int | None = None) -> None:
                                 continue
                             if (
                                 best_sell is not None
-                                and entry_price_for_check is not None
+                                and execution_snapshot.refreshed_entry_price is not None
                                 and best_sell > (
-                                    entry_price_for_check + _ORDERBOOK_SPREAD_CUTOFF_DEFAULT
+                                    execution_snapshot.refreshed_entry_price
+                                    + _ORDERBOOK_SPREAD_CUTOFF_DEFAULT
                                 )
                             ):
                                 if settings.CALIBRATION_MODE_ENABLED:
-                                    spread_abs = best_sell - entry_price_for_check
+                                    spread_abs = (
+                                        best_sell
+                                        - execution_snapshot.refreshed_entry_price
+                                    )
                                     spread_payload = {
                                         "market_id": market.id,
                                         "best_sell_price": best_sell,
-                                        "entry_price": entry_price_for_check,
+                                        "entry_price": (
+                                            execution_snapshot.refreshed_entry_price
+                                        ),
                                         "orderbook_spread_abs": spread_abs,
                                         "analysis_duration_ms": round((time.monotonic() - market_start) * 1000, 2),
                                     }
@@ -13837,7 +14413,9 @@ def main(max_cycles: int | None = None) -> None:
                                         final_action="skip",
                                         final_reason="orderbook_spread_too_wide",
                                         best_sell_price=best_sell,
-                                        entry_price=entry_price_for_check,
+                                        entry_price=(
+                                            execution_snapshot.refreshed_entry_price
+                                        ),
                                         option_index=option_index,
                                         **audit_context,
                                     ),
@@ -13852,12 +14430,14 @@ def main(max_cycles: int | None = None) -> None:
                                     market.id,
                                     question_short,
                                     best_sell,
-                                    entry_price_for_check,
+                                    execution_snapshot.refreshed_entry_price,
                                     data={
                                         "market_id": market.id,
                                         "final_reason": "orderbook_spread_too_wide",
                                         "best_sell_price": best_sell,
-                                        "entry_price": entry_price_for_check,
+                                        "entry_price": (
+                                            execution_snapshot.refreshed_entry_price
+                                        ),
                                         "option_index": option_index,
                                         "score_breakdown": score_receipt_fields,
                                     },
@@ -13946,7 +14526,7 @@ def main(max_cycles: int | None = None) -> None:
                         primary_source_whitelisted=_is_definitive_outcome_eligible(
                             decision_for_edge,
                             settings,
-                            market=market,
+                            market=active_market,
                         ),
                         cycle_overrides_applied=cycle_definitive_overrides_applied,
                         max_overrides_per_cycle=settings.MAX_DEFINITIVE_OVERRIDES_PER_CYCLE,
@@ -14175,7 +14755,6 @@ def main(max_cycles: int | None = None) -> None:
                             final_action="skip",
                             final_reason="market_closed_during_cycle",
                             bet_amount_usdc=bet_amount,
-                            market_data_age_seconds=market_data_age_seconds,
                             **audit_context,
                         ),
                     )
@@ -14224,7 +14803,6 @@ def main(max_cycles: int | None = None) -> None:
                             decision_terminal=True,
                             final_action="skip",
                             final_reason="insufficient_balance",
-                            market_data_age_seconds=market_data_age_seconds,
                             **order_audit_context,
                         ),
                     )
@@ -14263,7 +14841,6 @@ def main(max_cycles: int | None = None) -> None:
                             final_action="order_attempt",
                             final_reason="market_closed",
                             order_error=str(closed_exc),
-                            market_data_age_seconds=market_data_age_seconds,
                             **order_audit_context,
                         ),
                     )
@@ -14339,7 +14916,6 @@ def main(max_cycles: int | None = None) -> None:
                             final_action="order_attempt",
                             final_reason=order_failure_reason,
                             order_error=error_msg,
-                            market_data_age_seconds=market_data_age_seconds,
                             **order_audit_context,
                         ),
                     )
@@ -14447,6 +15023,38 @@ def main(max_cycles: int | None = None) -> None:
                     order_response,
                     submitted_amount_usdc=bet_amount,
                 )
+                try:
+                    order_persistence = _persist_submitted_order_lifecycle(
+                        state_manager=state_manager,
+                        market_id=market.id,
+                        outcome=decision_for_edge.outcome,
+                        order_response=order_response,
+                        lifecycle=order_lifecycle,
+                        submitted_amount_usdc=bet_amount,
+                        fallback_entry_price=entry_price,
+                        confidence=decision_for_edge.confidence,
+                        implied_prob=implied_prob,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to persist submitted order lifecycle: market=%s order_id=%s error=%s",
+                        market.id,
+                        order_response.id,
+                        exc,
+                        data={
+                            "market_id": market.id,
+                            "order_id": order_response.id,
+                            "order_status": order_response.status,
+                            "error": str(exc),
+                        },
+                    )
+                    order_persistence = {
+                        "pending_order_persisted": False,
+                        "fill_recorded": False,
+                        "recorded_fill_shares": 0.0,
+                        "recorded_fill_notional_usdc": 0.0,
+                        "persistence_error": str(exc),
+                    }
                 order_fill_count = order_lifecycle.fill_count
                 unfilled_canceled_order = (
                     normalized_order_status in {"cancelled", "canceled"}
@@ -14469,24 +15077,39 @@ def main(max_cycles: int | None = None) -> None:
                     if order_lifecycle.fully_filled:
                         trades_filled += 1
                         family_stats["orders_filled"] += 1
+                        final_reason = "order_filled"
+                        terminal_outcome = "order_filled"
                     elif order_lifecycle.partially_filled:
                         trades_partially_filled += 1
                         family_stats["orders_partially_filled"] += 1
+                        final_reason = "order_partially_filled"
+                        terminal_outcome = "order_partially_filled"
                     elif order_lifecycle.resting_unfilled:
                         trades_resting_unfilled += 1
                         family_stats["orders_resting_unfilled"] += 1
-                    total_usd_deployed += order_lifecycle.filled_notional_usdc
+                        final_reason = "order_resting_unfilled"
+                        terminal_outcome = "order_resting_unfilled"
+                    recorded_fill_notional = float(
+                        order_persistence.get("recorded_fill_notional_usdc") or 0.0
+                    )
+                    total_usd_deployed += recorded_fill_notional
                     family_stats["usd_deployed"] += (
-                        order_lifecycle.filled_notional_usdc
+                        recorded_fill_notional
                     )
-                    state_manager.reset_fill_failure_count(market.id)
-                    _credit_daily_expectancy_exposure(
-                        opportunity_role=opportunity_role,
-                        expected_value_usdc=expected_value_usdc,
-                    )
-                    audit_context["daily_expectancy_ev_credited"] = True
-                    if last_known_balance is not None:
-                        last_known_balance = max(0.0, float(last_known_balance) - float(bet_amount))
+                    if bool(order_persistence.get("fill_recorded")):
+                        state_manager.reset_fill_failure_count(market.id)
+                        _credit_daily_expectancy_exposure(
+                            opportunity_role=opportunity_role,
+                            expected_value_usdc=expected_value_usdc,
+                        )
+                        audit_context["daily_expectancy_ev_credited"] = True
+                        if last_known_balance is not None:
+                            last_known_balance = max(
+                                0.0,
+                                float(last_known_balance) - recorded_fill_notional,
+                            )
+                    else:
+                        audit_context["daily_expectancy_ev_credited"] = False
                 _refresh_last_known_balance()
                 final_order_audit_context = {
                     **order_audit_context,
@@ -14497,6 +15120,7 @@ def main(max_cycles: int | None = None) -> None:
                     "order_requested_count": order_lifecycle.requested_count,
                     "filled_notional_usdc": order_lifecycle.filled_notional_usdc,
                     "submitted_notional_usdc": bet_amount,
+                    **order_persistence,
                 }
                 log_trade_decision(
                     market_id=market.id,
@@ -14526,7 +15150,6 @@ def main(max_cycles: int | None = None) -> None:
                             else None
                         ),
                         balance_after_trade=last_known_balance if not unfilled_canceled_order else None,
-                        market_data_age_seconds=market_data_age_seconds,
                         **final_order_audit_context,
                     ),
                 )
@@ -14544,30 +15167,6 @@ def main(max_cycles: int | None = None) -> None:
                         },
                     )
                     continue
-
-                try:
-                    client_price = None
-                    client_shares = None
-                    if isinstance(order_response.raw, dict):
-                        client_price = order_response.raw.get("client_price")
-                        client_shares = order_response.raw.get("client_qty_shares")
-                    state_manager.record_trade(
-                        market.id,
-                        order_response,
-                        bet_amount,
-                        outcome=decision.outcome,
-                        entry_price=client_price or entry_price,
-                        implied_prob=implied_prob,
-                        confidence=decision_for_edge.confidence,
-                        shares=client_shares,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to record trade for market %s: %s",
-                        market.id,
-                        exc,
-                        data={"market_id": market.id, "error": str(exc)},
-                    )
 
                 market_duration = (time.monotonic() - market_start) * 1000
                 logger.debug(
@@ -14629,7 +15228,32 @@ def main(max_cycles: int | None = None) -> None:
                 }
                 for family_name, stats in sorted(execution_family_stats.items())
             }
-            orders_with_any_fill = trades_filled + trades_partially_filled
+            orders_with_any_fill = (
+                trades_filled
+                + trades_partially_filled
+                + fill_sync_metrics.new_fill_events
+            )
+            try:
+                pending_orders_open = len(state_manager.get_pending_orders())
+            except Exception:
+                pending_orders_open = 0
+            try:
+                research_queue_backlog = (
+                    state_manager.get_research_queue_backlog_summary(
+                        lookback_hours=max(
+                            settings.RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS,
+                            int(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS),
+                        )
+                    )
+                )
+            except Exception:
+                research_queue_backlog = {
+                    "active_total": 0,
+                    "priority_drain_candidates": 0,
+                    "soft_research_placeholders": 0,
+                    "repeated_low_yield": 0,
+                    "legacy_jurisdiction_holds": 0,
+                }
             cumulative_cycle_pnl_estimate = _resolved_pnl_estimate_total(state_manager)
             exchange_realized_pnl_total = state_manager.get_exchange_realized_pnl_total()
             api_cost_per_fill = (
@@ -14856,6 +15480,13 @@ def main(max_cycles: int | None = None) -> None:
                 "orders_resting_unfilled": trades_resting_unfilled,
                 "orders_with_any_fill": orders_with_any_fill,
                 "orders_canceled_unfilled": trades_canceled_unfilled,
+                "reconciled_fill_events": fill_sync_metrics.new_fill_events,
+                "reconciled_fill_notional_usdc": round(
+                    fill_sync_metrics.filled_notional_usdc,
+                    2,
+                ),
+                "pending_orders_open": pending_orders_open,
+                "research_queue_backlog": research_queue_backlog,
                 "total_usd_submitted": round(total_usd_submitted, 2),
                 "total_usd_deployed": round(total_usd_deployed, 2),
                 "projected_daily_expected_value_usdc": round(
@@ -15266,6 +15897,13 @@ def main(max_cycles: int | None = None) -> None:
                     "orders_resting_unfilled": trades_resting_unfilled,
                     "orders_with_any_fill": orders_with_any_fill,
                     "orders_canceled_unfilled": trades_canceled_unfilled,
+                    "reconciled_fill_events": fill_sync_metrics.new_fill_events,
+                    "reconciled_fill_notional_usdc": round(
+                        fill_sync_metrics.filled_notional_usdc,
+                        2,
+                    ),
+                    "pending_orders_open": pending_orders_open,
+                    "research_queue_backlog": research_queue_backlog,
                     "total_usd_submitted": round(total_usd_submitted, 2),
                     "total_usd_deployed": round(total_usd_deployed, 2),
                     "execution_family_breakdown": execution_family_breakdown,
@@ -15338,6 +15976,13 @@ def main(max_cycles: int | None = None) -> None:
                     "orders_resting_unfilled": trades_resting_unfilled,
                     "orders_with_any_fill": orders_with_any_fill,
                     "orders_canceled_unfilled": trades_canceled_unfilled,
+                    "reconciled_fill_events": fill_sync_metrics.new_fill_events,
+                    "reconciled_fill_notional_usdc": round(
+                        fill_sync_metrics.filled_notional_usdc,
+                        2,
+                    ),
+                    "pending_orders_open": pending_orders_open,
+                    "research_queue_backlog": research_queue_backlog,
                     "total_usd_submitted": round(total_usd_submitted, 2),
                     "total_usd_deployed": round(total_usd_deployed, 2),
                     "pre_analysis_rejection_breakdown": pre_analysis_rejection_breakdown,

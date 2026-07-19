@@ -37,6 +37,7 @@ class ScoreResult:
     final_score: float
     edge_market: float
     edge_external: float
+    edge_external_chosen: float
     evidence_quality: float
     liquidity_penalty: float
     staleness_penalty: float
@@ -93,6 +94,13 @@ class ScoreResult:
     lmsr_price: float | None = None
     inefficiency_signal: float | None = None
     kelly_raw: float | None = None
+
+
+def chosen_side_external_edge(decision: TradeDecision) -> float:
+    raw_edge = float(decision.edge_external or 0.0)
+    if str(decision.outcome or "").strip().upper() == "NO":
+        return -raw_edge
+    return raw_edge
 
 
 def compute_final_score(
@@ -180,7 +188,8 @@ def compute_final_score(
             )
         edge_market = edge_market_confidence - implied_prob_market
 
-    edge_external = decision.edge_external or 0.0
+    edge_external = float(decision.edge_external or 0.0)
+    edge_external_chosen = chosen_side_external_edge(decision)
     evidence_quality = max(0.0, min(1.0, decision.evidence_quality))
 
     liquidity = market.liquidity_usdc or 0.0
@@ -198,7 +207,7 @@ def compute_final_score(
         staleness_penalty = 0.03
 
     evidence_multiplier = 0.5 + (0.5 * evidence_quality)
-    weighted_edge = (0.50 * edge_market) + (0.35 * edge_external)
+    weighted_edge = (0.50 * edge_market) + (0.35 * edge_external_chosen)
     evidence_component = 0.15 * evidence_quality
     bayesian_component = 0.0
     if bayesian_posterior is not None:
@@ -245,7 +254,7 @@ def compute_final_score(
     low_info_threshold = max(0.0, min(1.0, low_info_penalty_threshold))
     low_info_base = max(0.0, low_info_penalty_base)
     normalized_edge_source = (edge_source or decision.edge_source or "").strip().lower()
-    source_confirmed_edge_value = max(edge_market, edge_external)
+    source_confirmed_edge_value = max(edge_market, edge_external_chosen)
     source_confirmed_edge = (
         normalized_edge_source == "computed"
         and bool(primary_source_url_present)
@@ -286,7 +295,10 @@ def compute_final_score(
         # near-binary read of the outcome.
         definitive_outcome_bonus = 0.10
     computed_edge_bonus = 0.0
-    if normalized_edge_source == "computed":
+    if (
+        normalized_edge_source == "computed"
+        and max(edge_market, edge_external_chosen) > 0.0
+    ):
         computed_edge_bonus = max(0.0, computed_edge_bonus_base) * (
             0.50 + (0.50 * evidence_quality)
         )
@@ -582,7 +594,8 @@ def compute_final_score(
         score_scale = max(0.0, float(historical_family_signal_score_scale))
         historical_family_score_adjustment = historical_family_signal * score_scale
         if historical_family_score_adjustment > 0.0 and not (
-            max(edge_market, edge_external) > 0.0 and evidence_quality >= 0.65
+            max(edge_market, edge_external_chosen) > 0.0
+            and evidence_quality >= 0.65
         ):
             historical_family_score_adjustment = 0.0
         size_scale = max(0.0, min(1.0, float(historical_family_size_scale_max)))
@@ -781,6 +794,7 @@ def compute_final_score(
         final_score=final_score,
         edge_market=edge_market,
         edge_external=edge_external,
+        edge_external_chosen=edge_external_chosen,
         evidence_quality=evidence_quality,
         liquidity_penalty=liquidity_penalty,
         staleness_penalty=staleness_penalty,

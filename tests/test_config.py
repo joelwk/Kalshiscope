@@ -217,6 +217,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
     def test_profit_tuning_defaults_are_loaded(self) -> None:
+        self.assertEqual(config.Settings.MARKET_FAMILY_BLOCKLIST, ())
         self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.18)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_THRESHOLD, 0.25)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.28)
@@ -225,6 +226,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER, 0.85)
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
+        self.assertEqual(config.Settings.KELLY_MIN_BET_POLICY, "skip")
 
     def test_strategy_component_weight_defaults(self) -> None:
         self.assertEqual(config.Settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.30)

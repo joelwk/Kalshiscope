@@ -862,7 +862,7 @@ class Settings:
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
-    KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
+    KELLY_MIN_BET_POLICY: str = "skip"  # skip|floor|fallback_edge_scaling
     KELLY_MIN_BANKROLL_USDC: float = 30.0
 
     # Side-flip guardrails
