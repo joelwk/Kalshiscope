@@ -203,7 +203,7 @@ class TestConfig(unittest.TestCase):
     def test_weather_profitability_defaults_are_conservative(self) -> None:
         self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.65)
         self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
-        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.65)
+        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.60)
         self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
         self.assertEqual(config.Settings.WEATHER_HIGH_EQ_EDGE_MULTIPLIER, 0.85)
@@ -213,6 +213,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK, 0.20)
         self.assertEqual(config.Settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER, 0.50)
         self.assertEqual(config.Settings.COMMODITY_MIN_EDGE, 0.22)
+        self.assertEqual(config.Settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER, 0.95)
+        self.assertEqual(config.Settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY, 0.75)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.30)
         self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
@@ -227,7 +229,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(config.Settings.KELLY_MIN_BET_POLICY, "skip")
-        self.assertEqual(config.Settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.85)
+        self.assertEqual(config.Settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.60)
 
     def test_strategy_component_weight_defaults(self) -> None:
         self.assertEqual(config.Settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.30)
@@ -342,6 +344,8 @@ class TestConfig(unittest.TestCase):
             "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=0.20",
             "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=0.50",
             "COMMODITY_MIN_EDGE=0.22",
+            "COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=0.95",
+            "COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75",
             "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=0.15",
             "GENERIC_PROXY_HIGH_EDGE_MIN=0.18",
             "EXTENDED_RESEARCH_COOLDOWN_CYCLES=3",
@@ -378,7 +382,7 @@ class TestConfig(unittest.TestCase):
             "KALSHI_FETCH_TOPUP_ENABLED=false",
             "KELLY_DYNAMIC_ENABLED=true",
             "KELLY_FRACTION_DEFAULT=0.30",
-            "KELLY_MIN_BET_NEAR_MISS_RATIO=0.85",
+            "KELLY_MIN_BET_NEAR_MISS_RATIO=0.60",
             "GROK_SELF_CONSISTENCY_ENABLED=true",
             "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2",
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS=420",

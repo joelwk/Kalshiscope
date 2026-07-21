@@ -90,6 +90,17 @@ class TestGrokClient(unittest.TestCase):
         with self.assertRaises(ValueError):
             _extract_json("no-json")
 
+    def test_extract_json_recovers_truncated_object(self) -> None:
+        """Brent deep-failure pattern: opens `{` but truncates mid-string without `}`."""
+        truncated = (
+            '{ "should_trade": true, "outcome": "YES", "confidence": 0.70, '
+            '"reasoning": "Buffer supports edge from WSJ quote'
+        )
+        payload = _extract_json(truncated)
+        self.assertTrue(payload["should_trade"])
+        self.assertEqual(payload["outcome"], "YES")
+        self.assertAlmostEqual(float(payload["confidence"]), 0.70)
+
     def test_is_retriable_grok_error_classifies_fast_internal(self) -> None:
         err = RuntimeError("StatusCode.INTERNAL: internal server error")
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))

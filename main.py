@@ -261,6 +261,19 @@ _PRE_ANALYSIS_HARD_REJECTION_TERMINAL_OUTCOMES = {
 # opportunities" log line and the per-cycle receipt summary.
 _RESEARCH_QUEUE_EVIDENCE_GAP_MAX = 0.08
 _RESEARCH_QUEUE_EDGE_GAP_MAX = 0.08
+# Settlement-aligned proxy edge near-misses (e.g. Brent 0.2165 vs 0.22) must
+# re-enter the queue; requiring evidence_basis=direct parked them as terminal skips.
+_RESEARCH_QUEUE_PROXY_EDGE_MIN_EQ = 0.70
+# Soft-demote chronic absence_only / soft-score parking so edge/kelly near-misses
+# win drain slots. Zero-yield promotions may still select these after demotion.
+_RESEARCH_QUEUE_CHRONIC_DRAIN_ATTEMPTS = 4
+_RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY = 0.20
+_RESEARCH_QUEUE_CHRONIC_DRAIN_REASONS = frozenset(
+    {
+        "no_trade_research_gap",
+        "pre_analysis_score_soft_research",
+    }
+)
 _SCORE_GATE_ALWAYS_BLOCK_REASONS = frozenset(
     {
         "non_positive_market_edge",
@@ -1278,6 +1291,50 @@ def _decision_has_near_binary_structured_probability(decision: TradeDecision) ->
     return False
 
 
+def _is_settlement_aligned_high_eq_computed(
+    decision: TradeDecision,
+    settings: Settings,
+) -> bool:
+    """High-EQ settlement-aligned computed quotes — EdgeRepair high-edge exempt.
+
+    Reuses COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY (0.75) as the EQ floor for
+    crypto/commodity live quotes that already cite a settlement-aligned primary
+    URL. Downstream score / edge / LMSR / Kelly gates still apply.
+    """
+    if str(getattr(decision, "edge_source", "") or "").strip().lower() != "computed":
+        return False
+    if (
+        str(getattr(decision, "source_match_class", "") or "").strip().lower()
+        != "settlement_aligned"
+    ):
+        return False
+    if not str(getattr(decision, "primary_source_url", "") or "").strip():
+        return False
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return False
+    min_eq = max(0.0, float(settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY))
+    return evidence_quality >= min_eq - 1e-9
+
+
+def _should_force_abstain_on_edge_repair_unresolved(
+    *,
+    unresolved_reason: str | None,
+    decision: TradeDecision,
+    settings: Settings,
+) -> bool:
+    """Force-abstain after failed EdgeRepair unless settlement-aligned high-EQ exempt."""
+    if not unresolved_reason:
+        return False
+    if unresolved_reason in {
+        "high_edge_without_definitive_evidence",
+        "near_binary_without_definitive_evidence",
+    } and _is_settlement_aligned_high_eq_computed(decision, settings):
+        return False
+    return True
+
+
 def _edge_repair_reason(
     *,
     decision: TradeDecision,
@@ -1312,10 +1369,18 @@ def _edge_repair_reason(
         and edge_source == "computed"
         and evidence_quality >= 0.60
     )
+    # Settlement-aligned high-EQ computed quotes (crypto/commodity live feeds)
+    # are similarly predictive; leave Kelly/LMSR/score to size or reject.
+    settlement_aligned_high_eq_exempt = _is_settlement_aligned_high_eq_computed(
+        decision, settings
+    )
+    high_edge_repair_exempt = (
+        sports_computed_odds_exempt or settlement_aligned_high_eq_exempt
+    )
     if (
         _decision_has_near_binary_structured_probability(decision)
         and not definitive
-        and not sports_computed_odds_exempt
+        and not high_edge_repair_exempt
     ):
         return "near_binary_without_definitive_evidence"
     confidence_for_edge = (
@@ -1333,7 +1398,7 @@ def _edge_repair_reason(
         and edge_value is not None
         and abs(float(edge_value)) > 0.35
         and not definitive
-        and not sports_computed_odds_exempt
+        and not high_edge_repair_exempt
     ):
         return "high_edge_without_definitive_evidence"
     return None
@@ -1759,6 +1824,11 @@ def _edge_threshold_for_market(
     High-EQ NWS/direct weather decisions may apply
     ``WEATHER_HIGH_EQ_EDGE_MULTIPLIER`` to the weather floor so near-misses
     at ~0.12 vs 0.14 are executable without lowering the low-EQ floor.
+
+    Near-settlement high-EQ commodity decisions may apply
+    ``COMMODITY_HIGH_EQ_EDGE_MULTIPLIER`` to ``COMMODITY_MIN_EDGE`` so knife-edge
+    buffers (~0.2165 vs 0.22) clear only when the live quote is settlement-
+    predictive; long-horizon commodity strikes keep the full floor.
     """
     min_edge = settings.MIN_EDGE
     if market is not None and not definitive_outcome_eligible:
@@ -1787,7 +1857,19 @@ def _edge_threshold_for_market(
         and is_commodity_market(market)
         and not definitive_outcome_eligible
     ):
-        min_edge = max(min_edge, float(settings.COMMODITY_MIN_EDGE))
+        commodity_floor = float(settings.COMMODITY_MIN_EDGE)
+        if decision is not None and _is_high_eq_commodity_near_settlement(
+            decision, market, settings
+        ):
+            multiplier = max(
+                0.0,
+                min(1.0, float(settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER)),
+            )
+            commodity_floor = max(
+                float(settings.MIN_EDGE),
+                commodity_floor * multiplier,
+            )
+        min_edge = max(min_edge, commodity_floor)
     if not definitive_outcome_eligible:
         low_price_multiplier = max(0.0, float(settings.LOW_PRICE_MIN_EDGE_MULTIPLIER))
         if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
@@ -1871,6 +1953,43 @@ def _is_high_eq_weather_nws_edge(
     return _is_nws_noaa_primary_source_url(
         str(getattr(decision, "primary_source_url", "") or "")
     )
+
+
+def _is_high_eq_commodity_near_settlement(
+    decision: TradeDecision,
+    market: Market | None,
+    settings: Settings,
+) -> bool:
+    """Commodity + high-EQ settlement-aligned quote near close — softer edge floor.
+
+    Long-horizon live quotes are not settlement-predictive (same premise as
+    ``_posterior_floor_scope_allows``); only near-close decisions get the
+    ``COMMODITY_HIGH_EQ_EDGE_MULTIPLIER`` relief.
+    """
+    if market is None or not is_commodity_market(market):
+        return False
+    if str(getattr(decision, "edge_source", "") or "").strip().lower() != "computed":
+        return False
+    if (
+        str(getattr(decision, "source_match_class", "") or "").strip().lower()
+        != "settlement_aligned"
+    ):
+        return False
+    primary_url = str(getattr(decision, "primary_source_url", "") or "").strip()
+    if not primary_url:
+        return False
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return False
+    min_eq = max(0.0, float(settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY))
+    if evidence_quality < min_eq - 1e-9:
+        return False
+    max_hours = float(settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE)
+    if max_hours <= 0:
+        return True
+    hours_to_close = _hours_to_market_close(market)
+    return hours_to_close is not None and hours_to_close <= max_hours
 
 
 def _passes_edge_threshold(
@@ -2591,6 +2710,13 @@ def _should_queue_research_for_blocked_trade(
         return False
     normalized_evidence_basis = str(evidence_basis or "").strip().lower()
     normalized_edge_source = str(getattr(decision, "edge_source", "") or "").strip().lower()
+    normalized_gap = max(0.0, float(threshold_gap))
+    if gate_name in {"kelly_sub_floor", "kelly_sub_floor_skip"}:
+        # Near-miss / crushed-fraction EE skips should retry after sizing fixes
+        # or bankroll moves rather than terminal-skip.
+        return True
+    if gate_name in {"hallucinated_edge", "extreme_market_edge"}:
+        return True
     if normalized_evidence_basis != "direct":
         if gate_name in {"evidence", "source"} and (
             normalized_evidence_basis in {"absence_only", "proxy"}
@@ -2598,8 +2724,21 @@ def _should_queue_research_for_blocked_trade(
             or float(getattr(decision, "evidence_quality", 0.0) or 0.0) <= 0.0
         ):
             return True
+        # High-quality settlement-aligned proxy edge near-misses (Brent knife-edge).
+        if (
+            gate_name == "edge"
+            and normalized_evidence_basis == "proxy"
+            and str(getattr(decision, "source_match_class", "") or "").strip().lower()
+            == "settlement_aligned"
+            and float(getattr(decision, "evidence_quality", 0.0) or 0.0)
+            >= _RESEARCH_QUEUE_PROXY_EDGE_MIN_EQ
+            and normalized_edge_source == "computed"
+            and normalized_gap <= _RESEARCH_QUEUE_EDGE_GAP_MAX
+        ):
+            if str(edge_reason or "") == "weather_underdog_blocked":
+                return False
+            return True
         return False
-    normalized_gap = max(0.0, float(threshold_gap))
     if gate_name == "evidence":
         return normalized_gap <= _RESEARCH_QUEUE_EVIDENCE_GAP_MAX
     if gate_name == "edge":
@@ -2611,8 +2750,6 @@ def _should_queue_research_for_blocked_trade(
         }:
             return True
         return normalized_gap <= _RESEARCH_QUEUE_EDGE_GAP_MAX
-    if gate_name in {"hallucinated_edge", "extreme_market_edge"}:
-        return True
     return False
 
 
@@ -2758,7 +2895,28 @@ def _kelly_fraction_for_decision(
 
     When raw confidence was crushed by calibration (large raw−cal gap), weather
     sizing is halved so floored posteriors cannot deploy full Kelly.
+
+    Exception (Jul 19 post-fix): high-quality settlement-aligned direct weather
+    evidence skips the weather multiplier and calibration-gap shrink. Those
+    shrinks were crushing EE trades below MIN_BET (KXLOWTMIA: fraction 0.075,
+    raw=$0.47) even after hallucinated-edge suppress succeeded.
     """
+    high_quality_settled = _is_high_quality_settled_evidence(
+        decision, settings, market=market
+    ) or _is_definitive_validated(decision, settings, market=market)
+    if market_family(market) == "weather" and high_quality_settled:
+        if market.close_time is not None:
+            close_time = market.close_time
+            if close_time.tzinfo is None:
+                close_time = close_time.replace(tzinfo=timezone.utc)
+            horizon_seconds = (close_time - datetime.now(timezone.utc)).total_seconds()
+            short_horizon_seconds = (
+                max(0, settings.KELLY_FRACTION_SHORT_HORIZON_HOURS) * 3600
+            )
+            if short_horizon_seconds > 0 and horizon_seconds <= short_horizon_seconds:
+                return max(0.0, min(1.0, float(settings.KELLY_FRACTION_SHORT_HORIZON)))
+        return max(0.0, min(1.0, float(settings.KELLY_FRACTION_DEFAULT)))
+
     fraction = _kelly_fraction_for_market_horizon(market, settings)
     if market_family(market) != "weather":
         return fraction
@@ -2779,10 +2937,23 @@ def _dynamic_kelly_floor_allowed(
     *,
     final_fraction: float,
     settings: Settings,
+    reference_fraction: float | None = None,
 ) -> bool:
+    """True when the applied Kelly fraction is at least the market's reference.
+
+    ``reference_fraction`` should be the horizon fraction *before* calibration-gap
+    shrink (or the high-quality settled override). Comparing only to
+    ``KELLY_FRACTION_DEFAULT`` permanently disabled near-miss flooring for weather
+    markets whose intended fraction is DEFAULT * WEATHER_MULTIPLIER.
+    """
     if not settings.KELLY_DYNAMIC_ENABLED:
         return False
-    return float(final_fraction) >= float(settings.KELLY_FRACTION_DEFAULT) - 1e-9
+    threshold = (
+        float(settings.KELLY_FRACTION_DEFAULT)
+        if reference_fraction is None
+        else float(reference_fraction)
+    )
+    return float(final_fraction) >= threshold - 1e-9
 
 
 def _sizing_mode_label(kelly_enabled: bool) -> str:
@@ -5244,7 +5415,10 @@ def _research_priority_for_reason(
     normalized_reason = str(reason or "").strip().lower()
     normalized_tier = str(participation_tier or "").strip().lower()
     priority = 0.35
-    if "edge" in normalized_gate or "edge" in normalized_reason:
+    if "kelly_sub_floor" in normalized_gate or "kelly_sub_floor" in normalized_reason:
+        # EE trades blocked only by min-bet sizing — highest drain value.
+        priority = 0.92
+    elif "edge" in normalized_gate or "edge" in normalized_reason:
         priority = 0.90
     elif "evidence" in normalized_gate or "source" in normalized_reason:
         priority = 0.85
@@ -5256,7 +5430,9 @@ def _research_priority_for_reason(
         priority = 0.58
     elif "analysis_cap" in normalized_gate or "lifetime" in normalized_reason:
         priority = 0.30
-    if normalized_tier == str(ParticipationTier.OPERATIONAL_ERROR_RETRY):
+    if normalized_tier == str(ParticipationTier.EXECUTION_ELIGIBLE):
+        priority = max(priority, 0.90)
+    elif normalized_tier == str(ParticipationTier.OPERATIONAL_ERROR_RETRY):
         priority = max(priority, 0.78)
     elif normalized_tier == str(ParticipationTier.DEEP_RESEARCH_REQUIRED):
         priority = max(priority, 0.72)
@@ -7013,19 +7189,93 @@ def _effective_research_queue_drain_quota(
     return quota
 
 
+def _research_queue_entry_reason(entry: dict[str, Any]) -> str:
+    """Best-effort queue reason from the entry row or mirrored audit payload."""
+    reason = str(entry.get("reason") or "").strip().lower()
+    if reason:
+        return reason
+    decision_json = entry.get("last_decision_json")
+    if not decision_json:
+        return ""
+    try:
+        payload = json.loads(decision_json)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    audit = payload.get("audit")
+    if isinstance(audit, dict):
+        for key in ("final_reason", "gate_reason", "rejection_reason"):
+            nested = str(audit.get(key) or "").strip().lower()
+            if nested:
+                return nested
+    return str(payload.get("reason") or "").strip().lower()
+
+
+def _research_queue_effective_drain_priority(
+    entry: dict[str, Any],
+    *,
+    base_priority: float | None = None,
+    drain_attempts: int | None = None,
+) -> float:
+    """Apply soft demotion for chronic research-gap / soft-score parking.
+
+    Edge and kelly near-misses keep full priority so they outrank repeatedly
+    drained absence_only stalls. Entries are never hard-excluded.
+    """
+    if base_priority is None:
+        base_priority = MarketStateManager.estimate_research_entry_priority(entry)
+    priority = float(base_priority or 0.0)
+    if drain_attempts is None:
+        drain_attempts, _last_attempt = (
+            MarketStateManager.research_queue_drain_attempt_metadata(entry)
+        )
+    if int(drain_attempts) < _RESEARCH_QUEUE_CHRONIC_DRAIN_ATTEMPTS:
+        return priority
+    reason = _research_queue_entry_reason(entry)
+    if reason not in _RESEARCH_QUEUE_CHRONIC_DRAIN_REASONS:
+        return priority
+    return max(0.0, priority - _RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY)
+
+
+def _research_queue_priority_below_drain_floor(
+    entry: dict[str, Any],
+    *,
+    min_priority: float,
+) -> bool:
+    """True when demoted effective priority fails the operator drain floor.
+
+    Unknown base priority stays admissible. Zero-yield promotions bypass this
+    check so chronic research-gap rows can still probe during a drought.
+    """
+    if min_priority <= 0.0:
+        return False
+    base_priority = MarketStateManager.estimate_research_entry_priority(entry)
+    if base_priority is None:
+        return False
+    effective = _research_queue_effective_drain_priority(
+        entry,
+        base_priority=base_priority,
+    )
+    return effective < min_priority
+
+
 def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, str, str]:
     """Prioritize persisted queue quality, then near-threshold older entries."""
-    priority = MarketStateManager.estimate_research_entry_priority(entry)
+    drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
+        entry
+    )
+    priority = _research_queue_effective_drain_priority(
+        entry,
+        drain_attempts=drain_attempts,
+    )
     raw_gap = entry.get("threshold_gap")
     try:
         threshold_gap = max(0.0, float(raw_gap))
     except (TypeError, ValueError):
         threshold_gap = float("inf")
-    drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
-        entry
-    )
     return (
-        -float(priority or 0.0),
+        -float(priority),
         threshold_gap,
         drain_attempts,
         str(entry.get("queued_at") or ""),
@@ -7035,7 +7285,13 @@ def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, float,
 
 def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, int, str, str]:
     """Promotion ranking when zero-yield cycles show the queue needs active repair."""
-    priority = MarketStateManager.estimate_research_entry_priority(entry)
+    drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
+        entry
+    )
+    priority = _research_queue_effective_drain_priority(
+        entry,
+        drain_attempts=drain_attempts,
+    )
     raw_gap = entry.get("threshold_gap")
     try:
         threshold_gap = max(0.0, float(raw_gap))
@@ -7045,11 +7301,8 @@ def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, f
         times_seen = max(0, int(entry.get("times_seen") or 0))
     except (TypeError, ValueError):
         times_seen = 0
-    drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
-        entry
-    )
     return (
-        -float(priority or 0.0),
+        -float(priority),
         threshold_gap,
         drain_attempts,
         -times_seen,
@@ -7307,17 +7560,31 @@ def _analyze_market_candidate(
                     "error": str(exc),
                 },
             )
-            decision = decision.model_copy(
-                update={
-                    "should_trade": False,
-                    "abstain": True,
-                    "bet_size_pct": 0.0,
-                    "reasoning": (
-                        f"[EdgeRepair unresolved reason={edge_repair_unresolved_reason}] "
-                        f"{decision.reasoning}"
-                    ),
-                }
-            )
+            if _should_force_abstain_on_edge_repair_unresolved(
+                unresolved_reason=repair_reason,
+                decision=decision,
+                settings=settings,
+            ):
+                decision = decision.model_copy(
+                    update={
+                        "should_trade": False,
+                        "abstain": True,
+                        "bet_size_pct": 0.0,
+                        "reasoning": (
+                            f"[EdgeRepair unresolved reason={edge_repair_unresolved_reason}] "
+                            f"{decision.reasoning}"
+                        ),
+                    }
+                )
+            else:
+                decision = decision.model_copy(
+                    update={
+                        "reasoning": (
+                            f"[EdgeRepair unresolved exempt reason={edge_repair_unresolved_reason}] "
+                            f"{decision.reasoning}"
+                        ),
+                    }
+                )
         if edge_repair_unresolved_reason is None:
             edge_repair_unresolved_reason = _edge_repair_reason(
                 decision=decision,
@@ -7325,7 +7592,13 @@ def _analyze_market_candidate(
                 settings=settings,
                 implied_prob=_get_implied_probability(market, decision.outcome),
             )
-            if edge_repair_unresolved_reason is not None:
+            if edge_repair_unresolved_reason is not None and (
+                _should_force_abstain_on_edge_repair_unresolved(
+                    unresolved_reason=edge_repair_unresolved_reason,
+                    decision=decision,
+                    settings=settings,
+                )
+            ):
                 decision = decision.model_copy(
                     update={
                         "should_trade": False,
@@ -8449,6 +8722,12 @@ def main(max_cycles: int | None = None) -> None:
                         "Find direct primary-source evidence for the exact resolution criteria; "
                         "do not reuse proxy or inferred evidence without a market-specific source."
                     )
+                if "kelly_sub_floor" in normalized_gate or "kelly_sub_floor" in normalized_reason:
+                    return (
+                        "Recompute Kelly sizing with current bankroll and evidence quality; "
+                        "high-quality settled evidence should clear MIN_BET via full Kelly fraction "
+                        "or near-miss floor rather than terminal skip."
+                    )
                 if "research_only" in normalized_gate or "analysis_cap" in normalized_gate:
                     return (
                         "Wait for outcome/settlement data and compare it with the repeated analyses "
@@ -8827,18 +9106,15 @@ def main(max_cycles: int | None = None) -> None:
                         # for cycle-receipt observability. Entries with no
                         # priority signal (None) are admitted under the same
                         # "unknown is admissible" rule the helper uses.
-                        if _drain_min_priority > 0.0:
-                            entry_priority = (
-                                state_manager.estimate_research_entry_priority(
-                                    entry
-                                )
-                            )
-                            if (
-                                entry_priority is not None
-                                and entry_priority < _drain_min_priority
-                            ):
-                                research_queue_drain_skipped_low_priority_count += 1
-                                continue
+                        # Chronic research-gap demotion is applied so repeated
+                        # absence_only drains fall below the floor while
+                        # zero-yield promotions can still bypass later.
+                        if _research_queue_priority_below_drain_floor(
+                            entry,
+                            min_priority=_drain_min_priority,
+                        ):
+                            research_queue_drain_skipped_low_priority_count += 1
+                            continue
                         drainable_research_entries[mid] = entry
                         selected += 1
                 except Exception as exc:
@@ -8895,18 +9171,12 @@ def main(max_cycles: int | None = None) -> None:
                             ):
                                 research_queue_drain_skipped_recent_attempt_count += 1
                                 continue
-                            if _drain_min_priority > 0.0:
-                                entry_priority = (
-                                    state_manager.estimate_research_entry_priority(
-                                        entry
-                                    )
-                                )
-                                if (
-                                    entry_priority is not None
-                                    and entry_priority < _drain_min_priority
-                                ):
-                                    research_queue_drain_skipped_low_priority_count += 1
-                                    continue
+                            if _research_queue_priority_below_drain_floor(
+                                entry,
+                                min_priority=_drain_min_priority,
+                            ):
+                                research_queue_drain_skipped_low_priority_count += 1
+                                continue
                             entry["is_drain_emergency_probe"] = True
                             drainable_research_entries[mid] = entry
                             emergency_selected += 1
@@ -13248,13 +13518,30 @@ def main(max_cycles: int | None = None) -> None:
                         decision_for_edge,
                         effective_confidence,
                     )
+                    kelly_reference_fraction = _kelly_fraction_for_market_horizon(
+                        active_market,
+                        settings,
+                    )
+                    # High-quality settled weather uses DEFAULT (not weather-
+                    # multiplied horizon) as the dynamic-floor reference.
+                    if abs(float(kelly_fraction_value) - float(kelly_reference_fraction)) > 1e-9 and (
+                        _is_high_quality_settled_evidence(
+                            decision_for_edge, settings, market=active_market
+                        )
+                        or _is_definitive_validated(
+                            decision_for_edge, settings, market=active_market
+                        )
+                    ):
+                        kelly_reference_fraction = float(kelly_fraction_value)
                     dynamic_kelly_floor_allowed = _dynamic_kelly_floor_allowed(
                         final_fraction=kelly_fraction_value,
                         settings=settings,
+                        reference_fraction=kelly_reference_fraction,
                     )
                     audit_context["kelly_dynamic_floor_allowed"] = (
                         dynamic_kelly_floor_allowed
                     )
+                    audit_context["kelly_reference_fraction"] = kelly_reference_fraction
 
                 score_gate_score_source = "runtime_recomputed"
                 short_prefix_score_penalty = float(
@@ -13686,9 +13973,28 @@ def main(max_cycles: int | None = None) -> None:
                             decision_for_edge,
                             effective_confidence,
                         )
+                        kelly_reference_fraction = _kelly_fraction_for_market_horizon(
+                            active_market,
+                            settings,
+                        )
+                        if abs(
+                            float(kelly_fraction_value) - float(kelly_reference_fraction)
+                        ) > 1e-9 and (
+                            _is_high_quality_settled_evidence(
+                                decision_for_edge, settings, market=active_market
+                            )
+                            or _is_definitive_validated(
+                                decision_for_edge, settings, market=active_market
+                            )
+                        ):
+                            kelly_reference_fraction = float(kelly_fraction_value)
                         dynamic_kelly_floor_allowed = _dynamic_kelly_floor_allowed(
                             final_fraction=kelly_fraction_value,
                             settings=settings,
+                            reference_fraction=kelly_reference_fraction,
+                        )
+                        audit_context["kelly_reference_fraction"] = (
+                            kelly_reference_fraction
                         )
                     min_edge_for_kelly = _edge_threshold_for_market(
                         implied_prob,
@@ -14098,15 +14404,57 @@ def main(max_cycles: int | None = None) -> None:
                     trades_skipped_kelly_sub_floor += 1
                     _record_should_trade_blocked("kelly_sub_floor_skip")
                     _record_rejection_reason(rejection_breakdown, "kelly_sub_floor_skip")
+                    kelly_sub_floor_gap = 0.0
+                    if settings.MIN_BET_USDC > 0:
+                        kelly_sub_floor_gap = max(
+                            0.0,
+                            (float(settings.MIN_BET_USDC) - float(raw_bet_amount))
+                            / float(settings.MIN_BET_USDC),
+                        )
+                    queue_kelly_sub_floor = _should_queue_research_for_blocked_trade(
+                        settings=settings,
+                        decision=decision_for_edge,
+                        evidence_basis=evidence_basis,
+                        gate_name="kelly_sub_floor_skip",
+                        threshold_gap=kelly_sub_floor_gap,
+                    )
+                    research_queue_position: int | None = None
+                    kelly_sub_floor_learning_target: str | None = None
+                    if queue_kelly_sub_floor:
+                        kelly_sub_floor_learning_target = _research_learning_target(
+                            gate_name="kelly_sub_floor_skip",
+                            reason="kelly_sub_floor_skip",
+                            market=market,
+                            decision=decision_for_edge,
+                        )
+                        research_queue_position = _enqueue_research_candidate(
+                            market=market,
+                            decision=decision_for_edge,
+                            reason="kelly_sub_floor_skip",
+                            gate_name="kelly_sub_floor_skip",
+                            threshold_gap=kelly_sub_floor_gap,
+                            edge_market=edge_value,
+                            participation_tier="execution_eligible",
+                            why_not_execution_eligible=(
+                                f"Kelly raw bet ${raw_bet_amount:.2f} below "
+                                f"MIN_BET ${settings.MIN_BET_USDC:.2f}"
+                            ),
+                            what_to_learn_next=kelly_sub_floor_learning_target,
+                        )
                     question_short = market.question[:40] + "..." if len(market.question) > 40 else market.question
+                    kelly_final_action = (
+                        "research_queued" if queue_kelly_sub_floor else "skip"
+                    )
                     logger.warning(
-                        "SKIP [%s] '%s' -> Kelly bet below min bet floor (raw=$%.2f < min=$%.2f)",
+                        "%s [%s] '%s' -> Kelly bet below min bet floor (raw=$%.2f < min=$%.2f)",
+                        "RESEARCH" if queue_kelly_sub_floor else "SKIP",
                         market.id,
                         question_short,
                         raw_bet_amount,
                         settings.MIN_BET_USDC,
                         data={
                             "market_id": market.id,
+                            "final_action": kelly_final_action,
                             "final_reason": "kelly_sub_floor_skip",
                             "sizing_mode": sizing_mode,
                             "raw_bet_amount_usdc": raw_bet_amount,
@@ -14114,6 +14462,7 @@ def main(max_cycles: int | None = None) -> None:
                             "kelly_sub_floor_skipped": True,
                             "min_bet_floor_applied": False,
                             "kelly_min_bet_policy": settings.KELLY_MIN_BET_POLICY,
+                            "research_queue_position": research_queue_position,
                             "score_breakdown": score_receipt_fields,
                         },
                     )
@@ -14125,8 +14474,8 @@ def main(max_cycles: int | None = None) -> None:
                         ).model_dump(),
                         execution_audit=_build_execution_audit(
                             decision_phase="post_min_bet_floor",
-                            decision_terminal=True,
-                            final_action="skip",
+                            decision_terminal=not queue_kelly_sub_floor,
+                            final_action=kelly_final_action,
                             final_reason="kelly_sub_floor_skip",
                             sizing_mode=sizing_mode,
                             position_decision="blocked",
@@ -14142,10 +14491,18 @@ def main(max_cycles: int | None = None) -> None:
                             kelly_raw=kelly_raw_value,
                             kelly_fraction_value=kelly_fraction_value,
                             posterior_for_kelly=posterior_for_kelly,
+                            research_queue_position=research_queue_position,
+                            learning_hold_reason=(
+                                "kelly_sub_floor_skip" if queue_kelly_sub_floor else None
+                            ),
+                            what_to_learn_next=kelly_sub_floor_learning_target,
                             **audit_context,
                         ),
                     )
-                    _record_terminal_outcome(state_manager, market.id, "kelly_sub_floor_skip")
+                    if not queue_kelly_sub_floor:
+                        _record_terminal_outcome(
+                            state_manager, market.id, "kelly_sub_floor_skip"
+                        )
                     continue
                 if min_bet_floor_applied:
                     logger.debug(

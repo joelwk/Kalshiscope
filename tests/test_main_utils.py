@@ -69,6 +69,8 @@ from main import (
     _requires_market_refresh,
     _research_queue_last_decision_json,
     _research_queue_drain_sort_key,
+    _research_queue_effective_drain_priority,
+    _research_queue_priority_below_drain_floor,
     _research_queue_recent_drain_attempt,
     _research_queue_zero_yield_sort_key,
     _resolve_dynamic_analysis_candidate_cap,
@@ -556,6 +558,86 @@ class TestMainUtils(unittest.TestCase):
             threshold_gap=0.10,
         )
         self.assertTrue(should_queue)
+
+    def test_should_queue_research_for_settlement_aligned_proxy_edge_near_miss(self) -> None:
+        """Brent-shaped: proxy + settlement_aligned + tiny edge gap must queue."""
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.63,
+            bet_size_pct=0.13,
+            reasoning="Settlement-aligned Brent quote near commodity floor.",
+            evidence_basis="proxy",
+            evidence_quality=0.75,
+            edge_source="computed",
+            source_match_class="settlement_aligned",
+            primary_source_url="https://www.bloomberg.com/energy",
+        )
+        settings = Settings(RESEARCH_QUEUE_ENABLED=True)
+        self.assertTrue(
+            _should_queue_research_for_blocked_trade(
+                settings=settings,
+                decision=decision,
+                evidence_basis="proxy",
+                gate_name="edge",
+                threshold_gap=0.0035,
+                edge_reason="edge 0.2165 below min 0.2200",
+            )
+        )
+        # Unverified / low-EQ proxy edge blocks stay terminal (not queued).
+        unverified = decision.model_copy(
+            update={"source_match_class": "unverified", "evidence_quality": 0.55}
+        )
+        self.assertFalse(
+            _should_queue_research_for_blocked_trade(
+                settings=settings,
+                decision=unverified,
+                evidence_basis="proxy",
+                gate_name="edge",
+                threshold_gap=0.0035,
+                edge_reason="edge 0.2165 below min 0.2200",
+            )
+        )
+        # Absence-only edge blocks are not edge-queue eligible.
+        absence = decision.model_copy(
+            update={
+                "evidence_basis": "absence_only",
+                "source_match_class": "missing_or_absence_only",
+                "evidence_quality": 0.45,
+                "edge_source": "none",
+            }
+        )
+        self.assertFalse(
+            _should_queue_research_for_blocked_trade(
+                settings=settings,
+                decision=absence,
+                evidence_basis="absence_only",
+                gate_name="edge",
+                threshold_gap=0.0035,
+            )
+        )
+
+    def test_should_queue_research_for_kelly_sub_floor_even_when_proxy(self) -> None:
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.81,
+            bet_size_pct=0.08,
+            reasoning="High-quality settled weather below MIN_BET.",
+            evidence_basis="proxy",
+            evidence_quality=0.90,
+            edge_source="computed",
+            source_match_class="settlement_aligned",
+        )
+        self.assertTrue(
+            _should_queue_research_for_blocked_trade(
+                settings=Settings(RESEARCH_QUEUE_ENABLED=True),
+                decision=decision,
+                evidence_basis="proxy",
+                gate_name="kelly_sub_floor_skip",
+                threshold_gap=0.25,
+            )
+        )
 
     def test_analysis_result_rank_prefers_lower_overconfidence_gap(self) -> None:
         safer = TradeDecision(
@@ -1392,6 +1474,115 @@ class TestMainUtils(unittest.TestCase):
 
         self.assertEqual([entry["market_id"] for entry in ordered], ["KXCLOSE", "KXWIDE", "KXUNKNOWN"])
 
+    def test_research_queue_drain_demotes_chronic_research_gap(self) -> None:
+        """High-attempt research_gap loses to fresh edge/kelly near-misses."""
+        chronic_gap = {
+            "market_id": "KXT20CHRONIC",
+            "reason": "no_trade_research_gap",
+            "research_priority": 0.55,
+            "threshold_gap": 0.11,
+            "queued_at": "2026-05-13T00:01:00+00:00",
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 7,
+                        "final_reason": "no_trade_research_gap",
+                    }
+                }
+            ),
+        }
+        fresh_edge = {
+            "market_id": "KXEDGEFRESH",
+            "reason": "edge_gate_blocked",
+            "research_priority": 0.90,
+            "threshold_gap": 0.01,
+            "queued_at": "2026-05-13T00:02:00+00:00",
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 0,
+                        "final_reason": "edge_gate_blocked",
+                    }
+                }
+            ),
+        }
+        fresh_kelly = {
+            "market_id": "KXKELLYFRESH",
+            "reason": "kelly_sub_floor_skip",
+            "research_priority": 0.92,
+            "threshold_gap": 0.0,
+            "queued_at": "2026-05-13T00:03:00+00:00",
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 1,
+                        "final_reason": "kelly_sub_floor_skip",
+                    }
+                }
+            ),
+        }
+
+        demoted = _research_queue_effective_drain_priority(chronic_gap)
+        self.assertAlmostEqual(demoted, 0.35, places=4)
+        self.assertTrue(
+            _research_queue_priority_below_drain_floor(
+                chronic_gap,
+                min_priority=0.40,
+            )
+        )
+        self.assertFalse(
+            _research_queue_priority_below_drain_floor(
+                fresh_edge,
+                min_priority=0.40,
+            )
+        )
+
+        ordered = sorted(
+            [chronic_gap, fresh_edge, fresh_kelly],
+            key=_research_queue_drain_sort_key,
+        )
+        self.assertEqual(
+            [entry["market_id"] for entry in ordered],
+            ["KXKELLYFRESH", "KXEDGEFRESH", "KXT20CHRONIC"],
+        )
+
+        zero_yield_ordered = sorted(
+            [chronic_gap, fresh_edge, fresh_kelly],
+            key=_research_queue_zero_yield_sort_key,
+        )
+        self.assertEqual(
+            [entry["market_id"] for entry in zero_yield_ordered],
+            ["KXKELLYFRESH", "KXEDGEFRESH", "KXT20CHRONIC"],
+        )
+
+    def test_research_queue_drain_does_not_demote_fresh_research_gap(self) -> None:
+        fresh_gap = {
+            "market_id": "KXGAPFRESH",
+            "reason": "no_trade_research_gap",
+            "research_priority": 0.55,
+            "threshold_gap": 0.11,
+            "queued_at": "2026-05-13T00:01:00+00:00",
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 2,
+                        "final_reason": "no_trade_research_gap",
+                    }
+                }
+            ),
+        }
+        self.assertAlmostEqual(
+            _research_queue_effective_drain_priority(fresh_gap),
+            0.55,
+            places=4,
+        )
+        self.assertFalse(
+            _research_queue_priority_below_drain_floor(
+                fresh_gap,
+                min_priority=0.40,
+            )
+        )
+
     def test_zero_yield_queue_sort_uses_gap_then_times_seen(self) -> None:
         entries = [
             {"market_id": "KXONCE", "threshold_gap": 0.04, "times_seen": 1, "queued_at": "2026-05-13T00:02:00+00:00"},
@@ -2120,6 +2311,7 @@ class TestMainUtils(unittest.TestCase):
         settings = Settings(
             EDGE_REPAIR_ENABLED=True,
             EDGE_BAND_CALIBRATION_ENABLED=True,
+            COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75,
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -2133,6 +2325,7 @@ class TestMainUtils(unittest.TestCase):
                 MarketOutcome(name="NO", price=0.60),
             ],
         )
+        # Low-EQ / non-settlement-aligned proxy still triggers repair.
         decision = TradeDecision(
             should_trade=True,
             outcome="YES",
@@ -2143,6 +2336,7 @@ class TestMainUtils(unittest.TestCase):
             edge_external=0.40,
             evidence_basis="proxy",
             evidence_quality=0.70,
+            source_match_class="verifiable_unmatched",
         )
         self.assertEqual(
             _edge_repair_reason(
@@ -2152,6 +2346,61 @@ class TestMainUtils(unittest.TestCase):
                 implied_prob=0.40,
             ),
             "high_edge_without_definitive_evidence",
+        )
+
+    def test_edge_repair_skips_settlement_aligned_high_eq_computed(self) -> None:
+        from main import (
+            _edge_repair_reason,
+            _is_settlement_aligned_high_eq_computed,
+            _should_force_abstain_on_edge_repair_unresolved,
+        )
+
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            EDGE_BAND_CALIBRATION_ENABLED=True,
+            COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXSOLD-26JUL2017-T80.9999",
+            question="Will SOL be above 80.9999?",
+            category="crypto",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.82,
+            raw_confidence=0.82,
+            bet_size_pct=0.2,
+            reasoning="Binance live quote vs strike",
+            edge_source="computed",
+            edge_external=0.42,
+            evidence_basis="proxy",
+            evidence_quality=0.75,
+            source_match_class="settlement_aligned",
+            primary_source_url="https://www.binance.com/en/trade/SOL_USDT",
+        )
+        self.assertTrue(_is_settlement_aligned_high_eq_computed(decision, settings))
+        self.assertIsNone(
+            _edge_repair_reason(
+                decision=decision,
+                market=market,
+                settings=settings,
+                implied_prob=0.40,
+            )
+        )
+        self.assertFalse(
+            _should_force_abstain_on_edge_repair_unresolved(
+                unresolved_reason="high_edge_without_definitive_evidence",
+                decision=decision,
+                settings=settings,
+            )
         )
 
     def test_order_exception_error_text_includes_kalshi_body(self) -> None:
@@ -2222,6 +2471,16 @@ class TestMainUtils(unittest.TestCase):
             _dynamic_kelly_floor_allowed(
                 final_fraction=final_fraction,
                 settings=settings,
+                reference_fraction=0.15,
+            )
+        )
+        # Weather at its intended horizon fraction should arm dynamic floor
+        # even when that fraction is below KELLY_FRACTION_DEFAULT.
+        self.assertTrue(
+            _dynamic_kelly_floor_allowed(
+                final_fraction=0.15,
+                settings=settings,
+                reference_fraction=0.15,
             )
         )
         raw_kelly = kelly_fraction(0.81, 0.69)
@@ -2238,6 +2497,59 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(
             _kelly_fraction_for_decision(market, settings, small_gap, 0.55),
             0.15,
+        )
+
+    def test_kelly_fraction_skips_weather_shrink_for_high_quality_settled(self) -> None:
+        from main import (
+            _dynamic_kelly_floor_allowed,
+            _kelly_fraction_for_decision,
+        )
+
+        settings = Settings(
+            KELLY_FRACTION_DEFAULT=0.30,
+            KELLY_FRACTION_WEATHER=0.50,
+            KELLY_FRACTION_SHORT_HORIZON_HOURS=0,
+            WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=0.20,
+            WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=0.50,
+            HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95,
+            DIRECT_SOURCE_WHITELIST=("weather.gov", "nws.noaa.gov"),
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXLOWTMIA-26JUL19-B81.5",
+            question="Will the low temp in Miami be below 81.5°F?",
+            category="weather",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.55,
+            raw_confidence=0.90,
+            bet_size_pct=0.3,
+            reasoning="NWS observation confirms settlement criterion.",
+            evidence_basis="direct",
+            evidence_quality=1.0,
+            raw_evidence_quality=0.95,
+            primary_source_url="https://www.weather.gov/mfl/",
+            source_match_class="settlement_aligned",
+            edge_source="computed",
+        )
+        # High-quality settled weather uses DEFAULT (0.30), not 0.075 shrink.
+        final_fraction = _kelly_fraction_for_decision(
+            market,
+            settings,
+            decision,
+            0.55,
+        )
+        self.assertAlmostEqual(final_fraction, 0.30)
+        self.assertTrue(
+            _dynamic_kelly_floor_allowed(
+                final_fraction=final_fraction,
+                settings=settings,
+                reference_fraction=final_fraction,
+            )
         )
 
     def test_no_trade_routing_distinguishes_validation_gate_from_model_choice(

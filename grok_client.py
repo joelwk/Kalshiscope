@@ -188,16 +188,66 @@ def _default_search_config(settings: Settings | None = None) -> SearchConfig:
     )
 
 
+def _attempt_close_truncated_json(snippet: str) -> str | None:
+    """Best-effort repair when a response opens `{` but truncates before `}`."""
+    if not snippet or "{" not in snippet:
+        return None
+    in_string = False
+    escape = False
+    depth = 0
+    for ch in snippet:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+    if depth <= 0 and not in_string:
+        return None
+    repaired = snippet
+    if in_string:
+        repaired += '"'
+    if depth > 0:
+        repaired += "}" * depth
+    return repaired
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     """Extract JSON object from potentially mixed text response."""
     if not text:
         raise ValueError("Empty response from Grok")
     start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
         raise ValueError("No JSON object found in Grok response")
-    snippet = text[start : end + 1]
-    return json.loads(snippet)
+    end = text.rfind("}")
+    candidates: list[str] = []
+    if end != -1 and end > start:
+        candidates.append(text[start : end + 1])
+    # Truncated deep responses (Brent: preview starts with `{` but no closing `}`).
+    closed = _attempt_close_truncated_json(text[start:])
+    if closed and closed not in candidates:
+        candidates.append(closed)
+    last_error: Exception | None = None
+    for snippet in candidates:
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            repaired = _repair_common_json_key_issues(snippet)
+            if repaired != snippet:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError as repair_exc:
+                    last_error = repair_exc
+    raise ValueError("No JSON object found in Grok response") from last_error
 
 
 def _normalize_model_response_text(text: str) -> str:

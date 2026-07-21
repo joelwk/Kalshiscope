@@ -761,6 +761,99 @@ def test_commodity_min_edge_raises_threshold() -> None:
     )
 
 
+def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from main import _edge_threshold_for_market, _passes_edge_threshold
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        COMMODITY_MIN_EDGE=0.22,
+        COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=0.95,
+        COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75,
+        DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        MAX_REASONABLE_EDGE=0.40,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.6265,
+        bet_size_pct=0.13,
+        reasoning="Settlement-aligned Brent buffer",
+        evidence_basis="proxy",
+        evidence_quality=0.75,
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url="https://www.bloomberg.com/energy",
+    )
+    near_close = Market(
+        id="KXBRENTD-26JUL2017-T87",
+        question="Will the brent crude oil close price be above 87?",
+        category="finance",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.41),
+            MarketOutcome(name="NO", price=0.59),
+        ],
+        liquidity_usdc=2600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=1.0),
+    )
+    far_close = near_close.model_copy(
+        update={"close_time": datetime.now(timezone.utc) + timedelta(hours=9.0)}
+    )
+
+    near_floor = _edge_threshold_for_market(
+        0.41, settings, "computed", market=near_close, decision=decision
+    )
+    far_floor = _edge_threshold_for_market(
+        0.41, settings, "computed", market=far_close, decision=decision
+    )
+    assert near_floor == pytest.approx(0.22 * 0.95)
+    assert far_floor == pytest.approx(0.22)
+
+    # Logged Brent knife-edge: 0.2165 clears high-EQ floor (~0.209) near settlement.
+    ok_near, edge_near, reason_near = _passes_edge_threshold(
+        0.41,
+        decision,
+        settings,
+        market=near_close,
+        effective_confidence_override=0.6265,
+    )
+    assert ok_near is True
+    assert edge_near == pytest.approx(0.2165)
+    assert reason_near == ""
+
+    ok_far, edge_far, reason_far = _passes_edge_threshold(
+        0.41,
+        decision,
+        settings,
+        market=far_close,
+        effective_confidence_override=0.6265,
+    )
+    assert ok_far is False
+    assert edge_far == pytest.approx(0.2165)
+    assert "below min" in reason_far
+
+    # Low-EQ / silver-like tiny edge still fails even near close.
+    weak = decision.model_copy(update={"evidence_quality": 0.55, "confidence": 0.4325})
+    ok_weak, _, reason_weak = _passes_edge_threshold(
+        0.41,
+        weak,
+        settings,
+        market=near_close,
+        effective_confidence_override=0.4325,
+    )
+    assert ok_weak is False
+    assert "below min" in reason_weak
+
+
 def test_weather_high_eq_edge_multiplier_lowers_floor_for_nws_direct() -> None:
     from main import _edge_threshold_for_market, _passes_edge_threshold
 

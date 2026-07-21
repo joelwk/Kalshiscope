@@ -91,6 +91,11 @@ class Settings:
     # Commodity futures (WTI/NATGAS/BRENT/etc.) historically underperform; raise
     # the edge bar without hard-blocking analysis eligibility.
     COMMODITY_MIN_EDGE: float = 0.22
+    # Near-settlement high-EQ commodity decisions may multiply COMMODITY_MIN_EDGE
+    # (0.22 * 0.95 ≈ 0.209) so knife-edge buffers clear without lowering the
+    # long-horizon / low-EQ floor that protects the toxic edge≥0.20 strike class.
+    COMMODITY_HIGH_EQ_EDGE_MULTIPLIER: float = 0.95
+    COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY: float = 0.75
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
@@ -627,7 +632,7 @@ class Settings:
     SCORE_EXTREME_CONFIDENCE_PENALTY_BASE: float = 0.08
     MENTION_MARKET_SCORE_PENALTY: float = 0.10
     WEATHER_SCORE_PENALTY: float = 0.12
-    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.65
+    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.60
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER: float = 0.72
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS: float = 0.65
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT: float = 0.75
@@ -864,8 +869,8 @@ class Settings:
     KELLY_FRACTION_WEATHER: float = 0.50
     KELLY_MIN_BET_POLICY: str = "skip"  # skip|floor|fallback_edge_scaling
     # When policy=skip and dynamic Kelly qualifies, floor bets within this
-    # fraction of MIN_BET instead of skipping (e.g. 0.85 → $1.70 of $2.00).
-    KELLY_MIN_BET_NEAR_MISS_RATIO: float = 0.85
+    # fraction of MIN_BET instead of skipping (e.g. 0.60 → $1.20 of $2.00).
+    KELLY_MIN_BET_NEAR_MISS_RATIO: float = 0.60
     KELLY_MIN_BANKROLL_USDC: float = 30.0
 
     # Side-flip guardrails
@@ -1138,6 +1143,14 @@ def load_settings() -> Settings:
         ),
         COMMODITY_MIN_EDGE=_read_env_float(
             "COMMODITY_MIN_EDGE", Settings.COMMODITY_MIN_EDGE
+        ),
+        COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=_read_env_float(
+            "COMMODITY_HIGH_EQ_EDGE_MULTIPLIER",
+            Settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER,
+        ),
+        COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY",
+            Settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY,
         ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE

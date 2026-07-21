@@ -161,7 +161,25 @@ def test_resolve_min_bet_floor_near_miss_floors_when_dynamic_allowed() -> None:
         kelly_path_active=True,
         min_bet_policy="skip",
         dynamic_kelly_floor_allowed=True,
-        near_miss_ratio=0.85,
+        near_miss_ratio=0.60,
+    )
+    assert adjusted == 2.0
+    assert abs(adjusted_pct - (2.0 / 12.0)) < 1e-9
+    assert floor_applied is True
+    assert sub_floor_skipped is False
+    assert policy == "near_miss_floor"
+
+
+def test_resolve_min_bet_floor_near_miss_floors_gold_style_60pct() -> None:
+    """EE gold case: $1.21 vs $2.00 (~0.605) floors at default near-miss ratio 0.60."""
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.21,
+        min_bet_usdc=2.0,
+        max_bet_usdc=12.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        dynamic_kelly_floor_allowed=True,
+        near_miss_ratio=0.60,
     )
     assert adjusted == 2.0
     assert abs(adjusted_pct - (2.0 / 12.0)) < 1e-9
@@ -178,7 +196,7 @@ def test_resolve_min_bet_floor_deep_sub_floor_still_skips() -> None:
         kelly_path_active=True,
         min_bet_policy="skip",
         dynamic_kelly_floor_allowed=False,
-        near_miss_ratio=0.85,
+        near_miss_ratio=0.60,
     )
     assert adjusted == 0.48
     assert floor_applied is False
