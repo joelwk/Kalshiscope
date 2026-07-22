@@ -37,8 +37,11 @@ def _extract_market_positions(payload: dict[str, Any] | None) -> list[dict[str, 
         return []
     for key in POSITION_RESPONSE_KEYS:
         rows = payload.get(key)
-        if isinstance(rows, list):
-            return [row for row in rows if isinstance(row, dict)]
+        if not isinstance(rows, list):
+            continue
+        dict_rows = [row for row in rows if isinstance(row, dict)]
+        if dict_rows:
+            return dict_rows
     return []
 
 

@@ -29,3 +29,25 @@ def test_show_balance_counts_supported_position_response_keys(
     check_balance.show_balance_and_positions()
 
     assert "Open market positions: 1" in capsys.readouterr().out
+
+
+def test_extract_market_positions_skips_empty_leading_keys() -> None:
+    payload = {
+        "market_positions": [],
+        "positions": [{"ticker": "FALLBACK-MARKET"}],
+    }
+
+    rows = check_balance._extract_market_positions(payload)
+
+    assert rows == [{"ticker": "FALLBACK-MARKET"}]
+
+
+def test_extract_market_positions_returns_empty_when_all_keys_empty() -> None:
+    payload = {
+        "market_positions": [],
+        "positions": [],
+        "portfolio_positions": [],
+        "data": [],
+    }
+
+    assert check_balance._extract_market_positions(payload) == []

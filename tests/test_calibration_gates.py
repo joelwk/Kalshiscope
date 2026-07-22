@@ -610,3 +610,43 @@ def test_family_hard_deny_uses_family_shrunk_pnl_cutoff_not_prefix() -> None:
     )
     assert tight.tier == GateTier.HARD_DENY
     assert tight.reason == "historical_family_pnl_block"
+
+
+def test_family_shrinkage_independent_of_prefix_shrinkage() -> None:
+    """Family Bayesian PnL shrinkage must not reuse prefix_shrinkage_enabled."""
+    family_stats = {
+        "crypto": PerformanceStats(
+            sample_size=12,
+            wins=3,
+            win_rate=0.25,
+            pnl_total=-12.0,
+        )
+    }
+    # Raw mean = -1.0; shrunk (~ -0.545) clears -0.60 but raw does not.
+    shared_kwargs = {
+        "market_id": "KXFAMTEST-123456-TEST",
+        "family": "crypto",
+        "prefix_stats": {},
+        "family_stats": family_stats,
+        "prefix_gate_enabled": False,
+        "prefix_shrinkage_enabled": False,
+        "family_gate_enabled": True,
+        "family_min_samples": 12,
+        "family_pnl_cutoff": -12.0,
+        "family_win_rate_cutoff": 0.40,
+        "family_shrunk_pnl_cutoff": -0.60,
+        "family_prior_strength": 10.0,
+    }
+
+    shrunk_on = evaluate_market_tiered(
+        **shared_kwargs,
+        family_shrinkage_enabled=True,
+    )
+    assert shrunk_on.tier == GateTier.NEUTRAL
+
+    shrunk_off = evaluate_market_tiered(
+        **shared_kwargs,
+        family_shrinkage_enabled=False,
+    )
+    assert shrunk_off.tier == GateTier.HARD_DENY
+    assert shrunk_off.reason == "historical_family_pnl_block"

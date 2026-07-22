@@ -220,6 +220,8 @@ def evaluate_market_tiered(
     family_min_samples: int = 12,
     family_pnl_cutoff: float = -12.0,
     family_win_rate_cutoff: float = 0.40,
+    family_shrinkage_enabled: bool = True,
+    family_prior_strength: float = 10.0,
     family_shrunk_pnl_cutoff: float = -0.50,
 ) -> EvaluateMarketResult:
     """Tiered market evaluation using Wilson lower-bound and Bayesian PnL shrinkage."""
@@ -348,8 +350,8 @@ def evaluate_market_tiered(
                 family_snapshot.pnl_total,
                 n_fam,
                 prior_pnl_per_trade=0.0,
-                prior_strength=prefix_prior_strength,
-            ) if prefix_shrinkage_enabled else (
+                prior_strength=family_prior_strength,
+            ) if family_shrinkage_enabled else (
                 family_snapshot.pnl_total / n_fam if n_fam > 0 else 0.0
             )
             family_loss_mode = _loss_mode(
@@ -429,9 +431,11 @@ def evaluate_market(
     family_min_samples: int = 12,
     family_pnl_cutoff: float = -12.0,
     family_win_rate_cutoff: float = 0.40,
+    family_shrinkage_enabled: bool = True,
+    family_prior_strength: float = 10.0,
     family_shrunk_pnl_cutoff: float = -0.50,
 ) -> tuple[bool, str | None, dict[str, Any]]:
-    """Backward-compatible wrapper returning (allowed, reason, metrics) tuple.
+    """ Backward-compatible wrapper returning (allowed, reason, metrics) tuple.
 
     Delegates to ``evaluate_market_tiered`` and maps the result back to the
     legacy shape so that existing callers and tests keep working without changes.
@@ -456,6 +460,8 @@ def evaluate_market(
         family_min_samples=family_min_samples,
         family_pnl_cutoff=family_pnl_cutoff,
         family_win_rate_cutoff=family_win_rate_cutoff,
+        family_shrinkage_enabled=family_shrinkage_enabled,
+        family_prior_strength=family_prior_strength,
         family_shrunk_pnl_cutoff=family_shrunk_pnl_cutoff,
     )
     enriched_metrics = dict(result.metrics)

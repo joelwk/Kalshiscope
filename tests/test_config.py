@@ -370,6 +370,7 @@ class TestConfig(unittest.TestCase):
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
             "MAX_SPORTS_CANDIDATES_PER_CYCLE=4",
+            "SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE=1",
             "MAX_MUSIC_CANDIDATES_PER_CYCLE=2",
             "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED=true",
             "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE=0.20",
@@ -403,9 +404,11 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",
             "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.05",
+            "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS=2.0",
+            "HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR=0.55",
             "CONVICTION_REPAIR_ENABLED=true",
             "CONVICTION_REPAIR_MIN_EDGE=0.12",
-            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
+            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.75",
             "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
             "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
             "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45",
@@ -748,7 +751,8 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.EDGE_BAND_CALIBRATION_ENABLED)
         self.assertTrue(settings.CONVICTION_REPAIR_ENABLED)
         self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.12)
-        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.90)
+        # Aligned with the validator's proxy evidence-quality cap (Jul 2026).
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.75)
         self.assertEqual(settings.CONVICTION_REPAIR_SCORE_GAP_MAX, 0.08)
         self.assertEqual(settings.CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR, 0.0)
         self.assertEqual(settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS, 0.06)
@@ -795,6 +799,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_FAMILY_MIN_SAMPLES, 12)
         self.assertEqual(settings.HISTORICAL_FAMILY_PNL_CUTOFF, -12.0)
         self.assertEqual(settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF, 0.40)
+        self.assertTrue(settings.HISTORICAL_FAMILY_SHRINKAGE_ENABLED)
+        self.assertEqual(settings.HISTORICAL_FAMILY_PRIOR_STRENGTH, 10.0)
         self.assertEqual(settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF, -0.50)
         self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE, 0.08)
@@ -1071,6 +1077,35 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.MAX_SPORTS_CANDIDATES_PER_CYCLE, 3)
+
+    def test_research_queue_near_close_drain_waiver_default_and_override(self) -> None:
+        """Jul 2026: hourly markets closed before the drain min-age elapsed, so
+        near-miss queue entries expired unexamined; the waiver defaults to 2h."""
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS, 2.0)
+        env = {
+            **self._required_env(),
+            "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS": "0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS, 0.0)
+
+    def test_sports_jurisdiction_probe_candidates_default_and_override(self) -> None:
+        """Jul 2026: while the exchange-confirmed jurisdiction hold is set,
+        sports analysis slots throttle to a probe cadence (default 1); 0
+        disables the throttle."""
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE, 1)
+        env = {
+            **self._required_env(),
+            "SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE": "0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE, 0)
 
     def test_daily_drawdown_preflight_setting_loads(self) -> None:
         env = {**self._required_env(), "DAILY_DRAWDOWN_PREFLIGHT_ENABLED": "false"}

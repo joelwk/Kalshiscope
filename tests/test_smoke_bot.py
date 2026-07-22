@@ -78,16 +78,18 @@ def test_bot_smoke_dry_run(
 def test_bot_does_not_restore_legacy_sports_jurisdiction_hold(
     monkeypatch, sample_market, sample_decision, dummy_settings
 ) -> None:
+    """The jurisdiction flag may throttle sports analysis slots, but the retired
+    analysis-level hold (synthetic jurisdiction_sports_analysis_held receipts)
+    must never come back and the flag must survive a cycle untouched."""
+    from market_state import MarketStateManager
+
+    seed_manager = MarketStateManager(dummy_settings.STATE_DB_PATH)
+    try:
+        seed_manager.set_runtime_flag("sports_jurisdiction_blocked", "1")
+    finally:
+        seed_manager.close()
+
     dummy_kalshi = DummyKalshi([sample_market])
-
-    def _unexpected_runtime_flag_read(*_args, **_kwargs):
-        raise AssertionError("legacy sports jurisdiction hold must not be restored")
-
-    monkeypatch.setattr(
-        main.MarketStateManager,
-        "get_runtime_flag",
-        _unexpected_runtime_flag_read,
-    )
     monkeypatch.setattr(main, "load_settings", lambda: dummy_settings)
     monkeypatch.setattr(
         main,
@@ -109,6 +111,20 @@ def test_bot_does_not_restore_legacy_sports_jurisdiction_hold(
         main.main()
 
     assert dummy_kalshi.submitted is False
+
+    verify_manager = MarketStateManager(dummy_settings.STATE_DB_PATH)
+    try:
+        held_receipts = verify_manager._conn.execute(
+            "SELECT COUNT(*) FROM decision_receipts "
+            "WHERE final_reason = 'jurisdiction_sports_analysis_held'"
+        ).fetchone()[0]
+        assert held_receipts == 0
+        # Order-scoped semantics: only an accepted sports order clears the flag.
+        assert (
+            verify_manager.get_runtime_flag("sports_jurisdiction_blocked") == "1"
+        )
+    finally:
+        verify_manager.close()
 
 
 def test_bot_smoke_parallel_analysis_dry_run(

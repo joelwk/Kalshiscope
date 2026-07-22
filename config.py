@@ -535,6 +535,14 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
+    # While the exchange-confirmed sports jurisdiction hold flag is set (order
+    # 403 with the Michigan sports message), throttle sports analysis slots to
+    # this probe cadence so freed slots flow to executable families. Jul 2026
+    # evidence: 657 sports analyses in 5 days produced 8 orders, all
+    # jurisdiction-rejected. Probes keep sports analysis-eligible and the flag
+    # auto-clears when the exchange accepts a sports order. 0 disables the
+    # throttle entirely (legacy behavior).
+    SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE: int = 1
     # Generic is the catch-all family (speech/album/photo-count/macro/etc). A
     # 15-cycle review found it dominated analysis (~48% of slots) yet was
     # majority absence-only (no findable settlement data) and produced 0 fills.
@@ -578,7 +586,12 @@ class Settings:
     # eligibility matches the standard actually used to execute; 0.20 parked
     # hundreds of repairable decisions as edge_below_repair_min.
     CONVICTION_REPAIR_MIN_EDGE: float = 0.12
-    CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY: float = 0.90
+    # Aligned with the validator's proxy evidence-quality cap (0.75). Jul 2026
+    # receipts: with the bar above the cap, repair evaluated 72 decisions in a
+    # session and triggered zero (miss reason evidence_quality_below_repair_min
+    # every time), so the deep re-research loop never ran for the
+    # settlement-aligned commodity/weather near-misses it was built for.
+    CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY: float = 0.75
     CONVICTION_REPAIR_SCORE_GAP_MAX: float = 0.08
     CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR: float = 0.0
     DAILY_EXPECTANCY_ENABLED: bool = True
@@ -729,6 +742,9 @@ class Settings:
     HISTORICAL_FAMILY_MIN_SAMPLES: int = 12
     HISTORICAL_FAMILY_PNL_CUTOFF: float = -12.0
     HISTORICAL_FAMILY_WIN_RATE_CUTOFF: float = 0.40
+    # Bayesian shrinkage on family PnL (independent of prefix shrinkage).
+    HISTORICAL_FAMILY_SHRINKAGE_ENABLED: bool = True
+    HISTORICAL_FAMILY_PRIOR_STRENGTH: float = 10.0
     # Per-trade Bayesian-shrunk PnL cutoff for family hard-deny (distinct from
     # HISTORICAL_TICKER_PREFIX_SHRUNK_PNL_CUTOFF so family/prefix bars can diverge).
     HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF: float = -0.50
@@ -787,6 +803,14 @@ class Settings:
     # band; below it there is no overconfidence to correct and shrinking only
     # destroys tradeable edge. 0.0 disables the band (cap still applies).
     HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE: float = 0.0
+    # Band-preserving clamp: a stage-one confidence at/above this floor cannot
+    # be shrunk below it. Jul 2026 evidence: the stacked shrink mapped raw
+    # 0.58-0.65 into 0.50-0.545 (zero decisions left in 0.55-0.60) while the
+    # 0.55-0.61 band was the best-calibrated pocket (70.4% win rate) and the
+    # post-shrink 0.5 bucket ran 69.9% -- the shrink was relocating decisions
+    # from the winning band into the losing one. Stage-one values below the
+    # floor keep the full shrink. 0.0 disables the clamp (legacy behavior).
+    HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR: float = 0.55
     RESEARCH_QUEUE_ENABLED: bool = True
     RESEARCH_QUEUE_PERSIST_TO_DB: bool = True
     RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS: int = 6
@@ -807,6 +831,11 @@ class Settings:
     RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
     RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
     RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES: float = 45.0
+    # Waive the drain min-age for entries whose market closes within this many
+    # hours. Hourly/same-day markets (Jul 2026: hourly commodity strikes) close
+    # before the min-age elapses, so their near-miss entries expired
+    # unexamined. 0 disables the waiver.
+    RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS: float = 2.0
     RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS: int = 1
     RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX: int = 1
     RESEARCH_QUEUE_SCORE_PROMOTION_GAP: float = 0.05
@@ -1541,6 +1570,10 @@ def load_settings() -> Settings:
             "MAX_SPORTS_CANDIDATES_PER_CYCLE",
             Settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
         ),
+        SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE=_read_env_int(
+            "SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE",
+            Settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE,
+        ),
         MAX_GENERIC_CANDIDATES_PER_CYCLE=_read_env_int(
             "MAX_GENERIC_CANDIDATES_PER_CYCLE",
             Settings.MAX_GENERIC_CANDIDATES_PER_CYCLE,
@@ -2051,6 +2084,14 @@ def load_settings() -> Settings:
             "HISTORICAL_FAMILY_WIN_RATE_CUTOFF",
             Settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
         ),
+        HISTORICAL_FAMILY_SHRINKAGE_ENABLED=_read_env_bool(
+            "HISTORICAL_FAMILY_SHRINKAGE_ENABLED",
+            Settings.HISTORICAL_FAMILY_SHRINKAGE_ENABLED,
+        ),
+        HISTORICAL_FAMILY_PRIOR_STRENGTH=_read_env_float(
+            "HISTORICAL_FAMILY_PRIOR_STRENGTH",
+            Settings.HISTORICAL_FAMILY_PRIOR_STRENGTH,
+        ),
         HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF=_read_env_float(
             "HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF",
             Settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF,
@@ -2197,6 +2238,10 @@ def load_settings() -> Settings:
             "HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE",
             Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE,
         ),
+        HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR=_read_env_float(
+            "HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR",
+            Settings.HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR,
+        ),
         RESEARCH_QUEUE_ENABLED=_read_env_bool(
             "RESEARCH_QUEUE_ENABLED",
             Settings.RESEARCH_QUEUE_ENABLED,
@@ -2244,6 +2289,10 @@ def load_settings() -> Settings:
         RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=_read_env_float(
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES",
             Settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES,
+        ),
+        RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS",
+            Settings.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS,
         ),
         RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS=_read_env_int(
             "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS",

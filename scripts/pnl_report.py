@@ -334,8 +334,11 @@ def _iter_exchange_position_rows(payload: dict[str, Any] | None) -> list[dict[st
         return []
     for key in ("market_positions", "positions", "portfolio_positions", "data"):
         rows = payload.get(key)
-        if isinstance(rows, list):
-            return [row for row in rows if isinstance(row, dict)]
+        if not isinstance(rows, list):
+            continue
+        dict_rows = [row for row in rows if isinstance(row, dict)]
+        if dict_rows:
+            return dict_rows
     return []
 
 

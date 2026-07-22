@@ -1914,6 +1914,74 @@ def _is_michigan_sports_jurisdiction_error(error_text: str) -> bool:
     return _MICHIGAN_SPORTS_JURISDICTION_MARKER in str(error_text or "").lower()
 
 
+_SPORTS_JURISDICTION_FLAG_KEY = "sports_jurisdiction_blocked"
+
+
+def _sports_jurisdiction_hold_active(state_manager: "MarketStateManager") -> bool:
+    """True while the exchange-confirmed sports jurisdiction hold flag is set.
+
+    The hold only throttles sports analysis-slot allocation (probe cadence);
+    sports markets stay analysis-eligible and order-scoped 403 handling is
+    unchanged, so this is not a family-level hard reject.
+    """
+    try:
+        return state_manager.get_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY) == "1"
+    except Exception as exc:
+        logger.debug(
+            "Sports jurisdiction flag read failed: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+        return False
+
+
+def _record_sports_jurisdiction_block(state_manager: "MarketStateManager") -> None:
+    try:
+        state_manager.set_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY, "1")
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist sports jurisdiction hold flag: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+
+
+def _clear_sports_jurisdiction_block(state_manager: "MarketStateManager") -> None:
+    """Clear the hold once the exchange accepts a sports order again."""
+    try:
+        if state_manager.get_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY) is None:
+            return
+        state_manager.clear_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY)
+        logger.info(
+            "Sports jurisdiction hold cleared: exchange accepted a sports order",
+            data={"runtime_flag": _SPORTS_JURISDICTION_FLAG_KEY},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to clear sports jurisdiction hold flag: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+
+
+def _effective_sports_candidate_cap(
+    base_cap: int | None,
+    *,
+    jurisdiction_hold_active: bool,
+    probe_cap: int,
+) -> int | None:
+    """Sports analysis-slot cap after applying the jurisdiction probe throttle.
+
+    ``probe_cap <= 0`` disables the throttle so operators can restore legacy
+    behavior without clearing the runtime flag.
+    """
+    if not jurisdiction_hold_active or probe_cap <= 0:
+        return base_cap
+    if base_cap is None:
+        return probe_cap
+    return min(base_cap, probe_cap)
+
+
 def _order_exception_error_text(exc: BaseException) -> str:
     """Compose order-failure text including Kalshi response body when present.
 
@@ -2931,6 +2999,26 @@ def _kelly_fraction_for_decision(
     if gap_threshold > 0.0 and gap >= gap_threshold:
         fraction *= max(0.0, float(settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER))
     return max(0.0, min(1.0, fraction))
+
+
+def _is_direct_high_eq_evidence(decision: TradeDecision, settings: Settings) -> bool:
+    """Direct-basis decision at/above the direct posterior-floor EQ bar.
+
+    Such decisions carry settlement-aligned evidence, so when the
+    calibration-gap shrink crushes the Kelly fraction the near-miss min-bet
+    floor must stay reachable. Jul 2026 receipts: kelly_sub_floor_skip
+    discarded eq=1.0 weather bets sized at ~95% of MIN_BET because the shrink
+    disqualified the floor — a double punishment for the same signal.
+    """
+    if _decision_evidence_basis(decision) != "direct":
+        return False
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return False
+    return evidence_quality >= float(
+        settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY
+    )
 
 
 def _dynamic_kelly_floor_allowed(
@@ -4293,8 +4381,11 @@ def _iter_exchange_position_rows(payload: dict[str, Any] | None) -> list[dict[st
         return []
     for key in ("market_positions", "positions", "portfolio_positions", "data"):
         rows = payload.get(key)
-        if isinstance(rows, list):
-            return [row for row in rows if isinstance(row, dict)]
+        if not isinstance(rows, list):
+            continue
+        dict_rows = [row for row in rows if isinstance(row, dict)]
+        if dict_rows:
+            return dict_rows
     return []
 
 
@@ -7260,8 +7351,32 @@ def _research_queue_priority_below_drain_floor(
     return effective < min_priority
 
 
-def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, str, str]:
-    """Prioritize persisted queue quality, then near-threshold older entries."""
+# Gates whose queue entries represent execution near-misses (a concrete trade
+# blocked just short of a threshold) rather than pre-analysis parking. Jul 2026
+# review: 13,899 pre_analysis placeholders drowned the handful of edge / kelly /
+# conviction near-misses, so drain slots almost never reached them (1,331
+# queued markets since Jul 15 -> 4 converted).
+_RESEARCH_QUEUE_EXECUTION_NEAR_MISS_GATES = frozenset(
+    {
+        "edge",
+        "kelly_sub_floor",
+        "kelly_sub_floor_skip",
+        "conviction_repair",
+        "evidence",
+    }
+)
+
+
+def _research_queue_execution_near_miss_tier(entry: dict[str, Any]) -> int:
+    """0 for execution-near-miss gate entries, 1 for everything else."""
+    gate_name = str(entry.get("gate_name") or "").strip().lower()
+    return 0 if gate_name in _RESEARCH_QUEUE_EXECUTION_NEAR_MISS_GATES else 1
+
+
+def _research_queue_drain_sort_key(
+    entry: dict[str, Any],
+) -> tuple[int, float, float, int, str, str]:
+    """Prioritize execution near-misses, then queue quality, then older entries."""
     drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
         entry
     )
@@ -7275,6 +7390,7 @@ def _research_queue_drain_sort_key(entry: dict[str, Any]) -> tuple[float, float,
     except (TypeError, ValueError):
         threshold_gap = float("inf")
     return (
+        _research_queue_execution_near_miss_tier(entry),
         -float(priority),
         threshold_gap,
         drain_attempts,
@@ -7814,6 +7930,19 @@ def _analyze_market_candidate(
             )
         else:
             calibrated_confidence = raw_historical_calibrated
+        # Band-preserving clamp: the stacked shrink must not relocate a
+        # stage-one confidence out of the 0.55+ band it qualified for (Jul
+        # 2026: the 0.55-0.61 band won 70.4% while everything shrunk into
+        # 0.50-0.55 -- see HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR).
+        history_band_floor = max(
+            0.0, settings.HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR
+        )
+        if (
+            history_band_floor > 0.0
+            and stage_one_confidence >= history_band_floor
+            and calibrated_confidence < history_band_floor
+        ):
+            calibrated_confidence = history_band_floor
         confidence_history_gap_applied = max(0.0, stage_one_confidence - calibrated_confidence)
         historical_bucket_sample_size = historical_shrink.sample_size
         historical_bucket_family = historical_shrink.family_used
@@ -9080,6 +9209,44 @@ def main(max_cycles: int | None = None) -> None:
                         excluded_market_ids=excluded_ids,
                         included_market_ids=tuple(current_market_ids),
                     )
+                    # Near-close min-age waiver: hourly/same-day markets close
+                    # before RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS elapses, so
+                    # their near-miss entries expired unexamined (Jul 2026:
+                    # hourly commodity strikes queued ~40min before close never
+                    # became drain-eligible). Fetch those without the min-age
+                    # bar; they still pass priority/cooldown filters below.
+                    near_close_waiver_hours = max(
+                        0.0,
+                        float(settings.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS),
+                    )
+                    if near_close_waiver_hours > 0.0:
+                        near_close_ids = tuple(
+                            str(getattr(m, "id", "") or "")
+                            for m in markets
+                            if isinstance(m, Market)
+                            and (
+                                (_hours_left := _hours_to_market_close(m)) is not None
+                                and 0.0 <= _hours_left <= near_close_waiver_hours
+                            )
+                        )
+                        if near_close_ids:
+                            waiver_rows = state_manager.get_drainable_research_entries(
+                                min_age_hours=0.0,
+                                max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
+                                limit=drain_pool_limit,
+                                excluded_market_ids=excluded_ids,
+                                included_market_ids=near_close_ids,
+                            )
+                            known_drain_ids = {
+                                str(row.get("market_id") or "") for row in drain_rows
+                            }
+                            for waiver_row in waiver_rows:
+                                waiver_mid = str(waiver_row.get("market_id") or "")
+                                if not waiver_mid or waiver_mid in known_drain_ids:
+                                    continue
+                                waiver_row["near_close_drain_waiver"] = True
+                                drain_rows.append(waiver_row)
+                                known_drain_ids.add(waiver_mid)
                     drain_rows = sorted(
                         drain_rows,
                         key=_research_queue_drain_sort_key,
@@ -9426,6 +9593,8 @@ def main(max_cycles: int | None = None) -> None:
                     family_min_samples=settings.HISTORICAL_FAMILY_MIN_SAMPLES,
                     family_pnl_cutoff=settings.HISTORICAL_FAMILY_PNL_CUTOFF,
                     family_win_rate_cutoff=settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
+                    family_shrinkage_enabled=settings.HISTORICAL_FAMILY_SHRINKAGE_ENABLED,
+                    family_prior_strength=settings.HISTORICAL_FAMILY_PRIOR_STRENGTH,
                     family_shrunk_pnl_cutoff=settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF,
                 )
 
@@ -10398,6 +10567,31 @@ def main(max_cycles: int | None = None) -> None:
                 if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
                 else None
             )
+            sports_jurisdiction_probe_cap = max(
+                0, settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE
+            )
+            sports_jurisdiction_hold = (
+                sports_jurisdiction_probe_cap > 0
+                and _sports_jurisdiction_hold_active(state_manager)
+            )
+            sports_candidate_cap = _effective_sports_candidate_cap(
+                sports_candidate_cap,
+                jurisdiction_hold_active=sports_jurisdiction_hold,
+                probe_cap=sports_jurisdiction_probe_cap,
+            )
+            if sports_jurisdiction_hold:
+                logger.info(
+                    "Sports jurisdiction hold active: sports analysis slots "
+                    "throttled to %d probe candidate(s) this cycle",
+                    sports_candidate_cap,
+                    data={
+                        "sports_jurisdiction_hold": True,
+                        "sports_candidate_cap": sports_candidate_cap,
+                        "max_sports_candidates_per_cycle": (
+                            settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
+                        ),
+                    },
+                )
             generic_candidate_cap = (
                 settings.MAX_GENERIC_CANDIDATES_PER_CYCLE
                 if settings.MAX_GENERIC_CANDIDATES_PER_CYCLE > 0
@@ -13524,6 +13718,8 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     # High-quality settled weather uses DEFAULT (not weather-
                     # multiplied horizon) as the dynamic-floor reference.
+                    # Direct high-EQ evidence also keeps the near-miss floor
+                    # reachable after calibration-gap fraction shrink.
                     if abs(float(kelly_fraction_value) - float(kelly_reference_fraction)) > 1e-9 and (
                         _is_high_quality_settled_evidence(
                             decision_for_edge, settings, market=active_market
@@ -13531,6 +13727,7 @@ def main(max_cycles: int | None = None) -> None:
                         or _is_definitive_validated(
                             decision_for_edge, settings, market=active_market
                         )
+                        or _is_direct_high_eq_evidence(decision_for_edge, settings)
                     ):
                         kelly_reference_fraction = float(kelly_fraction_value)
                     dynamic_kelly_floor_allowed = _dynamic_kelly_floor_allowed(
@@ -13986,6 +14183,7 @@ def main(max_cycles: int | None = None) -> None:
                             or _is_definitive_validated(
                                 decision_for_edge, settings, market=active_market
                             )
+                            or _is_direct_high_eq_evidence(decision_for_edge, settings)
                         ):
                             kelly_reference_fraction = float(kelly_fraction_value)
                         dynamic_kelly_floor_allowed = _dynamic_kelly_floor_allowed(
@@ -15314,15 +15512,20 @@ def main(max_cycles: int | None = None) -> None:
                         order_failure_reason = "order_submission_invalid_time_in_force"
                     elif _is_michigan_sports_jurisdiction_error(error_msg):
                         order_failure_reason = "jurisdiction_sports_blocked"
+                        _record_sports_jurisdiction_block(state_manager)
                         logger.warning(
                             "Order-scoped sports jurisdiction rejection: market=%s; "
-                            "future sports markets remain analysis-eligible",
+                            "sports analysis slots throttle to probe cadence until "
+                            "an order is accepted",
                             market.id,
                             data={
                                 "market_id": market.id,
                                 "market_family": market_family_name,
                                 "jurisdiction_rejection_scope": "order_only",
                                 "sports_analysis_remains_eligible": True,
+                                "sports_jurisdiction_probe_candidates_per_cycle": (
+                                    settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE
+                                ),
                             },
                         )
                     if (
@@ -15405,6 +15608,10 @@ def main(max_cycles: int | None = None) -> None:
                         "market_id": market.id,
                     },
                 )
+                if market_family_name == "sports":
+                    # A sports order the exchange accepted (no jurisdiction 403)
+                    # means the hold has lifted; restore full slot allocation.
+                    _clear_sports_jurisdiction_block(state_manager)
                 normalized_order_status = (order_response.status or "").strip().lower()
                 order_cancel_reason = None
                 order_fill_count = None

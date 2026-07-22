@@ -45,6 +45,10 @@ from main import (
     _dry_streak_sleep_seconds,
     _edge_band_label,
     _effective_research_queue_drain_quota,
+    _effective_sports_candidate_cap,
+    _clear_sports_jurisdiction_block,
+    _record_sports_jurisdiction_block,
+    _sports_jurisdiction_hold_active,
     _edge_threshold_for_market,
     _event_concentration_blocked,
     _event_side_conflict_blocked,
@@ -1474,6 +1478,46 @@ class TestMainUtils(unittest.TestCase):
 
         self.assertEqual([entry["market_id"] for entry in ordered], ["KXCLOSE", "KXWIDE", "KXUNKNOWN"])
 
+    def test_research_queue_drain_sort_ranks_near_miss_gates_above_placeholders(self) -> None:
+        """Jul 2026: 13,899 pre-analysis placeholders drowned the handful of
+        edge/kelly/conviction near-misses (1,331 queued -> 4 converted). Drain
+        slots must reach execution near-misses before parking entries, even
+        when a placeholder carries a higher estimated priority."""
+        placeholder = {
+            "market_id": "KXPLACEHOLDER",
+            "gate_name": "pre_analysis_opportunity_score",
+            "reason": "pre_analysis_score_soft_research",
+            "research_priority": 0.95,
+            "threshold_gap": 0.01,
+            "queued_at": "2026-07-22T00:01:00+00:00",
+        }
+        edge_near_miss = {
+            "market_id": "KXEDGEMISS",
+            "gate_name": "edge",
+            "reason": "edge_gate_blocked",
+            "research_priority": 0.55,
+            "threshold_gap": 0.02,
+            "queued_at": "2026-07-22T00:02:00+00:00",
+        }
+        kelly_near_miss = {
+            "market_id": "KXKELLYMISS",
+            "gate_name": "kelly_sub_floor_skip",
+            "reason": "kelly_sub_floor_skip",
+            "research_priority": 0.50,
+            "threshold_gap": 0.05,
+            "queued_at": "2026-07-22T00:03:00+00:00",
+        }
+
+        ordered = sorted(
+            [placeholder, edge_near_miss, kelly_near_miss],
+            key=_research_queue_drain_sort_key,
+        )
+
+        self.assertEqual(
+            [entry["market_id"] for entry in ordered],
+            ["KXEDGEMISS", "KXKELLYMISS", "KXPLACEHOLDER"],
+        )
+
     def test_research_queue_drain_demotes_chronic_research_gap(self) -> None:
         """High-attempt research_gap loses to fresh edge/kelly near-misses."""
         chronic_gap = {
@@ -2552,6 +2596,34 @@ class TestMainUtils(unittest.TestCase):
             )
         )
 
+    def test_direct_high_eq_evidence_keeps_near_miss_floor_reachable(self) -> None:
+        """Jul 2026: kelly_sub_floor_skip discarded eq=1.0 direct weather bets
+        at ~95% of MIN_BET because the calibration-gap shrink disqualified the
+        near-miss floor. Direct evidence at/above the posterior-floor EQ bar
+        must keep the floor reachable; proxy or low-EQ decisions must not."""
+        from main import _is_direct_high_eq_evidence
+
+        settings = Settings(
+            DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=0.80,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        direct_high_eq = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.55,
+            bet_size_pct=0.2,
+            reasoning="NWS observed low already crossed the strike.",
+            evidence_basis="direct",
+            evidence_quality=1.0,
+        )
+        self.assertTrue(_is_direct_high_eq_evidence(direct_high_eq, settings))
+        proxy = direct_high_eq.model_copy(update={"evidence_basis": "proxy"})
+        self.assertFalse(_is_direct_high_eq_evidence(proxy, settings))
+        low_eq = direct_high_eq.model_copy(update={"evidence_quality": 0.75})
+        self.assertFalse(_is_direct_high_eq_evidence(low_eq, settings))
+
     def test_no_trade_routing_distinguishes_validation_gate_from_model_choice(
         self,
     ) -> None:
@@ -3543,6 +3615,66 @@ class TestMainUtils(unittest.TestCase):
             3,
         )
 
+    def test_effective_sports_candidate_cap_probe_throttle(self) -> None:
+        """Jurisdiction hold throttles sports slots to the probe cadence;
+        probe_cap=0 disables the throttle and no hold keeps the base cap."""
+        self.assertEqual(
+            _effective_sports_candidate_cap(
+                6, jurisdiction_hold_active=True, probe_cap=1
+            ),
+            1,
+        )
+        self.assertEqual(
+            _effective_sports_candidate_cap(
+                None, jurisdiction_hold_active=True, probe_cap=1
+            ),
+            1,
+        )
+        self.assertEqual(
+            _effective_sports_candidate_cap(
+                6, jurisdiction_hold_active=True, probe_cap=0
+            ),
+            6,
+        )
+        self.assertEqual(
+            _effective_sports_candidate_cap(
+                6, jurisdiction_hold_active=False, probe_cap=1
+            ),
+            6,
+        )
+        self.assertIsNone(
+            _effective_sports_candidate_cap(
+                None, jurisdiction_hold_active=False, probe_cap=1
+            )
+        )
+        # Probe cadence never raises an operator cap tighter than the probe.
+        self.assertEqual(
+            _effective_sports_candidate_cap(
+                1, jurisdiction_hold_active=True, probe_cap=2
+            ),
+            1,
+        )
+
+    def test_sports_jurisdiction_flag_round_trip(self) -> None:
+        """Order-scoped 403 sets the hold, an accepted sports order clears it."""
+        import tempfile
+        from pathlib import Path
+
+        from market_state import MarketStateManager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            manager = MarketStateManager(str(Path(tmp_dir) / "state.db"))
+            try:
+                self.assertFalse(_sports_jurisdiction_hold_active(manager))
+                _record_sports_jurisdiction_block(manager)
+                self.assertTrue(_sports_jurisdiction_hold_active(manager))
+                # Clearing twice is safe (second call is a no-op).
+                _clear_sports_jurisdiction_block(manager)
+                _clear_sports_jurisdiction_block(manager)
+                self.assertFalse(_sports_jurisdiction_hold_active(manager))
+            finally:
+                manager.close()
+
     def test_best_orderbook_sell_price(self) -> None:
         orderbook = {
             "sells": [
@@ -4055,6 +4187,110 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(calibrated.confidence, 0.612)
         self.assertLess(calibrated.bet_size_pct, decision.bet_size_pct)
         self.assertIn("Confidence calibrated", calibrated.reasoning)
+
+    def test_historical_shrink_band_floor_preserves_qualifying_band(self) -> None:
+        """Jul 22 2026 review: the stacked shrink emptied the 0.55-0.60 band
+        (130 decisions at 0.50-0.55, zero at 0.55-0.60) while that band won
+        70.4% lifetime. A stage-one confidence >= the band floor must not be
+        shrunk below it; disabling the floor (0.0) restores legacy behavior."""
+
+        def _run(band_floor: float) -> dict:
+            market = Market(
+                id="KXMLBGAME-26JUL221910NYYBOS-NYY",
+                question="Will the Yankees beat the Red Sox tonight?",
+                outcomes=[
+                    MarketOutcome(name="YES", price=0.45),
+                    MarketOutcome(name="NO", price=0.55),
+                ],
+                liquidity_usdc=500.0,
+                category="sports",
+            )
+            decision = TradeDecision(
+                should_trade=True,
+                outcome="YES",
+                confidence=0.62,
+                bet_size_pct=0.3,
+                reasoning="test",
+                evidence_quality=0.8,
+            )
+            settings = Settings(
+                CONFIDENCE_SHRINKAGE_FLOOR=0.50,
+                CONFIDENCE_SHRINKAGE_FACTOR=1.0,
+                HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=0.30,
+                HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR=band_floor,
+                MAX_GLOBAL_CONFIDENCE=1.0,
+                MAX_SPORTS_CONFIDENCE=1.0,
+                XAI_API_KEY="xai-key",
+                KALSHI_API_KEY_ID="kalshi-key-id",
+                KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+            )
+            buckets = {
+                "sports": {0.6: {"win_rate": 0.20, "sample_size": 100}},
+            }
+            return _analyze_market_candidate(
+                market=market,
+                state=None,
+                anchor_analysis=None,
+                settings=settings,
+                grok_client=DummyGrokClient(decision),
+                historical_confidence_buckets=buckets,
+            )
+
+        # Legacy (floor disabled): bucket gap 0.42 * 0.60 shrinks 0.62 -> 0.368.
+        legacy = _run(band_floor=0.0)
+        self.assertAlmostEqual(legacy["confidence_after_calibration"], 0.368)
+        # Band floor 0.55: same shrink clamps at the band boundary instead.
+        clamped = _run(band_floor=0.55)
+        self.assertAlmostEqual(clamped["confidence_after_calibration"], 0.55)
+        self.assertAlmostEqual(
+            clamped["confidence_history_gap_applied"], 0.62 - 0.55
+        )
+
+    def test_historical_shrink_band_floor_keeps_full_shrink_below_band(self) -> None:
+        """Stage-one confidence below the band floor keeps the full shrink so
+        genuinely weak decisions stay suppressed."""
+        market = Market(
+            id="KXMLBGAME-26JUL221910LADSF-LAD",
+            question="Will the Dodgers beat the Giants tonight?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.45),
+                MarketOutcome(name="NO", price=0.55),
+            ],
+            liquidity_usdc=500.0,
+            category="sports",
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.52,
+            bet_size_pct=0.3,
+            reasoning="test",
+            evidence_quality=0.8,
+        )
+        settings = Settings(
+            CONFIDENCE_SHRINKAGE_FLOOR=0.50,
+            CONFIDENCE_SHRINKAGE_FACTOR=1.0,
+            HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=0.30,
+            HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR=0.55,
+            MAX_GLOBAL_CONFIDENCE=1.0,
+            MAX_SPORTS_CONFIDENCE=1.0,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        buckets = {
+            "sports": {0.5: {"win_rate": 0.20, "sample_size": 100}},
+        }
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(decision),
+            historical_confidence_buckets=buckets,
+        )
+        # Gap 0.32 * 0.60 = 0.192 -> 0.328; no clamp because 0.52 < 0.55.
+        self.assertAlmostEqual(result["confidence_after_calibration"], 0.328)
 
     def test_dry_streak_sleep_seconds_applies_after_three_zero_order_cycles(self) -> None:
         self.assertIsNone(
@@ -4957,6 +5193,21 @@ class TestHistoricalFamilyFlattening(unittest.TestCase):
         self.assertEqual(audit.get("historical_family_samples"), 99)
 
 
+class TestResearchQueueNearCloseWaiver(unittest.TestCase):
+    def test_drain_selection_includes_near_close_min_age_waiver(self) -> None:
+        """The drain block must fetch near-close markets without the min-age
+        bar (Jul 2026: hourly commodity near-misses expired unexamined) and
+        tag them so telemetry can attribute waiver-sourced probes."""
+        src = inspect.getsource(main_module.main)
+        drain_block = src.split("Near-close min-age waiver", 1)[1].split(
+            "Emergency second-pass drain", 1
+        )[0]
+        self.assertIn("RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS", drain_block)
+        self.assertIn("min_age_hours=0.0", drain_block)
+        self.assertIn("near_close_drain_waiver", drain_block)
+        self.assertIn("_hours_to_market_close", drain_block)
+
+
 class TestHistoricalFamilyStatsRuntimeLoad(unittest.TestCase):
     def test_confidence_shrink_block_does_not_reset_recent_family_stats(self) -> None:
         src = inspect.getsource(main_module.main)
@@ -5683,6 +5934,71 @@ class TestConvictionRepairEdgeEligibility(unittest.TestCase):
         self.assertEqual(
             diagnostics["conviction_repair_missed_reason"],
             "edge_below_repair_min",
+        )
+
+    def test_proxy_cap_eq_settlement_aligned_near_miss_is_triggerable(self) -> None:
+        """Jul 22 2026 receipts: eq=0.75 settlement-aligned commodity near-misses
+        (validator proxy cap) always missed with evidence_quality_below_repair_min
+        because the repair bar sat above the cap. At the aligned 0.75 default the
+        deep re-research pass must be reachable; below the cap it must still miss."""
+        market = Market(
+            id="KXGOLDH-26JUL2211-T4153.99",
+            question="Will the gold price at 11am EDT be above 4153.99?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.38),
+                MarketOutcome(name="NO", price=0.62),
+            ],
+            liquidity_usdc=800.0,
+            resolution_criteria="CME gold front-month price at settlement time",
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            raw_should_trade=True,
+            outcome="NO",
+            confidence=0.527,
+            raw_confidence=0.61,
+            bet_size_pct=0.0,
+            reasoning="CME quote 0.07-0.09pct below threshold; edge gate blocked.",
+            # YES-scale external edge; chosen-side (NO) edge is +0.23 as in the
+            # Jul 22 receipt (edge_external=-0.23, edge_external_chosen=0.23).
+            edge_external=-0.23,
+            edge_source="computed",
+            evidence_basis="proxy",
+            evidence_quality=0.75,
+            primary_source_url=(
+                "https://www.cmegroup.com/markets/metals/precious/gold.quotes.html"
+            ),
+            source_match_class="settlement_aligned",
+        )
+        diagnostics: dict[str, object] = {}
+
+        reason = _conviction_repair_reason(
+            decision=decision,
+            market=market,
+            settings=Settings(),
+            score_result=None,
+            score_threshold=None,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(reason, "conviction_repair_raw_trade_demotion")
+        self.assertTrue(diagnostics["conviction_repair_triggerable"])
+
+        below_cap = decision.model_copy(update={"evidence_quality": 0.74})
+        below_diag: dict[str, object] = {}
+        self.assertIsNone(
+            _conviction_repair_reason(
+                decision=below_cap,
+                market=market,
+                settings=Settings(),
+                score_result=None,
+                score_threshold=None,
+                diagnostics=below_diag,
+            )
+        )
+        self.assertEqual(
+            below_diag["conviction_repair_missed_reason"],
+            "evidence_quality_below_repair_min",
         )
 
 
