@@ -581,6 +581,79 @@ def test_record_resolution_can_update_online_calibration(tmp_path) -> None:
         manager.close()
 
 
+def test_record_market_winning_outcome_is_update_only(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        # Unknown market: no row is created (writes stay scoped to markets
+        # with local decision history).
+        assert manager.record_market_winning_outcome("KX-UNKNOWN", "YES") is False
+        # A blocked market with a decision-reason terminal outcome later gets
+        # the actual exchange winner recorded alongside it.
+        manager.record_terminal_outcome("KX-BLOCKED", "edge_gate_blocked")
+        assert manager.record_market_winning_outcome("KX-BLOCKED", "YES") is True
+        assert manager.record_market_winning_outcome("KX-BLOCKED", "YES") is False
+        row = manager._conn.execute(
+            """
+            SELECT last_terminal_outcome, resolved_winning_outcome,
+                   resolved_winning_outcome_at
+            FROM markets WHERE id = ?
+            """,
+            ("KX-BLOCKED",),
+        ).fetchone()
+        assert row["last_terminal_outcome"] == "edge_gate_blocked"
+        assert row["resolved_winning_outcome"] == "YES"
+        assert row["resolved_winning_outcome_at"] is not None
+    finally:
+        manager.close()
+
+
+def test_participation_tier_repr_leak_migration_normalizes_receipts(tmp_path) -> None:
+    db_path = str(tmp_path / "state.db")
+    manager = MarketStateManager(db_path)
+    try:
+        leaked_audit = (
+            '{"participation_tier": "ParticipationTier.SKIP_FOR_NOW_WITH_REASON"}'
+        )
+        clean_decision = '{"should_trade": false}'
+        manager._conn.execute(
+            """
+            INSERT INTO decision_receipts
+                (cycle_id, market_id, final_action, timestamp,
+                 decision_json, audit_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "c1",
+                "KX-LEAK",
+                "skip",
+                datetime.now(timezone.utc).isoformat(),
+                clean_decision,
+                leaked_audit,
+            ),
+        )
+        # Re-arm the one-shot migration so the reopened manager repairs the row.
+        manager._conn.execute(
+            "DELETE FROM runtime_flags WHERE key = 'participation_tier_repr_normalized'"
+        )
+        manager._conn.commit()
+    finally:
+        manager.close()
+
+    reopened = MarketStateManager(db_path)
+    try:
+        row = reopened._conn.execute(
+            "SELECT audit_json FROM decision_receipts WHERE market_id = ?",
+            ("KX-LEAK",),
+        ).fetchone()
+        assert row["audit_json"] == (
+            '{"participation_tier": "skip_for_now_with_reason"}'
+        )
+        flag = reopened.get_runtime_flag("participation_tier_repr_normalized")
+        assert flag == "v1"
+    finally:
+        reopened.close()
+
+
 def test_runtime_flags_persist_across_manager_instances(tmp_path) -> None:
     db_path = str(tmp_path / "runtime_flags.db")
     manager = MarketStateManager(db_path)

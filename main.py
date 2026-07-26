@@ -439,8 +439,15 @@ def _filter_markets(
     skip_weather_bin_markets: bool = False,
     skip_crypto_bin_markets: bool = False,
     family_blocklist=(),
+    resolved_winners: dict[str, str] | None = None,
 ):
-    """Filter markets based on liquidity, category, and close date constraints."""
+    """Filter markets based on liquidity, category, and close date constraints.
+
+    When ``resolved_winners`` is provided, settled markets carrying an
+    extractable YES/NO winner are recorded into it (market_id -> winner) so
+    the caller can persist actual resolutions for counterfactual audits of
+    blocked decisions.
+    """
     filtered = []
     skipped_liquidity = 0
     skipped_volume_24h = 0
@@ -572,6 +579,10 @@ def _filter_markets(
             skipped_likely_resolved_by_ticker += 1
             continue
         if _is_market_resolved_or_closed(market):
+            if resolved_winners is not None:
+                winning_outcome = _extract_winning_outcome(market)
+                if winning_outcome:
+                    resolved_winners[market.id] = winning_outcome
             skipped_resolved += 1
             continue
         if min_close_date and close_time:
@@ -3042,6 +3053,28 @@ def _dynamic_kelly_floor_allowed(
         else float(reference_fraction)
     )
     return float(final_fraction) >= threshold - 1e-9
+
+
+def _extreme_edge_size_dampener(
+    edge_value: float | None,
+    settings: Settings,
+) -> float:
+    """Stake multiplier for extreme claimed market edges (probe, don't block).
+
+    Jul 2026 resolved-outcome review: claimed edges in the top deciles ran
+    49%/31%/0% win rates while small edges ran 63-65%, yet sizing grew with
+    claimed edge. Dampen stakes at 35pp+ so extreme disagreement with the
+    market is probe-sized. Applied to the post-sizing bet fraction so min-bet
+    floors and the near-miss policy still decide execution.
+    """
+    band = _edge_band_label(edge_value)
+    if band == "35-45pp":
+        multiplier = settings.KELLY_EDGE_BAND_DAMPENER_35PP
+    elif band == "45pp+":
+        multiplier = settings.KELLY_EDGE_BAND_DAMPENER_45PP
+    else:
+        return 1.0
+    return max(0.0, min(1.0, float(multiplier)))
 
 
 def _sizing_mode_label(kelly_enabled: bool) -> str:
@@ -6072,6 +6105,8 @@ def _order_response_receipt(order_response: Any | None) -> dict[str, Any] | None
                 "client_order_id",
                 "client_price",
                 "client_qty_shares",
+                "client_amount_usdc",
+                "client_requested_notional_usdc",
                 "fill_count",
                 "status",
             )
@@ -7089,6 +7124,19 @@ def _cap_analysis_candidates(
         historical_gate_metrics = candidate.get("historical_gate_metrics")
         historical_gate_metric_penalty = 0.0
         historical_gate_metrics_present = isinstance(historical_gate_metrics, dict)
+        pre_analysis_breakdown = candidate.get("pre_analysis_breakdown")
+        historical_gate_penalty_already_applied = False
+        if isinstance(pre_analysis_breakdown, dict):
+            try:
+                historical_gate_penalty_already_applied = float(
+                    pre_analysis_breakdown.get(
+                        "pre_score_historical_gate_score_penalty",
+                        0.0,
+                    )
+                    or 0.0
+                ) > 0.0
+            except (TypeError, ValueError):
+                historical_gate_penalty_already_applied = False
         if historical_gate_metrics_present:
             try:
                 historical_gate_metric_penalty = float(
@@ -7102,14 +7150,12 @@ def _cap_analysis_candidates(
             historical_loss_penalty = min(0.20, abs(historical_pnl) / 250.0)
             if historical_win_rate and historical_win_rate < 0.50:
                 historical_loss_penalty += min(0.06, (0.50 - historical_win_rate) * 0.20)
-        # Avoid double-counting the historical-gate penalty: when the gate
-        # surfaced metrics, _pre_analysis_opportunity_score has already absorbed
-        # historical_gate_score_penalty into the base score. Re-deducting the
-        # 0.12 flat here would punish the same signal twice and over-demote
-        # markets that the gate already softened. Only fall back to the flat
-        # 0.12 when the gate ran but metrics never reached this candidate
-        # (legacy/backward-compat path).
-        if historical_gate_metrics_present:
+        # The base pre-analysis score normally already includes the historical
+        # gate's soft penalty. Apply it here only for legacy/manual candidates
+        # whose score breakdown proves it was not absorbed upstream.
+        if historical_gate_penalty_already_applied:
+            historical_gate_penalty = 0.0
+        elif historical_gate_metrics_present:
             historical_gate_penalty = max(0.0, historical_gate_metric_penalty)
         elif historical_gate_allowed is False:
             historical_gate_penalty = 0.12
@@ -7134,6 +7180,9 @@ def _cap_analysis_candidates(
             "repeated_penalty": round(repeated_penalty, 4),
             "historical_loss_penalty": round(historical_loss_penalty, 4),
             "historical_gate_penalty": round(historical_gate_penalty, 4),
+            "historical_gate_penalty_already_applied": (
+                historical_gate_penalty_already_applied
+            ),
             "short_prefix_penalty": round(short_prefix_penalty, 4),
             "source_difficulty_penalty": round(source_difficulty_penalty, 4),
         }
@@ -7278,6 +7327,92 @@ def _effective_research_queue_drain_quota(
     if sustained_zero_yield:
         return min(quota, 2)
     return quota
+
+
+_RESEARCH_QUEUE_BYPASSABLE_COOLDOWNS = frozenset(
+    {
+        "extended_research_cooldown",
+        "recently analyzed",
+    }
+)
+
+
+def _research_queue_probe_bypasses_cooldown(
+    *,
+    is_drain_probe: bool,
+    reason: str,
+) -> bool:
+    """Let an explicit queue drain override only analysis cooldowns.
+
+    A selected drain remains subject to closed-market, daily-analysis, lifetime,
+    position, drawdown, and execution risk gates. The queue retry cooldown has
+    already been checked during selection, so applying the ordinary analysis
+    cooldown again makes the drain a no-op.
+    """
+    normalized_reason = str(reason or "").strip().lower()
+    return bool(
+        is_drain_probe
+        and normalized_reason in _RESEARCH_QUEUE_BYPASSABLE_COOLDOWNS
+    )
+
+
+def _mark_admitted_research_queue_drains(
+    analysis_candidates: list[dict[str, Any]],
+    *,
+    state_manager: MarketStateManager,
+    cycle_id: str,
+    attempted_at: datetime | None = None,
+) -> tuple[int, int]:
+    """Persist drain attempts only for candidates that will reach Grok.
+
+    Returns ``(admitted_count, persisted_count)`` and updates each drain entry's
+    in-memory attempt metadata for prompt/audit context. Selection alone is not
+    an attempt: later cooldown, lifetime, drawdown, and research-only routing
+    can still remove a candidate before analysis.
+    """
+    admitted_count = 0
+    persisted_count = 0
+    marked_at = attempted_at or datetime.now(timezone.utc)
+    for candidate in analysis_candidates:
+        if not bool(candidate.get("is_research_queue_drain_probe")):
+            continue
+        entry = candidate.get("research_queue_drain_entry")
+        if not isinstance(entry, dict):
+            continue
+        market = candidate.get("market")
+        market_id = str(getattr(market, "id", "") or "").strip()
+        if not market_id:
+            continue
+        attempts, last_attempt = (
+            MarketStateManager.research_queue_drain_attempt_metadata(entry)
+        )
+        entry["research_queue_drain_attempts_before_selection"] = attempts
+        entry["research_queue_last_drain_attempt_at_before_selection"] = (
+            last_attempt.isoformat() if last_attempt else None
+        )
+        entry["research_queue_drain_attempts"] = attempts + 1
+        entry["research_queue_last_drain_attempt_at"] = marked_at.isoformat()
+        breakdown = candidate.get("pre_analysis_breakdown")
+        if isinstance(breakdown, dict):
+            breakdown["research_queue_drain_attempts"] = attempts + 1
+            breakdown["research_queue_last_drain_attempt_at"] = (
+                marked_at.isoformat()
+            )
+        admitted_count += 1
+        try:
+            state_manager.mark_research_queue_drain_attempt(
+                market_id,
+                cycle_id=cycle_id,
+                attempted_at=marked_at,
+            )
+            persisted_count += 1
+        except Exception as exc:
+            logger.debug(
+                "Research queue drain attempt metadata update failed: %s",
+                exc,
+                data={"market_id": market_id, "error": str(exc)},
+            )
+    return admitted_count, persisted_count
 
 
 def _research_queue_entry_reason(entry: dict[str, Any]) -> str:
@@ -8058,7 +8193,10 @@ def main(max_cycles: int | None = None) -> None:
     _log_settings_summary(settings)
     logger.info("PredictBot initializing...")
 
-    state_manager = MarketStateManager(settings.STATE_DB_PATH)
+    state_manager = MarketStateManager(
+        settings.STATE_DB_PATH,
+        research_queue_entry_ttl_hours=settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS,
+    )
     backfilled = state_manager.backfill_outcomes_from_settlements()
     if backfilled:
         logger.info(
@@ -8184,6 +8322,7 @@ def main(max_cycles: int | None = None) -> None:
             )
 
             filter_stats: dict[str, int] = {}
+            cycle_resolved_winners: dict[str, str] = {}
             markets = _filter_markets(
                 markets,
                 settings.MIN_LIQUIDITY_USDC,
@@ -8202,8 +8341,36 @@ def main(max_cycles: int | None = None) -> None:
                 extreme_yes_price_upper=settings.EXTREME_YES_PRICE_UPPER,
                 min_tradeable_yes_price=settings.MIN_TRADEABLE_IMPLIED_PRICE,
                 max_tradeable_yes_price=settings.MAX_TRADEABLE_IMPLIED_PRICE,
+                resolved_winners=cycle_resolved_winners,
             )
             logger.info("Filtered to %d eligible markets", len(markets))
+
+            # Persist actual settled winners for markets the bot has decision
+            # history on (UPDATE-only), so blocked should_trade decisions can
+            # be audited against real outcomes in future tuning reviews.
+            resolved_winners_recorded = 0
+            if cycle_resolved_winners:
+                try:
+                    for resolved_market_id, winner in cycle_resolved_winners.items():
+                        if state_manager.record_market_winning_outcome(
+                            resolved_market_id, winner
+                        ):
+                            resolved_winners_recorded += 1
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to persist resolved market winners: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+                if resolved_winners_recorded:
+                    logger.info(
+                        "Recorded %d resolved market winner(s) for audit",
+                        resolved_winners_recorded,
+                        data={
+                            "resolved_winners_recorded": resolved_winners_recorded,
+                            "resolved_winners_detected": len(cycle_resolved_winners),
+                        },
+                    )
 
             # Cycle 2 review: catalog-coverage early-warning. When the page
             # cap was hit AND the post-filter eligible count is below the
@@ -9091,6 +9258,24 @@ def main(max_cycles: int | None = None) -> None:
             recent_research_entries: dict[str, dict[str, Any]] = {}
             if settings.RESEARCH_QUEUE_ENABLED and settings.RESEARCH_QUEUE_PERSIST_TO_DB:
                 try:
+                    pruned_expired_entries = state_manager.prune_expired_research_entries(
+                        stale_after_hours=settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS,
+                    )
+                    if pruned_expired_entries:
+                        logger.info(
+                            "Research queue pruned %d expired/stale entries",
+                            pruned_expired_entries,
+                            data={
+                                "research_queue_pruned_entries": pruned_expired_entries,
+                            },
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "Research queue prune failed: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+                try:
                     raw_entries = state_manager.get_active_research_entries(
                         lookback_hours=max(1, settings.RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS),
                         limit=200,
@@ -9120,6 +9305,7 @@ def main(max_cycles: int | None = None) -> None:
             research_queue_emergency_probes_count = 0
             research_queue_zero_yield_promotions_count = 0
             research_queue_drain_attempts_marked_count = 0
+            research_queue_drain_cooldown_bypassed_count = 0
             if (
                 settings.RESEARCH_QUEUE_ENABLED
                 and settings.RESEARCH_QUEUE_PERSIST_TO_DB
@@ -9133,9 +9319,8 @@ def main(max_cycles: int | None = None) -> None:
                 # Snapshot the current cycle's tradeable market IDs so we don't
                 # "select" drain candidates that fell out of `_filter_markets`
                 # (closed, low-liquidity, expired, etc.) — without this guard
-                # the drain log claims selection but the per-market loop never
-                # marks the candidate as a probe and research_queue_drained_count
-                # stays at 0, producing misleading telemetry.
+                # the drain log claims selection but the per-market loop can
+                # never admit the candidate for analysis.
                 current_market_ids: set[str] = {
                     str(getattr(m, "id", "") or "")
                     for m in markets
@@ -9410,8 +9595,10 @@ def main(max_cycles: int | None = None) -> None:
                             data={"error": str(exc)},
                         )
                 if drainable_research_entries:
-                    drain_attempt_marked_at = datetime.now(timezone.utc)
-                    for mid, entry in list(drainable_research_entries.items()):
+                    # Selection is not an analysis attempt. Candidates can
+                    # still be removed by downstream admission checks, so keep
+                    # the persisted attempt counter unchanged until dispatch.
+                    for entry in drainable_research_entries.values():
                         attempts, last_attempt = (
                             MarketStateManager.research_queue_drain_attempt_metadata(
                                 entry
@@ -9421,23 +9608,10 @@ def main(max_cycles: int | None = None) -> None:
                         entry["research_queue_last_drain_attempt_at_before_selection"] = (
                             last_attempt.isoformat() if last_attempt else None
                         )
-                        entry["research_queue_drain_attempts"] = attempts + 1
+                        entry["research_queue_drain_attempts"] = attempts
                         entry["research_queue_last_drain_attempt_at"] = (
-                            drain_attempt_marked_at.isoformat()
+                            last_attempt.isoformat() if last_attempt else None
                         )
-                        try:
-                            state_manager.mark_research_queue_drain_attempt(
-                                mid,
-                                cycle_id=cycle_id,
-                                attempted_at=drain_attempt_marked_at,
-                            )
-                            research_queue_drain_attempts_marked_count += 1
-                        except Exception as exc:
-                            logger.debug(
-                                "Research queue drain attempt metadata update failed: %s",
-                                exc,
-                                data={"market_id": mid, "error": str(exc)},
-                            )
                 if drainable_research_entries:
                     logger.info(
                         "Research queue drain selected %d candidate(s) for forced re-analysis",
@@ -9479,9 +9653,7 @@ def main(max_cycles: int | None = None) -> None:
                             "research_queue_drain_retry_cooldown_minutes": (
                                 drain_retry_cooldown_minutes
                             ),
-                            "research_queue_drain_attempts_marked_count": (
-                                research_queue_drain_attempts_marked_count
-                            ),
+                            "research_queue_drain_attempts_deferred_until_admission": True,
                             "research_queue_zero_yield_reserved_slots": (
                                 zero_yield_reserved_slots
                             ),
@@ -9617,6 +9789,8 @@ def main(max_cycles: int | None = None) -> None:
                     market.id,
                     market.question[:80],
                 )
+                drain_entry = drainable_research_entries.get(market.id)
+                is_drain_probe = drain_entry is not None
                 try:
                     state = state_manager.get_market_state(market.id)
                 except Exception as exc:
@@ -9631,28 +9805,64 @@ def main(max_cycles: int | None = None) -> None:
                     state.next_eligible_cycle if isinstance(state, MarketState) else 0
                 )
                 if next_eligible_cycle > cycle_count:
-                    pre_analysis_blocked += 1
-                    _record_rejection_reason(
-                        pre_analysis_rejection_breakdown,
-                        "extended_research_cooldown",
-                    )
-                    _record_rejection_reason(
-                        rejection_breakdown,
-                        "extended_research_cooldown",
-                    )
-                    logger.debug(
-                        "Skipping %s: extended research cooldown until cycle %d",
-                        market.id,
-                        next_eligible_cycle,
-                        data={
-                            "market_id": market.id,
-                            "next_eligible_cycle": next_eligible_cycle,
-                            "current_cycle": cycle_count,
-                        },
-                    )
-                    continue
+                    if _research_queue_probe_bypasses_cooldown(
+                        is_drain_probe=is_drain_probe,
+                        reason="extended_research_cooldown",
+                    ):
+                        research_queue_drain_cooldown_bypassed_count += 1
+                        logger.debug(
+                            "Research queue drain bypassed extended cooldown: "
+                            "market=%s next_eligible_cycle=%d current_cycle=%d",
+                            market.id,
+                            next_eligible_cycle,
+                            cycle_count,
+                            data={
+                                "market_id": market.id,
+                                "research_queue_drain_cooldown_bypassed": True,
+                                "cooldown_reason": "extended_research_cooldown",
+                                "next_eligible_cycle": next_eligible_cycle,
+                                "current_cycle": cycle_count,
+                            },
+                        )
+                    else:
+                        pre_analysis_blocked += 1
+                        _record_rejection_reason(
+                            pre_analysis_rejection_breakdown,
+                            "extended_research_cooldown",
+                        )
+                        _record_rejection_reason(
+                            rejection_breakdown,
+                            "extended_research_cooldown",
+                        )
+                        logger.debug(
+                            "Skipping %s: extended research cooldown until cycle %d",
+                            market.id,
+                            next_eligible_cycle,
+                            data={
+                                "market_id": market.id,
+                                "next_eligible_cycle": next_eligible_cycle,
+                                "current_cycle": cycle_count,
+                            },
+                        )
+                        continue
 
                 should_skip, skip_reason = scheduler.should_skip(market, state, state_manager=state_manager)
+                if should_skip and _research_queue_probe_bypasses_cooldown(
+                    is_drain_probe=is_drain_probe,
+                    reason=skip_reason,
+                ):
+                    research_queue_drain_cooldown_bypassed_count += 1
+                    logger.debug(
+                        "Research queue drain bypassed scheduler cooldown: market=%s reason=%s",
+                        market.id,
+                        skip_reason,
+                        data={
+                            "market_id": market.id,
+                            "research_queue_drain_cooldown_bypassed": True,
+                            "cooldown_reason": skip_reason,
+                        },
+                    )
+                    should_skip = False
                 if should_skip:
                     if skip_reason == "market closed":
                         scheduler_skipped_closed += 1
@@ -9820,7 +10030,18 @@ def main(max_cycles: int | None = None) -> None:
                         historical_gate_metrics=historical_gate_metrics,
                     )
                 )
-                if pre_analysis_demoted:
+                if pre_analysis_demoted and is_drain_probe:
+                    logger.debug(
+                        "Research queue drain bypassed pre-analysis demotion: market=%s reason=%s",
+                        market.id,
+                        pre_analysis_demotion_reason,
+                        data={
+                            "market_id": market.id,
+                            "research_queue_drain_demotion_bypassed": True,
+                            "demotion_reason": pre_analysis_demotion_reason,
+                        },
+                    )
+                if pre_analysis_demoted and not is_drain_probe:
                     pre_analysis_blocked += 1
                     pre_analysis_research_routed_count += 1
                     if pre_analysis_demotion_reason:
@@ -10109,8 +10330,6 @@ def main(max_cycles: int | None = None) -> None:
                     continue
                 pre_analysis_score = None
                 pre_analysis_breakdown: dict[str, Any] | None = None
-                drain_entry = None
-                is_drain_probe = False
                 is_research_queue_score_promotion = False
                 research_queue_low_yield_placeholder = False
                 research_queue_score_promotion_gap = None
@@ -10181,8 +10400,6 @@ def main(max_cycles: int | None = None) -> None:
                     # telemetry. Includes drain probes so the receipt reflects
                     # the actual score landscape across all scored markets.
                     cycle_pre_score_samples.append(float(pre_analysis_score))
-                    drain_entry = drainable_research_entries.get(market.id)
-                    is_drain_probe = drain_entry is not None
                     if is_drain_probe:
                         # Forced probe from research-queue drain: bypass the
                         # pre-analysis score gate entirely so the longest-waiting
@@ -10215,7 +10432,6 @@ def main(max_cycles: int | None = None) -> None:
                                 "zero_yield_promotion_bypassed_priority_floor"
                             )
                         )
-                        research_queue_drained_count += 1
                     if (
                         not is_drain_probe
                         and not is_research_queue_score_promotion
@@ -10819,6 +11035,9 @@ def main(max_cycles: int | None = None) -> None:
                     should_route_research_only = (
                         analysis_count_for_research >= 5
                         and non_actionable_streak_for_research >= 3
+                        and not bool(
+                            candidate.get("is_research_queue_drain_probe")
+                        )
                     )
                     if not should_route_research_only:
                         analyzable_candidates.append(candidate)
@@ -10967,6 +11186,37 @@ def main(max_cycles: int | None = None) -> None:
                 analysis_candidates_count = 0
                 parallel_analysis_requested = False
                 analysis_phase_duration_ms = 0.0
+
+            (
+                research_queue_drained_count,
+                research_queue_drain_attempts_marked_count,
+            ) = _mark_admitted_research_queue_drains(
+                analysis_candidates,
+                state_manager=state_manager,
+                cycle_id=cycle_id,
+            )
+            if research_queue_drained_count:
+                logger.info(
+                    "Research queue drain admitted %d candidate(s) to Grok analysis",
+                    research_queue_drained_count,
+                    data={
+                        "research_queue_drained_count": research_queue_drained_count,
+                        "research_queue_drain_attempts_marked_count": (
+                            research_queue_drain_attempts_marked_count
+                        ),
+                        "research_queue_drain_cooldown_bypassed_count": (
+                            research_queue_drain_cooldown_bypassed_count
+                        ),
+                        "research_queue_drain_admitted_market_ids": [
+                            candidate["market"].id
+                            for candidate in analysis_candidates
+                            if bool(
+                                candidate.get("is_research_queue_drain_probe")
+                            )
+                            and isinstance(candidate.get("market"), Market)
+                        ],
+                    },
+                )
 
             if parallel_analysis_requested:
                 configured_workers = max(1, settings.ANALYSIS_MAX_WORKERS)
@@ -13427,6 +13677,11 @@ def main(max_cycles: int | None = None) -> None:
                         edge_block_reason = "weather_underdog_blocked"
                     else:
                         edge_block_reason = "edge_gate_blocked"
+                    # The blocked-direct counter previously only tracked the
+                    # evidence gate, reporting 0 while direct-evidence trades
+                    # were edge-gate-blocked (Jul 23: KXGOLDD-T4065 eq=1.0).
+                    if _decision_evidence_basis(decision_for_edge) == "direct":
+                        blocked_direct_evidence_count += 1
                     _record_should_trade_blocked(edge_block_reason)
                     _record_rejection_reason(rejection_breakdown, edge_block_reason)
                     if edge_reason == "non_sports_needs_direct_evidence":
@@ -14210,6 +14465,20 @@ def main(max_cycles: int | None = None) -> None:
                     )
                 else:
                     adjusted_bet_pct = edge_scaling_bet_pct
+                extreme_edge_dampener = _extreme_edge_size_dampener(
+                    edge_value, settings
+                )
+                if extreme_edge_dampener < 1.0 and adjusted_bet_pct > 0.0:
+                    audit_context["extreme_edge_size_dampener"] = (
+                        extreme_edge_dampener
+                    )
+                    audit_context["extreme_edge_size_original_bet_pct"] = (
+                        adjusted_bet_pct
+                    )
+                    adjusted_bet_pct = max(
+                        0.0,
+                        min(1.0, adjusted_bet_pct * extreme_edge_dampener),
+                    )
                 family_size_multiplier = float(
                     getattr(score_result, "historical_family_size_multiplier", 1.0)
                     or 1.0
@@ -15595,8 +15864,14 @@ def main(max_cycles: int | None = None) -> None:
                     market_family_name,
                 )
                 family_stats["order_attempts"] += 1
-                family_stats["usd_submitted"] += bet_amount
-                total_usd_submitted += bet_amount
+                submitted_requested_notional = _extract_order_numeric_field(
+                    getattr(order_response, "raw", None),
+                    ("client_requested_notional_usdc",),
+                )
+                if submitted_requested_notional is None:
+                    submitted_requested_notional = bet_amount
+                family_stats["usd_submitted"] += submitted_requested_notional
+                total_usd_submitted += submitted_requested_notional
 
                 logger.info(
                     "Order submitted: id=%s, status=%s",
@@ -15783,7 +16058,17 @@ def main(max_cycles: int | None = None) -> None:
                     "order_resting_unfilled": order_lifecycle.resting_unfilled,
                     "order_requested_count": order_lifecycle.requested_count,
                     "filled_notional_usdc": order_lifecycle.filled_notional_usdc,
-                    "submitted_notional_usdc": bet_amount,
+                    "approved_bet_budget_usdc": bet_amount,
+                    "submitted_notional_usdc": (
+                        round(
+                            float(order_lifecycle.requested_count)
+                            * float(order_lifecycle.fill_price),
+                            6,
+                        )
+                        if order_lifecycle.requested_count is not None
+                        and order_lifecycle.fill_price is not None
+                        else bet_amount
+                    ),
                     **order_persistence,
                 }
                 log_trade_decision(
@@ -16118,6 +16403,9 @@ def main(max_cycles: int | None = None) -> None:
                 ),
                 "research_queue_drain_attempts_marked_count": (
                     research_queue_drain_attempts_marked_count
+                ),
+                "research_queue_drain_cooldown_bypassed_count": (
+                    research_queue_drain_cooldown_bypassed_count
                 ),
                 "research_queue_emergency_probes_count": (
                     research_queue_emergency_probes_count
@@ -16495,6 +16783,7 @@ def main(max_cycles: int | None = None) -> None:
                         "skipped_likely_resolved_by_ticker",
                         0,
                     ),
+                    "resolved_winners_recorded": resolved_winners_recorded,
                     "scheduler_skipped_closed": scheduler_skipped_closed,
                     "scheduler_skipped_recently_analyzed": scheduler_skipped_recently,
                     "scheduler_skipped_other": scheduler_skipped_other,
@@ -16527,6 +16816,9 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     "research_queue_drain_attempts_marked_count": (
                         research_queue_drain_attempts_marked_count
+                    ),
+                    "research_queue_drain_cooldown_bypassed_count": (
+                        research_queue_drain_cooldown_bypassed_count
                     ),
                     "research_queue_emergency_probes_count": (
                         research_queue_emergency_probes_count

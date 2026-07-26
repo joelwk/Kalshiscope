@@ -812,3 +812,188 @@ def test_drainable_entries_exclude_soft_research_when_min_priority_set() -> None
     assert "KXEDGE-NEAR" in drained_ids
     assert all(not mid.startswith("KXSOFT-") for mid in drained_ids)
 
+
+def test_record_entry_stamps_default_ttl_expiry() -> None:
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    mgr = MarketStateManager(db_path=path, research_queue_entry_ttl_hours=48.0)
+    mgr.record_research_queue_entry(
+        market_id="KXTTL-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="r1",
+    )
+    row = mgr._conn.execute(
+        "SELECT expires_at FROM research_queue_entries WHERE market_id = ?",
+        ("KXTTL-001",),
+    ).fetchone()
+    assert row["expires_at"] is not None
+    expiry = datetime.fromisoformat(row["expires_at"])
+    delta_hours = (expiry - datetime.now(timezone.utc)).total_seconds() / 3600
+    assert 47.0 < delta_hours <= 48.0
+
+
+def test_record_entry_ttl_disabled_leaves_expiry_null() -> None:
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    mgr = MarketStateManager(db_path=path, research_queue_entry_ttl_hours=None)
+    mgr.record_research_queue_entry(
+        market_id="KXNOTTL-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="r1",
+    )
+    row = mgr._conn.execute(
+        "SELECT expires_at FROM research_queue_entries WHERE market_id = ?",
+        ("KXNOTTL-001",),
+    ).fetchone()
+    assert row["expires_at"] is None
+
+
+def test_record_entry_explicit_expiry_overrides_default_ttl() -> None:
+    mgr = _make_manager()
+    explicit = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    mgr.record_research_queue_entry(
+        market_id="KXEXPLICIT-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="r1",
+        expires_at=explicit,
+    )
+    row = mgr._conn.execute(
+        "SELECT expires_at FROM research_queue_entries WHERE market_id = ?",
+        ("KXEXPLICIT-001",),
+    ).fetchone()
+    assert row["expires_at"] == explicit
+
+
+def _zombie_decision_json() -> str:
+    return json.dumps(
+        {
+            "should_trade": False,
+            "confidence": 0.50,
+            "evidence_quality": 0.0,
+            "edge_source": "none",
+            "audit": {"synthetic_decision": True},
+        }
+    )
+
+
+def test_low_yield_zombie_recapture_is_skipped() -> None:
+    """A repeated low-yield placeholder must not refresh last_seen forever."""
+    mgr = _make_manager()
+    recorded = mgr.record_research_queue_entry(
+        market_id="KXZOMBIE-001",
+        cycle_id="c1",
+        gate_name="pre_analysis_movement_score",
+        reason="pre_analysis_score_soft_research",
+        threshold_gap=0.20,
+        last_decision_json=_zombie_decision_json(),
+    )
+    assert recorded is True
+    mgr._conn.execute(
+        "UPDATE research_queue_entries SET times_seen = 31 WHERE market_id = ?",
+        ("KXZOMBIE-001",),
+    )
+    mgr._conn.commit()
+    before = mgr._conn.execute(
+        "SELECT last_seen, times_seen FROM research_queue_entries WHERE market_id = ?",
+        ("KXZOMBIE-001",),
+    ).fetchone()
+
+    recaptured = mgr.record_research_queue_entry(
+        market_id="KXZOMBIE-001",
+        cycle_id="c2",
+        gate_name="pre_analysis_movement_score",
+        reason="pre_analysis_score_soft_research",
+        threshold_gap=0.20,
+        last_decision_json=_zombie_decision_json(),
+    )
+    assert recaptured is False
+    after = mgr._conn.execute(
+        "SELECT last_seen, times_seen FROM research_queue_entries WHERE market_id = ?",
+        ("KXZOMBIE-001",),
+    ).fetchone()
+    assert after["times_seen"] == before["times_seen"] == 31
+    assert after["last_seen"] == before["last_seen"]
+
+
+def test_near_miss_recapture_still_allowed_despite_high_times_seen() -> None:
+    """Direct-evidence / near-threshold entries are never zombie-blocked."""
+    mgr = _make_manager()
+    near_miss_json = json.dumps(
+        {
+            "should_trade": True,
+            "confidence": 0.68,
+            "evidence_quality": 0.92,
+            "edge_source": "computed",
+            "evidence_basis": "direct",
+            "audit": {"source_match_class": "settlement_aligned"},
+        }
+    )
+    mgr.record_research_queue_entry(
+        market_id="KXNEARMISS-001",
+        cycle_id="c1",
+        gate_name="edge_gate",
+        reason="edge_gate_blocked",
+        threshold_gap=0.02,
+        last_decision_json=near_miss_json,
+    )
+    mgr._conn.execute(
+        "UPDATE research_queue_entries SET times_seen = 31 WHERE market_id = ?",
+        ("KXNEARMISS-001",),
+    )
+    mgr._conn.commit()
+
+    recaptured = mgr.record_research_queue_entry(
+        market_id="KXNEARMISS-001",
+        cycle_id="c2",
+        gate_name="edge_gate",
+        reason="edge_gate_blocked",
+        threshold_gap=0.02,
+        last_decision_json=near_miss_json,
+    )
+    assert recaptured is True
+    row = mgr._conn.execute(
+        "SELECT times_seen FROM research_queue_entries WHERE market_id = ?",
+        ("KXNEARMISS-001",),
+    ).fetchone()
+    assert row["times_seen"] == 32
+
+
+def test_prune_stale_legacy_rows_without_expiry() -> None:
+    """Rows recorded before TTL stamping (expires_at NULL) are purged once
+    their last_seen falls outside the stale window."""
+    mgr = _make_manager()
+    now = datetime.now(timezone.utc)
+    stale_seen = (now - timedelta(days=30)).isoformat()
+    fresh_seen = now.isoformat()
+    for market_id, last_seen in (
+        ("KXLEGACY-STALE", stale_seen),
+        ("KXLEGACY-FRESH", fresh_seen),
+    ):
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id, "c1", last_seen, "g1", "r1",
+                0.0, None, last_seen, None, None,
+            ),
+        )
+    mgr._conn.commit()
+
+    pruned = mgr.prune_expired_research_entries(stale_after_hours=168.0)
+    assert pruned == 1
+    remaining = [
+        row["market_id"]
+        for row in mgr._conn.execute(
+            "SELECT market_id FROM research_queue_entries"
+        ).fetchall()
+    ]
+    assert remaining == ["KXLEGACY-FRESH"]
+

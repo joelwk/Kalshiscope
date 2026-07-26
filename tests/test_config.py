@@ -230,6 +230,10 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(config.Settings.KELLY_MIN_BET_POLICY, "skip")
         self.assertEqual(config.Settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.60)
+        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_35PP, 0.6)
+        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_45PP, 0.4)
+        self.assertEqual(config.Settings.MIN_CONFIDENCE_INCREASE_FOR_ADD, 0.05)
+        self.assertEqual(config.Settings.MIN_PRICE_MOVE_FOR_READD, 0.03)
 
     def test_strategy_component_weight_defaults(self) -> None:
         self.assertEqual(config.Settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.30)
@@ -478,20 +482,42 @@ class TestConfig(unittest.TestCase):
             ("CMEGroup", "EIAgov"),
         )
 
+    def test_env_example_research_profile_lists_are_not_spliced(self) -> None:
+        values = {}
+        for raw_line in Path(".env.example").read_text(encoding="utf-8").splitlines():
+            if "=" not in raw_line or raw_line.lstrip().startswith("#"):
+                continue
+            key, value = raw_line.split("=", 1)
+            values[key] = value
+
+        generic_handles = values["GENERIC_ALLOWED_X_HANDLES"].split(",")
+        commodity_domains = values["COMMODITY_ALLOWED_DOMAINS"].split(",")
+        self.assertIn("BBCBusiness", generic_handles)
+        self.assertIn("APBusiness", generic_handles)
+        self.assertIn("finance.yahoo.com", commodity_domains)
+        self.assertNotIn("finance.yahoo.comBusiness", commodity_domains)
+        self.assertTrue(all("." in domain for domain in commodity_domains))
+
     def test_commodity_profile_defaults_lead_with_settlement_grade(self) -> None:
-        # The first SEARCH_PROFILE_MAX_DOMAINS entries are the searchable set, so
-        # they must be reachable settlement-grade venues for commodity markets to
-        # cite a direct-evidence primary_source_url.
+        # The first SEARCH_PROFILE_MAX_DOMAINS entries are the searchable set.
+        # They must keep the settlement-grade trio reachable (so direct
+        # evidence stays citeable) while also carrying a crawlable live-price
+        # source: Jul 2026 logs showed an all-paywalled searchable set
+        # (WSJ/Bloomberg) returning zero results for spot prices, collapsing
+        # the commodity flow into absence_only skips.
         first_five = config.Settings.COMMODITY_ALLOWED_DOMAINS[
             : config.Settings.SEARCH_PROFILE_MAX_DOMAINS
         ]
         self.assertIn("cmegroup.com", first_five)
         self.assertIn("theice.com", first_five)
         self.assertIn("eia.gov", first_five)
-        for domain in first_five:
-            self.assertIn(
-                domain, config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
-            )
+        self.assertIn("tradingeconomics.com", first_five)
+        settlement_grade = [
+            domain
+            for domain in first_five
+            if domain in config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+        ]
+        self.assertGreaterEqual(len(settlement_grade), 3)
 
     def test_crypto_defaults_lead_with_settlement_grade_exchanges(self) -> None:
         first_five = config.Settings.CRYPTO_ALLOWED_DOMAINS[
@@ -670,6 +696,8 @@ class TestConfig(unittest.TestCase):
             "KELLY_FRACTION_SHORT_HORIZON": "0.1",
             "KELLY_MIN_BET_POLICY": "floor",
             "KELLY_MIN_BET_NEAR_MISS_RATIO": "0.90",
+            "KELLY_EDGE_BAND_DAMPENER_35PP": "0.5",
+            "KELLY_EDGE_BAND_DAMPENER_45PP": "0.3",
             "MAX_POSITION_PCT_OF_BANKROLL": "0.12",
             "COINFLIP_PRICE_LOWER": "0.46",
             "COINFLIP_PRICE_UPPER": "0.54",
@@ -696,6 +724,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON, 0.1)
         self.assertEqual(settings.KELLY_MIN_BET_POLICY, "floor")
         self.assertEqual(settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.90)
+        self.assertEqual(settings.KELLY_EDGE_BAND_DAMPENER_35PP, 0.5)
+        self.assertEqual(settings.KELLY_EDGE_BAND_DAMPENER_45PP, 0.3)
         self.assertEqual(settings.MAX_POSITION_PCT_OF_BANKROLL, 0.12)
         self.assertEqual(settings.COINFLIP_PRICE_LOWER, 0.46)
         self.assertEqual(settings.COINFLIP_PRICE_UPPER, 0.54)
@@ -766,7 +796,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.CALIBRATION_ONLINE_ALPHA, 0.15)
         self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 500)
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
-        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
+        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.55)
         self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 30.0)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.025)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
@@ -999,7 +1029,7 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
-        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 1)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 2)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
@@ -1012,6 +1042,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 4)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 8)
+        self.assertEqual(settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS, 168.0)
 
     def test_research_queue_drain_settings_env_override(self) -> None:
         env = {
@@ -1027,6 +1058,7 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP": "0.015",
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS": "6",
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN": "11",
+            "RESEARCH_QUEUE_ENTRY_TTL_HOURS": "48",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -1041,6 +1073,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.015)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 6)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 11)
+        self.assertEqual(settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS, 48.0)
 
     def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
         """Cycle 4 recovery: a growing research queue (127+ entries) needs

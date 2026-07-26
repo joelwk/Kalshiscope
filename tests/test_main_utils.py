@@ -53,6 +53,7 @@ from main import (
     _event_concentration_blocked,
     _event_side_conflict_blocked,
     _expected_value_usdc,
+    _extreme_edge_size_dampener,
     _should_apply_definitive_side_override,
     _event_ticker_prefix,
     _effective_position_override_threshold,
@@ -74,9 +75,11 @@ from main import (
     _research_queue_last_decision_json,
     _research_queue_drain_sort_key,
     _research_queue_effective_drain_priority,
+    _research_queue_probe_bypasses_cooldown,
     _research_queue_priority_below_drain_floor,
     _research_queue_recent_drain_attempt,
     _research_queue_zero_yield_sort_key,
+    _mark_admitted_research_queue_drains,
     _resolve_dynamic_analysis_candidate_cap,
     _resolve_min_bet_floor,
     _score_breakdown_from_execution_audit,
@@ -1699,6 +1702,80 @@ class TestMainUtils(unittest.TestCase):
             )
         )
 
+    def test_research_queue_probe_bypasses_only_analysis_cooldowns(self) -> None:
+        for reason in ("extended_research_cooldown", "recently analyzed"):
+            self.assertTrue(
+                _research_queue_probe_bypasses_cooldown(
+                    is_drain_probe=True,
+                    reason=reason,
+                )
+            )
+        for reason in ("market closed", "daily_reanalysis_cap_reached"):
+            self.assertFalse(
+                _research_queue_probe_bypasses_cooldown(
+                    is_drain_probe=True,
+                    reason=reason,
+                )
+            )
+        self.assertFalse(
+            _research_queue_probe_bypasses_cooldown(
+                is_drain_probe=False,
+                reason="recently analyzed",
+            )
+        )
+
+    def test_mark_research_queue_drain_attempt_only_after_admission(self) -> None:
+        attempted_at = datetime(2026, 7, 25, 16, 0, tzinfo=timezone.utc)
+        entry = {
+            "market_id": "KXDRAIN",
+            "last_decision_json": json.dumps(
+                {"audit": {"research_queue_drain_attempts": 2}}
+            ),
+        }
+
+        class _DrainStateManager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, datetime]] = []
+
+            def mark_research_queue_drain_attempt(
+                self,
+                market_id: str,
+                *,
+                cycle_id: str,
+                attempted_at: datetime,
+            ) -> None:
+                self.calls.append((market_id, cycle_id, attempted_at))
+
+        state_manager = _DrainStateManager()
+        admitted, persisted = _mark_admitted_research_queue_drains(
+            [
+                {
+                    "market": Market(id="KXDRAIN", question="Drain me"),
+                    "is_research_queue_drain_probe": True,
+                    "research_queue_drain_entry": entry,
+                    "pre_analysis_breakdown": {},
+                },
+                {
+                    "market": Market(id="KXNORMAL", question="Normal"),
+                    "is_research_queue_drain_probe": False,
+                },
+            ],
+            state_manager=state_manager,  # type: ignore[arg-type]
+            cycle_id="cycle-1",
+            attempted_at=attempted_at,
+        )
+
+        self.assertEqual((admitted, persisted), (1, 1))
+        self.assertEqual(
+            state_manager.calls,
+            [("KXDRAIN", "cycle-1", attempted_at)],
+        )
+        self.assertEqual(entry["research_queue_drain_attempts"], 3)
+        self.assertEqual(
+            entry["research_queue_last_drain_attempt_at"],
+            attempted_at.isoformat(),
+        )
+
     def test_conviction_repair_triggers_on_high_edge_high_evidence_no_trade(self) -> None:
         market = Market(
             id="KXSPORTS-26MAY161900TEAMATEAMB",
@@ -2776,10 +2853,61 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_calculate_bet(100, -1), 0)
         self.assertEqual(_calculate_bet(100, 2), 100)
 
+    def test_filter_markets_captures_resolved_winners(self) -> None:
+        now = datetime.now(timezone.utc)
+        settled = Market(
+            id="KXSETTLED-1",
+            question="Settled market",
+            close_time=now - timedelta(hours=1),
+            status="settled",
+            winning_option_raw="yes",
+        )
+        open_market = Market(
+            id="KXOPEN-1",
+            question="Open market",
+            close_time=now + timedelta(hours=6),
+        )
+        resolved_winners: dict[str, str] = {}
+        filtered = _filter_markets(
+            [settled, open_market],
+            min_liquidity=0,
+            allowlist=(),
+            blocklist=(),
+            resolved_winners=resolved_winners,
+        )
+        self.assertEqual([m.id for m in filtered], ["KXOPEN-1"])
+        self.assertEqual(resolved_winners, {"KXSETTLED-1": "YES"})
+
     def test_expected_value_usdc_uses_entry_price_and_probability(self) -> None:
         ev = _expected_value_usdc(probability=0.65, entry_price=0.50, amount_usdc=10.0)
         self.assertAlmostEqual(ev or 0.0, 3.0, places=6)
         self.assertEqual(_edge_band_label(0.30), "25-35pp")
+
+    def test_extreme_edge_size_dampener_bands(self) -> None:
+        settings = Settings(
+            KELLY_EDGE_BAND_DAMPENER_35PP=0.6,
+            KELLY_EDGE_BAND_DAMPENER_45PP=0.4,
+        )
+        # Bands below 35pp are untouched (63-65% WR zone).
+        self.assertEqual(_extreme_edge_size_dampener(None, settings), 1.0)
+        self.assertEqual(_extreme_edge_size_dampener(0.10, settings), 1.0)
+        self.assertEqual(_extreme_edge_size_dampener(0.34, settings), 1.0)
+        # 35-45pp claims are probe-sized (49% WR decile).
+        self.assertEqual(_extreme_edge_size_dampener(0.35, settings), 0.6)
+        self.assertEqual(_extreme_edge_size_dampener(0.44, settings), 0.6)
+        # 45pp+ claims get the strongest dampener (31%/0% WR deciles).
+        self.assertEqual(_extreme_edge_size_dampener(0.45, settings), 0.4)
+        self.assertEqual(_extreme_edge_size_dampener(0.82, settings), 0.4)
+        # NO-side edges are banded by magnitude as well.
+        self.assertEqual(_extreme_edge_size_dampener(-0.55, settings), 0.4)
+
+    def test_extreme_edge_size_dampener_disabled_band_passes_through(self) -> None:
+        settings = Settings(
+            KELLY_EDGE_BAND_DAMPENER_35PP=1.0,
+            KELLY_EDGE_BAND_DAMPENER_45PP=1.0,
+        )
+        self.assertEqual(_extreme_edge_size_dampener(0.40, settings), 1.0)
+        self.assertEqual(_extreme_edge_size_dampener(0.60, settings), 1.0)
 
     def test_daily_expectancy_role_selects_primary_then_satellite_cap(self) -> None:
         settings = Settings(
@@ -3419,6 +3547,9 @@ class TestMainUtils(unittest.TestCase):
             {
                 "market": market,
                 "pre_analysis_score": 0.65,
+                "pre_analysis_breakdown": {
+                    "pre_score_historical_gate_score_penalty": 0.05,
+                },
                 "historical_gate_allowed": False,
                 "historical_gate_metrics": {
                     "historical_gate_score_penalty": 0.05,
@@ -3448,9 +3579,54 @@ class TestMainUtils(unittest.TestCase):
             item for item in capped if item["market"].id == "KXSPORTS-METRICS-ATTACHED"
         )
         components = with_metrics["selection_rank_components"]
-        # Penalty must be exactly the metric-supplied value, NOT 0.12.
+        # The metric penalty is already inside the 0.65 base score, so ranking
+        # must not subtract it a second time.
+        assert components["historical_gate_penalty"] == 0.0
+        assert components["historical_gate_penalty_already_applied"] is True
+        assert components["risk_adjusted_score"] == 0.65
+
+    def test_cap_analysis_candidates_applies_metric_penalty_when_not_in_base_score(self) -> None:
+        candidates = [
+            {
+                "market": Market(
+                    id="KXSPORTS-LEGACY-METRICS",
+                    question="Will the NBA Lakers win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.65,
+                "historical_gate_allowed": False,
+                "historical_gate_metrics": {
+                    "historical_gate_score_penalty": 0.05,
+                },
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN-METRICS",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.50,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER-METRICS",
+                    question="Will the NBA Heat win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        with_metrics = next(
+            item for item in capped if item["market"].id == "KXSPORTS-LEGACY-METRICS"
+        )
+        components = with_metrics["selection_rank_components"]
         assert components["historical_gate_penalty"] == 0.05
-        assert components["risk_adjusted_score"] == 0.60  # 0.65 - 0.05
+        assert components["historical_gate_penalty_already_applied"] is False
+        assert components["risk_adjusted_score"] == 0.60
 
     def test_cap_analysis_candidates_falls_back_to_flat_penalty_without_metrics(self) -> None:
         """Backward-compat: when historical_gate_allowed is False but metrics

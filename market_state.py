@@ -19,6 +19,20 @@ logger = get_logger(__name__)
 _CONFIDENCE_TREND_WINDOW = 5
 _BAYESIAN_LR_SEMANTICS_FLAG = "bayesian_lr_semantics_version"
 _BAYESIAN_LR_SEMANTICS_VERSION = "single_odds_v1"
+_PARTICIPATION_TIER_REPR_FLAG = "participation_tier_repr_normalized"
+_PARTICIPATION_TIER_REPR_VERSION = "v1"
+# Historical receipts written before the StrEnum shim serialized the enum repr
+# ("ParticipationTier.X") instead of its value; map used by the one-time
+# normalization migration (315 leaked rows found in the Jul 2026 review).
+_PARTICIPATION_TIER_REPR_MAP = {
+    "ParticipationTier.EXECUTION_ELIGIBLE": "execution_eligible",
+    "ParticipationTier.DEEP_RESEARCH_REQUIRED": "deep_research_required",
+    "ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE": "research_only_learning_queue",
+    "ParticipationTier.MONITOR_ONLY": "monitor_only",
+    "ParticipationTier.SKIP_FOR_NOW_WITH_REASON": "skip_for_now_with_reason",
+    "ParticipationTier.OPERATIONAL_ERROR_RETRY": "operational_error_retry",
+    "ParticipationTier.TERMINAL_REJECT": "terminal_reject",
+}
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
 _ACTIVE_PENDING_ORDER_STATUSES = {
     "accepted",
@@ -52,9 +66,22 @@ _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
 class MarketStateManager:
     """SQLite-backed state manager for market analyses and positions."""
 
-    def __init__(self, db_path: str = "data/market_state.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/market_state.db",
+        *,
+        research_queue_entry_ttl_hours: float | None = 168.0,
+        research_queue_skip_low_yield_recapture: bool = True,
+    ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Default TTL stamped on research-queue entries recorded without an
+        # explicit expiry; None/<=0 disables stamping (legacy behavior, which
+        # produced a 16k-row queue with zero expirations by Jul 2026).
+        self.research_queue_entry_ttl_hours = research_queue_entry_ttl_hours
+        self.research_queue_skip_low_yield_recapture = (
+            research_queue_skip_low_yield_recapture
+        )
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
@@ -679,6 +706,46 @@ class MarketStateManager:
                 """,
                 (market_id, terminal_outcome, next_streak),
             )
+
+    def record_market_winning_outcome(
+        self,
+        market_id: str,
+        winning_outcome: str,
+    ) -> bool:
+        """Persist the actual settled winner for a market the bot has seen.
+
+        UPDATE-only by design: rows exist for markets with local decision
+        history, so writes stay bounded to markets worth auditing. Distinct
+        from ``last_terminal_outcome`` (the bot's decision reason) — this is
+        the exchange-side YES/NO result, enabling counterfactual analysis of
+        blocked ``should_trade`` decisions.
+        """
+        normalized_market_id = str(market_id or "").strip()
+        normalized_outcome = str(winning_outcome or "").strip()
+        if not normalized_market_id or not normalized_outcome:
+            return False
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE markets
+                SET resolved_winning_outcome = ?,
+                    resolved_winning_outcome_at = COALESCE(
+                        resolved_winning_outcome_at, ?
+                    )
+                WHERE id = ?
+                  AND (
+                    resolved_winning_outcome IS NULL
+                    OR resolved_winning_outcome != ?
+                  )
+                """,
+                (
+                    normalized_outcome,
+                    datetime.now(timezone.utc).isoformat(),
+                    normalized_market_id,
+                    normalized_outcome,
+                ),
+            )
+        return cursor.rowcount > 0
 
     def set_market_cooldown_cycle(self, market_id: str, next_eligible_cycle: int) -> None:
         normalized_market_id = str(market_id or "").strip()
@@ -2028,8 +2095,34 @@ class MarketStateManager:
         what_to_learn_next: str | None = None,
         expires_at: str | None = None,
         last_decision_json: str | None = None,
-    ) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
+    ) -> bool:
+        """Upsert a research-queue entry; returns False when capture is skipped.
+
+        Re-capture of repeated low-yield placeholders is skipped so zombie
+        markets (Jul 2026: 96 markets re-queued 31+ times with no evidence and
+        ~0.50 confidence) stop refreshing ``last_seen`` and age out of the
+        active window instead of consuming analysis budget forever.
+        """
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        if self.research_queue_skip_low_yield_recapture:
+            existing = self._conn.execute(
+                """
+                SELECT market_id, gate_name, reason, threshold_gap,
+                       last_decision_json, COALESCE(times_seen, 1) AS times_seen
+                FROM research_queue_entries
+                WHERE market_id = ?
+                """,
+                (market_id,),
+            ).fetchone()
+            if existing is not None and self.is_repeated_low_yield_research_entry(
+                dict(existing)
+            ):
+                return False
+        if expires_at is None:
+            ttl_hours = self.research_queue_entry_ttl_hours
+            if ttl_hours is not None and float(ttl_hours) > 0.0:
+                expires_at = (now + timedelta(hours=float(ttl_hours))).isoformat()
         self._conn.execute(
             """
             INSERT INTO research_queue_entries
@@ -2062,6 +2155,7 @@ class MarketStateManager:
             ),
         )
         self._conn.commit()
+        return True
 
     def mark_research_queue_drain_attempt(
         self,
@@ -2324,14 +2418,37 @@ class MarketStateManager:
             "legacy_jurisdiction_holds": legacy_jurisdiction,
         }
 
-    def prune_expired_research_entries(self) -> int:
-        now_iso = datetime.now(timezone.utc).isoformat()
+    def prune_expired_research_entries(
+        self,
+        *,
+        stale_after_hours: float | None = None,
+    ) -> int:
+        """Delete expired queue rows; optionally also stale legacy rows.
+
+        ``stale_after_hours`` additionally removes rows recorded before TTL
+        stamping existed (``expires_at IS NULL``) whose ``last_seen`` is older
+        than the window, draining the historical backlog progressively.
+        """
+        now = datetime.now(timezone.utc)
         cursor = self._conn.execute(
             "DELETE FROM research_queue_entries WHERE expires_at IS NOT NULL AND expires_at < ?",
-            (now_iso,),
+            (now.isoformat(),),
         )
+        pruned = cursor.rowcount
+        if stale_after_hours is not None and float(stale_after_hours) > 0.0:
+            stale_cutoff = (
+                now - timedelta(hours=float(stale_after_hours))
+            ).isoformat()
+            stale_cursor = self._conn.execute(
+                """
+                DELETE FROM research_queue_entries
+                WHERE expires_at IS NULL AND last_seen < ?
+                """,
+                (stale_cutoff,),
+            )
+            pruned += stale_cursor.rowcount
         self._conn.commit()
-        return cursor.rowcount
+        return pruned
 
     _JURISDICTION_SPORTS_HOLD_MARKERS = (
         "jurisdiction_sports_hold",
@@ -3256,6 +3373,12 @@ class MarketStateManager:
         self._ensure_column("markets", "non_actionable_streak", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "next_eligible_cycle", "INTEGER DEFAULT 0")
+        # Actual settled YES/NO winner, distinct from last_terminal_outcome
+        # (which stores the bot's decision reason). Enables counterfactual
+        # audits of blocked should_trade decisions: the Jul 2026 review found
+        # 91.4% of blocked markets had no observable resolution locally.
+        self._ensure_column("markets", "resolved_winning_outcome", "TEXT")
+        self._ensure_column("markets", "resolved_winning_outcome_at", "TEXT")
         self._ensure_column("decision_receipts", "score_json", "TEXT")
         self._ensure_column(
             "research_queue_entries",
@@ -3268,6 +3391,7 @@ class MarketStateManager:
             "TEXT DEFAULT 'unresolved'",
         )
         self._migrate_binary_bayesian_likelihood_ratios()
+        self._normalize_participation_tier_repr_leak()
 
     def _migrate_binary_bayesian_likelihood_ratios(self) -> None:
         """Correct legacy binary states whose odds were multiplied by LR twice."""
@@ -3303,6 +3427,44 @@ class MarketStateManager:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+
+    def _normalize_participation_tier_repr_leak(self) -> None:
+        """One-time repair of receipts storing the enum repr instead of value."""
+        row = self._conn.execute(
+            "SELECT value FROM runtime_flags WHERE key = ?",
+            (_PARTICIPATION_TIER_REPR_FLAG,),
+        ).fetchone()
+        if row is not None and str(row["value"] or "") == _PARTICIPATION_TIER_REPR_VERSION:
+            return
+        with self._conn:
+            for column in ("decision_json", "audit_json"):
+                for repr_text, value_text in _PARTICIPATION_TIER_REPR_MAP.items():
+                    self._conn.execute(
+                        f"""
+                        UPDATE decision_receipts
+                        SET {column} = REPLACE({column}, ?, ?)
+                        WHERE {column} LIKE ?
+                        """,
+                        (
+                            f'"{repr_text}"',
+                            f'"{value_text}"',
+                            f'%"{repr_text}"%',
+                        ),
+                    )
+            self._conn.execute(
+                """
+                INSERT INTO runtime_flags (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    _PARTICIPATION_TIER_REPR_FLAG,
+                    _PARTICIPATION_TIER_REPR_VERSION,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         columns = self._conn.execute(f"PRAGMA table_info({table})").fetchall()

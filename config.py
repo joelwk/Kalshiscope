@@ -23,7 +23,11 @@ class Settings:
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.08
     CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
-    CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
+    # Lowered 0.58 -> 0.55 (Jul 2026 review): calibrated confidence 0.55-0.61
+    # is the only profitable resolved tier (70.4% WR, +58.5% ROI) and the
+    # override still requires edge >= CONFIDENCE_GATE_MIN_EDGE plus evidence
+    # quality >= CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY.
+    CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.55
     # Direct-evidence posterior floor: for direct + computed + high-evidence
     # decisions, floor the posterior used by the edge gate, Kelly sizing, and the
     # score gate at the model's own outcome estimate (implied + edge_external) so
@@ -280,14 +284,19 @@ class Settings:
         "WTA",
         "atptour",
     )
-    # Ordered so the first SEARCH_PROFILE_MAX_DOMAINS entries are settlement-grade
-    # exchanges (in SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS); analytics/news sites that
-    # cannot satisfy a direct-evidence primary_source_url follow as fallback.
+    # Ordered so the first SEARCH_PROFILE_MAX_DOMAINS entries lead with
+    # settlement-grade exchanges (in SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS), with
+    # one crawlable spot-price aggregator (coingecko) in the searchable set —
+    # Jul 2026 logs showed exchange-only search returning "no spot price found"
+    # for ETH/SOL/DOGE dailies, forcing absence_only skips. Analytics/news
+    # sites that cannot satisfy a direct-evidence primary_source_url follow as
+    # fallback.
     CRYPTO_ALLOWED_DOMAINS: tuple[str, ...] = (
         "coinbase.com",
         "kraken.com",
         "binance.com",
         "coindesk.com",
+        "coingecko.com",
         "cointelegraph.com",
         "theblock.co",
         "decrypt.co",
@@ -357,12 +366,16 @@ class Settings:
         "LuminateData",
         "HitsDailyDouble",
     )
+    # aviationweather.gov (METAR observations for the airport stations NWS CLI
+    # reports settle on) sits in the searchable top-5; Jul 2026 logs showed
+    # "no observed METAR/ASOS value found" skips without it.
     WEATHER_ALLOWED_DOMAINS: tuple[str, ...] = (
         "weather.gov",
         "forecast.weather.gov",
         "noaa.gov",
-        "tropicaltidbits.com",
+        "aviationweather.gov",
         "wunderground.com",
+        "tropicaltidbits.com",
     )
     WEATHER_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "NWS",
@@ -417,13 +430,20 @@ class Settings:
     # (CME/ICE/EIA + Tier-1 wires). Without this they inherit GENERIC_ALLOWED_DOMAINS
     # (news wires) and can never cite the exchange settlement URL the commodities
     # prompt requires, so direct evidence is impossible and edges are suppressed.
+    # Top-5 keeps the settlement-grade trio (CME/ICE/EIA) and adds crawlable
+    # live-price sources: tradingeconomics (Grok cites it successfully on index
+    # markets) and reuters (unpaywalled wire). Jul 2026 logs showed the prior
+    # paywalled top-5 (WSJ/Bloomberg) returning "no live price or settlement
+    # data found for Brent despite multiple searches", forcing absence_only
+    # skips on the whole commodity dailies flow.
     COMMODITY_ALLOWED_DOMAINS: tuple[str, ...] = (
         "cmegroup.com",
         "theice.com",
         "eia.gov",
+        "tradingeconomics.com",
+        "reuters.com",
         "wsj.com",
         "bloomberg.com",
-        "reuters.com",
         "apnews.com",
     )
     COMMODITY_ALLOWED_X_HANDLES: tuple[str, ...] = (
@@ -604,8 +624,13 @@ class Settings:
     # Position limits
     MAX_POSITION_PER_MARKET_USDC: float = 200.0
     MAX_POSITION_PCT_OF_BANKROLL: float = 0.15
-    MIN_CONFIDENCE_INCREASE_FOR_ADD: float = 0.10
-    MIN_PRICE_MOVE_FOR_READD: float = 0.05
+    # Relaxed 0.10/0.05 -> 0.05/0.03 (Jul 2026 review): position_adjustment
+    # was the only gate whose blocked trades would have WON (+$46.37
+    # counterfactual over 43 blocked re-entries). Re-adds still face every
+    # downstream gate plus MAX_POSITION_PER_MARKET_USDC and
+    # MAX_POSITION_PCT_OF_BANKROLL exposure caps.
+    MIN_CONFIDENCE_INCREASE_FOR_ADD: float = 0.05
+    MIN_PRICE_MOVE_FOR_READD: float = 0.03
     HIGH_CONFIDENCE_POSITION_OVERRIDE: float = 0.85  # Allow adding to position if conf >= this
     OPPOSITE_OUTCOME_STRATEGY: str = "block"  # block|hedge
 
@@ -822,10 +847,11 @@ class Settings:
     # large queue cycles or lower to reduce log payload size.
     RESEARCH_QUEUE_CYCLE_LOG_MAXLEN: int = 200
     # Periodically promote stale research-queued markets back to deep analysis so
-    # the queue is not a write-only black hole. Conservative defaults: at most one
-    # forced probe per cycle, only after the entry has aged at least an hour.
+    # the queue is not a write-only black hole. Raised 1 -> 2 (Jul 2026 review):
+    # per-cycle capture inflow ran 2-6 entries against a drain of 1, pinning the
+    # active backlog at ~80 while same-day markets expired unexamined.
     RESEARCH_QUEUE_DRAIN_ENABLED: bool = True
-    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 1
+    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 2
     RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
     RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
     RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
@@ -841,6 +867,11 @@ class Settings:
     RESEARCH_QUEUE_SCORE_PROMOTION_GAP: float = 0.05
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS: int = 4
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN: int = 8
+    # TTL stamped on new research-queue entries and the stale window used to
+    # purge legacy rows without an expiry. Jul 2026 review: 16,423 rows,
+    # median age 78.6 days, zero expirations — the queue was a write-only
+    # black hole. 0 disables expiry (legacy behavior).
+    RESEARCH_QUEUE_ENTRY_TTL_HOURS: float = 168.0
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
     EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 3
     # Near-miss / research_queued after extended research uses a shorter cooldown
@@ -901,6 +932,15 @@ class Settings:
     # fraction of MIN_BET instead of skipping (e.g. 0.60 → $1.20 of $2.00).
     KELLY_MIN_BET_NEAR_MISS_RATIO: float = 0.60
     KELLY_MIN_BANKROLL_USDC: float = 30.0
+    # Stake dampeners for extreme claimed edges. Jul 2026 resolved-outcome
+    # review (n=558): claimed edge +0.37 -> 49% WR, +0.49 -> 31% WR,
+    # +0.82 -> 0% WR, while small edges (+0.01..0.09) ran 63-65% WR. Large
+    # model-vs-market disagreement is evidence the model is wrong, so
+    # 35pp+ claims are probe-sized instead of conviction-sized. Applied after
+    # Kelly/edge-scaling sizing so min-bet floors and the near-miss policy
+    # still decide execution. 1.0 disables a band.
+    KELLY_EDGE_BAND_DAMPENER_35PP: float = 0.6
+    KELLY_EDGE_BAND_DAMPENER_45PP: float = 0.4
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -2310,6 +2350,10 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS",
             Settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS,
         ),
+        RESEARCH_QUEUE_ENTRY_TTL_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_ENTRY_TTL_HOURS",
+            Settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS,
+        ),
         RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN=_read_env_int(
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN",
             Settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN,
@@ -2452,6 +2496,14 @@ def load_settings() -> Settings:
         KELLY_MIN_BANKROLL_USDC=_read_env_float(
             "KELLY_MIN_BANKROLL_USDC",
             Settings.KELLY_MIN_BANKROLL_USDC,
+        ),
+        KELLY_EDGE_BAND_DAMPENER_35PP=_read_env_float(
+            "KELLY_EDGE_BAND_DAMPENER_35PP",
+            Settings.KELLY_EDGE_BAND_DAMPENER_35PP,
+        ),
+        KELLY_EDGE_BAND_DAMPENER_45PP=_read_env_float(
+            "KELLY_EDGE_BAND_DAMPENER_45PP",
+            Settings.KELLY_EDGE_BAND_DAMPENER_45PP,
         ),
         FLIP_GUARD_ENABLED=_read_env_bool(
             "FLIP_GUARD_ENABLED",

@@ -5,6 +5,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -107,8 +108,9 @@ class KalshiClient:
         self.timeout_sec = timeout_sec
         self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
         self.default_time_in_force = _normalize_time_in_force(default_time_in_force)
-        # Honor the configured stake floor/ceiling when integer-contract rounding
-        # would otherwise push the spend below MIN_BET_USDC. 0 disables the guard.
+        # MIN_BET_USDC eligibility is decided by the execution pipeline before an
+        # OrderRequest reaches this client. Keep the values for compatibility and
+        # enforce MAX_BET_USDC again at the final integer-contract boundary.
         self.min_bet_usdc = max(0.0, float(min_bet_usdc))
         self.max_bet_usdc = max(0.0, float(max_bet_usdc))
         self.max_fetch_pages = (
@@ -488,15 +490,6 @@ class KalshiClient:
                 f"Order price {price:.3f} outside submission band "
                 f"[{_ORDER_SUBMISSION_MIN_PRICE:.2f}, {_ORDER_SUBMISSION_MAX_PRICE:.2f}]"
             )
-        count = max(1, int(order.amount_usdc / price))
-        # Integer-contract truncation can drop the actual spend below the
-        # configured MIN_BET_USDC floor (e.g. $2.00 / $0.59 -> 3 contracts =
-        # $1.77). Bump one contract to honor the floor when it stays within the
-        # MAX_BET_USDC ceiling.
-        if not is_market_order and self.min_bet_usdc > 0 and count * price < self.min_bet_usdc:
-            bumped_count = count + 1
-            if self.max_bet_usdc <= 0 or bumped_count * price <= self.max_bet_usdc:
-                count = bumped_count
         price_cents = int(round(price * _ONE_HUNDRED))
         price_cents = max(1, min(99, price_cents))
 
@@ -519,6 +512,34 @@ class KalshiClient:
             )
         else:
             yes_price_cents = price_cents if side == "yes" else _ONE_HUNDRED - price_cents
+
+        # Size against the actual submitted limit, not a stale displayed price.
+        # A marketable fallback can fill up to its aggressive 97-cent limit, so
+        # using the earlier quote here would still allow spend above the approved
+        # Kelly/order budget.
+        chosen_outcome_limit_price = (
+            _MARKET_FALLBACK_YES_PRICE_CENTS / _ONE_HUNDRED
+            if is_market_order
+            else price_cents / _ONE_HUNDRED
+        )
+        chosen_outcome_limit_cents = int(
+            round(chosen_outcome_limit_price * _ONE_HUNDRED)
+        )
+        order_budget_usdc = float(order.amount_usdc)
+        if self.max_bet_usdc > 0:
+            order_budget_usdc = min(order_budget_usdc, self.max_bet_usdc)
+        budget_cents = int(
+            (Decimal(str(order_budget_usdc)) * Decimal(_ONE_HUNDRED)).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+        count = budget_cents // chosen_outcome_limit_cents
+        if count < 1:
+            raise ValueError(
+                f"Order budget ${order_budget_usdc:.4f} cannot fund one contract "
+                f"at ${chosen_outcome_limit_price:.2f}"
+            )
+        requested_notional_usdc = count * chosen_outcome_limit_price
 
         payload = {
             "ticker": order.market_id,
@@ -621,9 +642,10 @@ class KalshiClient:
             )
         else:
             status = "partially_filled"
-        response_data["client_price"] = price
+        response_data["client_price"] = chosen_outcome_limit_price
         response_data["client_qty_shares"] = count
         response_data["client_amount_usdc"] = order.amount_usdc
+        response_data["client_requested_notional_usdc"] = requested_notional_usdc
         response_data["status"] = status
         return OrderResponse(
             id=str(order_id) if order_id else None,

@@ -517,10 +517,13 @@ class TestKalshiClient(unittest.TestCase):
         # Marketable buy YES crosses the spread with an aggressive YES bid.
         self.assertEqual(sent_payload["side"], "bid")
         self.assertEqual(sent_payload["price"], "0.9700")
+        self.assertEqual(sent_payload["count"], "6")
         self.assertEqual(sent_payload["self_trade_prevention_type"], "taker_at_cross")
         self.assertNotIn("type", sent_payload)
         self.assertTrue(sent_payload["client_order_id"].endswith("-fb"))
         self.assertEqual(response.id, "ord-6")
+        self.assertEqual(response.raw["client_price"], 0.97)
+        self.assertEqual(response.raw["client_requested_notional_usdc"], 5.82)
 
     def _client_with_bet_floor(self, min_bet: float, max_bet: float) -> KalshiClient:
         with patch.object(KalshiClient, "_load_private_key", return_value=_DummyPrivateKey()):
@@ -532,12 +535,12 @@ class TestKalshiClient(unittest.TestCase):
                 max_bet_usdc=max_bet,
             )
 
-    def test_submit_order_bumps_count_to_meet_min_bet_floor(self) -> None:
+    def test_submit_order_floors_count_within_approved_amount(self) -> None:
         client = self._client_with_bet_floor(2.0, 12.0)
         market = Market(
             id="MKT-MIN",
             question="Question",
-            outcomes=[{"name": "YES", "price": 0.59}, {"name": "NO", "price": 0.41}],
+            outcomes=[{"name": "YES", "price": 0.37}, {"name": "NO", "price": 0.63}],
         )
         order = OrderRequest(
             market_id="MKT-MIN",
@@ -545,17 +548,20 @@ class TestKalshiClient(unittest.TestCase):
             amount_usdc=2.0,
             side="BUY",
         )
-        response_payload = {"order_id": "ord-min", "fill_count": "4.00", "remaining_count": "0.00"}
+        response_payload = {"order_id": "ord-min", "fill_count": "5.00", "remaining_count": "0.00"}
 
         with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
-            client.submit_order(order, market=market)
+            response = client.submit_order(order, market=market)
 
         sent_payload = req_mock.call_args.kwargs["json"]
-        # 2.0 / 0.59 -> 3 contracts ($1.77, below the $2.00 floor) -> bump to 4 ($2.36).
-        self.assertEqual(sent_payload["count"], "4")
-        self.assertEqual(sent_payload["price"], "0.5900")
+        # The execution pipeline approved $2.00, so 6 contracts ($2.22) are
+        # forbidden even though 5 contracts ($1.85) land below MIN_BET_USDC.
+        self.assertEqual(sent_payload["count"], "5")
+        self.assertEqual(sent_payload["price"], "0.3700")
+        self.assertEqual(response.raw["client_amount_usdc"], 2.0)
+        self.assertEqual(response.raw["client_requested_notional_usdc"], 1.85)
 
-    def test_submit_order_does_not_bump_count_past_max_bet(self) -> None:
+    def test_submit_order_caps_count_at_configured_max_bet(self) -> None:
         client = self._client_with_bet_floor(2.0, 2.0)
         market = Market(
             id="MKT-MINCAP",
@@ -565,7 +571,7 @@ class TestKalshiClient(unittest.TestCase):
         order = OrderRequest(
             market_id="MKT-MINCAP",
             outcome="YES",
-            amount_usdc=2.0,
+            amount_usdc=5.0,
             side="BUY",
         )
         response_payload = {"order_id": "ord-cap", "fill_count": "3.00", "remaining_count": "0.00"}
@@ -574,8 +580,29 @@ class TestKalshiClient(unittest.TestCase):
             client.submit_order(order, market=market)
 
         sent_payload = req_mock.call_args.kwargs["json"]
-        # Bumping to 4 ($2.36) would exceed the $2.00 ceiling, so the count stays 3.
+        # The request exceeds MAX_BET_USDC, so the final integer count is based
+        # on the tighter $2.00 cap: floor($2.00 / $0.59) = 3 contracts.
         self.assertEqual(sent_payload["count"], "3")
+
+    def test_submit_order_rejects_budget_below_one_contract(self) -> None:
+        client = self._client_with_bet_floor(0.0, 12.0)
+        market = Market(
+            id="MKT-SMALL",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.59}, {"name": "NO", "price": 0.41}],
+        )
+        order = OrderRequest(
+            market_id="MKT-SMALL",
+            outcome="YES",
+            amount_usdc=0.30,
+            side="BUY",
+        )
+
+        with patch.object(client, "_request") as req_mock:
+            with self.assertRaisesRegex(ValueError, "cannot fund one contract"):
+                client.submit_order(order, market=market)
+
+        req_mock.assert_not_called()
 
     def test_submit_order_fill_or_kill_zero_fill_maps_to_canceled(self) -> None:
         client = self._client()
