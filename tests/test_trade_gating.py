@@ -733,6 +733,71 @@ def test_weather_favorite_still_passes_edge_gate() -> None:
     assert edge == pytest.approx(0.16)
 
 
+def test_weather_underdog_exempt_for_observed_direct_nws() -> None:
+    """Observed direct NWS reads bypass the underdog block; forecast proxy stays blocked."""
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        WEATHER_MIN_EDGE=0.05,
+        WEATHER_MIN_EVIDENCE_QUALITY=0.60,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        MAX_REASONABLE_EDGE=0.40,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHCHI-26JUL11-T85",
+        question="Will the high temperature in Chicago be above 85°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.32),
+            MarketOutcome(name="NO", price=0.68),
+        ],
+    )
+    observed_direct = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.55,
+        raw_confidence=0.55,
+        bet_size_pct=0.3,
+        reasoning="Observed CLI daily max already exceeds threshold",
+        evidence_basis="direct",
+        evidence_quality=0.72,
+        edge_source="computed",
+        my_prob=0.55,
+        primary_source_url="https://forecast.weather.gov/product.php?site=lot&product=CLI",
+    )
+    ok, edge, reason = _passes_edge_threshold(0.32, observed_direct, settings, market=market)
+    assert ok is True
+    assert reason == ""
+    assert edge == pytest.approx(0.23)
+
+    forecast_proxy = observed_direct.model_copy(update={"evidence_basis": "proxy"})
+    ok_proxy, _, reason_proxy = _passes_edge_threshold(
+        0.32, forecast_proxy, settings, market=market
+    )
+    assert ok_proxy is False
+    assert reason_proxy == "weather_underdog_blocked"
+
+    non_nws_direct = observed_direct.model_copy(
+        update={"primary_source_url": "https://www.wunderground.com/history"}
+    )
+    ok_non_nws, _, reason_non_nws = _passes_edge_threshold(
+        0.32, non_nws_direct, settings, market=market
+    )
+    assert ok_non_nws is False
+    assert reason_non_nws == "weather_underdog_blocked"
+
+    low_eq_direct = observed_direct.model_copy(update={"evidence_quality": 0.50})
+    ok_low_eq, _, reason_low_eq = _passes_edge_threshold(
+        0.32, low_eq_direct, settings, market=market
+    )
+    assert ok_low_eq is False
+    assert reason_low_eq == "weather_underdog_blocked"
+
+
 def test_commodity_min_edge_raises_threshold() -> None:
     from main import _edge_threshold_for_market
 
@@ -852,6 +917,82 @@ def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
     )
     assert ok_weak is False
     assert "below min" in reason_weak
+
+
+def test_settled_direct_commodity_near_close_waives_commodity_premium() -> None:
+    """Direct settlement-aligned eq>=0.95 near-close reads use the base MIN_EDGE."""
+    from datetime import datetime, timedelta, timezone
+
+    from main import _edge_threshold_for_market
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD=300.0,
+        MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER=0.70,
+        COMMODITY_MIN_EDGE=0.22,
+        COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=0.95,
+        COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75,
+        HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95,
+        DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    settled_direct = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.2,
+        reasoning="Live settlement-aligned exchange quote, observed value cited",
+        evidence_basis="direct",
+        evidence_quality=0.96,
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url="https://www.bloomberg.com/energy",
+    )
+    near_close = Market(
+        id="KXBRENTD-26JUL2017-T87",
+        question="Will the brent crude oil close price be above 87?",
+        category="finance",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=2600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=1.0),
+    )
+    far_close = near_close.model_copy(
+        update={"close_time": datetime.now(timezone.utc) + timedelta(hours=9.0)}
+    )
+
+    waived = _edge_threshold_for_market(
+        0.55, settings, "computed", market=near_close, decision=settled_direct
+    )
+    # Commodity premium waived; base MIN_EDGE with liquidity scaling governs.
+    assert waived == pytest.approx(0.12 * 0.70)
+
+    far_floor = _edge_threshold_for_market(
+        0.55, settings, "computed", market=far_close, decision=settled_direct
+    )
+    assert far_floor == pytest.approx(0.22)
+
+    # eq below the settled bar falls back to the high-EQ multiplier relief.
+    high_eq_only = settled_direct.model_copy(update={"evidence_quality": 0.90})
+    multiplier_floor = _edge_threshold_for_market(
+        0.55, settings, "computed", market=near_close, decision=high_eq_only
+    )
+    assert multiplier_floor == pytest.approx(0.22 * 0.95)
+
+    # Proxy basis never qualifies for the waiver even at eq>=0.95.
+    proxy_high_eq = settled_direct.model_copy(update={"evidence_basis": "proxy"})
+    proxy_floor = _edge_threshold_for_market(
+        0.55, settings, "computed", market=near_close, decision=proxy_high_eq
+    )
+    assert proxy_floor == pytest.approx(0.22 * 0.95)
 
 
 def test_weather_high_eq_edge_multiplier_lowers_floor_for_nws_direct() -> None:
@@ -1247,6 +1388,79 @@ def test_effective_score_gate_threshold_profitable_family_convergent_bypass() ->
         family_sample_size=40,
     )
     assert disabled == 0.52
+
+
+def test_effective_score_gate_threshold_convergent_computed_edge() -> None:
+    """Computed source-backed edges count as convergent evidence.
+
+    The self-consistency marker almost never co-occurred with a >=30-sample
+    profitable family (0/1857 receipts), so multi-book odds / live settlement
+    feeds (edge_source=computed at eq>=0.65) now satisfy convergence, and
+    lifetime family samples can satisfy the depth requirement when the recent
+    window is thin (e.g. sports under a jurisdiction hold).
+    """
+    settings = Settings(
+        SCORE_GATE_THRESHOLD=0.52,
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED=True,
+        SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT=0.08,
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES=30,
+    )
+    sports_market = Market(
+        id="KXMLBGAME-26JUL27-TOR",
+        question="Will Toronto win?",
+        category="sports",
+    )
+    convergent_computed = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.70,
+        family_is_profitable=True,
+        self_consistency_passed=False,
+        family_sample_size=12,
+        edge_source="computed",
+        lifetime_family_sample_size=178,
+    )
+    assert convergent_computed == 0.08
+
+    low_eq_computed = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.60,
+        family_is_profitable=True,
+        self_consistency_passed=False,
+        family_sample_size=12,
+        edge_source="computed",
+        lifetime_family_sample_size=178,
+    )
+    assert low_eq_computed == 0.52
+
+    fallback_source = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.70,
+        family_is_profitable=True,
+        self_consistency_passed=False,
+        family_sample_size=12,
+        edge_source="fallback",
+        lifetime_family_sample_size=178,
+    )
+    assert fallback_source == 0.52
+
+    thin_both_windows = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.70,
+        family_is_profitable=True,
+        self_consistency_passed=True,
+        family_sample_size=12,
+        edge_source="computed",
+        lifetime_family_sample_size=0,
+    )
+    assert thin_both_windows == 0.52
 
 
 def test_research_queue_receipt_emitted_on_soft_block() -> None:

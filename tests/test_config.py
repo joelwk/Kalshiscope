@@ -354,11 +354,13 @@ class TestConfig(unittest.TestCase):
             "GENERIC_PROXY_HIGH_EDGE_MIN=0.18",
             "EXTENDED_RESEARCH_COOLDOWN_CYCLES=3",
             "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES=2",
-            "MAX_REASONABLE_EDGE=0.40",
+            "MAX_REASONABLE_EDGE=0.28",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
             "CONFIDENCE_GATE_MIN_EDGE=0.08",
-            "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.75",
+            "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.60",
+            "MAX_GENERIC_CANDIDATES_PER_CYCLE=2",
+            "KELLY_EDGE_BAND_DAMPENER_25PP=0.75",
             "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55",
             "MIN_EVIDENCE_QUALITY_FOR_TRADE=0.55",
             "SCORE_GATE_THRESHOLD=0.15",
@@ -815,7 +817,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
         self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.72)
         self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.65)
-        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.40)
+        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.28)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
         self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)
@@ -889,10 +891,32 @@ class TestConfig(unittest.TestCase):
     def test_cycle1_review_defaults(self) -> None:
         """Defaults introduced or tuned by the cycle 1 log review."""
         defaults = config.Settings
-        self.assertEqual(defaults.MAX_REASONABLE_EDGE, 0.40)
+        # Tightened 0.40 -> 0.28 by the Jul 2026 max-profit review (edges
+        # above 0.30 ran <=50% WR; definitive-validated keeps the elevated cap).
+        self.assertEqual(defaults.MAX_REASONABLE_EDGE, 0.28)
         self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.50)
         self.assertEqual(defaults.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.95)
         self.assertEqual(defaults.GROK_STREAM_TIMEOUT_SECONDS_WEATHER, 120)
+
+    def test_max_profit_review_defaults(self) -> None:
+        """Defaults tuned by the Jul 2026 max-profit near-miss review."""
+        defaults = config.Settings
+        # Widened confidence-gate override: the 0.55-0.61 band (only profitable
+        # resolved tier) mostly carries eq 0.60, which the old 0.70 bar excluded.
+        self.assertEqual(defaults.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY, 0.60)
+        # Generic soft slot cap (analysis-slot allocation, not a hard reject).
+        self.assertEqual(defaults.MAX_GENERIC_CANDIDATES_PER_CYCLE, 2)
+        # New 25-35pp probe-sizing band.
+        self.assertEqual(defaults.KELLY_EDGE_BAND_DAMPENER_25PP, 0.75)
+
+    def test_kelly_edge_band_dampener_25pp_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "KELLY_EDGE_BAND_DAMPENER_25PP": "0.9",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.KELLY_EDGE_BAND_DAMPENER_25PP, 0.9)
 
     def test_high_quality_settled_evidence_min_eq_env_override(self) -> None:
         env = {

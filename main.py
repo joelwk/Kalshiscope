@@ -268,6 +268,8 @@ _RESEARCH_QUEUE_PROXY_EDGE_MIN_EQ = 0.70
 # win drain slots. Zero-yield promotions may still select these after demotion.
 _RESEARCH_QUEUE_CHRONIC_DRAIN_ATTEMPTS = 4
 _RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY = 0.20
+_RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY_STEP = 0.05
+_RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY_MAX = 0.40
 _RESEARCH_QUEUE_CHRONIC_DRAIN_REASONS = frozenset(
     {
         "no_trade_research_gap",
@@ -1868,19 +1870,26 @@ def _edge_threshold_for_market(
         and is_commodity_market(market)
         and not definitive_outcome_eligible
     ):
-        commodity_floor = float(settings.COMMODITY_MIN_EDGE)
-        if decision is not None and _is_high_eq_commodity_near_settlement(
+        if decision is not None and _is_settled_direct_commodity_near_close(
             decision, market, settings
         ):
-            multiplier = max(
-                0.0,
-                min(1.0, float(settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER)),
-            )
-            commodity_floor = max(
-                float(settings.MIN_EDGE),
-                commodity_floor * multiplier,
-            )
-        min_edge = max(min_edge, commodity_floor)
+            # Settled direct near-close reads waive the commodity premium
+            # entirely; the base MIN_EDGE (with liquidity scaling) governs.
+            pass
+        else:
+            commodity_floor = float(settings.COMMODITY_MIN_EDGE)
+            if decision is not None and _is_high_eq_commodity_near_settlement(
+                decision, market, settings
+            ):
+                multiplier = max(
+                    0.0,
+                    min(1.0, float(settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER)),
+                )
+                commodity_floor = max(
+                    float(settings.MIN_EDGE),
+                    commodity_floor * multiplier,
+                )
+            min_edge = max(min_edge, commodity_floor)
     if not definitive_outcome_eligible:
         low_price_multiplier = max(0.0, float(settings.LOW_PRICE_MIN_EDGE_MULTIPLIER))
         if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
@@ -2014,6 +2023,32 @@ def _order_exception_error_text(exc: BaseException) -> str:
     return "\n".join(parts)
 
 
+def _is_observed_direct_weather_evidence(
+    decision: TradeDecision,
+    settings: Settings,
+) -> bool:
+    """Direct weather evidence from an NWS/NOAA source at the weather EQ floor.
+
+    Distinguishes observed station/climate reads (evidence_basis=direct per
+    prompt rules) from forecast proxy (MapClick previews). Only the observed
+    class may bypass the weather underdog block: the ~32% lifetime underdog WR
+    that motivated the block came from forecast-proxy entries, while an
+    observed value that already contradicts the market price is
+    settlement-grade information.
+    """
+    if _decision_evidence_basis(decision) != "direct":
+        return False
+    if not _is_nws_noaa_primary_source_url(
+        str(getattr(decision, "primary_source_url", "") or "")
+    ):
+        return False
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return False
+    return evidence_quality >= float(settings.WEATHER_MIN_EVIDENCE_QUALITY) - 1e-9
+
+
 def _is_high_eq_weather_nws_edge(
     decision: TradeDecision,
     market: Market | None,
@@ -2063,6 +2098,44 @@ def _is_high_eq_commodity_near_settlement(
         return False
     min_eq = max(0.0, float(settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY))
     if evidence_quality < min_eq - 1e-9:
+        return False
+    max_hours = float(settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE)
+    if max_hours <= 0:
+        return True
+    hours_to_close = _hours_to_market_close(market)
+    return hours_to_close is not None and hours_to_close <= max_hours
+
+
+def _is_settled_direct_commodity_near_close(
+    decision: TradeDecision,
+    market: Market | None,
+    settings: Settings,
+) -> bool:
+    """Direct settlement-aligned commodity read at settled-evidence EQ near close.
+
+    Deliberately stricter than ``_is_high_eq_commodity_near_settlement``
+    (direct basis + eq >= HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ instead of
+    computed proxy at 0.75): the commodity family is historically negative, so
+    only the near-certain observed class may waive the COMMODITY_MIN_EDGE
+    premium down to the global MIN_EDGE. Stake remains shrunk by the
+    historical family size multiplier, and score/Kelly/LMSR gates still apply.
+    """
+    if market is None or not is_commodity_market(market):
+        return False
+    if _decision_evidence_basis(decision) != "direct":
+        return False
+    if (
+        str(getattr(decision, "source_match_class", "") or "").strip().lower()
+        != "settlement_aligned"
+    ):
+        return False
+    if not str(getattr(decision, "primary_source_url", "") or "").strip():
+        return False
+    try:
+        evidence_quality = float(decision.evidence_quality)
+    except (TypeError, ValueError):
+        return False
+    if evidence_quality < float(settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ) - 1e-9:
         return False
     max_hours = float(settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE)
     if max_hours <= 0:
@@ -2135,12 +2208,15 @@ def _passes_edge_threshold(
         if evidence_basis != "direct":
             return False, edge, "non_sports_needs_direct_evidence"
     # Weather underdogs (chosen-outcome implied < 0.50) have historically poor
-    # realized WR; keep them analyzable but do not execute.
+    # realized WR; keep them analyzable but do not execute. Observed direct
+    # NWS/NOAA reads are exempt (see _is_observed_direct_weather_evidence);
+    # they still face the weather min-edge floor below.
     if (
         market is not None
         and settings.WEATHER_BLOCK_UNDERDOG_ENTRIES
         and market_family(market) == "weather"
         and not is_definitive_validated
+        and not _is_observed_direct_weather_evidence(decision, settings)
         and implied_prob < float(settings.LOW_PRICE_THRESHOLD)
     ):
         return False, edge, "weather_underdog_blocked"
@@ -3063,12 +3139,14 @@ def _extreme_edge_size_dampener(
 
     Jul 2026 resolved-outcome review: claimed edges in the top deciles ran
     49%/31%/0% win rates while small edges ran 63-65%, yet sizing grew with
-    claimed edge. Dampen stakes at 35pp+ so extreme disagreement with the
+    claimed edge. Dampen stakes at 25pp+ so extreme disagreement with the
     market is probe-sized. Applied to the post-sizing bet fraction so min-bet
     floors and the near-miss policy still decide execution.
     """
     band = _edge_band_label(edge_value)
-    if band == "35-45pp":
+    if band == "25-35pp":
+        multiplier = settings.KELLY_EDGE_BAND_DAMPENER_25PP
+    elif band == "35-45pp":
         multiplier = settings.KELLY_EDGE_BAND_DAMPENER_35PP
     elif band == "45pp+":
         multiplier = settings.KELLY_EDGE_BAND_DAMPENER_45PP
@@ -5528,12 +5606,17 @@ def _build_counterfactual_audit_fields(
     return fields
 
 
+_RESEARCH_PRIORITY_SETTLEMENT_ALIGNED_BOOST = 0.06
+
+
 def _research_priority_for_reason(
     *,
     gate_name: str,
     reason: str,
     threshold_gap: float = 0.0,
     participation_tier: str | None = None,
+    settlement_aligned_computed: bool = False,
+    positive_edge: bool = False,
 ) -> float:
     normalized_gate = str(gate_name or "").strip().lower()
     normalized_reason = str(reason or "").strip().lower()
@@ -5562,6 +5645,11 @@ def _research_priority_for_reason(
         priority = max(priority, 0.72)
     elif normalized_tier == str(ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE):
         priority = max(priority, 0.55)
+    # Settlement-aligned computed near-misses with a live positive edge are the
+    # queue's convertible class (Jul 2026: drains spent slots on chronic
+    # absence_only gaps while knife-edge settlement-aligned entries waited).
+    if settlement_aligned_computed and positive_edge:
+        priority = min(1.0, priority + _RESEARCH_PRIORITY_SETTLEMENT_ALIGNED_BOOST)
     gap_penalty = min(0.20, max(0.0, float(threshold_gap)) * 0.50)
     return round(max(0.0, min(1.0, priority - gap_penalty)), 4)
 
@@ -6034,6 +6122,9 @@ def _decision_self_consistency_passed(decision: TradeDecision) -> bool:
     return "self_consistency_agreement" in combined
 
 
+_SCORE_GATE_CONVERGENT_COMPUTED_MIN_EQ = 0.65
+
+
 def _effective_score_gate_threshold(
     *,
     settings: Settings,
@@ -6043,17 +6134,36 @@ def _effective_score_gate_threshold(
     family_is_profitable: bool = False,
     self_consistency_passed: bool = False,
     family_sample_size: int = 0,
+    edge_source: str | None = None,
+    lifetime_family_sample_size: int = 0,
 ) -> float:
     if market_family(market) == "weather" and evidence_basis_class == "direct":
         return settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT
     if evidence_basis_class == "direct" and evidence_quality >= 0.80:
         return settings.SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY
+    # Convergence used to require the self-consistency marker, which almost
+    # never co-occurs with a >=30-sample profitable family (0/1857 receipts
+    # fired the fast-path). Source-backed computed edges at moderate evidence
+    # quality (multi-book sports odds, live settlement feeds) are the
+    # practical convergence signal, so accept either. Sample depth may come
+    # from the lifetime family history: a profitable family in a thin recent
+    # window (e.g. sports under a jurisdiction hold) should not lose its
+    # fast-path to windowing alone.
+    convergent_evidence = self_consistency_passed or (
+        str(edge_source or "").strip().lower() == "computed"
+        and evidence_quality >= _SCORE_GATE_CONVERGENT_COMPUTED_MIN_EQ
+    )
+    effective_family_samples = max(
+        int(family_sample_size or 0),
+        int(lifetime_family_sample_size or 0),
+    )
     if (
         settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED
         and family_is_profitable
-        and self_consistency_passed
+        and convergent_evidence
         and evidence_quality >= 0.48
-        and family_sample_size >= settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES
+        and effective_family_samples
+        >= settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES
     ):
         return settings.SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT
     return settings.SCORE_GATE_THRESHOLD
@@ -7447,7 +7557,10 @@ def _research_queue_effective_drain_priority(
     """Apply soft demotion for chronic research-gap / soft-score parking.
 
     Edge and kelly near-misses keep full priority so they outrank repeatedly
-    drained absence_only stalls. Entries are never hard-excluded.
+    drained absence_only stalls. Entries are never hard-excluded. The penalty
+    grows with each additional failed drain attempt (capped) so entries that
+    repeatedly probe without converting keep sinking below fresher near-misses
+    instead of oscillating around the drain floor.
     """
     if base_priority is None:
         base_priority = MarketStateManager.estimate_research_entry_priority(entry)
@@ -7461,7 +7574,15 @@ def _research_queue_effective_drain_priority(
     reason = _research_queue_entry_reason(entry)
     if reason not in _RESEARCH_QUEUE_CHRONIC_DRAIN_REASONS:
         return priority
-    return max(0.0, priority - _RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY)
+    extra_attempts = max(
+        0, int(drain_attempts) - _RESEARCH_QUEUE_CHRONIC_DRAIN_ATTEMPTS
+    )
+    penalty = min(
+        _RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY_MAX,
+        _RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY
+        + extra_attempts * _RESEARCH_QUEUE_CHRONIC_DRAIN_PRIORITY_PENALTY_STEP,
+    )
+    return max(0.0, priority - penalty)
 
 
 def _research_queue_priority_below_drain_floor(
@@ -7938,6 +8059,10 @@ def _analyze_market_candidate(
             self_consistency_passed=_decision_self_consistency_passed(decision),
             family_sample_size=int(
                 (family_context or {}).get("historical_family_sample_size", 0) or 0
+            ),
+            edge_source=decision.edge_source,
+            lifetime_family_sample_size=int(
+                (family_context or {}).get("lifetime_family_sample_size", 0) or 0
             ),
         )
     refinement_reasons = refinement.get_refinement_reasons(
@@ -9060,11 +9185,34 @@ def main(max_cycles: int | None = None) -> None:
                     market=market,
                     decision=decision,
                 )
+                positive_edge_signal = False
+                for edge_candidate_value in (
+                    edge_market,
+                    chosen_side_external_edge(decision),
+                ):
+                    try:
+                        if (
+                            edge_candidate_value is not None
+                            and float(edge_candidate_value) > 0.0
+                        ):
+                            positive_edge_signal = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
                 priority = _research_priority_for_reason(
                     gate_name=gate_name,
                     reason=reason,
                     threshold_gap=threshold_gap,
                     participation_tier=participation_tier,
+                    settlement_aligned_computed=(
+                        str(getattr(decision, "edge_source", "") or "").strip().lower()
+                        == "computed"
+                        and str(
+                            getattr(decision, "source_match_class", "") or ""
+                        ).strip().lower()
+                        == "settlement_aligned"
+                    ),
+                    positive_edge=positive_edge_signal,
                 )
                 entry = {
                     "market_id": market.id,
@@ -12359,6 +12507,10 @@ def main(max_cycles: int | None = None) -> None:
                     family_sample_size=int(
                         candidate.get("historical_family_sample_size", 0) or 0
                     ),
+                    edge_source=decision.edge_source,
+                    lifetime_family_sample_size=int(
+                        candidate.get("lifetime_family_sample_size", 0) or 0
+                    ),
                 )
                 conviction_repair_diagnostics: dict[str, Any] = {}
                 conviction_repair_reason = _conviction_repair_reason(
@@ -14135,6 +14287,10 @@ def main(max_cycles: int | None = None) -> None:
                     ),
                     family_sample_size=int(
                         candidate.get("historical_family_sample_size", 0) or 0
+                    ),
+                    edge_source=decision_for_edge.edge_source,
+                    lifetime_family_sample_size=int(
+                        candidate.get("lifetime_family_sample_size", 0) or 0
                     ),
                 )
                 score_gate_critical_reasons = _score_gate_critical_rejection_reasons(

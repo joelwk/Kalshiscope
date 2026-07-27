@@ -22,7 +22,12 @@ class Settings:
     MIN_CONFIDENCE: float = 0.62  # Raised to avoid low-confidence churn and improve calibration
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.08
-    CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
+    # Lowered 0.70 -> 0.60 (Jul 2026 review): the 0.55-0.61 calibrated band is
+    # the only profitable resolved tier (65.5% WR, +$52.91) but most of its
+    # candidates carry eq 0.60 (weather/commodity computed proxy), so the 0.70
+    # bar excluded nearly all of them. Edge >= CONFIDENCE_GATE_MIN_EDGE still
+    # applies, and the downstream evidence-quality gate keeps its own floor.
+    CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.60
     # Lowered 0.58 -> 0.55 (Jul 2026 review): calibrated confidence 0.55-0.61
     # is the only profitable resolved tier (70.4% WR, +58.5% ROI) and the
     # override still requires edge >= CONFIDENCE_GATE_MIN_EDGE plus evidence
@@ -115,11 +120,13 @@ class Settings:
     MAX_CORN_CONFIDENCE: float = 0.70
     MAX_CRYPTO_CONFIDENCE: float = 0.72
     # Hard sanity cap on model-vs-market edge to catch hallucinated
-    # opportunities. Raised from 0.32 to 0.40 after cycle 1 review showed a
-    # validated direct + settlement-aligned music chart trade with edge=0.56
-    # being hard-blocked before its score could be evaluated. The score gate
-    # threshold + stacked penalties continue to scale on edges above 0.32.
-    MAX_REASONABLE_EDGE: float = 0.40
+    # opportunities. Tightened 0.40 -> 0.28 (Jul 2026 resolved-outcome review):
+    # claimed-edge decile 10 (~0.54) ran 23% WR and edges above 0.30 ran <=50%
+    # WR, so non-definitive extreme disagreement with the market is treated as
+    # model error. Definitive-validated decisions keep the elevated
+    # DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX cap (the music-chart class that
+    # motivated the old 0.40 value stays executable through that path).
+    MAX_REASONABLE_EDGE: float = 0.28
     NON_SPORTS_REQUIRES_DIRECT_EVIDENCE: bool = True
     NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL: bool = True
     # Families with a universal canonical settlement source are exempt from the
@@ -567,8 +574,12 @@ class Settings:
     # 15-cycle review found it dominated analysis (~48% of slots) yet was
     # majority absence-only (no findable settlement data) and produced 0 fills.
     # A positive value caps generic candidates per cycle so freed slots flow to
-    # direct-evidence families. 0 (default) preserves legacy behavior (no cap).
-    MAX_GENERIC_CANDIDATES_PER_CYCLE: int = 0
+    # direct-evidence families. Default 2 (Jul 2026 review: generic is the only
+    # net-negative family at -$318 lifetime yet was the only uncapped one).
+    # This is a per-cycle analysis-slot cap, not a family hard reject: generic
+    # markets remain post-filter eligible and compete on pre-analysis score.
+    # 0 disables the cap (legacy behavior).
+    MAX_GENERIC_CANDIDATES_PER_CYCLE: int = 2
     MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
@@ -936,9 +947,12 @@ class Settings:
     # review (n=558): claimed edge +0.37 -> 49% WR, +0.49 -> 31% WR,
     # +0.82 -> 0% WR, while small edges (+0.01..0.09) ran 63-65% WR. Large
     # model-vs-market disagreement is evidence the model is wrong, so
-    # 35pp+ claims are probe-sized instead of conviction-sized. Applied after
+    # 25pp+ claims are probe-sized instead of conviction-sized. Applied after
     # Kelly/edge-scaling sizing so min-bet floors and the near-miss policy
-    # still decide execution. 1.0 disables a band.
+    # still decide execution. 1.0 disables a band. The 25-35pp band was added
+    # after sizing was observed to grow with claimed edge while win rate fell
+    # monotonically above ~0.20.
+    KELLY_EDGE_BAND_DAMPENER_25PP: float = 0.75
     KELLY_EDGE_BAND_DAMPENER_35PP: float = 0.6
     KELLY_EDGE_BAND_DAMPENER_45PP: float = 0.4
 
@@ -2496,6 +2510,10 @@ def load_settings() -> Settings:
         KELLY_MIN_BANKROLL_USDC=_read_env_float(
             "KELLY_MIN_BANKROLL_USDC",
             Settings.KELLY_MIN_BANKROLL_USDC,
+        ),
+        KELLY_EDGE_BAND_DAMPENER_25PP=_read_env_float(
+            "KELLY_EDGE_BAND_DAMPENER_25PP",
+            Settings.KELLY_EDGE_BAND_DAMPENER_25PP,
         ),
         KELLY_EDGE_BAND_DAMPENER_35PP=_read_env_float(
             "KELLY_EDGE_BAND_DAMPENER_35PP",

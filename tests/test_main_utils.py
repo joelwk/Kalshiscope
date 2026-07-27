@@ -72,6 +72,7 @@ from main import (
     _passes_edge_threshold,
     _passes_refreshed_edge_guard,
     _requires_market_refresh,
+    _research_priority_for_reason,
     _research_queue_last_decision_json,
     _research_queue_drain_sort_key,
     _research_queue_effective_drain_priority,
@@ -1569,8 +1570,10 @@ class TestMainUtils(unittest.TestCase):
             ),
         }
 
+        # Progressive demotion: base 0.20 penalty + 0.05 per attempt beyond
+        # the chronic threshold (7 attempts -> 0.20 + 3*0.05 = 0.35 penalty).
         demoted = _research_queue_effective_drain_priority(chronic_gap)
-        self.assertAlmostEqual(demoted, 0.35, places=4)
+        self.assertAlmostEqual(demoted, 0.20, places=4)
         self.assertTrue(
             _research_queue_priority_below_drain_floor(
                 chronic_gap,
@@ -1600,6 +1603,85 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(
             [entry["market_id"] for entry in zero_yield_ordered],
             ["KXKELLYFRESH", "KXEDGEFRESH", "KXT20CHRONIC"],
+        )
+
+    def test_research_priority_settlement_aligned_positive_edge_boost(self) -> None:
+        base = _research_priority_for_reason(
+            gate_name="edge",
+            reason="edge_gate_blocked",
+            threshold_gap=0.0,
+        )
+        boosted = _research_priority_for_reason(
+            gate_name="edge",
+            reason="edge_gate_blocked",
+            threshold_gap=0.0,
+            settlement_aligned_computed=True,
+            positive_edge=True,
+        )
+        self.assertAlmostEqual(boosted, min(1.0, base + 0.06), places=4)
+        # Boost requires BOTH the settlement-aligned computed source and a
+        # live positive edge; either alone keeps the base priority.
+        self.assertAlmostEqual(
+            _research_priority_for_reason(
+                gate_name="edge",
+                reason="edge_gate_blocked",
+                settlement_aligned_computed=True,
+                positive_edge=False,
+            ),
+            base,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            _research_priority_for_reason(
+                gate_name="edge",
+                reason="edge_gate_blocked",
+                settlement_aligned_computed=False,
+                positive_edge=True,
+            ),
+            base,
+            places=4,
+        )
+
+    def test_research_queue_chronic_demotion_grows_with_attempts_capped(self) -> None:
+        def _gap_entry(attempts: int) -> dict:
+            return {
+                "market_id": f"KXGAP{attempts}",
+                "reason": "no_trade_research_gap",
+                "research_priority": 0.90,
+                "threshold_gap": 0.0,
+                "last_decision_json": json.dumps(
+                    {
+                        "audit": {
+                            "research_queue_drain_attempts": attempts,
+                            "final_reason": "no_trade_research_gap",
+                        }
+                    }
+                ),
+            }
+
+        # At the chronic threshold: flat base penalty.
+        self.assertAlmostEqual(
+            _research_queue_effective_drain_priority(
+                _gap_entry(4), base_priority=0.90
+            ),
+            0.70,
+            places=4,
+        )
+        # Each additional failed attempt adds 0.05.
+        self.assertAlmostEqual(
+            _research_queue_effective_drain_priority(
+                _gap_entry(6), base_priority=0.90
+            ),
+            0.60,
+            places=4,
+        )
+        # Penalty is capped at 0.40 total.
+        self.assertAlmostEqual(
+            _research_queue_effective_drain_priority(
+                _gap_entry(30), base_priority=0.90
+            ),
+            0.50,
+            places=4,
         )
 
     def test_research_queue_drain_does_not_demote_fresh_research_gap(self) -> None:
@@ -2885,13 +2967,17 @@ class TestMainUtils(unittest.TestCase):
 
     def test_extreme_edge_size_dampener_bands(self) -> None:
         settings = Settings(
+            KELLY_EDGE_BAND_DAMPENER_25PP=0.75,
             KELLY_EDGE_BAND_DAMPENER_35PP=0.6,
             KELLY_EDGE_BAND_DAMPENER_45PP=0.4,
         )
-        # Bands below 35pp are untouched (63-65% WR zone).
+        # Bands below 25pp are untouched (63-65% WR zone).
         self.assertEqual(_extreme_edge_size_dampener(None, settings), 1.0)
         self.assertEqual(_extreme_edge_size_dampener(0.10, settings), 1.0)
-        self.assertEqual(_extreme_edge_size_dampener(0.34, settings), 1.0)
+        self.assertEqual(_extreme_edge_size_dampener(0.24, settings), 1.0)
+        # 25-35pp claims start probing down (WR falls monotonically above ~0.20).
+        self.assertEqual(_extreme_edge_size_dampener(0.25, settings), 0.75)
+        self.assertEqual(_extreme_edge_size_dampener(0.34, settings), 0.75)
         # 35-45pp claims are probe-sized (49% WR decile).
         self.assertEqual(_extreme_edge_size_dampener(0.35, settings), 0.6)
         self.assertEqual(_extreme_edge_size_dampener(0.44, settings), 0.6)
@@ -2903,9 +2989,11 @@ class TestMainUtils(unittest.TestCase):
 
     def test_extreme_edge_size_dampener_disabled_band_passes_through(self) -> None:
         settings = Settings(
+            KELLY_EDGE_BAND_DAMPENER_25PP=1.0,
             KELLY_EDGE_BAND_DAMPENER_35PP=1.0,
             KELLY_EDGE_BAND_DAMPENER_45PP=1.0,
         )
+        self.assertEqual(_extreme_edge_size_dampener(0.30, settings), 1.0)
         self.assertEqual(_extreme_edge_size_dampener(0.40, settings), 1.0)
         self.assertEqual(_extreme_edge_size_dampener(0.60, settings), 1.0)
 

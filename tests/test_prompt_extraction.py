@@ -6,10 +6,11 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Jul 24 2026: the prior prompt update session changed the
-    # system prompts without refreshing these hashes (stale at HEAD).
-    "analyze": "17d2a831b32eb9c58a6ee2b3f2d1457528b4393f45d5226b5b21b927da1de621",
-    "deep": "8dc203a0d1449c9a2ba89a113b58c1ac465efd2e701280afa4d2faefdbf87045",
+    # Re-pinned Jul 27 2026: shared_output_rules gained the observed
+    # settlement-aligned value -> evidence_basis=direct classification rule
+    # (max-profit near-miss review).
+    "analyze": "846ccb2714352edebe77ba0dc4e8e94b8fbd74c955db4d346b8877a839c97165",
+    "deep": "ea0c9f26bb4f9b1dcb492186239980483037c0ba60c05308aecde420bd2b6f1c",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
@@ -40,8 +41,10 @@ EXPECTED_MARKET_PROMPT_HASHES = {
     # abstain at evidence_quality<=0.55 when neither odds nor result is citable.
     "sports:deep_false": "8c5b8648394a196ddeeeffa834d1e5df7728577c5364caff714956781fcbd483",
     "sports:deep_true": "143a8bfb5eae1f6298add98f936fc74d2667cc4981a9db9de090653047c8ec27",
-    "weather:deep_false": "7af2b629004409b327d0d1de8687181d5852ff6c5aa251a4db008fb322a44c48",
-    "weather:deep_true": "e6729f90d2554492e1dd3780ae1a11fb31822639442588523b86a43fd83d6eb4",
+    # Weather re-pinned Jul 27 2026: category hint now instructs classifying
+    # observed NWS/NOAA CLI/METAR reads that resolve the threshold as direct.
+    "weather:deep_false": "ff12127144f053ad19f375a4d692dc9bdab4c5b8625c27bc4dfd202ee2b56fcd",
+    "weather:deep_true": "9e8e0dc0da8916337d2c460b5e71c45fb78bf510e6bb8e02b2a945fc66fb80b0",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
