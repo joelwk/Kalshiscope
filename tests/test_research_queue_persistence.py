@@ -653,6 +653,38 @@ def test_estimate_research_entry_priority_boosts_missing_url_settlement_aligned(
     assert low_info == pytest.approx(0.50)
 
 
+def test_is_url_repair_near_miss_detection() -> None:
+    repair = {
+        "last_decision_json": json.dumps(
+            {
+                "audit": {
+                    "source_match_class": "settlement_aligned",
+                    "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                    "pre_execution_final_score": 0.50,
+                    "edge_market": 0.18,
+                }
+            }
+        ),
+    }
+    assert MarketStateManager.is_url_repair_near_miss(repair) is True
+    assert (
+        MarketStateManager.is_url_repair_near_miss(
+            {
+                "last_decision_json": json.dumps(
+                    {
+                        "audit": {
+                            "source_match_class": "missing_or_absence_only",
+                            "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                            "edge_market": 0.18,
+                        }
+                    }
+                ),
+            }
+        )
+        is False
+    )
+
+
 def test_estimate_research_entry_priority_conviction_repair_signal_alone_is_sufficient() -> None:
     # Repair entries are persisted with threshold_gap=0.0 and a full decision
     # audit; even without other signals the gate alone must clear the drain

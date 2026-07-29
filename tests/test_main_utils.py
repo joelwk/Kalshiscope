@@ -42,6 +42,7 @@ from main import (
     _satellite_recap_bet,
     _daily_trade_cap_reached,
     _daily_expectancy_role,
+    _direct_evidence_family_affinity,
     _dry_streak_sleep_seconds,
     _edge_band_label,
     _effective_research_queue_drain_quota,
@@ -1015,6 +1016,94 @@ class TestMainUtils(unittest.TestCase):
             breakdown["pre_score_direct_evidence_family_affinity"], 0.0
         )
 
+    def test_pre_analysis_affinity_overlay_under_sports_jurisdiction_hold(self) -> None:
+        """Hold overlay eases weather dominance and boosts crypto/generic."""
+        self.assertAlmostEqual(
+            _direct_evidence_family_affinity("weather"),
+            0.12,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            _direct_evidence_family_affinity(
+                "weather",
+                sports_jurisdiction_hold_active=True,
+            ),
+            0.06,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            _direct_evidence_family_affinity(
+                "crypto",
+                sports_jurisdiction_hold_active=True,
+            ),
+            0.08,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            _direct_evidence_family_affinity(
+                "generic",
+                sports_jurisdiction_hold_active=True,
+            ),
+            0.04,
+            places=4,
+        )
+        self.assertEqual(
+            _direct_evidence_family_affinity("crypto"),
+            0.0,
+        )
+
+        settings = Settings()
+        crypto = Market(
+            id="KXBTCD-26JUL29-T120000",
+            question="Will Bitcoin be above 120000?",
+            category="Crypto",
+            liquidity_usdc=800.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Per Coinbase BTC-USD",
+        )
+        weather = Market(
+            id="KXHIGHDEN-26JUN20-B89.5",
+            question="Will the high temperature in Denver be 89-90F on Jun 20?",
+            category="weather",
+            liquidity_usdc=800.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Per NWS/NOAA daily high temperature",
+        )
+        state = MarketState(market_id=crypto.id, analysis_count=0, non_actionable_streak=0)
+        _, crypto_bd = _pre_analysis_opportunity_score(
+            crypto,
+            state,
+            settings,
+            traded_before=False,
+            sports_jurisdiction_hold_active=True,
+        )
+        _, weather_bd = _pre_analysis_opportunity_score(
+            weather,
+            MarketState(market_id=weather.id, analysis_count=0, non_actionable_streak=0),
+            settings,
+            traded_before=False,
+            sports_jurisdiction_hold_active=True,
+        )
+        self.assertTrue(crypto_bd["pre_score_sports_jurisdiction_hold_affinity"])
+        self.assertAlmostEqual(
+            crypto_bd["pre_score_direct_evidence_family_affinity"],
+            0.08,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            weather_bd["pre_score_direct_evidence_family_affinity"],
+            0.06,
+            places=4,
+        )
+
     def test_pre_analysis_demotion_for_repeated_non_actionable_family(self) -> None:
         market = Market(
             id="KXPERSONMENTION-26APR09-TERM",
@@ -1724,6 +1813,53 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(
             [entry["market_id"] for entry in ordered],
             ["KXCLOSE", "KXMANY", "KXONCE"],
+        )
+
+    def test_zero_yield_queue_sort_prefers_url_repair_near_miss(self) -> None:
+        chronic_gap = {
+            "market_id": "KXT20CHRONIC",
+            "reason": "no_trade_research_gap",
+            "research_priority": 0.70,
+            "threshold_gap": 0.02,
+            "times_seen": 12,
+            "queued_at": "2026-05-13T00:01:00+00:00",
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_queue_drain_attempts": 5,
+                        "final_reason": "no_trade_research_gap",
+                        "research_priority": 0.70,
+                    }
+                }
+            ),
+        }
+        url_repair = {
+            "market_id": "KXSOLDREPAIR",
+            "reason": "evidence_quality_below_min",
+            "research_priority": 0.45,
+            "threshold_gap": 0.05,
+            "times_seen": 2,
+            "queued_at": "2026-05-13T00:02:00+00:00",
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_priority": 0.45,
+                        "source_match_class": "settlement_aligned",
+                        "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                        "pre_execution_final_score": 0.50,
+                        "edge_market": 0.18,
+                        "research_queue_drain_attempts": 1,
+                    }
+                }
+            ),
+        }
+        ordered = sorted(
+            [chronic_gap, url_repair],
+            key=_research_queue_zero_yield_sort_key,
+        )
+        self.assertEqual(
+            [entry["market_id"] for entry in ordered],
+            ["KXSOLDREPAIR", "KXT20CHRONIC"],
         )
 
     def test_zero_yield_drought_limits_queue_drain_to_diagnostic_probe(self) -> None:

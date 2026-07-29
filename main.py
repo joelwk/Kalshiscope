@@ -320,6 +320,16 @@ _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY = {
     "weather": 0.12,
     "entertainment": 0.03,
 }
+# While Michigan sports jurisdiction hold blocks the only historically
+# profitable family, nudge analysis toward executable live-quote families
+# (crypto/generic) and ease weather dominance that mostly recirculates as
+# research_gap / EQ-floor misses. Soft affinity only — never a hard block.
+_PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY_SPORTS_HOLD = {
+    "weather": 0.06,
+    "crypto": 0.08,
+    "generic": 0.04,
+    "entertainment": 0.03,
+}
 # Minimum non-actionable streak before a never-traded market with a recent
 # fallback edge is benched as high-churn. Raised 3 -> 5 in the 10-cycle review:
 # the calibration/scoring fixes mean markets that previously churned on fallback
@@ -2000,6 +2010,24 @@ def _effective_sports_candidate_cap(
     if base_cap is None:
         return probe_cap
     return min(base_cap, probe_cap)
+
+
+def _direct_evidence_family_affinity(
+    family: str,
+    *,
+    sports_jurisdiction_hold_active: bool = False,
+) -> float:
+    """Soft pre-analysis affinity for families with findable settlement evidence.
+
+    When sports orders are jurisdiction-blocked, use the hold overlay so
+    analysis spend shifts toward executable live-quote families.
+    """
+    table = (
+        _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY_SPORTS_HOLD
+        if sports_jurisdiction_hold_active
+        else _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY
+    )
+    return float(table.get(str(family or "").strip().lower(), 0.0))
 
 
 def _order_exception_error_text(exc: BaseException) -> str:
@@ -6712,6 +6740,7 @@ def _pre_analysis_opportunity_score(
     historical_family_stats: dict[str, float | int] | None = None,
     historical_prefix_stats: dict[str, Any] | None = None,
     historical_gate_metrics: dict[str, Any] | None = None,
+    sports_jurisdiction_hold_active: bool = False,
 ) -> tuple[float, dict[str, Any]]:
     """Estimate opportunity quality before expensive enrichment/analysis."""
     now_utc = datetime.now(timezone.utc)
@@ -6912,8 +6941,9 @@ def _pre_analysis_opportunity_score(
             settings.PRE_ANALYSIS_HISTORICAL_FAMILY_PROFIT_BONUS
         )
     source_difficulty_penalty = _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES.get(family, 0.0)
-    direct_evidence_family_affinity = _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY.get(
-        family, 0.0
+    direct_evidence_family_affinity = _direct_evidence_family_affinity(
+        family,
+        sports_jurisdiction_hold_active=sports_jurisdiction_hold_active,
     )
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
@@ -7035,6 +7065,9 @@ def _pre_analysis_opportunity_score(
     return score, {
         "pre_score_tradeable_price": tradeable_price_score,
         "pre_score_direct_evidence_family_affinity": direct_evidence_family_affinity,
+        "pre_score_sports_jurisdiction_hold_affinity": bool(
+            sports_jurisdiction_hold_active
+        ),
         "pre_score_liquidity": liquidity_score,
         "pre_score_horizon": horizon_score,
         "pre_score_post_event_bonus": post_event_bonus,
@@ -7655,8 +7688,13 @@ def _research_queue_drain_sort_key(
     )
 
 
-def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, float, int, int, str, str]:
-    """Promotion ranking when zero-yield cycles show the queue needs active repair."""
+def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[int, float, float, int, int, str, str]:
+    """Promotion ranking when zero-yield cycles show the queue needs active repair.
+
+    Prefer URL-repair near-misses (settlement-aligned + missing https URL) over
+    chronic research_gap stubs so the promotion slot spends API on convertible
+    candidates first.
+    """
     drain_attempts, _last_attempt = MarketStateManager.research_queue_drain_attempt_metadata(
         entry
     )
@@ -7673,7 +7711,11 @@ def _research_queue_zero_yield_sort_key(entry: dict[str, Any]) -> tuple[float, f
         times_seen = max(0, int(entry.get("times_seen") or 0))
     except (TypeError, ValueError):
         times_seen = 0
+    url_repair_rank = (
+        0 if MarketStateManager.is_url_repair_near_miss(entry) else 1
+    )
     return (
+        url_repair_rank,
         -float(priority),
         threshold_gap,
         drain_attempts,
@@ -9931,6 +9973,14 @@ def main(max_cycles: int | None = None) -> None:
                     score_penalty=settings.HISTORICAL_SHORT_PREFIX_SCORE_PENALTY,
                 )
 
+            # Compute once before pre-analysis scoring so affinity overlay can
+            # rebalance toward executable live-quote families while sports
+            # orders are jurisdiction-blocked.
+            sports_jurisdiction_hold = (
+                max(0, settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE) > 0
+                and _sports_jurisdiction_hold_active(state_manager)
+            )
+
             for market in markets:
                 logger.debug(
                     "Analyzing market: id=%s, question='%s'",
@@ -10492,6 +10542,7 @@ def main(max_cycles: int | None = None) -> None:
                         historical_family_stats=historical_family_stats,
                         historical_prefix_stats=historical_prefix_stats,
                         historical_gate_metrics=historical_gate_metrics,
+                        sports_jurisdiction_hold_active=sports_jurisdiction_hold,
                     )
                     research_entry = recent_research_entries.get(market.id)
                     is_research_queue_score_promotion = False
@@ -10933,10 +10984,6 @@ def main(max_cycles: int | None = None) -> None:
             )
             sports_jurisdiction_probe_cap = max(
                 0, settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE
-            )
-            sports_jurisdiction_hold = (
-                sports_jurisdiction_probe_cap > 0
-                and _sports_jurisdiction_hold_active(state_manager)
             )
             sports_candidate_cap = _effective_sports_candidate_cap(
                 sports_candidate_cap,

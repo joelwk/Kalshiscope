@@ -13,26 +13,25 @@ EXPECTED_SYSTEM_PROMPT_HASHES = {
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    # Re-pinned Jul 28 2026: crypto/commodities/generic URL+should_trade guidance,
-    # weather MapClick underdog discipline, sports odds-URL-before-absence_only.
+    # Re-pinned Jul 29 2026: deep constraints repair-before-abstain lines.
     "commodities:deep_false": "5ace0c9e5c8448d4ad6caad4a3e64d30b178078b63237bdc4a6b0aa1cb84650a",
-    "commodities:deep_true": "1c75b0a8c7381d14475e650aaa5a29c5549c86d4c0d889c460545d784fff4535",
+    "commodities:deep_true": "619ef9ec2575c891090092db00fdce3bf1e225e6e746bd187bbefebbbf1e789b",
     "crypto:deep_false": "296581f0b94cf1a90e39fc0e6b981cf96283143a0f7fbb64aee5f8c5f895f553",
-    "crypto:deep_true": "0438160e8a3e2d397c031d96d307b355cc17c418d1c9be7a654b2fe5df8f62d3",
+    "crypto:deep_true": "7de5dbdef1c2fd6c1cc7db844aec15a71313bdeba6a2c3dc3bd12a5fecc950f4",
     "generic:deep_false": "de34974965eea79e2a926963f5a7b444f12ab7f8621a5120d1879f26481c258d",
-    "generic:deep_true": "025ab15385c459c735d3c251b49a8d2998e3834faf5d5f553aa00fffc82ad5db",
+    "generic:deep_true": "b6e5d0d3186eb8b32babf3fe3a943d78974eeacf61c983dd37507b82e8736dfc",
     "music:deep_false": "a0d39c5d325a41abdd64dd72aa6662e7283fbc1c70b1272a10fe0c6b72a52b59",
-    "music:deep_true": "d72de80ce67f2cda44fc9919df27bf8d0e697ee8d8679fd3c6e0d85acb9f02e0",
+    "music:deep_true": "f74dce78195e106bf56220b4c29de25871b10b19721048d07187b2109a38c5ce",
     "politics:deep_false": "877eb11281828ff2aade2c1253170f423539068a0c1f609bdb9ac03931cb2f47",
-    "politics:deep_true": "dc530b2b007842269c27876611a175f182fc0ab3c7c4b9a8912ff7dae7b63f21",
+    "politics:deep_true": "cd980413d86def36d37cf4f173e0ec75af9f9a64dd8b493475be3033d4254713",
     "speech:deep_false": "a4dfa6c4e3d77f919a3ca7b9f454249f629e2b0e5df5cad8ad4e0783ba046473",
-    "speech:deep_true": "2c30597de08dfc29c4900f6e8ac42aadb3ccb26c412c5e86c5617867cfa40952",
+    "speech:deep_true": "f904c60a2c1248799fe5fdc559e528041302b5f7433919be03ea58cca233ccdd",
     "speech_mention:deep_false": "f15420e53452fbb09616a8bea172b6181d90e2f84584fbcbfa4c09b80860d9d2",
-    "speech_mention:deep_true": "3fc0a9b8a5691bc6b4843ef5e451b770da517266705c919ee4480b081199545f",
+    "speech_mention:deep_true": "ea76dc238b78eaec219b4c681c6ffb025ab61e19f9b95b87404afad671774ac2",
     "sports:deep_false": "6d6783072a778b067bf364ed473c16226e0c4438fe891440ca67c8f56b5a42f9",
-    "sports:deep_true": "e77971b37851f106dc134ff3c2f2d2336e45dbe49c1c8c5a2158b046ca9c5521",
+    "sports:deep_true": "17b6e5c35259d837df3217c14bf662d6dfa05e9162735a4a79d736e765626476",
     "weather:deep_false": "eeacbb3c933b623e93880a80f8bd27003800ec17393f78547b2357805b9e4db2",
-    "weather:deep_true": "683b8b54051bc5fe58fe9191eacb4a51cb9b02fc704c29de4fa09cc1063d7e14",
+    "weather:deep_true": "e9a577927c76d9bc0bc5262b441b09b20c9a03525cbd54e3093f57a62b20ebf0",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -198,3 +197,13 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "primary_source_url must be a real https:// link" in _SYSTEM_PROMPT_ANALYZE
     assert "Side consistency:" in _SYSTEM_PROMPT_ANALYZE
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE
+
+
+def test_deep_constraints_prefer_repair_before_abstain() -> None:
+    from prompts.loader import load_lines
+
+    lines = load_lines("user/fragments/constraints_deep")
+    joined = "\n".join(lines)
+    assert "Repair before abstain" in joined
+    assert "paste the real https primary_source_url" in joined
+    assert "Only abstain after repair attempts" in joined
