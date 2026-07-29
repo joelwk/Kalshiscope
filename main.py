@@ -23,7 +23,6 @@ from bayesian_engine import (
 from calibration_gates import (
     GateTier,
     evaluate_market,
-    evaluate_market_tiered,
     evaluate_short_prefix_penalty,
     load_family_stats,
     load_short_prefix_stats,
@@ -4274,6 +4273,9 @@ class GuaranteedOrderSlot:
     submission_attempts: int = 0
     last_error: str | None = None
     order_id: str | None = None
+    needs_replacement: bool = False
+    replacement_count: int = 0
+    replacement_reason: str | None = None
 
 
 @dataclass
@@ -4286,10 +4288,11 @@ class GuaranteedOrderPlan:
     )
     slots: list[GuaranteedOrderSlot] = field(default_factory=list)
     normal_execution_suppressed: int = 0
+    retired_market_ids: set[str] = field(default_factory=set)
 
     @property
     def locked_count(self) -> int:
-        return len(self.slots)
+        return sum(1 for slot in self.slots if not slot.needs_replacement)
 
     @property
     def completed_count(self) -> int:
@@ -4327,9 +4330,13 @@ class GuaranteedOrderPlan:
                     "submission_attempts": slot.submission_attempts,
                     "last_error": slot.last_error,
                     "order_id": slot.order_id,
+                    "needs_replacement": slot.needs_replacement,
+                    "replacement_count": slot.replacement_count,
+                    "replacement_reason": slot.replacement_reason,
                 }
                 for slot in self.slots
             ],
+            "retired_market_ids": sorted(self.retired_market_ids),
         }
 
 
@@ -4524,6 +4531,7 @@ def _lock_guaranteed_order_markets(
     markets: list[Market],
     *,
     excluded_market_ids: set[str],
+    excluded_market_families: set[str] | None = None,
     settings: Settings,
     cycle_number: int,
 ) -> list[GuaranteedOrderSlot]:
@@ -4531,8 +4539,15 @@ def _lock_guaranteed_order_markets(
     if plan.target <= 0:
         return []
 
+    normalized_excluded_families = {
+        str(family or "").strip().lower()
+        for family in (excluded_market_families or set())
+        if str(family or "").strip()
+    }
     current_by_id = {market.id: market for market in markets if market.id}
     for slot in plan.slots:
+        if slot.needs_replacement:
+            continue
         refreshed = current_by_id.get(slot.market_id)
         if refreshed is not None:
             slot.market = refreshed
@@ -4540,31 +4555,76 @@ def _lock_guaranteed_order_markets(
     if plan.is_fully_locked:
         return []
 
-    locked_ids = {slot.market_id for slot in plan.slots}
+    locked_ids = {
+        slot.market_id for slot in plan.slots if not slot.needs_replacement
+    }
     candidates = [
         market
         for market in markets
         if market.id not in locked_ids
         and market.id not in excluded_market_ids
+        and market.id not in plan.retired_market_ids
+        and market_family(market) not in normalized_excluded_families
         and _is_guaranteed_order_market_candidate(market, settings)
     ]
     candidates.sort(key=_guaranteed_order_market_rank, reverse=True)
 
     newly_locked: list[GuaranteedOrderSlot] = []
-    slots_needed = max(0, plan.target - plan.locked_count)
-    for market in candidates[:slots_needed]:
+    candidate_index = 0
+    for slot in (slot for slot in plan.slots if slot.needs_replacement):
+        if candidate_index >= len(candidates):
+            break
+        market = candidates[candidate_index]
+        candidate_index += 1
+        slot.replacement_count += 1
+        slot.market_id = market.id
+        slot.market = market
+        slot.locked_cycle = cycle_number
+        slot.client_order_id = (
+            f"BOT-GUAR-{plan.run_id}-{slot.slot_number:03d}"
+            f"-R{slot.replacement_count:03d}"
+        )
+        slot.decision = None
+        slot.research_completed = False
+        slot.completed = False
+        slot.submission_attempts = 0
+        slot.last_error = None
+        slot.order_id = None
+        slot.needs_replacement = False
+        slot.replacement_reason = None
+        locked_ids.add(market.id)
+        newly_locked.append(slot)
+
+    slots_needed = max(0, plan.target - len(plan.slots))
+    for market in candidates[candidate_index : candidate_index + slots_needed]:
         slot = GuaranteedOrderSlot(
-            slot_number=plan.locked_count + 1,
+            slot_number=len(plan.slots) + 1,
             market_id=market.id,
             market=market,
             locked_cycle=cycle_number,
             client_order_id=(
-                f"BOT-GUAR-{plan.run_id}-{plan.locked_count + 1:03d}"
+                f"BOT-GUAR-{plan.run_id}-{len(plan.slots) + 1:03d}"
             ),
         )
         plan.slots.append(slot)
         newly_locked.append(slot)
     return newly_locked
+
+
+def _mark_guaranteed_order_slot_for_replacement(
+    plan: GuaranteedOrderPlan,
+    slot: GuaranteedOrderSlot,
+    *,
+    reason: str,
+) -> None:
+    """Retire an unexecutable market while preserving its fixed plan slot."""
+    if slot.completed:
+        return
+    plan.retired_market_ids.add(slot.market_id)
+    slot.needs_replacement = True
+    slot.replacement_reason = reason
+    if not slot.last_error:
+        slot.last_error = reason
 
 
 def _forced_execution_decision(
@@ -4733,7 +4793,8 @@ def _attempt_guaranteed_order_slot(
             client_order_id=slot.client_order_id,
         )
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        error_text = _order_exception_error_text(exc)
+        error = f"{type(exc).__name__}: {error_text}"
         slot.last_error = error
         return GuaranteedOrderAttemptResult(
             status="submission_failed",
@@ -4796,25 +4857,64 @@ def _run_guaranteed_order_phase(
     extended_research_market_ids: set[str],
 ) -> GuaranteedOrderCycleResult:
     result = GuaranteedOrderCycleResult()
-    new_slots = _lock_guaranteed_order_markets(
-        plan,
-        markets,
-        excluded_market_ids=excluded_market_ids,
-        settings=settings,
-        cycle_number=cycle_number,
+    sports_jurisdiction_hold = (
+        not settings.DRY_RUN and _sports_jurisdiction_hold_active(state_manager)
     )
-    result.locked = len(new_slots)
-    if new_slots:
+    excluded_market_families = {"sports"} if sports_jurisdiction_hold else set()
+    if sports_jurisdiction_hold:
+        slots_retired_for_hold = []
+        for slot in plan.slots:
+            if (
+                not slot.completed
+                and not slot.needs_replacement
+                and market_family(slot.market) == "sports"
+            ):
+                slots_retired_for_hold.append(slot.slot_number)
+                _mark_guaranteed_order_slot_for_replacement(
+                    plan,
+                    slot,
+                    reason="jurisdiction_sports_blocked",
+                )
         logger.warning(
-            "Guaranteed-order plan locked %d market(s): %s",
-            len(new_slots),
-            ", ".join(slot.market_id for slot in new_slots),
+            "Guaranteed-order selection excludes sports while the exchange-confirmed "
+            "jurisdiction hold is active",
             data={
-                "guaranteed_orders_n": plan.target,
-                "guaranteed_orders_locked": plan.locked_count,
-                "newly_locked_market_ids": [slot.market_id for slot in new_slots],
+                "sports_jurisdiction_hold": True,
+                "excluded_market_family": "sports",
+                "retired_guaranteed_order_slots": slots_retired_for_hold,
             },
         )
+
+    def _lock_available_slots() -> list[GuaranteedOrderSlot]:
+        new_slots = _lock_guaranteed_order_markets(
+            plan,
+            markets,
+            excluded_market_ids=excluded_market_ids,
+            excluded_market_families=excluded_market_families,
+            settings=settings,
+            cycle_number=cycle_number,
+        )
+        result.locked += len(new_slots)
+        if new_slots:
+            logger.warning(
+                "Guaranteed-order plan locked %d market(s): %s",
+                len(new_slots),
+                ", ".join(slot.market_id for slot in new_slots),
+                data={
+                    "guaranteed_orders_n": plan.target,
+                    "guaranteed_orders_locked": plan.locked_count,
+                    "newly_locked_market_ids": [slot.market_id for slot in new_slots],
+                    "replacement_slots": [
+                        slot.slot_number
+                        for slot in new_slots
+                        if slot.replacement_count > 0
+                    ],
+                    "excluded_market_families": sorted(excluded_market_families),
+                },
+            )
+        return new_slots
+
+    _lock_available_slots()
     if not plan.is_fully_locked:
         logger.error(
             "Guaranteed-order plan is waiting for enough eligible markets: "
@@ -4825,9 +4925,13 @@ def _run_guaranteed_order_phase(
         )
         return result
 
-    for slot in plan.slots:
-        if slot.completed:
-            continue
+    pending_slots = [
+        slot
+        for slot in plan.slots
+        if not slot.completed and not slot.needs_replacement
+    ]
+    while pending_slots:
+        slot = pending_slots.pop(0)
         attempt = _attempt_guaranteed_order_slot(
             slot,
             grok_client=grok_client,
@@ -4916,6 +5020,13 @@ def _run_guaranteed_order_phase(
                         **audit,
                     ),
                 )
+            _mark_guaranteed_order_slot_for_replacement(
+                plan,
+                slot,
+                reason="guaranteed_order_market_validation_failed",
+            )
+            replacement_slots = _lock_available_slots()
+            pending_slots.extend(replacement_slots)
             continue
         if decision is None:
             continue
@@ -4928,6 +5039,14 @@ def _run_guaranteed_order_phase(
                 result.attempts_by_family.get(family, 0) + 1
             )
         if attempt.status == "submission_failed":
+            jurisdiction_sports_blocked = _is_michigan_sports_jurisdiction_error(
+                attempt.error or ""
+            )
+            submission_failure_reason = (
+                "jurisdiction_sports_blocked"
+                if jurisdiction_sports_blocked
+                else "guaranteed_order_submission_failed"
+            )
             result.failures.append(
                 {
                     "slot_number": slot.slot_number,
@@ -4944,12 +5063,51 @@ def _run_guaranteed_order_phase(
                     decision_phase="guaranteed_order_submission",
                     decision_terminal=False,
                     final_action="order_attempt",
-                    final_reason="guaranteed_order_submission_failed",
+                    final_reason=submission_failure_reason,
                     guaranteed_order_retry_pending=True,
                     order_error=attempt.error,
                     **audit,
                 ),
             )
+            if jurisdiction_sports_blocked:
+                _record_sports_jurisdiction_block(state_manager)
+                excluded_market_families.add("sports")
+                retired_slot_numbers: set[int] = {slot.slot_number}
+                _mark_guaranteed_order_slot_for_replacement(
+                    plan,
+                    slot,
+                    reason="jurisdiction_sports_blocked",
+                )
+                for pending_slot in plan.slots:
+                    if (
+                        pending_slot is not slot
+                        and not pending_slot.completed
+                        and not pending_slot.needs_replacement
+                        and market_family(pending_slot.market) == "sports"
+                    ):
+                        retired_slot_numbers.add(pending_slot.slot_number)
+                        _mark_guaranteed_order_slot_for_replacement(
+                            plan,
+                            pending_slot,
+                            reason="jurisdiction_sports_blocked",
+                        )
+                pending_slots = [
+                    pending_slot
+                    for pending_slot in pending_slots
+                    if pending_slot.slot_number not in retired_slot_numbers
+                ]
+                logger.warning(
+                    "Guaranteed-order sports market rejected by jurisdiction; "
+                    "retiring pending sports slots and selecting executable families",
+                    data={
+                        "market_id": slot.market_id,
+                        "retired_slot_numbers": sorted(retired_slot_numbers),
+                        "excluded_market_family": "sports",
+                        "jurisdiction_rejection_scope": "guaranteed_order_plan",
+                    },
+                )
+                replacement_slots = _lock_available_slots()
+                pending_slots.extend(replacement_slots)
             continue
 
         slot.completed = True

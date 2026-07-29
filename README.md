@@ -77,7 +77,10 @@ distinct markets for an additional initial-plus-deep research pass and forced
 minimum-size execution. Ordinary gate-cleared submissions are suppressed in
 this mode so the run cannot exceed the target. Dry runs persist exactly that
 many attempted-order receipts; bounded live runs fail explicitly if Kalshi does
-not accept all target submissions.
+not accept all target submissions. Live guarantee plans exclude sports while an
+exchange-confirmed jurisdiction hold is active. If that restriction is first
+discovered during forced submission, the rejected sports slot is retired and
+replaced with a non-sports market using a new idempotency key.
 
 Start in dry run and switch to live only after reviewing behavior in logs.
 

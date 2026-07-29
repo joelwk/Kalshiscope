@@ -40,4 +40,6 @@ def dummy_settings(tmp_path) -> Settings:
         STATE_DB_PATH=str(tmp_path / "market_state.db"),
         STATE_JSON_EXPORT_PATH=str(tmp_path / "market_state.json"),
         EXPORT_STATE_JSON=False,
+        LOG_DIR=str(tmp_path / "logs"),
+        ENABLE_FILE_LOGGING=False,
     )
