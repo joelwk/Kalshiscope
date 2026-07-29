@@ -237,6 +237,12 @@ def test_order_reconciliation_maps_lifecycle_and_blocks_unknown_resting(tmp_path
         assert manager.get_position("MKT-partial-cancel").total_amount_usdc == 0.8
         assert len(manager.get_pending_orders(active_only=True)) == 1
         assert len(manager.get_order_history()) == 5
+        assert manager._conn.execute(
+            "SELECT COUNT(*) FROM active_pending_orders"
+        ).fetchone()[0] == 1
+        assert manager._conn.execute(
+            "SELECT COUNT(*) FROM order_lifecycle_history"
+        ).fetchone()[0] == 5
     finally:
         manager.close()
 
@@ -525,5 +531,12 @@ def test_reconciliation_migration_is_idempotent_and_preserves_audit_rows(tmp_pat
                 "SELECT resolved_winning_outcome FROM markets WHERE id = 'MKT-HISTORY'"
             ).fetchone()
             assert market["resolved_winning_outcome"] == "YES"
+            views = {
+                row["name"]
+                for row in manager._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'view'"
+                ).fetchall()
+            }
+            assert {"active_pending_orders", "order_lifecycle_history"} <= views
         finally:
             manager.close()

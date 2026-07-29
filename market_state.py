@@ -4143,12 +4143,43 @@ class MarketStateManager:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_markets_last_seen_cycle ON markets (last_seen_cycle_id)"
         )
+        self._create_order_lifecycle_views()
         # Normalize legacy outcome rows before classifying positions so a
         # resolved trade without an exchange-settlement row is still closed.
         self._backfill_resolution_state()
         self._migrate_state_reconciliation_schema()
         self._migrate_binary_bayesian_likelihood_ratios()
         self._normalize_participation_tier_repr_leak()
+
+    def _create_order_lifecycle_views(self) -> None:
+        """Expose unambiguous read-only views for operators and diagnostics."""
+        self._conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS active_pending_orders AS
+            SELECT *
+            FROM pending_orders
+            WHERE LOWER(COALESCE(status, '')) IN (
+                    'accepted', 'open', 'partially_filled',
+                    'partial', 'pending', 'resting'
+                )
+              AND (
+                    remaining_shares > 1e-9
+                    OR (
+                        remaining_shares IS NULL
+                        AND (
+                            requested_shares IS NULL
+                            OR COALESCE(filled_shares, 0) < requested_shares - 1e-9
+                        )
+                    )
+                )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS order_lifecycle_history AS
+            SELECT * FROM pending_orders
+            """
+        )
 
     def _migrate_state_reconciliation_schema(self) -> None:
         row = self._conn.execute(

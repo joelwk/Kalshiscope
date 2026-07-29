@@ -120,6 +120,7 @@ See `.env.example` for the full set of runtime controls.
 - `STATE_JSON_EXPORT_INTERVAL_CYCLES` controls snapshot frequency (default `1`). A cycle receipt is committed before its snapshot is replaced.
 - Export complete history on demand without changing SQLite: `poetry run python scripts/export_state_audit.py --table decision_receipts --since 2026-07-01T00:00:00+00:00 --format ndjson --output decisions.ndjson`. Repeat `--table` to select multiple tables; omit it for every audit table.
 - Exchange order/position reconciliation runs before execution. Live submissions are suppressed when either snapshot is incomplete or when an exchange resting order is not represented locally.
+- `pending_orders` is retained as the compatibility-backed order lifecycle table; terminal rows are intentionally preserved. For direct SQLite inspection use `SELECT * FROM active_pending_orders` for actionable orders and `SELECT * FROM order_lifecycle_history` for the complete audit history.
 - Resolution tracking runs on a configurable cycle interval.
 - Logs are written under `LOG_DIR` (default `logs/`), including standard and error-focused outputs.
 
