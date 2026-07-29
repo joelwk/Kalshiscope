@@ -108,6 +108,21 @@ class TestConfig(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GUARANTEED_ORDERS_N"):
                 config.load_settings()
 
+    def test_state_reconciliation_and_export_settings(self) -> None:
+        env = {
+            **self._required_env(),
+            "ORDER_RECONCILIATION_ENABLED": "false",
+            "POSITION_SYNC_INTERVAL_CYCLES": "4",
+            "STATE_JSON_EXPORT_INTERVAL_CYCLES": "3",
+            "STATE_JSON_RECENT_DECISIONS_LIMIT": "250",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.ORDER_RECONCILIATION_ENABLED)
+        self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 4)
+        self.assertEqual(settings.STATE_JSON_EXPORT_INTERVAL_CYCLES, 3)
+        self.assertEqual(settings.STATE_JSON_RECENT_DECISIONS_LIMIT, 250)
+
     def test_missing_required_env_raises(self) -> None:
         env = {"XAI_API_KEY": "xai-key"}
         with patch.dict(os.environ, env, clear=True):

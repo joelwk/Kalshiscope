@@ -211,6 +211,62 @@ class TestKalshiClient(unittest.TestCase):
         self.assertEqual(settlements, settlements_payload)
         self.assertEqual(fills, fills_payload)
 
+    def test_portfolio_stream_methods_forward_cursor_and_fixed_point_filters(self) -> None:
+        client = self._client()
+        with patch.object(
+            client,
+            "_request",
+            side_effect=[
+                _DummyResponse({"market_positions": [], "cursor": ""}),
+                _DummyResponse({"orders": [], "cursor": ""}),
+                _DummyResponse({"order": {"order_id": "o-1"}}),
+                _DummyResponse({"fills": [], "cursor": ""}),
+                _DummyResponse({"settlements": [], "cursor": ""}),
+            ],
+        ) as request:
+            client.get_positions(
+                limit=1000,
+                cursor="p-1",
+                count_filter="position",
+                subaccount=2,
+            )
+            client.get_orders(
+                status="resting",
+                limit=1000,
+                cursor="o-1",
+                subaccount=2,
+            )
+            client.get_order("o-1", subaccount=2)
+            client.get_fills(
+                limit=1000,
+                cursor="f-1",
+                order_id="o-1",
+                min_ts=100,
+                max_ts=200,
+                subaccount=2,
+            )
+            client.get_settlements(
+                limit=1000,
+                cursor="s-1",
+                min_ts=100,
+                max_ts=200,
+                subaccount=2,
+            )
+
+        self.assertEqual(
+            request.call_args_list[0].kwargs["params"],
+            {
+                "limit": 1000,
+                "cursor": "p-1",
+                "count_filter": "position",
+                "subaccount": 2,
+            },
+        )
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["status"], "resting")
+        self.assertNotIn("params", request.call_args_list[2].kwargs)
+        self.assertEqual(request.call_args_list[3].kwargs["params"]["min_ts"], 100)
+        self.assertEqual(request.call_args_list[4].kwargs["params"]["max_ts"], 200)
+
     def test_get_markets_passes_close_time_window_filters(self) -> None:
         client = self._client()
         pages = [

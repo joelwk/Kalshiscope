@@ -342,8 +342,16 @@ def test_resting_order_is_recorded_only_after_fill_reconciliation(tmp_path) -> N
 
         class FillClient:
             @staticmethod
-            def get_fills(*, limit: int) -> dict:
-                assert limit == 200
+            def get_fills(
+                *,
+                limit: int,
+                cursor: str | None,
+                min_ts: int | None,
+                subaccount: int,
+            ) -> dict:
+                assert limit == 1000
+                assert cursor is None
+                assert subaccount == 0
                 return {
                     "fills": [
                         {
@@ -374,7 +382,7 @@ def test_resting_order_is_recorded_only_after_fill_reconciliation(tmp_path) -> N
         assert position is not None
         assert position.total_amount_usdc == 2.0
         assert position.trade_count == 1
-        assert first_sync.new_fill_events == 1
+        assert first_sync.new_fill_events == 2
         assert first_sync.filled_notional_usdc == 2.0
         assert duplicate_sync.new_fill_events == 0
         assert manager.get_pending_order("order-resting")["status"] == "filled"

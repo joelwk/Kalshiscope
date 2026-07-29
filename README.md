@@ -115,7 +115,11 @@ See `.env.example` for the full set of runtime controls.
 
 ## State and Logging
 
-- State persistence: `STATE_DB_PATH` (SQLite) and optional JSON export (`STATE_JSON_EXPORT_PATH`).
+- State persistence: `STATE_DB_PATH` (SQLite) remains the complete audit store.
+- `STATE_JSON_EXPORT_PATH` is an atomic, bounded schema-version-2 snapshot. It contains current-cycle markets, open positions, active orders, unresolved outcomes, recent settlements, calibration/research state, sync checkpoints, the current cycle receipt, and at most `STATE_JSON_RECENT_DECISIONS_LIMIT` decisions from that cycle. It intentionally excludes full receipt and trade history.
+- `STATE_JSON_EXPORT_INTERVAL_CYCLES` controls snapshot frequency (default `1`). A cycle receipt is committed before its snapshot is replaced.
+- Export complete history on demand without changing SQLite: `poetry run python scripts/export_state_audit.py --table decision_receipts --since 2026-07-01T00:00:00+00:00 --format ndjson --output decisions.ndjson`. Repeat `--table` to select multiple tables; omit it for every audit table.
+- Exchange order/position reconciliation runs before execution. Live submissions are suppressed when either snapshot is incomplete or when an exchange resting order is not represented locally.
 - Resolution tracking runs on a configurable cycle interval.
 - Logs are written under `LOG_DIR` (default `logs/`), including standard and error-focused outputs.
 

@@ -501,6 +501,7 @@ class Settings:
     # many distinct markets are locked for initial + deep research and forced
     # execution. A bounded run that cannot complete the target fails loudly.
     GUARANTEED_ORDERS_N: int = 0
+    ORDER_RECONCILIATION_ENABLED: bool = True
     POSITION_SYNC_ENABLED: bool = True
     POSITION_SYNC_INTERVAL_CYCLES: int = 3
     PRE_ORDER_MARKET_REFRESH: bool = True
@@ -526,6 +527,8 @@ class Settings:
     STATE_DB_PATH: str = "data/market_state.db"
     STATE_JSON_EXPORT_PATH: str = "data/market_state.json"
     EXPORT_STATE_JSON: bool = True
+    STATE_JSON_EXPORT_INTERVAL_CYCLES: int = 1
+    STATE_JSON_RECENT_DECISIONS_LIMIT: int = 500
 
     # Definitive side override
     MAX_DEFINITIVE_OVERRIDES_PER_CYCLE: int = 2
@@ -1505,6 +1508,10 @@ def load_settings() -> Settings:
         GUARANTEED_ORDERS_N=_read_env_int(
             "GUARANTEED_ORDERS_N", Settings.GUARANTEED_ORDERS_N
         ),
+        ORDER_RECONCILIATION_ENABLED=_read_env_bool(
+            "ORDER_RECONCILIATION_ENABLED",
+            Settings.ORDER_RECONCILIATION_ENABLED,
+        ),
         POSITION_SYNC_ENABLED=_read_env_bool(
             "POSITION_SYNC_ENABLED", Settings.POSITION_SYNC_ENABLED
         ),
@@ -1586,6 +1593,14 @@ def load_settings() -> Settings:
         ),
         EXPORT_STATE_JSON=_read_env_bool(
             "EXPORT_STATE_JSON", Settings.EXPORT_STATE_JSON
+        ),
+        STATE_JSON_EXPORT_INTERVAL_CYCLES=_read_env_int(
+            "STATE_JSON_EXPORT_INTERVAL_CYCLES",
+            Settings.STATE_JSON_EXPORT_INTERVAL_CYCLES,
+        ),
+        STATE_JSON_RECENT_DECISIONS_LIMIT=_read_env_int(
+            "STATE_JSON_RECENT_DECISIONS_LIMIT",
+            Settings.STATE_JSON_RECENT_DECISIONS_LIMIT,
         ),
         REANALYSIS_COOLDOWN_HOURS=_read_env_int(
             "REANALYSIS_COOLDOWN_HOURS",
@@ -2667,6 +2682,18 @@ def load_settings() -> Settings:
     _validate_required(settings)
     if settings.GUARANTEED_ORDERS_N < 0:
         raise ValueError("GUARANTEED_ORDERS_N must be greater than or equal to zero")
+    if settings.POSITION_SYNC_INTERVAL_CYCLES < 0:
+        raise ValueError(
+            "POSITION_SYNC_INTERVAL_CYCLES must be greater than or equal to zero"
+        )
+    if settings.STATE_JSON_EXPORT_INTERVAL_CYCLES < 0:
+        raise ValueError(
+            "STATE_JSON_EXPORT_INTERVAL_CYCLES must be greater than or equal to zero"
+        )
+    if settings.STATE_JSON_RECENT_DECISIONS_LIMIT <= 0:
+        raise ValueError(
+            "STATE_JSON_RECENT_DECISIONS_LIMIT must be greater than zero"
+        )
     return settings
 
 

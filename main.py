@@ -3503,6 +3503,13 @@ def _coerce_datetime(value: object) -> datetime | None:
         return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    fractional_match = re.match(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$",
+        text,
+    )
+    if fractional_match:
+        base, fraction, suffix = fractional_match.groups()
+        text = f"{base}.{fraction[:6].ljust(6, '0')}{suffix}"
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -5372,7 +5379,56 @@ def _iter_exchange_position_rows(payload: dict[str, Any] | None) -> list[dict[st
     return []
 
 
-def _parse_exchange_position_row(row: dict[str, Any]) -> tuple[str, str, float, int] | None:
+def _exchange_next_cursor(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    cursor = payload.get("cursor") or payload.get("next_cursor")
+    normalized = str(cursor or "").strip()
+    return normalized or None
+
+
+def _sync_watermark_min_ts(
+    state_manager: MarketStateManager,
+    stream: str,
+    *,
+    overlap_seconds: int = 300,
+) -> int | None:
+    rows = state_manager.get_exchange_sync_state(stream)
+    if not rows or not rows[0].get("high_watermark_ts"):
+        return None
+    watermark = _coerce_datetime(rows[0]["high_watermark_ts"])
+    if watermark is None:
+        return None
+    return max(0, int(watermark.timestamp()) - max(0, overlap_seconds))
+
+
+def _latest_timestamp(values: list[datetime | None]) -> str | None:
+    valid = [value for value in values if value is not None]
+    return max(valid).astimezone(timezone.utc).isoformat() if valid else None
+
+
+def _exchange_row_timestamp(
+    row: dict[str, Any],
+    *keys: str,
+) -> datetime | None:
+    for key in keys:
+        value = row.get(key)
+        parsed = _coerce_datetime(value)
+        if parsed is not None:
+            return parsed
+        numeric = _coerce_float(value)
+        if numeric is None:
+            continue
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            continue
+    return None
+
+
+def _parse_exchange_position_row(row: dict[str, Any]) -> tuple[str, str, float, float] | None:
     market_id = str(
         row.get("ticker")
         or row.get("market_ticker")
@@ -5387,10 +5443,10 @@ def _parse_exchange_position_row(row: dict[str, Any]) -> tuple[str, str, float, 
         no_count = float(row.get("no_count") or row.get("no_count_fp") or 0.0)
         contracts_raw = yes_count - no_count
     try:
-        contracts = int(float(contracts_raw or 0.0))
+        contracts = float(contracts_raw or 0.0)
     except (TypeError, ValueError):
         return None
-    if contracts == 0:
+    if abs(contracts) <= 1e-12:
         return None
     outcome = "YES" if contracts > 0 else "NO"
     exposure_raw = row.get("market_exposure_dollars")
@@ -5400,14 +5456,68 @@ def _parse_exchange_position_row(row: dict[str, Any]) -> tuple[str, str, float, 
     return market_id, outcome, abs(amount_usdc), abs(contracts)
 
 
+@dataclass(frozen=True)
+class PositionSyncMetrics:
+    synced_positions: int = 0
+    reconciled_positions: int = 0
+    closed_positions: int = 0
+    pages_fetched: int = 0
+    complete: bool = False
+
+    def __iter__(self):
+        # Retain compatibility with the former two-value return contract.
+        yield self.synced_positions
+        yield self.reconciled_positions
+
+
 def _sync_positions_from_exchange(
     *,
     state_manager: MarketStateManager,
     kalshi_client: KalshiClient,
-) -> tuple[int, int]:
-    payload = kalshi_client.get_positions()
-    rows = _iter_exchange_position_rows(payload)
-    synced = 0
+    max_pages: int = 50,
+) -> PositionSyncMetrics:
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages_fetched = 0
+    try:
+        for _ in range(max(1, int(max_pages))):
+            payload = kalshi_client.get_positions(
+                limit=1000,
+                cursor=cursor,
+                count_filter="position",
+                subaccount=0,
+            )
+            pages_fetched += 1
+            rows.extend(_iter_exchange_position_rows(payload))
+            cursor = _exchange_next_cursor(payload)
+            if not cursor:
+                break
+        complete = not cursor
+        if not complete:
+            error = f"position page cap reached after {pages_fetched} pages"
+            state_manager.record_exchange_sync_state(
+                "positions",
+                success=False,
+                cursor_exhausted=False,
+                rows_seen=len(rows),
+                error=error,
+            )
+            logger.warning(error)
+            return PositionSyncMetrics(
+                pages_fetched=pages_fetched,
+                complete=False,
+            )
+    except Exception as exc:
+        state_manager.record_exchange_sync_state(
+            "positions",
+            success=False,
+            cursor_exhausted=False,
+            rows_seen=len(rows),
+            error=str(exc),
+        )
+        raise
+
+    snapshots: list[dict[str, Any]] = []
     local_updates = 0
     for row in rows:
         parsed = _parse_exchange_position_row(row)
@@ -5420,14 +5530,17 @@ def _sync_positions_from_exchange(
             or abs(existing.total_amount_usdc - amount_usdc) > 0.01
         ):
             local_updates += 1
-        state_manager.upsert_position_snapshot(
-            market_id=market_id,
-            outcome=outcome,
-            total_amount_usdc=amount_usdc,
+        snapshots.append(
+            {
+                "market_id": market_id,
+                "outcome": outcome,
+                "total_amount_usdc": amount_usdc,
+                "contracts": contracts,
+                "source": "exchange",
+            }
         )
-        synced += 1
         logger.debug(
-            "Position sync row: market=%s outcome=%s contracts=%d amount_usdc=%.4f",
+            "Position sync row: market=%s outcome=%s contracts=%.4f amount_usdc=%.4f",
             market_id,
             outcome,
             contracts,
@@ -5439,7 +5552,356 @@ def _sync_positions_from_exchange(
                 "amount_usdc": amount_usdc,
             },
         )
-    return synced, local_updates
+    synced_at = datetime.now(timezone.utc)
+    synced, closed = state_manager.apply_complete_position_snapshot(
+        snapshots,
+        synced_at=synced_at,
+    )
+    state_manager.record_exchange_sync_state(
+        "positions",
+        success=True,
+        cursor_exhausted=True,
+        rows_seen=len(rows),
+        high_watermark_ts=synced_at.isoformat(),
+        attempted_at=synced_at,
+    )
+    return PositionSyncMetrics(
+        synced_positions=synced,
+        reconciled_positions=local_updates,
+        closed_positions=closed,
+        pages_fetched=pages_fetched,
+        complete=True,
+    )
+
+
+@dataclass(frozen=True)
+class OrderSyncMetrics:
+    reconciled_orders: int = 0
+    active_local_count: int = 0
+    exchange_resting_count: int = 0
+    unknown_exchange_orders: tuple[str, ...] = ()
+    pages_fetched: int = 0
+    complete: bool = False
+
+    @property
+    def live_submission_blocked(self) -> bool:
+        return not self.complete or bool(self.unknown_exchange_orders)
+
+
+def _reconciliation_execution_gate(
+    *,
+    dry_run: bool,
+    orders_ready: bool,
+    positions_ready: bool,
+    unknown_exchange_orders: tuple[str, ...] = (),
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if not orders_ready:
+        reasons.append("orders_incomplete")
+    if not positions_ready:
+        reasons.append("positions_incomplete")
+    if unknown_exchange_orders:
+        reasons.append("untracked_resting_orders")
+    return bool(not dry_run and reasons), reasons
+
+
+def _exchange_order_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("orders") or payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _unwrap_exchange_order(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("order")
+    if isinstance(nested, dict):
+        return nested
+    return payload if payload.get("order_id") or payload.get("id") else None
+
+
+def _exchange_order_id(row: dict[str, Any]) -> str:
+    return str(row.get("order_id") or row.get("id") or "").strip()
+
+
+def _normalized_exchange_order_status(
+    row: dict[str, Any],
+    *,
+    filled_shares: float,
+) -> str:
+    raw_status = str(row.get("status") or "").strip().lower()
+    if raw_status in {"resting", "open", "accepted", "pending"}:
+        return "resting"
+    if raw_status in {"executed", "filled"}:
+        return "filled"
+    if raw_status in {"canceled", "cancelled"}:
+        return "canceled_partially_filled" if filled_shares > 0.0 else "canceled"
+    if raw_status in {"expired", "rejected"}:
+        return raw_status
+    return raw_status or "unknown"
+
+
+def _exchange_order_fill_cost(row: dict[str, Any]) -> float | None:
+    maker = _extract_order_numeric_field(row, ("maker_fill_cost_dollars",))
+    taker = _extract_order_numeric_field(row, ("taker_fill_cost_dollars",))
+    if maker is None and taker is None:
+        return None
+    return max(0.0, float(maker or 0.0) + float(taker or 0.0))
+
+
+def _exchange_order_price(row: dict[str, Any], outcome: str) -> float | None:
+    normalized = str(outcome or "").strip().lower()
+    price = _extract_order_numeric_field(
+        row,
+        (f"{normalized}_price_dollars", "price_dollars"),
+    )
+    if price is None:
+        price = _extract_order_numeric_field(
+            row,
+            (f"{normalized}_price", "price"),
+        )
+        if price is not None and price > 1.0:
+            price /= 100.0
+    return max(0.0, min(1.0, float(price))) if price is not None else None
+
+
+def _find_historical_order(
+    *,
+    kalshi_client: KalshiClient,
+    order_id: str,
+    ticker: str,
+    max_pages: int,
+) -> dict[str, Any] | None:
+    cursor: str | None = None
+    for _ in range(max(1, int(max_pages))):
+        payload = kalshi_client.get_historical_orders(
+            ticker=ticker or None,
+            limit=1000,
+            cursor=cursor,
+        )
+        for row in _exchange_order_rows(payload):
+            if _exchange_order_id(row) == order_id:
+                return row
+        cursor = _exchange_next_cursor(payload)
+        if not cursor:
+            return None
+    raise RuntimeError(f"historical order page cap reached for order {order_id}")
+
+
+def _apply_exchange_order_snapshot(
+    *,
+    state_manager: MarketStateManager,
+    pending: dict[str, Any],
+    row: dict[str, Any],
+) -> bool:
+    order_id = _exchange_order_id(row)
+    filled_shares = max(
+        0.0,
+        float(
+            _extract_order_numeric_field(
+                row,
+                ("fill_count_fp", "fill_count", "filled_count"),
+            )
+            or 0.0
+        ),
+    )
+    requested = _extract_order_numeric_field(
+        row,
+        ("initial_count_fp", "initial_count", "count_fp", "count"),
+    )
+    remaining = _extract_order_numeric_field(
+        row,
+        ("remaining_count_fp", "remaining_count", "remaining_quantity"),
+    )
+    exchange_status = str(row.get("status") or "").strip().lower()
+    if exchange_status in {"executed", "filled"} and filled_shares <= 0.0:
+        filled_shares = max(0.0, float(requested or 0.0))
+    local_status = _normalized_exchange_order_status(
+        row,
+        filled_shares=filled_shares,
+    )
+    if local_status not in {
+        "resting",
+        "filled",
+        "canceled",
+        "canceled_partially_filled",
+        "expired",
+        "rejected",
+    }:
+        raise ValueError(
+            f"unsupported exchange status {exchange_status!r} for order {order_id}"
+        )
+    price = _exchange_order_price(row, str(pending.get("outcome") or ""))
+    cumulative_cost = _exchange_order_fill_cost(row)
+    if cumulative_cost is None and price is not None:
+        cumulative_cost = filled_shares * price
+    exchange_updated = str(
+        row.get("last_update_time") or row.get("updated_time") or ""
+    ).strip() or None
+    response = OrderResponse(id=order_id, status=local_status, raw=row)
+    return state_manager.apply_pending_order_fill(
+        order_id=order_id,
+        cumulative_filled_shares=filled_shares,
+        exchange_requested_shares=requested,
+        exchange_remaining_shares=remaining,
+        cumulative_filled_amount_usdc=cumulative_cost,
+        fill_price=price,
+        status=local_status,
+        exchange_status=exchange_status,
+        exchange_updated_at=exchange_updated,
+        raw=row,
+        record_trade_order=response,
+    ) is not None
+
+
+def _sync_orders_from_exchange(
+    *,
+    state_manager: MarketStateManager,
+    kalshi_client: KalshiClient,
+    max_pages: int = 50,
+) -> OrderSyncMetrics:
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages_fetched = 0
+    try:
+        for _ in range(max(1, int(max_pages))):
+            payload = kalshi_client.get_orders(
+                status="resting",
+                limit=1000,
+                cursor=cursor,
+                subaccount=0,
+            )
+            pages_fetched += 1
+            rows.extend(_exchange_order_rows(payload))
+            cursor = _exchange_next_cursor(payload)
+            if not cursor:
+                break
+        if cursor:
+            error = f"order page cap reached after {pages_fetched} pages"
+            state_manager.record_exchange_sync_state(
+                "orders",
+                success=False,
+                cursor_exhausted=False,
+                rows_seen=len(rows),
+                error=error,
+            )
+            return OrderSyncMetrics(pages_fetched=pages_fetched, complete=False)
+    except Exception as exc:
+        state_manager.record_exchange_sync_state(
+            "orders",
+            success=False,
+            cursor_exhausted=False,
+            rows_seen=len(rows),
+            error=str(exc),
+        )
+        raise
+
+    history_by_id = {
+        str(row["order_id"]): row
+        for row in state_manager.get_order_history()
+        if row.get("order_id")
+    }
+    active_by_id = {
+        str(row["order_id"]): row
+        for row in state_manager.get_pending_orders(active_only=True)
+        if row.get("order_id")
+    }
+    resting_by_id = {
+        order_id: row
+        for row in rows
+        if (order_id := _exchange_order_id(row))
+    }
+    unknown_exchange = tuple(
+        sorted(set(resting_by_id).difference(history_by_id))
+    )
+    reconciled = 0
+    lookup_errors: list[str] = []
+
+    # Apply all locally-known resting rows, including invalid terminal-to-active
+    # regressions. The state manager rejects regressions monotonically.
+    for order_id, row in resting_by_id.items():
+        pending = history_by_id.get(order_id)
+        if pending:
+            try:
+                applied = _apply_exchange_order_snapshot(
+                    state_manager=state_manager,
+                    pending=pending,
+                    row=row,
+                )
+            except Exception as exc:
+                lookup_errors.append(f"{order_id}: {exc}")
+            else:
+                if applied:
+                    reconciled += 1
+
+    # A complete resting snapshot proves only that an order is no longer
+    # active. Fetch the individual lifecycle before changing local state.
+    for order_id, pending in active_by_id.items():
+        if order_id in resting_by_id:
+            continue
+        try:
+            payload = kalshi_client.get_order(order_id, subaccount=0)
+            order_row = _unwrap_exchange_order(payload)
+        except Exception as live_exc:
+            try:
+                order_row = _find_historical_order(
+                    kalshi_client=kalshi_client,
+                    order_id=order_id,
+                    ticker=str(pending.get("market_id") or ""),
+                    max_pages=max_pages,
+                )
+            except Exception as historical_exc:
+                lookup_errors.append(
+                    f"{order_id}: live={live_exc}; historical={historical_exc}"
+                )
+                continue
+        if order_row is None:
+            lookup_errors.append(f"{order_id}: absent from live and historical orders")
+            continue
+        try:
+            applied = _apply_exchange_order_snapshot(
+                state_manager=state_manager,
+                pending=pending,
+                row=order_row,
+            )
+        except Exception as exc:
+            lookup_errors.append(f"{order_id}: {exc}")
+        else:
+            if applied:
+                reconciled += 1
+
+    complete = not lookup_errors
+    state_manager.record_exchange_sync_state(
+        "orders",
+        success=complete,
+        cursor_exhausted=True,
+        rows_seen=len(rows),
+        high_watermark_ts=datetime.now(timezone.utc).isoformat() if complete else None,
+        error="; ".join(lookup_errors) if lookup_errors else None,
+    )
+    if lookup_errors:
+        logger.warning(
+            "Order reconciliation incomplete: %s",
+            "; ".join(lookup_errors),
+            data={"lookup_errors": lookup_errors},
+        )
+    if unknown_exchange:
+        logger.error(
+            "Exchange has %d untracked resting order(s); live submissions blocked",
+            len(unknown_exchange),
+            data={"unknown_exchange_order_ids": list(unknown_exchange)},
+        )
+    return OrderSyncMetrics(
+        reconciled_orders=reconciled,
+        active_local_count=len(active_by_id),
+        exchange_resting_count=len(resting_by_id),
+        unknown_exchange_orders=unknown_exchange,
+        pages_fetched=pages_fetched,
+        complete=complete,
+    )
 
 
 def _iter_exchange_settlement_rows(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -5476,7 +5938,7 @@ def _parse_exchange_settlement_row(row: dict[str, Any]) -> dict[str, Any] | None
         or ""
     ).strip().upper()
     winning_outcome = winning_outcome_raw if winning_outcome_raw in {"YES", "NO"} else None
-    yes_contracts = int(
+    yes_contracts = float(
         _coerce_float(
             row.get("yes_count")
             or row.get("yes_count_fp")
@@ -5484,7 +5946,7 @@ def _parse_exchange_settlement_row(row: dict[str, Any]) -> dict[str, Any] | None
             or 0
         ) or 0.0
     )
-    no_contracts = int(
+    no_contracts = float(
         _coerce_float(
             row.get("no_count")
             or row.get("no_count_fp")
@@ -5493,7 +5955,7 @@ def _parse_exchange_settlement_row(row: dict[str, Any]) -> dict[str, Any] | None
         ) or 0.0
     )
     predicted_outcome: str | None = None
-    contracts = 0
+    contracts = 0.0
     avg_price: float | None = None
     cost_dollars: float = 0.0
     if yes_contracts > 0:
@@ -5567,11 +6029,48 @@ def _sync_settlements_from_exchange(
     state_manager: MarketStateManager,
     kalshi_client: KalshiClient,
     settings: Settings | None = None,
-    limit: int = 200,
+    limit: int = 1000,
+    max_pages: int = 50,
 ) -> int:
-    payload = kalshi_client.get_settlements(limit=limit)
-    rows = _iter_exchange_settlement_rows(payload)
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages_fetched = 0
+    min_ts = _sync_watermark_min_ts(state_manager, "settlements")
+    try:
+        for _ in range(max(1, int(max_pages))):
+            payload = kalshi_client.get_settlements(
+                limit=min(1000, max(1, int(limit))),
+                cursor=cursor,
+                min_ts=min_ts,
+                subaccount=0,
+            )
+            pages_fetched += 1
+            rows.extend(_iter_exchange_settlement_rows(payload))
+            cursor = _exchange_next_cursor(payload)
+            if not cursor:
+                break
+        if cursor:
+            error = f"settlement page cap reached after {pages_fetched} pages"
+            state_manager.record_exchange_sync_state(
+                "settlements",
+                success=False,
+                cursor_exhausted=False,
+                rows_seen=len(rows),
+                error=error,
+            )
+            return 0
+    except Exception as exc:
+        state_manager.record_exchange_sync_state(
+            "settlements",
+            success=False,
+            cursor_exhausted=False,
+            rows_seen=len(rows),
+            error=str(exc),
+        )
+        raise
+
     imported = 0
+    timestamps: list[datetime | None] = []
     for row in rows:
         parsed = _parse_exchange_settlement_row(row)
         if parsed is None:
@@ -5595,6 +6094,23 @@ def _sync_settlements_from_exchange(
             ),
         )
         imported += 1
+        timestamps.append(
+            parsed.get("settled_at")
+            or _exchange_row_timestamp(
+                row,
+                "settled_time",
+                "created_time",
+                "created_at",
+                "ts",
+            )
+        )
+    state_manager.record_exchange_sync_state(
+        "settlements",
+        success=True,
+        cursor_exhausted=True,
+        rows_seen=len(rows),
+        high_watermark_ts=_latest_timestamp(timestamps),
+    )
     return imported
 
 
@@ -5605,6 +6121,8 @@ class ExchangeFillSyncMetrics:
     filled_shares: float = 0.0
     filled_notional_usdc: float = 0.0
     external_order_count: int = 0
+    pages_fetched: int = 0
+    complete: bool = False
 
 
 def _exchange_fill_rows(payload: Any) -> list[dict[str, Any]]:
@@ -5625,6 +6143,10 @@ def _exchange_fill_order_id(row: dict[str, Any]) -> str:
         or row.get("client_order_id")
         or ""
     ).strip()
+
+
+def _exchange_fill_id(row: dict[str, Any]) -> str:
+    return str(row.get("fill_id") or "").strip()
 
 
 def _exchange_fill_quantity(row: dict[str, Any]) -> float:
@@ -5667,12 +6189,49 @@ def _sync_exchange_fills(
     *,
     state_manager: MarketStateManager,
     kalshi_client: KalshiClient,
-    limit: int = 200,
+    limit: int = 1000,
+    max_pages: int = 50,
 ) -> ExchangeFillSyncMetrics:
-    payload = kalshi_client.get_fills(limit=limit)
-    rows = _exchange_fill_rows(payload)
-    if not rows:
-        return ExchangeFillSyncMetrics()
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages_fetched = 0
+    min_ts = _sync_watermark_min_ts(state_manager, "fills")
+    try:
+        for _ in range(max(1, int(max_pages))):
+            payload = kalshi_client.get_fills(
+                limit=min(1000, max(1, int(limit))),
+                cursor=cursor,
+                min_ts=min_ts,
+                subaccount=0,
+            )
+            pages_fetched += 1
+            rows.extend(_exchange_fill_rows(payload))
+            cursor = _exchange_next_cursor(payload)
+            if not cursor:
+                break
+        if cursor:
+            error = f"fill page cap reached after {pages_fetched} pages"
+            state_manager.record_exchange_sync_state(
+                "fills",
+                success=False,
+                cursor_exhausted=False,
+                rows_seen=len(rows),
+                error=error,
+            )
+            return ExchangeFillSyncMetrics(
+                pages_fetched=pages_fetched,
+                complete=False,
+            )
+    except Exception as exc:
+        state_manager.record_exchange_sync_state(
+            "fills",
+            success=False,
+            cursor_exhausted=False,
+            rows_seen=len(rows),
+            error=str(exc),
+        )
+        raise
+
     known_order_ids = state_manager.get_known_order_ids()
     pending_by_order_id = {
         str(pending["order_id"]): pending
@@ -5681,25 +6240,47 @@ def _sync_exchange_fills(
     }
     external_order_ids: set[str] = set()
     fill_aggregates: dict[str, dict[str, Any]] = {}
+    inserted_fill_events = 0
+    timestamps: list[datetime | None] = []
     for row in rows:
         order_id = _exchange_fill_order_id(row)
         if not order_id:
             continue
+        filled_at = _exchange_row_timestamp(row, "created_time", "created_at", "ts")
+        timestamps.append(filled_at)
+        quantity = _exchange_fill_quantity(row)
+        outcome = str(row.get("side") or row.get("outcome_side") or "").upper()
+        pending = pending_by_order_id.get(order_id)
+        if pending is not None:
+            outcome = str(pending.get("outcome") or outcome)
+        price = _exchange_fill_price(row, outcome=outcome)
+        if price is None and pending is not None and pending.get("limit_price") is not None:
+            price = float(pending["limit_price"])
+        fill_id = _exchange_fill_id(row)
+        market_id = str(
+            row.get("market_ticker")
+            or row.get("ticker")
+            or (pending.get("market_id") if pending else "")
+            or ""
+        ).strip()
+        if fill_id and state_manager.record_order_fill_event(
+            fill_id=fill_id,
+            order_id=order_id,
+            market_id=market_id,
+            quantity=quantity,
+            price=price,
+            amount_usdc=quantity * float(price or 0.0),
+            filled_at=filled_at.isoformat() if filled_at is not None else None,
+            raw=row,
+        ):
+            inserted_fill_events += 1
         if order_id not in known_order_ids:
             external_order_ids.add(order_id)
             continue
-        pending = pending_by_order_id.get(order_id)
         if pending is None:
             continue
-        quantity = _exchange_fill_quantity(row)
         if quantity <= 0.0:
             continue
-        price = _exchange_fill_price(
-            row,
-            outcome=str(pending.get("outcome") or ""),
-        )
-        if price is None and pending.get("limit_price") is not None:
-            price = float(pending["limit_price"])
         aggregate = fill_aggregates.setdefault(
             order_id,
             {"shares": 0.0, "notional": 0.0, "rows": []},
@@ -5710,7 +6291,6 @@ def _sync_exchange_fills(
         aggregate["rows"].append(row)
 
     reconciled_orders = 0
-    new_fill_events = 0
     filled_shares = 0.0
     filled_notional_usdc = 0.0
     for order_id, aggregate in fill_aggregates.items():
@@ -5752,16 +6332,25 @@ def _sync_exchange_fills(
         delta_notional = float(update["delta_filled_amount_usdc"] or 0.0)
         if delta_shares <= 0.0:
             continue
-        new_fill_events += 1
         filled_shares += delta_shares
         filled_notional_usdc += delta_notional
 
+    state_manager.record_exchange_sync_state(
+        "fills",
+        success=True,
+        cursor_exhausted=True,
+        rows_seen=len(rows),
+        high_watermark_ts=_latest_timestamp(timestamps),
+    )
+
     return ExchangeFillSyncMetrics(
         reconciled_orders=reconciled_orders,
-        new_fill_events=new_fill_events,
+        new_fill_events=inserted_fill_events,
         filled_shares=round(filled_shares, 8),
         filled_notional_usdc=round(filled_notional_usdc, 8),
         external_order_count=len(external_order_ids),
+        pages_fetched=pages_fetched,
+        complete=True,
     )
 
 
@@ -9310,6 +9899,9 @@ def main(max_cycles: int | None = None) -> None:
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
+    order_reconciliation_ready = False
+    position_reconciliation_ready = False
+    unknown_exchange_order_ids: tuple[str, ...] = ()
 
     while True:
         cycle_count += 1
@@ -9442,6 +10034,25 @@ def main(max_cycles: int | None = None) -> None:
             markets = _dedupe_markets_by_matchup(markets)
 
             markets = scheduler.prioritize_markets(markets, state_manager)
+            try:
+                persisted_market_count = state_manager.upsert_market_snapshots(
+                    markets,
+                    cycle_id=cycle_id,
+                )
+                logger.debug(
+                    "Persisted %d current market metadata row(s)",
+                    persisted_market_count,
+                    data={
+                        "cycle_id": cycle_id,
+                        "persisted_market_count": persisted_market_count,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Current market metadata persistence failed: %s",
+                    exc,
+                    data={"cycle_id": cycle_id, "error": str(exc)},
+                )
             # Counter of market_family for the post-prioritization eligible
             # list. This shows operators *which* families survived the page
             # cap (the exact question raised by the cycle 2 review).
@@ -9521,31 +10132,94 @@ def main(max_cycles: int | None = None) -> None:
                     exc,
                     data={"error": str(exc)},
                 )
-            if (
-                settings.POSITION_SYNC_ENABLED
-                and settings.POSITION_SYNC_INTERVAL_CYCLES > 0
-                and cycle_count % settings.POSITION_SYNC_INTERVAL_CYCLES == 0
-            ):
+            order_sync_metrics = OrderSyncMetrics()
+            order_sync_due = settings.ORDER_RECONCILIATION_ENABLED
+            if order_sync_due:
                 try:
-                    synced_positions, reconciled_positions = _sync_positions_from_exchange(
+                    order_sync_metrics = _sync_orders_from_exchange(
                         state_manager=state_manager,
                         kalshi_client=kalshi_client,
+                        max_pages=settings.KALSHI_MAX_FETCH_PAGES,
+                    )
+                    order_reconciliation_ready = order_sync_metrics.complete
+                    unknown_exchange_order_ids = (
+                        order_sync_metrics.unknown_exchange_orders
                     )
                     logger.info(
-                        "Kalshi position sync complete: synced=%d reconciled=%d",
-                        synced_positions,
-                        reconciled_positions,
+                        "Kalshi order reconciliation: complete=%s resting=%d local_active=%d unknown=%d",
+                        order_sync_metrics.complete,
+                        order_sync_metrics.exchange_resting_count,
+                        order_sync_metrics.active_local_count,
+                        len(order_sync_metrics.unknown_exchange_orders),
                         data={
-                            "synced_positions": synced_positions,
-                            "reconciled_positions": reconciled_positions,
+                            "order_sync": order_sync_metrics.__dict__,
                         },
                     )
                 except Exception as exc:
+                    order_reconciliation_ready = False
+                    logger.warning(
+                        "Kalshi order reconciliation failed: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+            elif not settings.ORDER_RECONCILIATION_ENABLED:
+                order_reconciliation_ready = False
+
+            position_sync_metrics = PositionSyncMetrics()
+            position_sync_due = (
+                settings.POSITION_SYNC_ENABLED
+                and settings.POSITION_SYNC_INTERVAL_CYCLES > 0
+                and (
+                    cycle_count == 1
+                    or cycle_count % settings.POSITION_SYNC_INTERVAL_CYCLES == 0
+                )
+            )
+            if position_sync_due:
+                try:
+                    position_sync_metrics = _sync_positions_from_exchange(
+                        state_manager=state_manager,
+                        kalshi_client=kalshi_client,
+                        max_pages=settings.KALSHI_MAX_FETCH_PAGES,
+                    )
+                    position_reconciliation_ready = position_sync_metrics.complete
+                    logger.info(
+                        "Kalshi position sync complete: synced=%d reconciled=%d closed=%d pages=%d",
+                        position_sync_metrics.synced_positions,
+                        position_sync_metrics.reconciled_positions,
+                        position_sync_metrics.closed_positions,
+                        position_sync_metrics.pages_fetched,
+                        data={"position_sync": position_sync_metrics.__dict__},
+                    )
+                except Exception as exc:
+                    position_reconciliation_ready = False
                     logger.warning(
                         "Kalshi position sync failed: %s",
                         exc,
                         data={"error": str(exc)},
                     )
+            elif not settings.POSITION_SYNC_ENABLED:
+                position_reconciliation_ready = False
+
+            (
+                reconciliation_live_blocked,
+                reconciliation_block_reasons,
+            ) = _reconciliation_execution_gate(
+                dry_run=settings.DRY_RUN,
+                orders_ready=order_reconciliation_ready,
+                positions_ready=position_reconciliation_ready,
+                unknown_exchange_orders=unknown_exchange_order_ids,
+            )
+            if reconciliation_live_blocked:
+                logger.error(
+                    "Live submissions blocked for cycle %d: %s",
+                    cycle_count,
+                    ", ".join(reconciliation_block_reasons),
+                    data={
+                        "cycle": cycle_count,
+                        "reconciliation_block_reasons": reconciliation_block_reasons,
+                        "unknown_exchange_order_ids": list(unknown_exchange_order_ids),
+                    },
+                )
 
             if settings.RESOLUTION_SYNC_INTERVAL_CYCLES > 0:
                 if cycle_count % settings.RESOLUTION_SYNC_INTERVAL_CYCLES == 0:
@@ -9567,6 +10241,7 @@ def main(max_cycles: int | None = None) -> None:
                             state_manager=state_manager,
                             kalshi_client=kalshi_client,
                             settings=settings,
+                            max_pages=settings.KALSHI_MAX_FETCH_PAGES,
                         )
                         if synced_settlements > 0:
                             logger.info(
@@ -9602,6 +10277,7 @@ def main(max_cycles: int | None = None) -> None:
                 fill_sync_metrics = _sync_exchange_fills(
                     state_manager=state_manager,
                     kalshi_client=kalshi_client,
+                    max_pages=settings.KALSHI_MAX_FETCH_PAGES,
                 )
                 if (
                     fill_sync_metrics.new_fill_events > 0
@@ -16244,6 +16920,45 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     continue
 
+                if reconciliation_live_blocked:
+                    logger.warning(
+                        "RECONCILIATION_BLOCK: [%s] live order suppressed (%s)",
+                        market.id,
+                        ", ".join(reconciliation_block_reasons),
+                        data={
+                            "market_id": market.id,
+                            "reconciliation_block_reasons": reconciliation_block_reasons,
+                            "unknown_exchange_order_ids": list(
+                                unknown_exchange_order_ids
+                            ),
+                        },
+                    )
+                    trades_skipped_position += 1
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="state_reconciliation_block",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="state_reconciliation_incomplete",
+                            reconciliation_block_reasons=reconciliation_block_reasons,
+                            unknown_exchange_order_ids=list(
+                                unknown_exchange_order_ids
+                            ),
+                            **order_audit_context,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "state_reconciliation_incomplete",
+                    )
+                    continue
+
                 if settings.DRY_RUN:
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
                     logger.info(
@@ -17228,7 +17943,11 @@ def main(max_cycles: int | None = None) -> None:
                     market_duration,
                 )
 
-            if guaranteed_order_plan.target > 0 and not guaranteed_order_plan.is_complete:
+            if (
+                guaranteed_order_plan.target > 0
+                and not guaranteed_order_plan.is_complete
+                and not reconciliation_live_blocked
+            ):
                 guaranteed_cycle_result = _run_guaranteed_order_phase(
                     plan=guaranteed_order_plan,
                     markets=markets,
@@ -17271,15 +17990,20 @@ def main(max_cycles: int | None = None) -> None:
                     family_stats["order_attempts"] += family_attempts
                 if guaranteed_cycle_result.usd_submitted > 0:
                     _refresh_last_known_balance()
-            if settings.EXPORT_STATE_JSON:
-                try:
-                    state_manager.export_to_json(settings.STATE_JSON_EXPORT_PATH)
-                except Exception as exc:
-                    logger.warning(
-                        "State export failed: %s",
-                        exc,
-                        data={"path": settings.STATE_JSON_EXPORT_PATH, "error": str(exc)},
-                    )
+            elif (
+                guaranteed_order_plan.target > 0
+                and not guaranteed_order_plan.is_complete
+                and reconciliation_live_blocked
+            ):
+                guaranteed_order_failures_this_cycle.append(
+                    {
+                        "stage": "state_reconciliation",
+                        "reason": "state_reconciliation_incomplete",
+                        "reconciliation_block_reasons": list(
+                            reconciliation_block_reasons
+                        ),
+                    }
+                )
 
             cycle_duration = (time.monotonic() - cycle_start) * 1000
             mode_suffix = " [ANALYSIS_ONLY]" if analysis_only_mode else ""
@@ -17727,6 +18451,14 @@ def main(max_cycles: int | None = None) -> None:
                 if confidence_calibration_historical_win_rates
                 else None,
                 "analysis_only_mode": analysis_only_mode,
+                "reconciliation_live_blocked": reconciliation_live_blocked,
+                "reconciliation_block_reasons": reconciliation_block_reasons,
+                "unknown_exchange_order_ids": list(unknown_exchange_order_ids),
+                "order_reconciliation": order_sync_metrics.__dict__,
+                "position_reconciliation": position_sync_metrics.__dict__,
+                "fill_reconciliation": fill_sync_metrics.__dict__,
+                "order_reconciliation_ready": order_reconciliation_ready,
+                "position_reconciliation_ready": position_reconciliation_ready,
                 "balance_at_cycle_start": cycle_balance_start,
                 "cash_balance_at_cycle_start": cycle_cash_balance,
                 "total_portfolio_value_at_cycle_start": cycle_balance_start,
@@ -17763,12 +18495,14 @@ def main(max_cycles: int | None = None) -> None:
                 "Cycle receipt",
                 data={"cycle_receipt": cycle_receipt},
             )
+            cycle_receipt_persisted = False
             try:
                 state_manager.record_cycle_receipt(
                     cycle_id=cycle_id,
                     cycle_number=cycle_count,
                     payload=cycle_receipt,
                 )
+                cycle_receipt_persisted = True
             except Exception as receipt_exc:
                 logger.warning(
                     "Cycle receipt persistence failed: cycle=%s error=%s",
@@ -17776,6 +18510,35 @@ def main(max_cycles: int | None = None) -> None:
                     receipt_exc,
                     data={"cycle_id": cycle_id, "error": str(receipt_exc)},
                 )
+            if (
+                settings.EXPORT_STATE_JSON
+                and settings.STATE_JSON_EXPORT_INTERVAL_CYCLES > 0
+                and cycle_count % settings.STATE_JSON_EXPORT_INTERVAL_CYCLES == 0
+            ):
+                if not cycle_receipt_persisted:
+                    logger.warning(
+                        "State export skipped because current cycle receipt was not persisted",
+                        data={"cycle_id": cycle_id},
+                    )
+                else:
+                    try:
+                        state_manager.export_to_json(
+                            settings.STATE_JSON_EXPORT_PATH,
+                            cycle_id=cycle_id,
+                            recent_decisions_limit=(
+                                settings.STATE_JSON_RECENT_DECISIONS_LIMIT
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "State export failed: %s",
+                            exc,
+                            data={
+                                "path": settings.STATE_JSON_EXPORT_PATH,
+                                "cycle_id": cycle_id,
+                                "error": str(exc),
+                            },
+                        )
             logger.info(
                 "Price bucket summary: low=%d mid=%d high=%d",
                 price_bucket_stats[_PRICE_BUCKET_LOW],
