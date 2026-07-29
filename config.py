@@ -496,6 +496,11 @@ class Settings:
 
     # Execution
     DRY_RUN: bool = True
+    # Opt-in run-level execution guarantee. When positive, normal analysis and
+    # gates still run, but ordinary submissions are suppressed; exactly this
+    # many distinct markets are locked for initial + deep research and forced
+    # execution. A bounded run that cannot complete the target fails loudly.
+    GUARANTEED_ORDERS_N: int = 0
     POSITION_SYNC_ENABLED: bool = True
     POSITION_SYNC_INTERVAL_CYCLES: int = 3
     PRE_ORDER_MARKET_REFRESH: bool = True
@@ -1497,6 +1502,9 @@ def load_settings() -> Settings:
             Settings.KALSHI_FETCH_TOPUP_ENABLED,
         ),
         DRY_RUN=_read_env_bool("DRY_RUN", Settings.DRY_RUN),
+        GUARANTEED_ORDERS_N=_read_env_int(
+            "GUARANTEED_ORDERS_N", Settings.GUARANTEED_ORDERS_N
+        ),
         POSITION_SYNC_ENABLED=_read_env_bool(
             "POSITION_SYNC_ENABLED", Settings.POSITION_SYNC_ENABLED
         ),
@@ -2657,6 +2665,8 @@ def load_settings() -> Settings:
     )
 
     _validate_required(settings)
+    if settings.GUARANTEED_ORDERS_N < 0:
+        raise ValueError("GUARANTEED_ORDERS_N must be greater than or equal to zero")
     return settings
 
 

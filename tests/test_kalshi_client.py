@@ -456,6 +456,40 @@ class TestKalshiClient(unittest.TestCase):
         # Unfilled good-till-canceled limit rests on the book (not canceled).
         self.assertEqual(response.status, "resting")
 
+    def test_submit_order_uses_explicit_idempotency_key(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-IDEMPOTENT",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id=market.id,
+            outcome="YES",
+            amount_usdc=5.0,
+        )
+        response_payload = {
+            "order_id": "ord-idempotent",
+            "fill_count": "0.00",
+            "remaining_count": "10.00",
+        }
+
+        with patch.object(
+            client,
+            "_request",
+            return_value=_DummyResponse(response_payload),
+        ) as req_mock:
+            client.submit_order(
+                order,
+                market=market,
+                client_order_id="BOT-GUAR-run-001",
+            )
+
+        self.assertEqual(
+            req_mock.call_args.kwargs["json"]["client_order_id"],
+            "BOT-GUAR-run-001",
+        )
+
     def test_submit_order_uses_no_price_for_no_side(self) -> None:
         client = self._client()
         market = Market(

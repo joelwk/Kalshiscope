@@ -71,6 +71,14 @@ python main.py
 - `DRY_RUN=true`: analyze and log candidate trades only.
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
+`GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
+continues its normal analysis and gating loop but reserves exactly that many
+distinct markets for an additional initial-plus-deep research pass and forced
+minimum-size execution. Ordinary gate-cleared submissions are suppressed in
+this mode so the run cannot exceed the target. Dry runs persist exactly that
+many attempted-order receipts; bounded live runs fail explicitly if Kalshi does
+not accept all target submissions.
+
 Start in dry run and switch to live only after reviewing behavior in logs.
 
 ## Environment Variables

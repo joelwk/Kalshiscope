@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import sys
@@ -4002,6 +4002,7 @@ def _log_settings_summary(settings) -> None:
         close_days_info,
         data={
             "dry_run": settings.DRY_RUN,
+            "guaranteed_orders_n": settings.GUARANTEED_ORDERS_N,
             "min_bet_usdc": settings.MIN_BET_USDC,
             "max_bet_usdc": settings.MAX_BET_USDC,
             "min_confidence": settings.MIN_CONFIDENCE,
@@ -4256,6 +4257,116 @@ class ExecutionMarketSnapshot:
     orderbook_error: Exception | None
 
 
+class GuaranteedOrdersIncompleteError(RuntimeError):
+    """Raised when a bounded guaranteed-order run cannot reach its target."""
+
+
+@dataclass
+class GuaranteedOrderSlot:
+    slot_number: int
+    market_id: str
+    market: Market
+    locked_cycle: int
+    client_order_id: str
+    decision: TradeDecision | None = None
+    research_completed: bool = False
+    completed: bool = False
+    submission_attempts: int = 0
+    last_error: str | None = None
+    order_id: str | None = None
+
+
+@dataclass
+class GuaranteedOrderPlan:
+    target: int
+    run_id: str = field(
+        default_factory=lambda: hashlib.sha1(
+            str(time.time_ns()).encode("utf-8")
+        ).hexdigest()[:12]
+    )
+    slots: list[GuaranteedOrderSlot] = field(default_factory=list)
+    normal_execution_suppressed: int = 0
+
+    @property
+    def locked_count(self) -> int:
+        return len(self.slots)
+
+    @property
+    def completed_count(self) -> int:
+        return sum(1 for slot in self.slots if slot.completed)
+
+    @property
+    def remaining_count(self) -> int:
+        return max(0, self.target - self.completed_count)
+
+    @property
+    def is_fully_locked(self) -> bool:
+        return self.locked_count == self.target
+
+    @property
+    def is_complete(self) -> bool:
+        return self.completed_count == self.target
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "target": self.target,
+            "run_id": self.run_id,
+            "locked_count": self.locked_count,
+            "completed_count": self.completed_count,
+            "remaining_count": self.remaining_count,
+            "is_complete": self.is_complete,
+            "normal_execution_suppressed": self.normal_execution_suppressed,
+            "slots": [
+                {
+                    "slot_number": slot.slot_number,
+                    "market_id": slot.market_id,
+                    "locked_cycle": slot.locked_cycle,
+                    "client_order_id": slot.client_order_id,
+                    "research_completed": slot.research_completed,
+                    "completed": slot.completed,
+                    "submission_attempts": slot.submission_attempts,
+                    "last_error": slot.last_error,
+                    "order_id": slot.order_id,
+                }
+                for slot in self.slots
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class GuaranteedOrderAttemptResult:
+    status: str
+    decision: TradeDecision | None = None
+    active_market: Market | None = None
+    amount_usdc: float = 0.0
+    order_response: OrderResponse | None = None
+    order_lifecycle: OrderLifecycleMetrics | None = None
+    order_persistence: dict[str, Any] | None = None
+    submission_attempted: bool = False
+    intense_research_performed: bool = False
+    token_usage: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass
+class GuaranteedOrderCycleResult:
+    locked: int = 0
+    attempted: int = 0
+    completed: int = 0
+    filled: int = 0
+    partially_filled: int = 0
+    resting_unfilled: int = 0
+    canceled_unfilled: int = 0
+    usd_submitted: float = 0.0
+    usd_deployed: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    attempts_by_family: dict[str, int] = field(default_factory=dict)
+    failures: list[dict[str, Any]] = field(default_factory=list)
+
+
 def _load_execution_market_snapshot(
     *,
     market: Market,
@@ -4363,6 +4474,581 @@ def _load_execution_market_snapshot(
         orderbook_best_sell=orderbook_best_sell,
         orderbook_error=orderbook_error,
     )
+
+
+def _is_guaranteed_order_market_candidate(
+    market: Market,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether either result can be safely represented as an order."""
+    if not market.id or _is_market_resolved_or_closed(market):
+        return False
+    close_time = market.close_time
+    if close_time is not None:
+        close_time_utc = (
+            close_time.replace(tzinfo=timezone.utc)
+            if close_time.tzinfo is None
+            else close_time.astimezone(timezone.utc)
+        )
+        if close_time_utc <= (now or datetime.now(timezone.utc)):
+            return False
+    for side in ("YES", "NO"):
+        price = _get_outcome_entry_price(market, side)
+        if price is None:
+            return False
+        if not (
+            settings.ORDER_SUBMISSION_MIN_PRICE
+            <= price
+            <= settings.ORDER_SUBMISSION_MAX_PRICE
+        ):
+            return False
+    return True
+
+
+def _guaranteed_order_market_rank(market: Market) -> tuple[float, float, float, str]:
+    """Prefer liquid, active, information-rich markets for forced research."""
+    yes_price = _get_outcome_entry_price(market, "YES")
+    price_quality = 0.0 if yes_price is None else 1.0 - abs(yes_price - 0.5)
+    return (
+        float(market.liquidity_usdc or 0.0),
+        float(market.volume_24h or market.volume or 0.0),
+        price_quality,
+        str(market.id),
+    )
+
+
+def _lock_guaranteed_order_markets(
+    plan: GuaranteedOrderPlan,
+    markets: list[Market],
+    *,
+    excluded_market_ids: set[str],
+    settings: Settings,
+    cycle_number: int,
+) -> list[GuaranteedOrderSlot]:
+    """Lock distinct markets until the plan contains exactly its target count."""
+    if plan.target <= 0:
+        return []
+
+    current_by_id = {market.id: market for market in markets if market.id}
+    for slot in plan.slots:
+        refreshed = current_by_id.get(slot.market_id)
+        if refreshed is not None:
+            slot.market = refreshed
+
+    if plan.is_fully_locked:
+        return []
+
+    locked_ids = {slot.market_id for slot in plan.slots}
+    candidates = [
+        market
+        for market in markets
+        if market.id not in locked_ids
+        and market.id not in excluded_market_ids
+        and _is_guaranteed_order_market_candidate(market, settings)
+    ]
+    candidates.sort(key=_guaranteed_order_market_rank, reverse=True)
+
+    newly_locked: list[GuaranteedOrderSlot] = []
+    slots_needed = max(0, plan.target - plan.locked_count)
+    for market in candidates[:slots_needed]:
+        slot = GuaranteedOrderSlot(
+            slot_number=plan.locked_count + 1,
+            market_id=market.id,
+            market=market,
+            locked_cycle=cycle_number,
+            client_order_id=(
+                f"BOT-GUAR-{plan.run_id}-{plan.locked_count + 1:03d}"
+            ),
+        )
+        plan.slots.append(slot)
+        newly_locked.append(slot)
+    return newly_locked
+
+
+def _forced_execution_decision(
+    decision: TradeDecision,
+    market: Market,
+    *,
+    amount_usdc: float,
+    max_bet_usdc: float,
+) -> TradeDecision:
+    """Turn the deep-research side judgment into an execution instruction."""
+    outcome = str(decision.outcome or "").strip().upper()
+    if _find_market_outcome(market, outcome) is None:
+        probability_yes = decision.probability_yes
+        if probability_yes is None:
+            probability_yes = getattr(decision, "my_prob", None)
+        if probability_yes is None:
+            raise ValueError(
+                f"Deep research returned unmappable outcome {decision.outcome!r} "
+                f"for guaranteed market {market.id}"
+            )
+        outcome = "YES" if float(probability_yes) >= 0.5 else "NO"
+    if _get_outcome_entry_price(market, outcome) is None:
+        raise ValueError(
+            f"Guaranteed market {market.id} has no executable price for {outcome}"
+        )
+    bet_size_pct = 1.0
+    if max_bet_usdc > 0:
+        bet_size_pct = max(0.0, min(1.0, amount_usdc / max_bet_usdc))
+    return decision.model_copy(
+        update={
+            "should_trade": True,
+            "abstain": False,
+            "outcome": outcome,
+            "bet_size_pct": bet_size_pct,
+            "reasoning": (
+                "[GuaranteedOrder forced after initial+deep research; "
+                "ordinary execution gates are audit-only for this slot] "
+                f"{decision.reasoning}"
+            ),
+        }
+    )
+
+
+def _attempt_guaranteed_order_slot(
+    slot: GuaranteedOrderSlot,
+    *,
+    grok_client: GrokClient,
+    kalshi_client: KalshiClient,
+    state_manager: MarketStateManager,
+    settings: Settings,
+) -> GuaranteedOrderAttemptResult:
+    """Research a locked slot intensely and make its one forced order attempt."""
+    intense_research_performed = False
+    token_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+    }
+
+    def _capture_usage(analyzed_decision: TradeDecision) -> None:
+        for usage_key in token_usage:
+            token_usage[usage_key] += int(
+                getattr(analyzed_decision, usage_key, 0) or 0
+            )
+
+    decision = slot.decision
+    amount_usdc = max(0.0, float(settings.MIN_BET_USDC))
+    if settings.MAX_BET_USDC > 0:
+        amount_usdc = min(amount_usdc, float(settings.MAX_BET_USDC))
+    if amount_usdc <= 0:
+        error = "Guaranteed orders require MIN_BET_USDC and MAX_BET_USDC to allow a positive order"
+        slot.last_error = error
+        return GuaranteedOrderAttemptResult(status="invalid_bet_size", error=error)
+
+    if decision is None:
+        try:
+            research_market = slot.market
+            search_config = _build_extended_reanalysis_search_config(
+                build_market_search_config(settings, research_market),
+                settings,
+            )
+            initial_decision = grok_client.analyze_market(
+                research_market,
+                search_config=search_config,
+                previous_analysis=None,
+                allow_self_consistency=True,
+            )
+            _capture_usage(initial_decision)
+            deep_decision = grok_client.analyze_market_deep(
+                research_market,
+                previous_analysis=initial_decision,
+                search_config=search_config,
+            )
+            _capture_usage(deep_decision)
+            decision = _forced_execution_decision(
+                deep_decision,
+                research_market,
+                amount_usdc=amount_usdc,
+                max_bet_usdc=settings.MAX_BET_USDC,
+            )
+            slot.decision = decision
+            slot.research_completed = True
+            slot.last_error = None
+            intense_research_performed = True
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            slot.last_error = error
+            return GuaranteedOrderAttemptResult(
+                status="research_failed",
+                intense_research_performed=intense_research_performed,
+                token_usage=token_usage,
+                error=error,
+            )
+
+    try:
+        execution_snapshot = _load_execution_market_snapshot(
+            market=slot.market,
+            decision=decision,
+            kalshi_client=kalshi_client,
+            settings=settings,
+            market_snapshot_monotonic=time.monotonic(),
+        )
+        active_market = execution_snapshot.market
+        if _is_market_resolved_or_closed(active_market):
+            raise MarketClosedError(f"Guaranteed market {active_market.id} is closed")
+        entry_price = _get_outcome_entry_price(active_market, decision.outcome)
+        if entry_price is None or not (
+            settings.ORDER_SUBMISSION_MIN_PRICE
+            <= entry_price
+            <= settings.ORDER_SUBMISSION_MAX_PRICE
+        ):
+            raise ValueError(
+                f"Guaranteed market {active_market.id} price for {decision.outcome} "
+                f"is outside submission band: {entry_price!r}"
+            )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        slot.last_error = error
+        return GuaranteedOrderAttemptResult(
+            status="market_validation_failed",
+            decision=decision,
+            amount_usdc=amount_usdc,
+            intense_research_performed=intense_research_performed,
+            token_usage=token_usage,
+            error=error,
+        )
+
+    if settings.DRY_RUN:
+        slot.submission_attempts += 1
+        return GuaranteedOrderAttemptResult(
+            status="dry_run",
+            decision=decision,
+            active_market=active_market,
+            amount_usdc=amount_usdc,
+            intense_research_performed=intense_research_performed,
+            token_usage=token_usage,
+        )
+
+    order = _build_order_request_from_market(active_market, decision, amount_usdc)
+    slot.submission_attempts += 1
+    try:
+        order_response = kalshi_client.submit_order(
+            order,
+            market=active_market,
+            client_order_id=slot.client_order_id,
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        slot.last_error = error
+        return GuaranteedOrderAttemptResult(
+            status="submission_failed",
+            decision=decision,
+            active_market=active_market,
+            amount_usdc=amount_usdc,
+            submission_attempted=True,
+            intense_research_performed=intense_research_performed,
+            token_usage=token_usage,
+            error=error,
+        )
+
+    lifecycle = _order_lifecycle_metrics(
+        order_response,
+        submitted_amount_usdc=amount_usdc,
+    )
+    try:
+        order_persistence = _persist_submitted_order_lifecycle(
+            state_manager=state_manager,
+            market_id=active_market.id,
+            outcome=decision.outcome,
+            order_response=order_response,
+            lifecycle=lifecycle,
+            submitted_amount_usdc=amount_usdc,
+            fallback_entry_price=entry_price,
+            confidence=decision.confidence,
+            implied_prob=_get_implied_probability(active_market, decision.outcome),
+        )
+    except Exception as exc:
+        order_persistence = {
+            "pending_order_persisted": False,
+            "fill_recorded": False,
+            "persistence_error": f"{type(exc).__name__}: {exc}",
+        }
+    return GuaranteedOrderAttemptResult(
+        status="submitted",
+        decision=decision,
+        active_market=active_market,
+        amount_usdc=amount_usdc,
+        order_response=order_response,
+        order_lifecycle=lifecycle,
+        order_persistence=order_persistence,
+        submission_attempted=True,
+        intense_research_performed=intense_research_performed,
+        token_usage=token_usage,
+    )
+
+
+def _run_guaranteed_order_phase(
+    *,
+    plan: GuaranteedOrderPlan,
+    markets: list[Market],
+    excluded_market_ids: set[str],
+    cycle_number: int,
+    settings: Settings,
+    grok_client: GrokClient,
+    kalshi_client: KalshiClient,
+    state_manager: MarketStateManager,
+    log_decision: Any,
+    extended_research_market_ids: set[str],
+) -> GuaranteedOrderCycleResult:
+    result = GuaranteedOrderCycleResult()
+    new_slots = _lock_guaranteed_order_markets(
+        plan,
+        markets,
+        excluded_market_ids=excluded_market_ids,
+        settings=settings,
+        cycle_number=cycle_number,
+    )
+    result.locked = len(new_slots)
+    if new_slots:
+        logger.warning(
+            "Guaranteed-order plan locked %d market(s): %s",
+            len(new_slots),
+            ", ".join(slot.market_id for slot in new_slots),
+            data={
+                "guaranteed_orders_n": plan.target,
+                "guaranteed_orders_locked": plan.locked_count,
+                "newly_locked_market_ids": [slot.market_id for slot in new_slots],
+            },
+        )
+    if not plan.is_fully_locked:
+        logger.error(
+            "Guaranteed-order plan is waiting for enough eligible markets: "
+            "locked=%d target=%d; no forced orders will run until all slots are locked",
+            plan.locked_count,
+            plan.target,
+            data=plan.summary(),
+        )
+        return result
+
+    for slot in plan.slots:
+        if slot.completed:
+            continue
+        attempt = _attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok_client,
+            kalshi_client=kalshi_client,
+            state_manager=state_manager,
+            settings=settings,
+        )
+        result.prompt_tokens += int(attempt.token_usage.get("prompt_tokens", 0))
+        result.completion_tokens += int(
+            attempt.token_usage.get("completion_tokens", 0)
+        )
+        result.reasoning_tokens += int(
+            attempt.token_usage.get("reasoning_tokens", 0)
+        )
+        result.cached_tokens += int(attempt.token_usage.get("cached_tokens", 0))
+        decision = attempt.decision
+        if decision is not None and attempt.intense_research_performed:
+            extended_research_market_ids.add(slot.market_id)
+            try:
+                state_manager.record_analysis(
+                    slot.market_id,
+                    decision,
+                    is_refined=True,
+                    refinement_reason="guaranteed_order_intense_research",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to persist guaranteed-order analysis: market=%s error=%s",
+                    slot.market_id,
+                    exc,
+                    data={"market_id": slot.market_id, "error": str(exc)},
+                )
+
+        audit = {
+            "guaranteed_order_mode": True,
+            "guaranteed_order_forced_execution": True,
+            "guaranteed_order_target": plan.target,
+            "guaranteed_order_slot": slot.slot_number,
+            "guaranteed_order_market_locked": True,
+            "guaranteed_order_locked_cycle": slot.locked_cycle,
+            "guaranteed_order_research_completed": slot.research_completed,
+            "intense_research_used": slot.research_completed,
+            "initial_research_used": slot.research_completed,
+            "deep_research_used": slot.research_completed,
+            "normal_execution_gates_bypassed": True,
+            "forced_bet_amount_usdc": attempt.amount_usdc,
+        }
+        if attempt.status in {"research_failed", "invalid_bet_size"}:
+            result.failures.append(
+                {
+                    "slot_number": slot.slot_number,
+                    "market_id": slot.market_id,
+                    "status": attempt.status,
+                    "error": attempt.error,
+                }
+            )
+            logger.error(
+                "Guaranteed-order slot %d research failed: market=%s error=%s",
+                slot.slot_number,
+                slot.market_id,
+                attempt.error,
+                data={**audit, "market_id": slot.market_id, "error": attempt.error},
+            )
+            continue
+        if attempt.status == "market_validation_failed":
+            result.failures.append(
+                {
+                    "slot_number": slot.slot_number,
+                    "market_id": slot.market_id,
+                    "status": attempt.status,
+                    "error": attempt.error,
+                }
+            )
+            if decision is not None:
+                log_decision(
+                    market_id=slot.market_id,
+                    question=slot.market.question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase="guaranteed_order_market_validation",
+                        decision_terminal=False,
+                        final_action="skip",
+                        final_reason="guaranteed_order_market_validation_failed",
+                        guaranteed_order_retry_pending=True,
+                        order_error=attempt.error,
+                        **audit,
+                    ),
+                )
+            continue
+        if decision is None:
+            continue
+
+        active_market = attempt.active_market or slot.market
+        family = market_family(active_market)
+        if attempt.status == "dry_run" or attempt.submission_attempted:
+            result.attempted += 1
+            result.attempts_by_family[family] = (
+                result.attempts_by_family.get(family, 0) + 1
+            )
+        if attempt.status == "submission_failed":
+            result.failures.append(
+                {
+                    "slot_number": slot.slot_number,
+                    "market_id": slot.market_id,
+                    "status": attempt.status,
+                    "error": attempt.error,
+                }
+            )
+            log_decision(
+                market_id=slot.market_id,
+                question=slot.market.question,
+                decision=decision.model_dump(),
+                execution_audit=_build_execution_audit(
+                    decision_phase="guaranteed_order_submission",
+                    decision_terminal=False,
+                    final_action="order_attempt",
+                    final_reason="guaranteed_order_submission_failed",
+                    guaranteed_order_retry_pending=True,
+                    order_error=attempt.error,
+                    **audit,
+                ),
+            )
+            continue
+
+        slot.completed = True
+        slot.last_error = None
+        result.completed += 1
+        if attempt.status == "dry_run":
+            logger.warning(
+                "GUARANTEED DRY_RUN: slot=%d/%d market=%s outcome=%s amount=$%.2f",
+                slot.slot_number,
+                plan.target,
+                slot.market_id,
+                decision.outcome,
+                attempt.amount_usdc,
+                data={**audit, "market_id": slot.market_id, "outcome": decision.outcome},
+            )
+            log_decision(
+                market_id=slot.market_id,
+                question=slot.market.question,
+                decision=decision.model_dump(),
+                execution_audit=_build_execution_audit(
+                    decision_phase="guaranteed_order_dry_run",
+                    decision_terminal=True,
+                    final_action="order_attempt",
+                    final_reason="dry_run",
+                    guaranteed_order_completed=True,
+                    **audit,
+                ),
+            )
+            _record_terminal_outcome(state_manager, slot.market_id, "dry_run")
+            continue
+
+        response = attempt.order_response
+        lifecycle = attempt.order_lifecycle
+        if response is None or lifecycle is None:
+            slot.completed = False
+            result.completed -= 1
+            slot.last_error = "missing submitted-order response"
+            continue
+        slot.order_id = response.id
+        result.usd_submitted += attempt.amount_usdc
+        if lifecycle.fully_filled:
+            result.filled += 1
+        elif lifecycle.partially_filled:
+            result.partially_filled += 1
+        elif lifecycle.resting_unfilled:
+            result.resting_unfilled += 1
+        elif lifecycle.status in {"cancelled", "canceled"} and lifecycle.fill_count <= 0:
+            result.canceled_unfilled += 1
+        result.usd_deployed += float(
+            (attempt.order_persistence or {}).get("recorded_fill_notional_usdc", 0.0)
+            or 0.0
+        )
+        log_decision(
+            market_id=slot.market_id,
+            question=slot.market.question,
+            decision=decision.model_dump(),
+            order=_order_response_receipt(response),
+            execution_audit=_build_execution_audit(
+                decision_phase="guaranteed_order_submission",
+                decision_terminal=True,
+                final_action="order_attempt",
+                final_reason="order_submitted",
+                guaranteed_order_completed=True,
+                order_id=response.id,
+                order_status=response.status,
+                order_fully_filled=lifecycle.fully_filled,
+                order_partially_filled=lifecycle.partially_filled,
+                order_resting_unfilled=lifecycle.resting_unfilled,
+                order_requested_count=lifecycle.requested_count,
+                **(attempt.order_persistence or {}),
+                **audit,
+            ),
+        )
+        _record_terminal_outcome(state_manager, slot.market_id, "order_submitted")
+        excluded_market_ids.add(slot.market_id)
+        logger.warning(
+            "GUARANTEED ORDER SUBMITTED: slot=%d/%d market=%s outcome=%s order_id=%s",
+            slot.slot_number,
+            plan.target,
+            slot.market_id,
+            decision.outcome,
+            response.id,
+            data={
+                **audit,
+                "market_id": slot.market_id,
+                "outcome": decision.outcome,
+                "order_id": response.id,
+                "order_status": response.status,
+            },
+        )
+
+    if plan.is_complete:
+        logger.warning(
+            "Guaranteed-order target complete: %d/%d",
+            plan.completed_count,
+            plan.target,
+            data=plan.summary(),
+        )
+    return result
 
 
 def _confidence_gate_override_metrics(
@@ -8435,10 +9121,25 @@ def main(max_cycles: int | None = None) -> None:
         raise
 
     logger.info(
-        "PredictBot started (dry_run=%s, max_cycles=%s)",
+        "PredictBot started (dry_run=%s, max_cycles=%s, guaranteed_orders_n=%d)",
         settings.DRY_RUN,
         max_cycles if max_cycles is not None else "unlimited",
+        settings.GUARANTEED_ORDERS_N,
     )
+    guaranteed_order_plan = GuaranteedOrderPlan(
+        target=settings.GUARANTEED_ORDERS_N,
+    )
+    if guaranteed_order_plan.target > 0:
+        logger.warning(
+            "Guaranteed-order mode enabled: exactly %d forced order(s) will be "
+            "submitted/attempted; ordinary gate-cleared executions are suppressed",
+            guaranteed_order_plan.target,
+            data={
+                "guaranteed_orders_n": guaranteed_order_plan.target,
+                "dry_run": settings.DRY_RUN,
+                "normal_execution_suppressed": True,
+            },
+        )
     cycle_count = 0
     current_trade_day = datetime.now(timezone.utc).date()
     daily_trade_count = 0
@@ -8773,6 +9474,10 @@ def main(max_cycles: int | None = None) -> None:
                 )
 
             trades_attempted = 0
+            guaranteed_orders_attempted_this_cycle = 0
+            guaranteed_orders_completed_this_cycle = 0
+            guaranteed_orders_locked_this_cycle = 0
+            guaranteed_order_failures_this_cycle: list[dict[str, Any]] = []
             trades_filled = 0
             trades_partially_filled = 0
             trades_resting_unfilled = 0
@@ -15297,6 +16002,44 @@ def main(max_cycles: int | None = None) -> None:
                         expected_value_usdc=expected_value_usdc,
                     ),
                 }
+                if guaranteed_order_plan.target > 0:
+                    guaranteed_order_plan.normal_execution_suppressed += 1
+                    logger.info(
+                        "Guaranteed-order mode: normal execution suppressed after "
+                        "full gating for market=%s",
+                        market.id,
+                        data={
+                            "market_id": market.id,
+                            "guaranteed_orders_n": guaranteed_order_plan.target,
+                            "guaranteed_orders_completed": (
+                                guaranteed_order_plan.completed_count
+                            ),
+                            "normal_execution_suppressed": True,
+                        },
+                    )
+                    log_trade_decision(
+                        market_id=market.id,
+                        question=market.question,
+                        decision=decision_for_edge.model_copy(
+                            update={"bet_size_pct": bet_pct}
+                        ).model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="guaranteed_order_exclusive_execution",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="guaranteed_order_normal_execution_suppressed",
+                            guaranteed_order_mode=True,
+                            guaranteed_orders_n=guaranteed_order_plan.target,
+                            normal_gates_completed=True,
+                            **order_audit_context,
+                        ),
+                    )
+                    _record_terminal_outcome(
+                        state_manager,
+                        market.id,
+                        "guaranteed_order_normal_execution_suppressed",
+                    )
+                    continue
                 # Skip order placement if in analysis-only mode (insufficient balance)
                 if analysis_only_mode:
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
@@ -16327,6 +17070,49 @@ def main(max_cycles: int | None = None) -> None:
                     market_duration,
                 )
 
+            if guaranteed_order_plan.target > 0 and not guaranteed_order_plan.is_complete:
+                guaranteed_cycle_result = _run_guaranteed_order_phase(
+                    plan=guaranteed_order_plan,
+                    markets=markets,
+                    excluded_market_ids=traded_market_ids,
+                    cycle_number=cycle_count,
+                    settings=settings,
+                    grok_client=grok_client,
+                    kalshi_client=kalshi_client,
+                    state_manager=state_manager,
+                    log_decision=log_trade_decision,
+                    extended_research_market_ids=extended_research_market_ids,
+                )
+                guaranteed_orders_locked_this_cycle = guaranteed_cycle_result.locked
+                guaranteed_orders_attempted_this_cycle = (
+                    guaranteed_cycle_result.attempted
+                )
+                guaranteed_orders_completed_this_cycle = (
+                    guaranteed_cycle_result.completed
+                )
+                guaranteed_order_failures_this_cycle = guaranteed_cycle_result.failures
+                trades_attempted += guaranteed_cycle_result.attempted
+                daily_trade_count += guaranteed_cycle_result.attempted
+                trades_filled += guaranteed_cycle_result.filled
+                trades_partially_filled += guaranteed_cycle_result.partially_filled
+                trades_resting_unfilled += guaranteed_cycle_result.resting_unfilled
+                trades_canceled_unfilled += guaranteed_cycle_result.canceled_unfilled
+                total_usd_submitted += guaranteed_cycle_result.usd_submitted
+                total_usd_deployed += guaranteed_cycle_result.usd_deployed
+                cycle_prompt_tokens += guaranteed_cycle_result.prompt_tokens
+                cycle_completion_tokens += guaranteed_cycle_result.completion_tokens
+                cycle_reasoning_tokens += guaranteed_cycle_result.reasoning_tokens
+                cycle_cached_tokens += guaranteed_cycle_result.cached_tokens
+                for guaranteed_family, family_attempts in (
+                    guaranteed_cycle_result.attempts_by_family.items()
+                ):
+                    family_stats = _execution_family_stats_bucket(
+                        execution_family_stats,
+                        guaranteed_family,
+                    )
+                    family_stats["order_attempts"] += family_attempts
+                if guaranteed_cycle_result.usd_submitted > 0:
+                    _refresh_last_known_balance()
             if settings.EXPORT_STATE_JSON:
                 try:
                     state_manager.export_to_json(settings.STATE_JSON_EXPORT_PATH)
@@ -16630,6 +17416,28 @@ def main(max_cycles: int | None = None) -> None:
                 "score_gate_passed": score_gate_passed,
                 "order_attempted": trades_attempted,
                 "order_attempts": trades_attempted,
+                "guaranteed_order_mode": guaranteed_order_plan.target > 0,
+                "guaranteed_orders_target": guaranteed_order_plan.target,
+                "guaranteed_orders_locked": guaranteed_order_plan.locked_count,
+                "guaranteed_orders_completed": guaranteed_order_plan.completed_count,
+                "guaranteed_orders_remaining": guaranteed_order_plan.remaining_count,
+                "guaranteed_orders_complete": guaranteed_order_plan.is_complete,
+                "guaranteed_orders_locked_this_cycle": (
+                    guaranteed_orders_locked_this_cycle
+                ),
+                "guaranteed_orders_attempted_this_cycle": (
+                    guaranteed_orders_attempted_this_cycle
+                ),
+                "guaranteed_orders_completed_this_cycle": (
+                    guaranteed_orders_completed_this_cycle
+                ),
+                "guaranteed_order_failures_this_cycle": (
+                    guaranteed_order_failures_this_cycle
+                ),
+                "guaranteed_normal_execution_suppressed": (
+                    guaranteed_order_plan.normal_execution_suppressed
+                ),
+                "guaranteed_order_slots": guaranteed_order_plan.summary()["slots"],
                 "orders_filled": trades_filled,
                 "orders_partially_filled": trades_partially_filled,
                 "orders_resting_unfilled": trades_resting_unfilled,
@@ -17257,6 +18065,25 @@ def main(max_cycles: int | None = None) -> None:
                 data={"cycle_count": cycle_count, "max_cycles": max_cycles},
             )
             break
+
+    if guaranteed_order_plan.target > 0:
+        guarantee_summary = guaranteed_order_plan.summary()
+        if not guaranteed_order_plan.is_complete:
+            message = (
+                "Guaranteed-order run incomplete: "
+                f"completed={guaranteed_order_plan.completed_count}/"
+                f"{guaranteed_order_plan.target}, "
+                f"locked={guaranteed_order_plan.locked_count}. "
+                "The run is not considered completed."
+            )
+            logger.critical(message, data=guarantee_summary)
+            raise GuaranteedOrdersIncompleteError(message)
+        logger.warning(
+            "Guaranteed-order run completed exactly at target: %d/%d",
+            guaranteed_order_plan.completed_count,
+            guaranteed_order_plan.target,
+            data=guarantee_summary,
+        )
 
 
 if __name__ == "__main__":

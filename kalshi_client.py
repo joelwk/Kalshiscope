@@ -470,6 +470,7 @@ class KalshiClient:
         market: Market | None = None,
         *,
         retry_suffix: str | None = None,
+        client_order_id: str | None = None,
     ) -> OrderResponse:
         """Submit a buy/sell order in Kalshi format."""
         side = _to_kalshi_side(order.outcome)
@@ -543,9 +544,8 @@ class KalshiClient:
 
         payload = {
             "ticker": order.market_id,
-            "client_order_id": _build_client_order_id(
-                order.market_id or "",
-                suffix=retry_suffix,
+            "client_order_id": client_order_id or _build_client_order_id(
+                order.market_id or "", suffix=retry_suffix
             ),
             "side": book_side,
             "count": str(count),

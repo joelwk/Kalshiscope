@@ -92,6 +92,22 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
         self.assertEqual(settings.MAX_MARKET_DATA_AGE_SECONDS, 120)
 
+    def test_guaranteed_orders_defaults_disabled_and_parses_override(self) -> None:
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.GUARANTEED_ORDERS_N, 0)
+
+        env = {**self._required_env(), "GUARANTEED_ORDERS_N": "3"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GUARANTEED_ORDERS_N, 3)
+
+    def test_guaranteed_orders_rejects_negative_target(self) -> None:
+        env = {**self._required_env(), "GUARANTEED_ORDERS_N": "-1"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "GUARANTEED_ORDERS_N"):
+                config.load_settings()
+
     def test_missing_required_env_raises(self) -> None:
         env = {"XAI_API_KEY": "xai-key"}
         with patch.dict(os.environ, env, clear=True):
@@ -372,6 +388,7 @@ class TestConfig(unittest.TestCase):
             "MIN_BET_USDC=5.0",
             "MAX_BET_USDC=12.0",
             "DRY_RUN=true",
+            "GUARANTEED_ORDERS_N=0",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
@@ -759,6 +776,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
         self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
+        self.assertEqual(settings.GUARANTEED_ORDERS_N, 0)
         self.assertTrue(settings.POSITION_SYNC_ENABLED)
         self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
         self.assertEqual(settings.ORDER_PRICE_IMPROVEMENT_CENTS, 1)
