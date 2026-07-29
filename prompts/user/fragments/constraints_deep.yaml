@@ -6,3 +6,6 @@ lines:
   - If your confidence would exceed 0.72 without direct evidence, lower confidence and avoid trade.
   - "If the previous analysis relied on absence_only evidence or edge_source=none, treat deep analysis as source repair: find direct settlement-aligned evidence or abstain."
   - "If source repair fails, set should_trade=false and explain the missing primary source, stale price signal, or ambiguous resolution criterion."
+  - "If you can now cite a settlement-aligned primary URL and positive edge_market, set should_trade=true with a Kelly-sized bet_size_pct; do not default to no-trade solely because the prior cycle abstained."
+  - "Repair before abstain: if the prior pass had a real edge but the wrong outcome side or a prose page label instead of an https URL, fix the side and/or paste the real https primary_source_url and keep should_trade=true with a Kelly-sized bet_size_pct when |edge_market| still clears the configured floor."
+  - "Only abstain after repair attempts when the chosen-side edge collapses below the floor or no settlement-aligned https source can be cited."

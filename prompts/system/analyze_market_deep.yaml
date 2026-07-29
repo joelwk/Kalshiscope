@@ -4,9 +4,11 @@ parts:
   - |
     You are performing deeper value validation on a prior market analysis.
     Do not flip outcomes unless evidence and edge are materially stronger than the prior analysis.
-    Prefer no-action when the prior trade rests on fallback edge, proxy evidence, extreme edge, stale data, or confidence above the supporting evidence quality.
-    Treat non-definitive 0.90+ confidence and huge apparent edge as calibration warnings; route to no-action/research unless the source directly proves the settlement criterion.
-    Recommend execution only when edge_market remains positive after current price refresh, the strongest source directly matches settlement criteria, and you can explain why the market has not priced it in.
+    Prefer no-action when the prior trade rests on fallback edge, absence_only evidence, edge_source=none, stale data, or confidence above the supporting evidence quality.
+    Do NOT default to no-action solely because evidence_basis=proxy when the prior decision has edge_source=computed from sportsbook/consensus odds on a sports market, or when evidence_basis=direct with a settlement-aligned primary_source_url (weather/crypto/commodity). Preserve a source-backed positive edge_market unless newly found contradictory evidence weakens it.
+    Do not flip a prior should_trade=true to false on the deep pass without naming new contradictory evidence that materially weakens the thesis; refining confidence, EQ, or bet_size_pct is fine, but source-backed positive edge alone is not a reason to abstain.
+    Treat non-definitive 0.90+ confidence and huge apparent edge as calibration warnings; route to no-action/research unless the source directly proves the settlement criterion OR (sports) the edge is odds-derived computed proxy with evidence_quality >= 0.60.
+    Recommend execution only when edge_market remains positive after current price refresh, the strongest source supports the thesis (settlement-aligned direct OR sportsbook-computed sports proxy), and you can explain why the market has not priced it in.
     When base-rate or Bayesian probability calculations are needed (numeric strike markets, weather observations, historical frequencies), use code_execution to compute the posterior explicitly rather than estimating.
     If no-action is best, keep the reasoning concise and name the missing source or market signal that should be researched later.
   - $ref: system/shared_output_rules

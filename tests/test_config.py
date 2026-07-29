@@ -171,6 +171,11 @@ class TestConfig(unittest.TestCase):
             "WEATHER_MIN_EVIDENCE_QUALITY": "0.72",
             "SPORTS_MIN_EVIDENCE_QUALITY": "0.61",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE": "0.18",
+            "WEATHER_BLOCK_UNDERDOG_ENTRIES": "false",
+            "WEATHER_POSTERIOR_FLOOR_MAX_EDGE": "0.15",
+            "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK": "0.25",
+            "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER": "0.40",
+            "COMMODITY_MIN_EDGE": "0.25",
             "DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS": "0.59",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE": "2",
             "KELLY_FRACTION_WEATHER": "0.45",
@@ -186,6 +191,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.72)
         self.assertEqual(settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.61)
         self.assertEqual(settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.18)
+        self.assertFalse(settings.WEATHER_BLOCK_UNDERDOG_ENTRIES)
+        self.assertEqual(settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE, 0.15)
+        self.assertEqual(settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK, 0.25)
+        self.assertEqual(settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER, 0.40)
+        self.assertEqual(settings.COMMODITY_MIN_EDGE, 0.25)
         self.assertEqual(settings.DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS, 0.59)
         self.assertEqual(settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 2)
         self.assertEqual(settings.KELLY_FRACTION_WEATHER, 0.45)
@@ -193,14 +203,23 @@ class TestConfig(unittest.TestCase):
     def test_weather_profitability_defaults_are_conservative(self) -> None:
         self.assertEqual(config.Settings.MAX_WEATHER_CONFIDENCE, 0.65)
         self.assertEqual(config.Settings.WEATHER_SCORE_PENALTY, 0.12)
-        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.80)
+        self.assertEqual(config.Settings.WEATHER_MIN_EVIDENCE_QUALITY, 0.60)
         self.assertEqual(config.Settings.SPORTS_MIN_EVIDENCE_QUALITY, 0.55)
         self.assertEqual(config.Settings.WEATHER_MIN_EDGE, 0.14)
+        self.assertEqual(config.Settings.WEATHER_HIGH_EQ_EDGE_MULTIPLIER, 0.85)
         self.assertEqual(config.Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE, 0.34)
+        self.assertTrue(config.Settings.WEATHER_BLOCK_UNDERDOG_ENTRIES)
+        self.assertEqual(config.Settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE, 0.20)
+        self.assertEqual(config.Settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK, 0.20)
+        self.assertEqual(config.Settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER, 0.50)
+        self.assertEqual(config.Settings.COMMODITY_MIN_EDGE, 0.22)
+        self.assertEqual(config.Settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER, 0.95)
+        self.assertEqual(config.Settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY, 0.75)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD_WEATHER_DIRECT, 0.30)
         self.assertEqual(config.Settings.MAX_WEATHER_CANDIDATES_PER_CYCLE, 1)
 
     def test_profit_tuning_defaults_are_loaded(self) -> None:
+        self.assertEqual(config.Settings.MARKET_FAMILY_BLOCKLIST, ())
         self.assertEqual(config.Settings.LOW_PRICE_MIN_EDGE, 0.18)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_THRESHOLD, 0.25)
         self.assertEqual(config.Settings.VERY_LOW_PRICE_MIN_EDGE, 0.28)
@@ -209,6 +228,107 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER, 0.85)
         self.assertEqual(config.Settings.MIN_TRADEABLE_IMPLIED_PRICE, 0.12)
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
+        self.assertEqual(config.Settings.KELLY_MIN_BET_POLICY, "skip")
+        self.assertEqual(config.Settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.60)
+        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_35PP, 0.6)
+        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_45PP, 0.4)
+        self.assertEqual(config.Settings.MIN_CONFIDENCE_INCREASE_FOR_ADD, 0.05)
+        self.assertEqual(config.Settings.MIN_PRICE_MOVE_FOR_READD, 0.03)
+
+    def test_strategy_component_weight_defaults(self) -> None:
+        self.assertEqual(config.Settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.30)
+        self.assertEqual(config.Settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT, 0.18)
+        self.assertEqual(config.Settings.SCORE_BAYESIAN_COMPONENT_WEIGHT, 0.10)
+
+    def test_historical_confidence_shrink_cap_defaults(self) -> None:
+        self.assertEqual(config.Settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA, 0.05)
+        self.assertEqual(
+            config.Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE, 0.0
+        )
+
+    def test_direct_posterior_floor_defaults_and_override(self) -> None:
+        self.assertTrue(config.Settings.DIRECT_POSTERIOR_FLOOR_ENABLED)
+        self.assertEqual(
+            config.Settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY, 0.80
+        )
+        self.assertEqual(
+            config.Settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE, 1.5
+        )
+        env = {
+            **self._required_env(),
+            "DIRECT_POSTERIOR_FLOOR_ENABLED": "false",
+            "DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY": "0.90",
+            "DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE": "3.0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.DIRECT_POSTERIOR_FLOOR_ENABLED)
+        self.assertEqual(settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY, 0.90)
+        self.assertEqual(settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE, 3.0)
+
+    def test_historical_family_negative_size_scale_default_and_override(self) -> None:
+        self.assertEqual(
+            config.Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE, 0.25
+        )
+        env = {
+            **self._required_env(),
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE": "0.50",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE, 0.50)
+
+    def test_bayesian_confidence_guard_defaults(self) -> None:
+        self.assertEqual(config.Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
+        self.assertEqual(config.Settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE, 0.05)
+
+    def test_entry_price_floor_override_defaults(self) -> None:
+        self.assertTrue(config.Settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED)
+        self.assertEqual(config.Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE, 0.20)
+        self.assertEqual(
+            config.Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY, 0.60
+        )
+
+    def test_flip_guard_direct_override_defaults(self) -> None:
+        self.assertTrue(config.Settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED)
+        self.assertEqual(config.Settings.FLIP_GUARD_DIRECT_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO, 5.0)
+
+    def test_entry_floor_and_flip_direct_env_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED": "false",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE": "0.25",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY": "0.70",
+            "FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED": "false",
+            "FLIP_GUARD_DIRECT_MIN_EDGE": "0.22",
+            "FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO": "8.0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED)
+        self.assertEqual(settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE, 0.25)
+        self.assertEqual(settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY, 0.70)
+        self.assertFalse(settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED)
+        self.assertEqual(settings.FLIP_GUARD_DIRECT_MIN_EDGE, 0.22)
+        self.assertEqual(settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO, 8.0)
+
+    def test_strategy_and_shrink_settings_env_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "SCORE_KELLY_COMPONENT_WEIGHT": "0.50",
+            "SCORE_INEFFICIENCY_COMPONENT_WEIGHT": "0.40",
+            "SCORE_BAYESIAN_COMPONENT_WEIGHT": "0.20",
+            "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA": "0.08",
+            "HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE": "0.62",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.SCORE_KELLY_COMPONENT_WEIGHT, 0.50)
+        self.assertEqual(settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT, 0.40)
+        self.assertEqual(settings.SCORE_BAYESIAN_COMPONENT_WEIGHT, 0.20)
+        self.assertEqual(settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA, 0.08)
+        self.assertEqual(settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE, 0.62)
 
     def test_env_example_profit_thresholds_match_conservative_defaults(self) -> None:
         env_example = Path(".env.example").read_text(encoding="utf-8")
@@ -220,16 +340,35 @@ class TestConfig(unittest.TestCase):
             "LOW_PRICE_MIN_EDGE_MULTIPLIER=0.85",
             "FALLBACK_EDGE_MIN_EDGE=0.30",
             "FALLBACK_EDGE_MIN_EDGE_MULTIPLIER=0.90",
+            "WEATHER_MIN_EDGE=0.14",
+            "WEATHER_HIGH_EQ_EDGE_MULTIPLIER=0.85",
             "WEATHER_FALLBACK_EDGE_MIN_EDGE=0.34",
-            "MAX_REASONABLE_EDGE=0.40",
+            "WEATHER_BLOCK_UNDERDOG_ENTRIES=true",
+            "WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20",
+            "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=0.20",
+            "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=0.50",
+            "COMMODITY_MIN_EDGE=0.22",
+            "COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=0.95",
+            "COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75",
+            "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=0.15",
+            "GENERIC_PROXY_HIGH_EDGE_MIN=0.18",
+            "EXTENDED_RESEARCH_COOLDOWN_CYCLES=3",
+            "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES=2",
+            "MAX_REASONABLE_EDGE=0.28",
             "DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50",
             "HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95",
             "CONFIDENCE_GATE_MIN_EDGE=0.08",
-            "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.75",
+            "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.60",
+            "MAX_GENERIC_CANDIDATES_PER_CYCLE=2",
+            "KELLY_EDGE_BAND_DAMPENER_25PP=0.75",
             "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55",
             "MIN_EVIDENCE_QUALITY_FOR_TRADE=0.55",
-            "SCORE_GATE_THRESHOLD=0.48",
-            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.40",
+            "SCORE_GATE_THRESHOLD=0.15",
+            "SCORE_GATE_THRESHOLD_DIRECT_HIGH_QUALITY=0.10",
+            "SCORE_KELLY_COMPONENT_WEIGHT=0.30",
+            "SCORE_INEFFICIENCY_COMPONENT_WEIGHT=0.18",
+            "SCORE_BAYESIAN_COMPONENT_WEIGHT=0.10",
+            "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=0.05",
             "MIN_BET_USDC=5.0",
             "MAX_BET_USDC=12.0",
             "DRY_RUN=true",
@@ -237,6 +376,11 @@ class TestConfig(unittest.TestCase):
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
             "MAX_SPORTS_CANDIDATES_PER_CYCLE=4",
+            "SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE=1",
+            "MAX_MUSIC_CANDIDATES_PER_CYCLE=2",
+            "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED=true",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE=0.20",
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY=0.60",
             "MAX_TRADES_PER_CYCLE=4",
             "MAX_TRADES_PER_DAY=4",
             "MAX_DAILY_DRAWDOWN_USDC=15.0",
@@ -245,6 +389,7 @@ class TestConfig(unittest.TestCase):
             "KALSHI_FETCH_TOPUP_ENABLED=false",
             "KELLY_DYNAMIC_ENABLED=true",
             "KELLY_FRACTION_DEFAULT=0.30",
+            "KELLY_MIN_BET_NEAR_MISS_RATIO=0.60",
             "GROK_SELF_CONSISTENCY_ENABLED=true",
             "GROK_DEEP_ANALYSIS_MAX_ATTEMPTS=2",
             "GROK_ANALYSIS_MAX_BUDGET_SECONDS=420",
@@ -259,17 +404,22 @@ class TestConfig(unittest.TestCase):
             "PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE=0.28",
             "PRE_ANALYSIS_ADAPTIVE_BOOST=0.03",
             "PRE_ANALYSIS_REDUCED_MAX_CANDIDATES=8",
-            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=1",
+            "RESEARCH_QUEUE_DRAIN_PER_CYCLE=3",
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=0.40",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",
             "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.05",
+            "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS=2.0",
+            "HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR=0.55",
             "CONVICTION_REPAIR_ENABLED=true",
-            "CONVICTION_REPAIR_MIN_EDGE=0.20",
-            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.90",
+            "CONVICTION_REPAIR_MIN_EDGE=0.12",
+            "CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY=0.75",
             "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
             "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
+            "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45",
+            "BAYESIAN_MIN_UPDATES_FOR_TRADE=3",
+            "BAYESIAN_MIN_POSTERIOR_DIVERGENCE=0.05",
             "HISTORICAL_FAMILY_SIGNAL_ENABLED=true",
             "HISTORICAL_FAMILY_SCORE_SCALE=0.06",
             "HISTORICAL_FAMILY_SIZE_SCALE_MAX=0.25",
@@ -316,6 +466,76 @@ class TestConfig(unittest.TestCase):
             settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
             ("Netflix", "flixpatrol"),
         )
+
+    def test_commodity_profile_settings_overrides(self) -> None:
+        env = {
+            **self._required_env(),
+            "COMMODITY_ALLOWED_DOMAINS": "cmegroup.com,theice.com",
+            "COMMODITY_ALLOWED_X_HANDLES": "CMEGroup,EIAgov",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.COMMODITY_ALLOWED_DOMAINS,
+            ("cmegroup.com", "theice.com"),
+        )
+        self.assertEqual(
+            settings.COMMODITY_ALLOWED_X_HANDLES,
+            ("CMEGroup", "EIAgov"),
+        )
+
+    def test_env_example_research_profile_lists_are_not_spliced(self) -> None:
+        values = {}
+        for raw_line in Path(".env.example").read_text(encoding="utf-8").splitlines():
+            if "=" not in raw_line or raw_line.lstrip().startswith("#"):
+                continue
+            key, value = raw_line.split("=", 1)
+            values[key] = value
+
+        generic_handles = values["GENERIC_ALLOWED_X_HANDLES"].split(",")
+        commodity_domains = values["COMMODITY_ALLOWED_DOMAINS"].split(",")
+        self.assertIn("BBCBusiness", generic_handles)
+        self.assertIn("APBusiness", generic_handles)
+        self.assertIn("finance.yahoo.com", commodity_domains)
+        self.assertNotIn("finance.yahoo.comBusiness", commodity_domains)
+        self.assertTrue(all("." in domain for domain in commodity_domains))
+
+    def test_commodity_profile_defaults_lead_with_settlement_grade(self) -> None:
+        # The first SEARCH_PROFILE_MAX_DOMAINS entries are the searchable set.
+        # They must keep the settlement-grade trio reachable (so direct
+        # evidence stays citeable) while also carrying a crawlable live-price
+        # source: Jul 2026 logs showed an all-paywalled searchable set
+        # (WSJ/Bloomberg) returning zero results for spot prices, collapsing
+        # the commodity flow into absence_only skips.
+        first_five = config.Settings.COMMODITY_ALLOWED_DOMAINS[
+            : config.Settings.SEARCH_PROFILE_MAX_DOMAINS
+        ]
+        self.assertIn("cmegroup.com", first_five)
+        self.assertIn("theice.com", first_five)
+        self.assertIn("eia.gov", first_five)
+        self.assertIn("tradingeconomics.com", first_five)
+        settlement_grade = [
+            domain
+            for domain in first_five
+            if domain in config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+        ]
+        self.assertGreaterEqual(len(settlement_grade), 3)
+
+    def test_crypto_defaults_lead_with_settlement_grade_exchanges(self) -> None:
+        first_five = config.Settings.CRYPTO_ALLOWED_DOMAINS[
+            : config.Settings.SEARCH_PROFILE_MAX_DOMAINS
+        ]
+        for exchange in ("coinbase.com", "kraken.com", "binance.com", "coindesk.com"):
+            self.assertIn(exchange, first_five)
+            self.assertIn(
+                exchange, config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+            )
+
+    def test_index_settlement_source_is_allowlisted_and_searchable(self) -> None:
+        self.assertIn(
+            "nasdaq.com", config.Settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS
+        )
+        self.assertIn("nasdaq.com", config.Settings.GENERIC_ALLOWED_DOMAINS)
 
     def test_build_search_config(self) -> None:
         env = {
@@ -467,6 +687,7 @@ class TestConfig(unittest.TestCase):
             "BAYESIAN_SKIP_STALE_UPDATES": "false",
             "BAYESIAN_PRIOR_DEFAULT": "0.58",
             "BAYESIAN_MIN_UPDATES_FOR_TRADE": "3",
+            "BAYESIAN_MIN_POSTERIOR_DIVERGENCE": "0.07",
             "LMSR_ENABLED": "true",
             "LMSR_LIQUIDITY_PARAM_B": "120000",
             "LMSR_MIN_INEFFICIENCY": "0.04",
@@ -476,6 +697,9 @@ class TestConfig(unittest.TestCase):
             "KELLY_FRACTION_SHORT_HORIZON_HOURS": "2",
             "KELLY_FRACTION_SHORT_HORIZON": "0.1",
             "KELLY_MIN_BET_POLICY": "floor",
+            "KELLY_MIN_BET_NEAR_MISS_RATIO": "0.90",
+            "KELLY_EDGE_BAND_DAMPENER_35PP": "0.5",
+            "KELLY_EDGE_BAND_DAMPENER_45PP": "0.3",
             "MAX_POSITION_PCT_OF_BANKROLL": "0.12",
             "COINFLIP_PRICE_LOWER": "0.46",
             "COINFLIP_PRICE_UPPER": "0.54",
@@ -490,6 +714,7 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.BAYESIAN_SKIP_STALE_UPDATES)
         self.assertEqual(settings.BAYESIAN_PRIOR_DEFAULT, 0.58)
         self.assertEqual(settings.BAYESIAN_MIN_UPDATES_FOR_TRADE, 3)
+        self.assertEqual(settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE, 0.07)
         self.assertEqual(settings.BAYESIAN_MAX_POSTERIOR, 0.90)
         self.assertTrue(settings.LMSR_ENABLED)
         self.assertEqual(settings.LMSR_LIQUIDITY_PARAM_B, 120000.0)
@@ -500,6 +725,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON_HOURS, 2)
         self.assertEqual(settings.KELLY_FRACTION_SHORT_HORIZON, 0.1)
         self.assertEqual(settings.KELLY_MIN_BET_POLICY, "floor")
+        self.assertEqual(settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.90)
+        self.assertEqual(settings.KELLY_EDGE_BAND_DAMPENER_35PP, 0.5)
+        self.assertEqual(settings.KELLY_EDGE_BAND_DAMPENER_45PP, 0.3)
         self.assertEqual(settings.MAX_POSITION_PCT_OF_BANKROLL, 0.12)
         self.assertEqual(settings.COINFLIP_PRICE_LOWER, 0.46)
         self.assertEqual(settings.COINFLIP_PRICE_UPPER, 0.54)
@@ -554,8 +782,9 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.EDGE_REPAIR_ENABLED)
         self.assertTrue(settings.EDGE_BAND_CALIBRATION_ENABLED)
         self.assertTrue(settings.CONVICTION_REPAIR_ENABLED)
-        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.20)
-        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.90)
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EDGE, 0.12)
+        # Aligned with the validator's proxy evidence-quality cap (Jul 2026).
+        self.assertEqual(settings.CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY, 0.75)
         self.assertEqual(settings.CONVICTION_REPAIR_SCORE_GAP_MAX, 0.08)
         self.assertEqual(settings.CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR, 0.0)
         self.assertEqual(settings.SCORE_SOURCE_CONFIRMED_EDGE_BONUS, 0.06)
@@ -569,7 +798,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.CALIBRATION_ONLINE_ALPHA, 0.15)
         self.assertEqual(settings.CALIBRATION_ONLINE_MAX_SAMPLES_PER_BUCKET, 500)
         self.assertFalse(settings.EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE)
-        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.58)
+        self.assertEqual(settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE, 0.55)
         self.assertEqual(settings.KELLY_MIN_BANKROLL_USDC, 30.0)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_BASE, 0.025)
         self.assertEqual(settings.SCORE_REPEATED_ANALYSIS_PENALTY_START_COUNT, 1)
@@ -588,7 +817,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_COMMODITY_CONFIDENCE, 0.78)
         self.assertEqual(settings.MAX_CRYPTO_CONFIDENCE, 0.72)
         self.assertEqual(settings.MAX_WEATHER_CONFIDENCE, 0.65)
-        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.40)
+        self.assertEqual(settings.MAX_REASONABLE_EDGE, 0.28)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
         self.assertTrue(settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
         self.assertTrue(settings.DRY_STREAK_SLEEP_ENABLED)
@@ -602,6 +831,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_FAMILY_MIN_SAMPLES, 12)
         self.assertEqual(settings.HISTORICAL_FAMILY_PNL_CUTOFF, -12.0)
         self.assertEqual(settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF, 0.40)
+        self.assertTrue(settings.HISTORICAL_FAMILY_SHRINKAGE_ENABLED)
+        self.assertEqual(settings.HISTORICAL_FAMILY_PRIOR_STRENGTH, 10.0)
+        self.assertEqual(settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF, -0.50)
         self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE, 0.12)
@@ -619,7 +851,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_PNL_CUTOFF, -5.0)
         self.assertEqual(settings.HISTORICAL_SHORT_PREFIX_SCORE_PENALTY, 0.10)
         self.assertEqual(settings.EXTENDED_RESEARCH_AFTER_STREAK, 2)
-        self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 5)
+        self.assertEqual(settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES, 3)
+        self.assertEqual(settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES, 2)
+        self.assertEqual(settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.18)
         self.assertEqual(settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST, 2.0)
         self.assertEqual(settings.PRE_ANALYSIS_ZERO_TRADE_RATE_PENALTY, 0.04)
         self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
@@ -657,10 +891,32 @@ class TestConfig(unittest.TestCase):
     def test_cycle1_review_defaults(self) -> None:
         """Defaults introduced or tuned by the cycle 1 log review."""
         defaults = config.Settings
-        self.assertEqual(defaults.MAX_REASONABLE_EDGE, 0.40)
+        # Tightened 0.40 -> 0.28 by the Jul 2026 max-profit review (edges
+        # above 0.30 ran <=50% WR; definitive-validated keeps the elevated cap).
+        self.assertEqual(defaults.MAX_REASONABLE_EDGE, 0.28)
         self.assertEqual(defaults.DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX, 0.50)
         self.assertEqual(defaults.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.95)
         self.assertEqual(defaults.GROK_STREAM_TIMEOUT_SECONDS_WEATHER, 120)
+
+    def test_max_profit_review_defaults(self) -> None:
+        """Defaults tuned by the Jul 2026 max-profit near-miss review."""
+        defaults = config.Settings
+        # Widened confidence-gate override: the 0.55-0.61 band (only profitable
+        # resolved tier) mostly carries eq 0.60, which the old 0.70 bar excluded.
+        self.assertEqual(defaults.CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY, 0.60)
+        # Generic soft slot cap (analysis-slot allocation, not a hard reject).
+        self.assertEqual(defaults.MAX_GENERIC_CANDIDATES_PER_CYCLE, 2)
+        # New 25-35pp probe-sizing band.
+        self.assertEqual(defaults.KELLY_EDGE_BAND_DAMPENER_25PP, 0.75)
+
+    def test_kelly_edge_band_dampener_25pp_env_override(self) -> None:
+        env = {
+            **self._required_env(),
+            "KELLY_EDGE_BAND_DAMPENER_25PP": "0.9",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.KELLY_EDGE_BAND_DAMPENER_25PP, 0.9)
 
     def test_high_quality_settled_evidence_min_eq_env_override(self) -> None:
         env = {
@@ -670,6 +926,46 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ, 0.90)
+
+    def test_proxy_high_edge_participation_min_edge_env_override(self) -> None:
+        self.assertEqual(config.Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE, 0.15)
+        self.assertEqual(config.Settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.18)
+        env = {
+            **self._required_env(),
+            "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE": "0.22",
+            "GENERIC_PROXY_HIGH_EDGE_MIN": "0.25",
+            "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES": "3",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE, 0.22)
+        self.assertEqual(settings.GENERIC_PROXY_HIGH_EDGE_MIN, 0.25)
+        self.assertEqual(settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES, 3)
+
+    def test_self_consistency_top_candidates_env_override(self) -> None:
+        self.assertEqual(config.Settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES, 0)
+        env = {
+            **self._required_env(),
+            "GROK_SELF_CONSISTENCY_TOP_CANDIDATES": "3",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES, 3)
+
+    def test_primary_source_url_exempt_families_env_override(self) -> None:
+        self.assertEqual(
+            config.Settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES, ("sports", "weather")
+        )
+        env = {
+            **self._required_env(),
+            "PRIMARY_SOURCE_URL_EXEMPT_FAMILIES": "sports,weather,crypto",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            tuple(settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES),
+            ("sports", "weather", "crypto"),
+        )
 
     def test_grok_stream_timeout_seconds_weather_env_override(self) -> None:
         env = {
@@ -757,7 +1053,7 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_ENABLED)
-        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 1)
+        self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_PER_CYCLE, 2)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS, 1.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS, 12.0)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
@@ -770,6 +1066,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PROXY_PENALTY_CONVERGENT_REDUCTION_ENABLED)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 4)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 8)
+        self.assertEqual(settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS, 168.0)
 
     def test_research_queue_drain_settings_env_override(self) -> None:
         env = {
@@ -785,6 +1082,7 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP": "0.015",
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS": "6",
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN": "11",
+            "RESEARCH_QUEUE_ENTRY_TTL_HOURS": "48",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -799,6 +1097,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.015)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS, 6)
         self.assertEqual(settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN, 11)
+        self.assertEqual(settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS, 48.0)
 
     def test_research_queue_drain_higher_per_cycle_value_loads(self) -> None:
         """Cycle 4 recovery: a growing research queue (127+ entries) needs
@@ -835,6 +1134,35 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.MAX_SPORTS_CANDIDATES_PER_CYCLE, 3)
+
+    def test_research_queue_near_close_drain_waiver_default_and_override(self) -> None:
+        """Jul 2026: hourly markets closed before the drain min-age elapsed, so
+        near-miss queue entries expired unexamined; the waiver defaults to 2h."""
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS, 2.0)
+        env = {
+            **self._required_env(),
+            "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS": "0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS, 0.0)
+
+    def test_sports_jurisdiction_probe_candidates_default_and_override(self) -> None:
+        """Jul 2026: while the exchange-confirmed jurisdiction hold is set,
+        sports analysis slots throttle to a probe cadence (default 1); 0
+        disables the throttle."""
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE, 1)
+        env = {
+            **self._required_env(),
+            "SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE": "0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE, 0)
 
     def test_daily_drawdown_preflight_setting_loads(self) -> None:
         env = {**self._required_env(), "DAILY_DRAWDOWN_PREFLIGHT_ENABLED": "false"}

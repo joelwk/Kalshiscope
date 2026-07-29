@@ -24,8 +24,19 @@ def _bucket(confidence: float) -> str:
     return f"{left:.1f}-{right:.1f}"
 
 
-def _market_family_from_id(market_id: str) -> str:
-    return family_from_text(market_id)
+def _infer_market_family(
+    *,
+    market_id: str,
+    question: str = "",
+    category: str = "",
+) -> str:
+    """Match calibration_gates / MarketStateManager family inference.
+
+    family_from_text needs ticker + question + category so keyword-only
+    edge cases (e.g. ncaa in category, olympics in question) classify the
+    same way as live trading and historical gates.
+    """
+    return family_from_text(f"{market_id} {question} {category}")
 
 
 def run(db_path: str) -> None:
@@ -122,13 +133,46 @@ def run(db_path: str) -> None:
             }
             required_family_columns = {"market_id", "won", "pnl_estimate", "amount_usdc", "confidence"}
             if required_family_columns.issubset(trade_outcome_columns):
-                family_rows = conn.execute(
-                    """
-                    SELECT market_id, won, pnl_estimate, amount_usdc, confidence
-                    FROM trade_outcomes
-                    WHERE won IS NOT NULL
-                    """
-                ).fetchall()
+                markets_columns = (
+                    {
+                        str(column["name"])
+                        for column in conn.execute("PRAGMA table_info(markets)").fetchall()
+                    }
+                    if _table_exists(conn, "markets")
+                    else set()
+                )
+                can_join_markets = {"id", "question", "category"}.issubset(markets_columns)
+                if can_join_markets:
+                    family_rows = conn.execute(
+                        """
+                        SELECT
+                            t.market_id AS market_id,
+                            COALESCE(m.question, '') AS question,
+                            COALESCE(m.category, '') AS category,
+                            t.won AS won,
+                            t.pnl_estimate AS pnl_estimate,
+                            t.amount_usdc AS amount_usdc,
+                            t.confidence AS confidence
+                        FROM trade_outcomes t
+                        LEFT JOIN markets m ON m.id = t.market_id
+                        WHERE t.won IS NOT NULL
+                        """
+                    ).fetchall()
+                else:
+                    family_rows = conn.execute(
+                        """
+                        SELECT
+                            market_id,
+                            '' AS question,
+                            '' AS category,
+                            won,
+                            pnl_estimate,
+                            amount_usdc,
+                            confidence
+                        FROM trade_outcomes
+                        WHERE won IS NOT NULL
+                        """
+                    ).fetchall()
                 family_stats: dict[str, dict[str, float]] = defaultdict(
                     lambda: {
                         "n": 0.0,
@@ -139,7 +183,11 @@ def run(db_path: str) -> None:
                     }
                 )
                 for family_row in family_rows:
-                    family = _market_family_from_id(str(family_row["market_id"] or ""))
+                    family = _infer_market_family(
+                        market_id=str(family_row["market_id"] or ""),
+                        question=str(family_row["question"] or ""),
+                        category=str(family_row["category"] or ""),
+                    )
                     stats = family_stats[family]
                     stats["n"] += 1.0
                     stats["wins"] += 1.0 if int(family_row["won"] or 0) == 1 else 0.0
@@ -512,6 +560,7 @@ def run(db_path: str) -> None:
             total_score_gate_blocked = 0
             total_decisions = 0
             evidence_basis_counts: dict[str, int] = defaultdict(int)
+            quota_paused_cycles = 0
             for row in cycle_rows:
                 payload_raw = row["payload_json"]
                 if not payload_raw:
@@ -527,6 +576,8 @@ def run(db_path: str) -> None:
                 total_api_cost += float(payload.get("api_cost_estimate_usd") or 0.0)
                 total_order_attempts += int(payload.get("order_attempts") or 0)
                 total_decisions += int(payload.get("decisions_made") or 0)
+                if payload.get("xai_quota_paused"):
+                    quota_paused_cycles += 1
                 rejection_breakdown = payload.get("rejection_breakdown")
                 if isinstance(rejection_breakdown, dict):
                     total_score_gate_blocked += int(
@@ -566,19 +617,8 @@ def run(db_path: str) -> None:
                     print("  evidence_basis_breakdown:")
                     for basis in sorted(evidence_basis_counts):
                         print(f"    {basis}: n={evidence_basis_counts[basis]}")
-
-            quota_paused_cycles = sum(
-                1
-                for row in cycle_rows
-                if row["payload_json"]
-                and isinstance(
-                    (lambda r: json.loads(r) if r else {})(row["payload_json"]),
-                    dict,
-                )
-                and json.loads(row["payload_json"]).get("xai_quota_paused")
-            )
-            if quota_paused_cycles > 0:
-                print(f"  xai_quota_paused_cycles={quota_paused_cycles}")
+                if quota_paused_cycles > 0:
+                    print(f"  xai_quota_paused_cycles={quota_paused_cycles}")
 
         profitable_row = conn.execute(
             """

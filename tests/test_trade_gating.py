@@ -9,6 +9,7 @@ from main import (
     _adjust_bet_size_for_edge,
     _apply_definitive_outcome_floors,
     _build_execution_audit,
+    _direct_evidence_posterior_floor,
     _effective_score_gate_threshold,
     _extract_winning_outcome,
     _filter_markets,
@@ -19,8 +20,11 @@ from main import (
     _is_uniform_implied_probability,
     _min_evidence_quality_for_market,
     _passes_edge_threshold,
+    _passes_lmsr_inefficiency_threshold,
     _should_suppress_hallucinated_edge_penalty,
     _sizing_mode_label,
+    _sports_settlement_source_matches_market,
+    _sports_ticker_alias_tokens,
     _zero_bet_skip_message,
 )
 from models import Market, MarketOutcome, TradeDecision
@@ -69,6 +73,23 @@ def test_edge_gate_allows_when_edge_clears_threshold() -> None:
     assert ok is True
     assert round(edge, 4) == 0.06
     assert reason == ""
+
+
+@pytest.mark.parametrize(
+    ("signal", "minimum", "expected"),
+    [
+        (None, 0.03, True),
+        (0.05, 0.03, True),
+        (0.02, 0.03, False),
+        (-0.20, 0.03, False),
+    ],
+)
+def test_lmsr_gate_requires_positive_chosen_side_inefficiency(
+    signal: float | None,
+    minimum: float,
+    expected: bool,
+) -> None:
+    assert _passes_lmsr_inefficiency_threshold(signal, minimum) is expected
 
 
 def test_edge_gate_blocks_non_sports_without_direct_evidence() -> None:
@@ -347,6 +368,911 @@ def test_confidence_override_allows_when_floor_and_thresholds_met() -> None:
     assert override_path == "edge_default"
 
 
+def test_confidence_override_uses_pre_calibration_confidence() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.08,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.65,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.48,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.70,
+    )
+    blocked, _, blocked_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+    )
+    assert blocked is False
+    assert blocked_path == "none"
+
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+        pre_calibration_confidence=0.58,
+    )
+    assert allowed is True
+    assert override_path == "edge_default"
+
+
+def test_confidence_override_pre_calibration_still_enforces_evidence_quality() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.08,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.65,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.48,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.60,
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.20,
+        pre_calibration_confidence=0.62,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def test_confidence_override_pre_calibration_still_enforces_edge() -> None:
+    settings = Settings(
+        CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=True,
+        CONFIDENCE_GATE_MIN_EDGE=0.08,
+        CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.65,
+        CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55,
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.48,
+        bet_size_pct=0.3,
+        reasoning="test",
+        evidence_quality=0.90,
+    )
+    allowed, _, override_path = _is_confidence_override_allowed(
+        settings=settings,
+        decision=decision,
+        override_edge=0.05,
+        pre_calibration_confidence=0.62,
+    )
+    assert allowed is False
+    assert override_path == "none"
+
+
+def _direct_decision(
+    *,
+    confidence: float = 0.60,
+    edge_external: float | None = 0.13,
+    evidence_quality: float = 0.85,
+    evidence_basis: str = "direct",
+    edge_source: str = "computed",
+    outcome: str = "YES",
+) -> TradeDecision:
+    return TradeDecision(
+        should_trade=True,
+        outcome=outcome,
+        confidence=confidence,
+        bet_size_pct=0.5,
+        reasoning="direct settlement-aligned read",
+        edge_source=edge_source,
+        edge_external=edge_external,
+        evidence_quality=evidence_quality,
+        evidence_basis=evidence_basis,
+    )
+
+
+def _floor_settings(**overrides) -> Settings:
+    base = dict(
+        DIRECT_POSTERIOR_FLOOR_ENABLED=True,
+        DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=0.80,
+        MAX_GLOBAL_CONFIDENCE_DIRECT=0.89,
+        MIN_EDGE=0.08,
+        MAX_REASONABLE_EDGE=0.40,
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_direct_posterior_floor_reconstructs_model_estimate() -> None:
+    settings = _floor_settings()
+    floor = _direct_evidence_posterior_floor(_direct_decision(), 0.67, settings)
+    assert floor == pytest.approx(0.80)
+
+
+def test_direct_posterior_floor_outcome_aware_for_no_bets() -> None:
+    settings = _floor_settings()
+    # NO bet: edge_external is stored YES-side (-0.18), so the chosen (NO) edge is
+    # +0.18. implied_prob here is the chosen-outcome (NO) price 0.65, so the model
+    # NO posterior is floored at 0.65 + 0.18 = 0.83.
+    decision = _direct_decision(edge_external=-0.18, outcome="NO")
+    floor = _direct_evidence_posterior_floor(decision, 0.65, settings)
+    assert floor == pytest.approx(0.83)
+
+
+def test_direct_posterior_floor_none_when_no_bet_lacks_chosen_edge() -> None:
+    settings = _floor_settings()
+    # NO bet whose YES-side edge is positive => the model actually favors YES, not
+    # the NO call. The chosen (NO) edge is negative, so the floor must not fire.
+    decision = _direct_decision(edge_external=0.10, outcome="NO")
+    assert _direct_evidence_posterior_floor(decision, 0.65, settings) is None
+
+
+def test_atl_shaped_yes_side_edge_unblocks_floor_after_enrichment() -> None:
+    """Regression: chosen-side NO polarity must normalize before the floor.
+
+    Live ATL log had my_prob=0.82 / edge_external=+0.29 on outcome=NO, which
+    made the YES-side floor refuse to fire. After enrichment the stored edge is
+    YES-side negative and the floor reconstructs a ~0.20 weather-capped edge.
+    """
+    from grok_client import GrokClient
+
+    settings = _floor_settings(WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20)
+    market = Market(
+        id="KXHIGHTATL-26JUL14-B85.5",
+        question="Will the maximum temperature be 85-86 on Jul 14, 2026?",
+        category="climate",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.47),
+            MarketOutcome(name="NO", price=0.53),
+        ],
+    )
+    raw = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.545,
+        raw_confidence=0.82,
+        bet_size_pct=0.4,
+        reasoning="NWS direct evidence",
+        my_prob=0.82,
+        implied_prob_external=0.53,
+        edge_external=0.29,
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43",
+    )
+    enriched = GrokClient(api_key="x")._validate_and_enrich_decision(
+        market, raw, profile_name="weather"
+    )
+    assert enriched.edge_external is not None
+    assert enriched.edge_external < 0.0
+    # Calibrated confidence left near market; floor must restore model edge.
+    floor = _direct_evidence_posterior_floor(
+        enriched, 0.53, settings, market=market
+    )
+    assert floor is not None
+    assert floor == pytest.approx(0.73, abs=0.02)
+    edge_ok, edge_value, _reason = _passes_edge_threshold(
+        0.53,
+        enriched.model_copy(update={"confidence": 0.545}),
+        settings,
+        market=market,
+        effective_confidence_override=max(0.545, floor),
+    )
+    assert edge_ok
+    assert edge_value is not None
+    assert edge_value >= 0.14
+
+
+def test_direct_posterior_floor_capped_at_direct_ceiling() -> None:
+    settings = _floor_settings()
+    # implied 0.66 + edge 0.30 = 0.96 model estimate, capped at 0.89.
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(edge_external=0.30), 0.66, settings
+    )
+    assert floor == pytest.approx(0.89)
+
+
+def test_direct_posterior_floor_none_for_proxy_or_low_eq_or_nonpositive_edge() -> None:
+    settings = _floor_settings()
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(evidence_basis="proxy"), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(evidence_quality=0.70), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(edge_external=0.0), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(
+        _direct_decision(edge_source="fallback"), 0.67, settings
+    ) is None
+    assert _direct_evidence_posterior_floor(_direct_decision(), None, settings) is None
+
+
+def test_direct_posterior_floor_weather_nws_proxy_applies() -> None:
+    settings = _floor_settings()
+    market = Market(
+        id="KXHIGHAUS-26JUL10-B93.5",
+        question="Will the high temperature in Austin be above 93.5°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.545,
+        bet_size_pct=0.4,
+        reasoning="NWS forecast",
+        edge_source="computed",
+        edge_external=0.13,
+        evidence_basis="proxy",
+        evidence_quality=0.90,
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=30.3&lon=-97.7",
+    )
+    floor = _direct_evidence_posterior_floor(decision, 0.55, settings, market=market)
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_skips_weather_underdog() -> None:
+    settings = _floor_settings(WEATHER_BLOCK_UNDERDOG_ENTRIES=True)
+    market = Market(
+        id="KXHIGHMIA-26JUL11-T88",
+        question="Will the high temperature in Miami be above 88°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.28),
+            MarketOutcome(name="NO", price=0.72),
+        ],
+    )
+    decision = _direct_decision(edge_external=0.18, evidence_quality=0.90)
+    assert _direct_evidence_posterior_floor(decision, 0.28, settings, market=market) is None
+
+
+def test_direct_posterior_floor_caps_weather_edge() -> None:
+    settings = _floor_settings(WEATHER_POSTERIOR_FLOOR_MAX_EDGE=0.20)
+    market = Market(
+        id="KXHIGHMIA-26JUL11-T92",
+        question="Will the high temperature in Miami be above 92°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.60),
+            MarketOutcome(name="NO", price=0.40),
+        ],
+    )
+    # Raw computed edge 0.35 would floor at 0.95; weather cap keeps preserved edge ≤ 0.20.
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(edge_external=0.35, evidence_quality=0.90),
+        0.60,
+        settings,
+        market=market,
+    )
+    assert floor == pytest.approx(0.80)
+
+
+def test_weather_underdog_blocked_at_edge_gate() -> None:
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        WEATHER_MIN_EDGE=0.05,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        MAX_REASONABLE_EDGE=0.40,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHCHI-26JUL11-T85",
+        question="Will the high temperature in Chicago be above 85°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.32),
+            MarketOutcome(name="NO", price=0.68),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.55,
+        raw_confidence=0.55,
+        bet_size_pct=0.3,
+        reasoning="NWS underdog",
+        evidence_basis="direct",
+        evidence_quality=0.90,
+        edge_source="computed",
+        my_prob=0.55,
+    )
+    ok, edge, reason = _passes_edge_threshold(0.32, decision, settings, market=market)
+    assert ok is False
+    assert reason == "weather_underdog_blocked"
+    assert edge == pytest.approx(0.23)
+
+
+def test_weather_favorite_still_passes_edge_gate() -> None:
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        WEATHER_MIN_EDGE=0.05,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        MAX_REASONABLE_EDGE=0.40,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHCHI-26JUL11-T78",
+        question="Will the high temperature in Chicago be above 78°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.62),
+            MarketOutcome(name="NO", price=0.38),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.78,
+        raw_confidence=0.78,
+        bet_size_pct=0.3,
+        reasoning="NWS favorite",
+        evidence_basis="direct",
+        evidence_quality=0.90,
+        edge_source="computed",
+        my_prob=0.78,
+    )
+    ok, edge, reason = _passes_edge_threshold(0.62, decision, settings, market=market)
+    assert ok is True
+    assert reason == ""
+    assert edge == pytest.approx(0.16)
+
+
+def test_weather_underdog_exempt_for_observed_direct_nws() -> None:
+    """Observed direct NWS reads bypass the underdog block; forecast proxy stays blocked."""
+    settings = Settings(
+        MIN_EDGE=0.05,
+        LOW_PRICE_THRESHOLD=0.50,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        WEATHER_MIN_EDGE=0.05,
+        WEATHER_MIN_EVIDENCE_QUALITY=0.60,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        MAX_REASONABLE_EDGE=0.40,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHCHI-26JUL11-T85",
+        question="Will the high temperature in Chicago be above 85°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.32),
+            MarketOutcome(name="NO", price=0.68),
+        ],
+    )
+    observed_direct = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.55,
+        raw_confidence=0.55,
+        bet_size_pct=0.3,
+        reasoning="Observed CLI daily max already exceeds threshold",
+        evidence_basis="direct",
+        evidence_quality=0.72,
+        edge_source="computed",
+        my_prob=0.55,
+        primary_source_url="https://forecast.weather.gov/product.php?site=lot&product=CLI",
+    )
+    ok, edge, reason = _passes_edge_threshold(0.32, observed_direct, settings, market=market)
+    assert ok is True
+    assert reason == ""
+    assert edge == pytest.approx(0.23)
+
+    forecast_proxy = observed_direct.model_copy(update={"evidence_basis": "proxy"})
+    ok_proxy, _, reason_proxy = _passes_edge_threshold(
+        0.32, forecast_proxy, settings, market=market
+    )
+    assert ok_proxy is False
+    assert reason_proxy == "weather_underdog_blocked"
+
+    non_nws_direct = observed_direct.model_copy(
+        update={"primary_source_url": "https://www.wunderground.com/history"}
+    )
+    ok_non_nws, _, reason_non_nws = _passes_edge_threshold(
+        0.32, non_nws_direct, settings, market=market
+    )
+    assert ok_non_nws is False
+    assert reason_non_nws == "weather_underdog_blocked"
+
+    low_eq_direct = observed_direct.model_copy(update={"evidence_quality": 0.50})
+    ok_low_eq, _, reason_low_eq = _passes_edge_threshold(
+        0.32, low_eq_direct, settings, market=market
+    )
+    assert ok_low_eq is False
+    assert reason_low_eq == "weather_underdog_blocked"
+
+
+def test_commodity_min_edge_raises_threshold() -> None:
+    from main import _edge_threshold_for_market
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        COMMODITY_MIN_EDGE=0.22,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXWTI-26JUL12-T70.00",
+        question="Will WTI settle above 70?",
+        category="finance",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    assert _edge_threshold_for_market(0.55, settings, "computed", market=market) == pytest.approx(
+        0.22
+    )
+
+
+def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from main import _edge_threshold_for_market, _passes_edge_threshold
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        COMMODITY_MIN_EDGE=0.22,
+        COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=0.95,
+        COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75,
+        DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        MAX_REASONABLE_EDGE=0.40,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.6265,
+        bet_size_pct=0.13,
+        reasoning="Settlement-aligned Brent buffer",
+        evidence_basis="proxy",
+        evidence_quality=0.75,
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url="https://www.bloomberg.com/energy",
+    )
+    near_close = Market(
+        id="KXBRENTD-26JUL2017-T87",
+        question="Will the brent crude oil close price be above 87?",
+        category="finance",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.41),
+            MarketOutcome(name="NO", price=0.59),
+        ],
+        liquidity_usdc=2600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=1.0),
+    )
+    far_close = near_close.model_copy(
+        update={"close_time": datetime.now(timezone.utc) + timedelta(hours=9.0)}
+    )
+
+    near_floor = _edge_threshold_for_market(
+        0.41, settings, "computed", market=near_close, decision=decision
+    )
+    far_floor = _edge_threshold_for_market(
+        0.41, settings, "computed", market=far_close, decision=decision
+    )
+    assert near_floor == pytest.approx(0.22 * 0.95)
+    assert far_floor == pytest.approx(0.22)
+
+    # Logged Brent knife-edge: 0.2165 clears high-EQ floor (~0.209) near settlement.
+    ok_near, edge_near, reason_near = _passes_edge_threshold(
+        0.41,
+        decision,
+        settings,
+        market=near_close,
+        effective_confidence_override=0.6265,
+    )
+    assert ok_near is True
+    assert edge_near == pytest.approx(0.2165)
+    assert reason_near == ""
+
+    ok_far, edge_far, reason_far = _passes_edge_threshold(
+        0.41,
+        decision,
+        settings,
+        market=far_close,
+        effective_confidence_override=0.6265,
+    )
+    assert ok_far is False
+    assert edge_far == pytest.approx(0.2165)
+    assert "below min" in reason_far
+
+    # Low-EQ / silver-like tiny edge still fails even near close.
+    weak = decision.model_copy(update={"evidence_quality": 0.55, "confidence": 0.4325})
+    ok_weak, _, reason_weak = _passes_edge_threshold(
+        0.41,
+        weak,
+        settings,
+        market=near_close,
+        effective_confidence_override=0.4325,
+    )
+    assert ok_weak is False
+    assert "below min" in reason_weak
+
+
+def test_settled_direct_commodity_near_close_waives_commodity_premium() -> None:
+    """Direct settlement-aligned eq>=0.95 near-close reads use the base MIN_EDGE."""
+    from datetime import datetime, timedelta, timezone
+
+    from main import _edge_threshold_for_market
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        MIN_EDGE_HIGH_LIQUIDITY_THRESHOLD=300.0,
+        MIN_EDGE_HIGH_LIQUIDITY_MULTIPLIER=0.70,
+        COMMODITY_MIN_EDGE=0.22,
+        COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=0.95,
+        COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=0.75,
+        HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95,
+        DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    settled_direct = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.2,
+        reasoning="Live settlement-aligned exchange quote, observed value cited",
+        evidence_basis="direct",
+        evidence_quality=0.96,
+        edge_source="computed",
+        source_match_class="settlement_aligned",
+        primary_source_url="https://www.bloomberg.com/energy",
+    )
+    near_close = Market(
+        id="KXBRENTD-26JUL2017-T87",
+        question="Will the brent crude oil close price be above 87?",
+        category="finance",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=2600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=1.0),
+    )
+    far_close = near_close.model_copy(
+        update={"close_time": datetime.now(timezone.utc) + timedelta(hours=9.0)}
+    )
+
+    waived = _edge_threshold_for_market(
+        0.55, settings, "computed", market=near_close, decision=settled_direct
+    )
+    # Commodity premium waived; base MIN_EDGE with liquidity scaling governs.
+    assert waived == pytest.approx(0.12 * 0.70)
+
+    far_floor = _edge_threshold_for_market(
+        0.55, settings, "computed", market=far_close, decision=settled_direct
+    )
+    assert far_floor == pytest.approx(0.22)
+
+    # eq below the settled bar falls back to the high-EQ multiplier relief.
+    high_eq_only = settled_direct.model_copy(update={"evidence_quality": 0.90})
+    multiplier_floor = _edge_threshold_for_market(
+        0.55, settings, "computed", market=near_close, decision=high_eq_only
+    )
+    assert multiplier_floor == pytest.approx(0.22 * 0.95)
+
+    # Proxy basis never qualifies for the waiver even at eq>=0.95.
+    proxy_high_eq = settled_direct.model_copy(update={"evidence_basis": "proxy"})
+    proxy_floor = _edge_threshold_for_market(
+        0.55, settings, "computed", market=near_close, decision=proxy_high_eq
+    )
+    assert proxy_floor == pytest.approx(0.22 * 0.95)
+
+
+def test_weather_high_eq_edge_multiplier_lowers_floor_for_nws_direct() -> None:
+    from main import _edge_threshold_for_market, _passes_edge_threshold
+
+    settings = Settings(
+        MIN_EDGE=0.08,
+        WEATHER_MIN_EDGE=0.14,
+        WEATHER_HIGH_EQ_EDGE_MULTIPLIER=0.85,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        VERY_LOW_PRICE_THRESHOLD=0.25,
+        VERY_LOW_PRICE_MIN_EDGE=0.28,
+        MAX_REASONABLE_EDGE=0.40,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=False,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    market = Market(
+        id="KXHIGHTSEA-26JUL16-T69",
+        question="Will the maximum temperature be <69 on Jul 16?",
+        category="climate",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.42),
+            MarketOutcome(name="NO", price=0.58),
+        ],
+        liquidity_usdc=50.0,
+    )
+    high_eq = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.70,
+        bet_size_pct=0.2,
+        reasoning="NWS forecast supports NO",
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        edge_source="computed",
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=47.6&lon=-122.3",
+    )
+    low_eq = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.70,
+        bet_size_pct=0.2,
+        reasoning="proxy weather guess",
+        evidence_basis="proxy",
+        evidence_quality=0.60,
+        edge_source="computed",
+        primary_source_url="https://www.weather.com/weather/today/l/Seattle",
+    )
+
+    high_eq_floor = _edge_threshold_for_market(
+        0.58, settings, "computed", market=market, decision=high_eq
+    )
+    low_eq_floor = _edge_threshold_for_market(
+        0.58, settings, "computed", market=market, decision=low_eq
+    )
+    assert high_eq_floor == pytest.approx(0.14 * 0.85)
+    assert low_eq_floor == pytest.approx(0.14)
+
+    # Logged near-miss band: edge 0.12 clears high-EQ floor (~0.119), not raw 0.14.
+    ok_near, edge_near, reason_near = _passes_edge_threshold(
+        0.58,
+        high_eq.model_copy(update={"confidence": 0.70}),
+        settings,
+        market=market,
+    )
+    assert ok_near is True
+    assert edge_near == pytest.approx(0.12)
+    assert reason_near == ""
+
+    ok_low, _, reason_low = _passes_edge_threshold(
+        0.58,
+        low_eq.model_copy(update={"confidence": 0.70}),
+        settings,
+        market=market,
+    )
+    assert ok_low is False
+    assert "below min" in reason_low
+
+
+def test_direct_posterior_floor_weather_proxy_without_nws_url_is_none() -> None:
+    settings = _floor_settings()
+    market = Market(
+        id="KXHIGHAUS-26JUL10-B93.5",
+        question="Will the high temperature in Austin be above 93.5°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.545,
+        bet_size_pct=0.4,
+        reasoning="weather.com forecast",
+        edge_source="computed",
+        edge_external=0.13,
+        evidence_basis="proxy",
+        evidence_quality=0.90,
+        primary_source_url="https://www.weather.com/weather/today/l/Austin",
+    )
+    assert _direct_evidence_posterior_floor(decision, 0.55, settings, market=market) is None
+
+
+def test_edge_gate_allows_weather_high_eq_edge_above_generic_max() -> None:
+    """High-EQ NWS weather may use DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX (favorites)."""
+    settings = Settings(
+        MIN_EDGE=0.05,
+        WEATHER_MIN_EDGE=0.05,
+        MAX_REASONABLE_EDGE=0.40,
+        DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX=0.50,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=False,
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=True,
+        LOW_PRICE_THRESHOLD=0.50,
+    )
+    market = Market(
+        id="KXHIGHTDAL-26JUL10-B98.5",
+        question="Will the high temperature in Dallas be above 98.5°F?",
+        category="weather",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.97,
+        bet_size_pct=0.5,
+        reasoning="NWS direct",
+        edge_source="computed",
+        evidence_basis="direct",
+        evidence_quality=0.90,
+        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=32.8&lon=-96.8",
+    )
+    ok, edge, reason = _passes_edge_threshold(
+        0.55,
+        decision,
+        settings,
+        market=market,
+        effective_confidence_override=0.97,
+    )
+    assert ok is True, reason
+    assert edge == pytest.approx(0.42)
+
+
+def test_direct_posterior_floor_disabled_returns_none() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_ENABLED=False)
+    assert _direct_evidence_posterior_floor(_direct_decision(), 0.67, settings) is None
+
+
+def test_direct_posterior_floor_unblocks_edge_gate_after_calibration_inversion() -> None:
+    settings = _floor_settings()
+    market = Market(
+        id="KXAAA-FLOOR",
+        question="Direct evidence generic market",
+        outcomes=[MarketOutcome(name="YES", price=0.67), MarketOutcome(name="NO", price=0.33)],
+        liquidity_usdc=600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    # Calibration crushed confidence to 0.60; raw model edge is +0.13.
+    decision = _direct_decision(confidence=0.60, edge_external=0.13)
+    floor = _direct_evidence_posterior_floor(decision, 0.67, settings, market=market)
+    assert floor == pytest.approx(0.80)
+
+    # Without the floor the calibrated confidence yields a negative market edge.
+    blocked_ok, blocked_edge, _ = _passes_edge_threshold(
+        0.67, decision, settings, market=market,
+        effective_confidence_override=decision.confidence,
+    )
+    assert blocked_ok is False
+    assert blocked_edge is not None and blocked_edge < 0
+
+    # With the floor applied the real positive edge clears the gate.
+    ok, edge, reason = _passes_edge_threshold(
+        0.67, decision, settings, market=market,
+        effective_confidence_override=max(decision.confidence, floor),
+    )
+    assert ok is True
+    assert edge == pytest.approx(0.13)
+    assert reason == ""
+
+
+def _price_strike_market(
+    market_id: str,
+    *,
+    hours_to_close: float,
+    question: str = "Will the gold close price be above the strike today?",
+) -> Market:
+    return Market(
+        id=market_id,
+        question=question,
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=400.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=hours_to_close),
+    )
+
+
+def test_direct_posterior_floor_scope_suppressed_for_far_numeric_strike() -> None:
+    # A live quote hours before settlement is not predictive; no floor.
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market("KXGOLDD-26JUN1017-T4157", hours_to_close=4.0)
+    assert (
+        _direct_evidence_posterior_floor(_direct_decision(), 0.55, settings, market=market)
+        is None
+    )
+
+
+def test_direct_posterior_floor_kept_for_near_settlement_numeric_strike() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market("KXGOLDD-26JUN1017-T4157", hours_to_close=0.5)
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_kept_for_weather_numeric_strike() -> None:
+    # NWS forecasts predict the settlement quantity; weather keeps the floor.
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market(
+        "KXLOWTCHI-26JUN10-T72",
+        hours_to_close=10.0,
+        question="Will the low temperature in Chicago be 72F or below today?",
+    )
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_scope_guard_disabled_with_zero_max_hours() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=0.0)
+    market = _price_strike_market("KXGOLDD-26JUN1017-T4157", hours_to_close=6.0)
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_unaffected_for_non_strike_ticker() -> None:
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = _price_strike_market(
+        "KXAAAGASD-26JUN11-4.140",
+        hours_to_close=8.0,
+        question="Will average gas prices be above $4.14?",
+    )
+    floor = _direct_evidence_posterior_floor(
+        _direct_decision(), 0.55, settings, market=market
+    )
+    assert floor == pytest.approx(0.68)
+
+
+def test_direct_posterior_floor_scope_suppressed_when_close_time_missing() -> None:
+    # Proximity cannot be verified without close_time; treat as out of scope.
+    settings = _floor_settings(DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=1.5)
+    market = Market(
+        id="KXGOLDD-26JUN1017-T4157",
+        question="Will the gold close price be above the strike today?",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=400.0,
+        close_time=None,
+    )
+    assert (
+        _direct_evidence_posterior_floor(_direct_decision(), 0.55, settings, market=market)
+        is None
+    )
+
+
 def test_effective_score_gate_threshold_uses_weather_direct_threshold() -> None:
     settings = Settings(
         SCORE_GATE_THRESHOLD=0.25,
@@ -462,6 +1388,79 @@ def test_effective_score_gate_threshold_profitable_family_convergent_bypass() ->
         family_sample_size=40,
     )
     assert disabled == 0.52
+
+
+def test_effective_score_gate_threshold_convergent_computed_edge() -> None:
+    """Computed source-backed edges count as convergent evidence.
+
+    The self-consistency marker almost never co-occurred with a >=30-sample
+    profitable family (0/1857 receipts), so multi-book odds / live settlement
+    feeds (edge_source=computed at eq>=0.65) now satisfy convergence, and
+    lifetime family samples can satisfy the depth requirement when the recent
+    window is thin (e.g. sports under a jurisdiction hold).
+    """
+    settings = Settings(
+        SCORE_GATE_THRESHOLD=0.52,
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED=True,
+        SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT=0.08,
+        SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES=30,
+    )
+    sports_market = Market(
+        id="KXMLBGAME-26JUL27-TOR",
+        question="Will Toronto win?",
+        category="sports",
+    )
+    convergent_computed = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.70,
+        family_is_profitable=True,
+        self_consistency_passed=False,
+        family_sample_size=12,
+        edge_source="computed",
+        lifetime_family_sample_size=178,
+    )
+    assert convergent_computed == 0.08
+
+    low_eq_computed = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.60,
+        family_is_profitable=True,
+        self_consistency_passed=False,
+        family_sample_size=12,
+        edge_source="computed",
+        lifetime_family_sample_size=178,
+    )
+    assert low_eq_computed == 0.52
+
+    fallback_source = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.70,
+        family_is_profitable=True,
+        self_consistency_passed=False,
+        family_sample_size=12,
+        edge_source="fallback",
+        lifetime_family_sample_size=178,
+    )
+    assert fallback_source == 0.52
+
+    thin_both_windows = _effective_score_gate_threshold(
+        settings=settings,
+        market=sports_market,
+        evidence_basis_class="proxy",
+        evidence_quality=0.70,
+        family_is_profitable=True,
+        self_consistency_passed=True,
+        family_sample_size=12,
+        edge_source="computed",
+        lifetime_family_sample_size=0,
+    )
+    assert thin_both_windows == 0.52
 
 
 def test_research_queue_receipt_emitted_on_soft_block() -> None:
@@ -787,6 +1786,71 @@ def test_high_quality_settled_suppresses_hallucinated_edge_penalty() -> None:
             decision=decision,
             evidence_basis="direct",
             settings=settings,
+        )
+        is True
+    )
+
+
+def test_sports_ticker_alias_tokens_expand_lad_nyy() -> None:
+    aliases = _sports_ticker_alias_tokens("KXMLBF5-26JUL182008LADNYY-LAD")
+    assert "dodgers" in aliases
+    assert "yankees" in aliases
+    assert "lad" in aliases
+    assert "nyy" in aliases
+
+
+def test_abbreviated_sports_title_matches_nickname_sources() -> None:
+    """Kalshi 'Los Angeles D' titles must match MLB.com Dodgers/Yankees sources."""
+    market = Market(
+        id="KXMLBF5-26JUL182008LADNYY-LAD",
+        question=(
+            "Will Los Angeles D be the Los Angeles D vs New York Y "
+            "first 5 innings winner?"
+        ),
+        category="Sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.47),
+            MarketOutcome(name="NO", price=0.53),
+        ],
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.70,
+        bet_size_pct=0.5,
+        reasoning=(
+            "Game postponed (MLB.com 7/19/26); no F5 played so LAD did not win it. "
+            "Direct settlement fact from official postponement notice."
+        ),
+        evidence_basis="direct",
+        evidence_quality=1.0,
+        raw_evidence_quality=0.95,
+        primary_source_url=(
+            "https://www.mlb.com/news/"
+            "dodgers-yankees-saturday-july-18-2026-postponed-due-to-weather"
+        ),
+        key_sources=[
+            "https://www.mlb.com/news/"
+            "dodgers-yankees-saturday-july-18-2026-postponed-due-to-weather",
+            "https://www.espn.com/mlb/game/_/gameId/401816157/dodgers-yankees",
+        ],
+        source_match_class="settlement_aligned",
+        edge_source="computed",
+        my_prob=0.02,
+        definitive_outcome_detected=False,
+    )
+    settings = Settings(
+        DIRECT_SOURCE_WHITELIST=("mlb.com", "espn.com"),
+        HIGH_QUALITY_SETTLED_EVIDENCE_MIN_EQ=0.95,
+    )
+    assert _sports_settlement_source_matches_market(decision, market) is True
+    assert _is_high_quality_settled_evidence(decision, settings, market=market) is True
+    assert (
+        _should_suppress_hallucinated_edge_penalty(
+            decision=decision,
+            evidence_basis="direct",
+            settings=settings,
+            market=market,
         )
         is True
     )

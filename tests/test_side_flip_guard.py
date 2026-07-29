@@ -105,6 +105,49 @@ def test_flip_guard_allows_high_evidence_override() -> None:
     assert guarded.outcome == "NO"
 
 
+def test_flip_guard_allows_direct_settlement_flip_with_negative_conf_delta() -> None:
+    # Fresh direct, settlement-aligned evidence with a strong edge overrides a
+    # stale, more-confident anchor even when the new confidence is lower.
+    settings = Settings()
+    market = _market()
+    decision = _decision("NO", 0.58, evidence_quality=0.85).model_copy(
+        update={
+            "evidence_basis": "direct",
+            "source_match_class": "settlement_aligned",
+            "likelihood_ratio": 10.0,
+        }
+    )
+    anchor = {"outcome": "YES", "confidence": 0.70}
+
+    guarded, triggered, blocked = _apply_flip_guard(market, decision, anchor, settings)
+
+    assert triggered is True
+    assert blocked is False
+    assert guarded.should_trade is True
+    assert guarded.outcome == "NO"
+
+
+def test_flip_guard_direct_override_requires_settlement_aligned() -> None:
+    # Same negative-conf_delta flip but proxy/unverified source -> still blocked
+    # (the direct override must not open proxy flips).
+    settings = Settings()
+    market = _market()
+    decision = _decision("NO", 0.58, evidence_quality=0.85).model_copy(
+        update={
+            "evidence_basis": "proxy",
+            "source_match_class": "preview_or_proxy",
+            "likelihood_ratio": 10.0,
+        }
+    )
+    anchor = {"outcome": "YES", "confidence": 0.70}
+
+    guarded, triggered, blocked = _apply_flip_guard(market, decision, anchor, settings)
+
+    assert blocked is True
+    assert guarded.should_trade is False
+    assert guarded.outcome == "YES"
+
+
 def test_flip_guard_uses_raw_confidence_for_direct_high_likelihood_flips() -> None:
     settings = Settings()
     market = _market()

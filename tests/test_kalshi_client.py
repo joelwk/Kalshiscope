@@ -432,7 +432,10 @@ class TestKalshiClient(unittest.TestCase):
             side="BUY",
         )
         response_payload = {
-            "order": {"order_id": "ord-1", "status": "resting"},
+            "order_id": "ord-1",
+            "fill_count": "0.00",
+            "remaining_count": "10.00",
+            "ts_ms": 1,
         }
 
         with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
@@ -440,12 +443,17 @@ class TestKalshiClient(unittest.TestCase):
 
         sent_payload = req_mock.call_args.kwargs["json"]
         self.assertEqual(sent_payload["ticker"], "MKT-3")
-        self.assertEqual(sent_payload["side"], "yes")
+        # YES book: buying YES is a ``bid`` quoted in fixed-point dollars.
+        self.assertEqual(sent_payload["side"], "bid")
         self.assertEqual(sent_payload["time_in_force"], "good_till_canceled")
-        self.assertEqual(sent_payload["count"], 10)
-        self.assertEqual(sent_payload["yes_price"], 50)
+        self.assertEqual(sent_payload["self_trade_prevention_type"], "taker_at_cross")
+        self.assertEqual(sent_payload["count"], "10")
+        self.assertEqual(sent_payload["price"], "0.5000")
+        self.assertNotIn("yes_price", sent_payload)
         self.assertNotIn("no_price", sent_payload)
+        self.assertNotIn("type", sent_payload)
         self.assertEqual(response.id, "ord-1")
+        # Unfilled good-till-canceled limit rests on the book (not canceled).
         self.assertEqual(response.status, "resting")
 
     def test_submit_order_uses_no_price_for_no_side(self) -> None:
@@ -461,17 +469,25 @@ class TestKalshiClient(unittest.TestCase):
             amount_usdc=6.0,
             side="BUY",
         )
-        response_payload = {"order": {"order_id": "ord-2", "status": "resting"}}
+        response_payload = {
+            "order_id": "ord-2",
+            "fill_count": "10.00",
+            "remaining_count": "0.00",
+        }
 
         with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
             response = client.submit_order(order, market=market)
 
         sent_payload = req_mock.call_args.kwargs["json"]
-        self.assertEqual(sent_payload["side"], "no")
-        self.assertEqual(sent_payload["count"], 10)
-        self.assertEqual(sent_payload["no_price"], 60)
+        # Buying NO at 0.60 is selling YES at 0.40, i.e. an ``ask`` on the YES book.
+        self.assertEqual(sent_payload["side"], "ask")
+        self.assertEqual(sent_payload["count"], "10")
+        self.assertEqual(sent_payload["price"], "0.4000")
         self.assertNotIn("yes_price", sent_payload)
+        self.assertNotIn("no_price", sent_payload)
         self.assertEqual(response.id, "ord-2")
+        # Fully filled order reports executed.
+        self.assertEqual(response.status, "executed")
 
     def test_submit_order_market_uses_fill_or_kill_and_fallback_suffix(self) -> None:
         client = self._client()
@@ -487,17 +503,133 @@ class TestKalshiClient(unittest.TestCase):
             side="BUY",
             order_type="market",
         )
-        response_payload = {"order": {"order_id": "ord-6", "status": "filled"}}
+        response_payload = {
+            "order_id": "ord-6",
+            "fill_count": "15.00",
+            "remaining_count": "0.00",
+        }
 
         with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
             response = client.submit_order(order, market=market, retry_suffix="fb")
 
         sent_payload = req_mock.call_args.kwargs["json"]
-        self.assertEqual(sent_payload["type"], "market")
         self.assertEqual(sent_payload["time_in_force"], "fill_or_kill")
-        self.assertEqual(sent_payload["yes_price"], 97)
+        # Marketable buy YES crosses the spread with an aggressive YES bid.
+        self.assertEqual(sent_payload["side"], "bid")
+        self.assertEqual(sent_payload["price"], "0.9700")
+        self.assertEqual(sent_payload["count"], "6")
+        self.assertEqual(sent_payload["self_trade_prevention_type"], "taker_at_cross")
+        self.assertNotIn("type", sent_payload)
         self.assertTrue(sent_payload["client_order_id"].endswith("-fb"))
         self.assertEqual(response.id, "ord-6")
+        self.assertEqual(response.raw["client_price"], 0.97)
+        self.assertEqual(response.raw["client_requested_notional_usdc"], 5.82)
+
+    def _client_with_bet_floor(self, min_bet: float, max_bet: float) -> KalshiClient:
+        with patch.object(KalshiClient, "_load_private_key", return_value=_DummyPrivateKey()):
+            return KalshiClient(
+                base_url="https://api.example/trade-api/v2",
+                api_key_id="test-key",
+                private_key_path="unused.pem",
+                min_bet_usdc=min_bet,
+                max_bet_usdc=max_bet,
+            )
+
+    def test_submit_order_floors_count_within_approved_amount(self) -> None:
+        client = self._client_with_bet_floor(2.0, 12.0)
+        market = Market(
+            id="MKT-MIN",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.37}, {"name": "NO", "price": 0.63}],
+        )
+        order = OrderRequest(
+            market_id="MKT-MIN",
+            outcome="YES",
+            amount_usdc=2.0,
+            side="BUY",
+        )
+        response_payload = {"order_id": "ord-min", "fill_count": "5.00", "remaining_count": "0.00"}
+
+        with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
+            response = client.submit_order(order, market=market)
+
+        sent_payload = req_mock.call_args.kwargs["json"]
+        # The execution pipeline approved $2.00, so 6 contracts ($2.22) are
+        # forbidden even though 5 contracts ($1.85) land below MIN_BET_USDC.
+        self.assertEqual(sent_payload["count"], "5")
+        self.assertEqual(sent_payload["price"], "0.3700")
+        self.assertEqual(response.raw["client_amount_usdc"], 2.0)
+        self.assertEqual(response.raw["client_requested_notional_usdc"], 1.85)
+
+    def test_submit_order_caps_count_at_configured_max_bet(self) -> None:
+        client = self._client_with_bet_floor(2.0, 2.0)
+        market = Market(
+            id="MKT-MINCAP",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.59}, {"name": "NO", "price": 0.41}],
+        )
+        order = OrderRequest(
+            market_id="MKT-MINCAP",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        response_payload = {"order_id": "ord-cap", "fill_count": "3.00", "remaining_count": "0.00"}
+
+        with patch.object(client, "_request", return_value=_DummyResponse(response_payload)) as req_mock:
+            client.submit_order(order, market=market)
+
+        sent_payload = req_mock.call_args.kwargs["json"]
+        # The request exceeds MAX_BET_USDC, so the final integer count is based
+        # on the tighter $2.00 cap: floor($2.00 / $0.59) = 3 contracts.
+        self.assertEqual(sent_payload["count"], "3")
+
+    def test_submit_order_rejects_budget_below_one_contract(self) -> None:
+        client = self._client_with_bet_floor(0.0, 12.0)
+        market = Market(
+            id="MKT-SMALL",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.59}, {"name": "NO", "price": 0.41}],
+        )
+        order = OrderRequest(
+            market_id="MKT-SMALL",
+            outcome="YES",
+            amount_usdc=0.30,
+            side="BUY",
+        )
+
+        with patch.object(client, "_request") as req_mock:
+            with self.assertRaisesRegex(ValueError, "cannot fund one contract"):
+                client.submit_order(order, market=market)
+
+        req_mock.assert_not_called()
+
+    def test_submit_order_fill_or_kill_zero_fill_maps_to_canceled(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-6B",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.40}, {"name": "NO", "price": 0.60}],
+        )
+        order = OrderRequest(
+            market_id="MKT-6B",
+            outcome="YES",
+            amount_usdc=6.0,
+            side="BUY",
+            order_type="market",
+        )
+        # V2 fill-or-kill that finds no liquidity returns zero fills and no status.
+        response_payload = {
+            "order_id": "ord-6b",
+            "fill_count": "0.00",
+            "remaining_count": "15.00",
+        }
+
+        with patch.object(client, "_request", return_value=_DummyResponse(response_payload)):
+            response = client.submit_order(order, market=market)
+
+        self.assertEqual(response.id, "ord-6b")
+        self.assertEqual(response.status, "canceled")
 
     def test_normalize_time_in_force_maps_legacy_values_to_valid_rest_values(self) -> None:
         self.assertEqual(_normalize_time_in_force(None), "good_till_canceled")
@@ -545,6 +677,102 @@ class TestKalshiClient(unittest.TestCase):
         with patch.object(client, "_request", side_effect=http_error):
             with self.assertRaises(MarketClosedError):
                 client.submit_order(order, market=market)
+
+    def test_submit_order_attaches_response_body_on_http_error(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-MI",
+            question="Sports question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-MI",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        body = (
+            '{"error":{"code":"michigan_residents_are_not_currently_'
+            'allowed_to_open_positions_in_Sports"}}'
+        )
+        response = _DummyHttpResponse(body, status_code=403)
+        http_error = requests.exceptions.HTTPError(
+            "403 Client Error: Forbidden for url: https://api.example/orders",
+            response=response,
+        )
+
+        with patch.object(client, "_request", side_effect=http_error):
+            with self.assertRaises(requests.exceptions.HTTPError) as raised:
+                client.submit_order(order, market=market)
+        self.assertEqual(getattr(raised.exception, "_kalshi_response_body", None), body)
+
+    def _rate_limit_error(self) -> requests.exceptions.HTTPError:
+        response = _DummyHttpResponse(
+            '{"error":{"code":"too_many_requests","message":"too many requests"}}',
+            status_code=429,
+        )
+        return requests.exceptions.HTTPError("429 Too Many Requests", response=response)
+
+    def test_submit_order_retries_rate_limit_with_same_payload(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-8",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-8",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        success = _DummyResponse({"order": {"order_id": "ord-8", "status": "resting"}})
+
+        with patch("kalshi_client.time.sleep") as sleep_mock:
+            with patch.object(
+                client,
+                "_request",
+                side_effect=[self._rate_limit_error(), success],
+            ) as req_mock:
+                response = client.submit_order(order, market=market)
+
+        self.assertEqual(response.id, "ord-8")
+        self.assertEqual(req_mock.call_count, 2)
+        first_payload = req_mock.call_args_list[0].kwargs["json"]
+        second_payload = req_mock.call_args_list[1].kwargs["json"]
+        # Idempotent retry: a 429 was never accepted, so the identical
+        # client_order_id must be reused.
+        self.assertEqual(first_payload, second_payload)
+        sleep_mock.assert_called_once()
+
+    def test_submit_order_rate_limit_exhausts_retries_and_raises(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-9",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-9",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+
+        with patch("kalshi_client.time.sleep"):
+            with patch.object(
+                client,
+                "_request",
+                side_effect=[
+                    self._rate_limit_error(),
+                    self._rate_limit_error(),
+                    self._rate_limit_error(),
+                ],
+            ) as req_mock:
+                with self.assertRaises(requests.exceptions.HTTPError):
+                    client.submit_order(order, market=market)
+
+        self.assertEqual(req_mock.call_count, 3)
 
 
 if __name__ == "__main__":

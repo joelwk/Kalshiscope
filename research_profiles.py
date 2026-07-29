@@ -124,7 +124,18 @@ _COMMODITY_KEYWORDS = (
     "brent",
     "crude",
     "oil",
+    "wti",
+    "natgas",
+    "natural gas",
+    "heating oil",
     "gas prices",
+)
+# Kalshi commodity futures often use short tickers (KXWTI/KXNATGAS/…) whose
+# questions may omit the commodity keyword. Prefix detection keeps adaptive
+# edge thresholds applied without hard-blocking those markets.
+_COMMODITY_TICKER_PATTERN = re.compile(
+    r"\bKX(?:WTI|BRENT|NATGAS|NG|CLU|HOIL|GOLD|SILVER|COPPER)\b",
+    re.IGNORECASE,
 )
 _MUSIC_KEYWORDS = (
     "streams",
@@ -263,6 +274,16 @@ def profile_for_market(settings: Settings, market: Market) -> ResearchProfile:
             domains=settings.ENTERTAINMENT_ALLOWED_DOMAINS,
             x_handles=settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
         )
+    # Commodities and indices fall into the "generic" family but settle on
+    # exchange data; route them to the commodity search profile so the model can
+    # reach (and cite) the CME/ICE/EIA settlement pages required for direct
+    # evidence. Mirrors the commodity special-casing in _category_research_hint.
+    if is_commodity_market(market):
+        return ResearchProfile(
+            name="commodity",
+            domains=settings.COMMODITY_ALLOWED_DOMAINS,
+            x_handles=settings.COMMODITY_ALLOWED_X_HANDLES,
+        )
     return ResearchProfile(
         name="generic",
         domains=settings.GENERIC_ALLOWED_DOMAINS,
@@ -328,6 +349,9 @@ def family_from_text(text: str) -> str:
 
 
 def is_commodity_market(market: Market) -> bool:
+    market_id = str(getattr(market, "id", "") or "")
+    if _COMMODITY_TICKER_PATTERN.search(market_id):
+        return True
     return _has_keyword_match(_market_text(market), _COMMODITY_KEYWORDS)
 
 

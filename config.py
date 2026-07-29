@@ -22,8 +22,32 @@ class Settings:
     MIN_CONFIDENCE: float = 0.62  # Raised to avoid low-confidence churn and improve calibration
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.08
-    CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.70
-    CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.58
+    # Lowered 0.70 -> 0.60 (Jul 2026 review): the 0.55-0.61 calibrated band is
+    # the only profitable resolved tier (65.5% WR, +$52.91) but most of its
+    # candidates carry eq 0.60 (weather/commodity computed proxy), so the 0.70
+    # bar excluded nearly all of them. Edge >= CONFIDENCE_GATE_MIN_EDGE still
+    # applies, and the downstream evidence-quality gate keeps its own floor.
+    CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY: float = 0.60
+    # Lowered 0.58 -> 0.55 (Jul 2026 review): calibrated confidence 0.55-0.61
+    # is the only profitable resolved tier (70.4% WR, +58.5% ROI) and the
+    # override still requires edge >= CONFIDENCE_GATE_MIN_EDGE plus evidence
+    # quality >= CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY.
+    CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE: float = 0.55
+    # Direct-evidence posterior floor: for direct + computed + high-evidence
+    # decisions, floor the posterior used by the edge gate, Kelly sizing, and the
+    # score gate at the model's own outcome estimate (implied + edge_external) so
+    # confidence calibration cannot invert a genuine positive edge into a
+    # negative market edge. Bounded by MAX_GLOBAL_CONFIDENCE_DIRECT.
+    DIRECT_POSTERIOR_FLOOR_ENABLED: bool = True
+    DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY: float = 0.80
+    # Scope guard for numeric-strike price markets (commodity/index/crypto
+    # -T<strike> tickers): a live quote confirms the CURRENT value, not the
+    # settlement value, so the floor only applies when settlement is within
+    # this many hours (or the decision passes definitive validation). Weather
+    # keeps the floor: forecasts predict the settlement quantity itself.
+    # June 2026 evidence: floored commodity strikes placed 3-4h out ran a 52%
+    # realized win rate at ~0.57 entries. Set to 0 to disable the scope guard.
+    DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE: float = 1.5
     MIN_EVIDENCE_QUALITY_FOR_TRADE: float = 0.55
     SPORTS_MIN_EVIDENCE_QUALITY: float = 0.55
     MIN_LIQUIDITY_USDC: float = 15.0
@@ -38,6 +62,19 @@ class Settings:
     MIN_EDGE_MEDIUM_LIQUIDITY_MULTIPLIER: float = 0.85
     LOW_PRICE_THRESHOLD: float = 0.50
     VERY_LOW_PRICE_THRESHOLD: float = 0.25
+    # Allow high-edge, direct, settlement-aligned trades to bypass the hard
+    # VERY_LOW_PRICE_THRESHOLD entry floor. The min-edge ladder already prices
+    # low-entry risk (VERY_LOW_PRICE_MIN_EDGE), so the hard floor otherwise
+    # discards legitimate cheap longshots backed by direct settlement evidence
+    # (e.g. a 0.21-priced market with a 0.49 direct edge).
+    ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED: bool = True
+    ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE: float = 0.20
+    # eq floor set to MIN_EVIDENCE_QUALITY_FOR_TRADE level (0.60) rather than 0.80
+    # so the override actually recovers the observed lost class (direct,
+    # settlement-aligned, edge 0.49, eq 0.60). The direct + settlement_aligned +
+    # strong-edge gates already make this a high bar; the market must still clear
+    # the separate evidence-quality and edge gates downstream.
+    ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY: float = 0.60
     HIGH_PRICE_THRESHOLD: float = 0.65
     LOW_PRICE_MIN_EDGE: float = 0.18
     VERY_LOW_PRICE_MIN_EDGE: float = 0.28
@@ -49,7 +86,25 @@ class Settings:
     FALLBACK_EDGE_MIN_EDGE: float = 0.30
     FALLBACK_EDGE_MIN_EDGE_MULTIPLIER: float = 0.90
     WEATHER_MIN_EDGE: float = 0.14
+    WEATHER_HIGH_EQ_EDGE_MULTIPLIER: float = 0.85
     WEATHER_FALLBACK_EDGE_MIN_EDGE: float = 0.34
+    # Block weather entries when the chosen-outcome market price is an underdog
+    # (< LOW_PRICE_THRESHOLD). Lifetime weather underdog WR ~32% / large negative PnL.
+    WEATHER_BLOCK_UNDERDOG_ENTRIES: bool = True
+    # Cap the edge preserved by the weather posterior floor so extreme raw claims
+    # cannot be fully resurrected after calibration shrink.
+    WEATHER_POSTERIOR_FLOOR_MAX_EDGE: float = 0.20
+    # When raw−calibrated confidence gap is large, shrink weather Kelly sizing.
+    WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK: float = 0.20
+    WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER: float = 0.50
+    # Commodity futures (WTI/NATGAS/BRENT/etc.) historically underperform; raise
+    # the edge bar without hard-blocking analysis eligibility.
+    COMMODITY_MIN_EDGE: float = 0.22
+    # Near-settlement high-EQ commodity decisions may multiply COMMODITY_MIN_EDGE
+    # (0.22 * 0.95 ≈ 0.209) so knife-edge buffers clear without lowering the
+    # long-horizon / low-EQ floor that protects the toxic edge≥0.20 strike class.
+    COMMODITY_HIGH_EQ_EDGE_MULTIPLIER: float = 0.95
+    COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY: float = 0.75
     REQUIRE_IMPLIED_PRICE: bool = True
     
     # Confidence caps to prevent overconfidence on high-variance events
@@ -65,13 +120,20 @@ class Settings:
     MAX_CORN_CONFIDENCE: float = 0.70
     MAX_CRYPTO_CONFIDENCE: float = 0.72
     # Hard sanity cap on model-vs-market edge to catch hallucinated
-    # opportunities. Raised from 0.32 to 0.40 after cycle 1 review showed a
-    # validated direct + settlement-aligned music chart trade with edge=0.56
-    # being hard-blocked before its score could be evaluated. The score gate
-    # threshold + stacked penalties continue to scale on edges above 0.32.
-    MAX_REASONABLE_EDGE: float = 0.40
+    # opportunities. Tightened 0.40 -> 0.28 (Jul 2026 resolved-outcome review):
+    # claimed-edge decile 10 (~0.54) ran 23% WR and edges above 0.30 ran <=50%
+    # WR, so non-definitive extreme disagreement with the market is treated as
+    # model error. Definitive-validated decisions keep the elevated
+    # DEFINITIVE_OUTCOME_EDGE_REASONABLE_MAX cap (the music-chart class that
+    # motivated the old 0.40 value stays executable through that path).
+    MAX_REASONABLE_EDGE: float = 0.28
     NON_SPORTS_REQUIRES_DIRECT_EVIDENCE: bool = True
     NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL: bool = True
+    # Families with a universal canonical settlement source are exempt from the
+    # per-market primary_source_url requirement for direct evidence: sports
+    # (ESPN/league sites) and weather (NWS/NOAA). Other non-sports markets still
+    # require a settlement-grade primary_source_url to qualify as direct.
+    PRIMARY_SOURCE_URL_EXEMPT_FAMILIES: tuple[str, ...] = ("sports", "weather")
     MAX_SPEECH_CONFIDENCE: float = 0.65
 
     # Filtering
@@ -168,6 +230,7 @@ class Settings:
         "bea.gov",
         "federalreserve.gov",
         "sec.gov",
+        "nasdaq.com",
         "weather.gov",
         "noaa.gov",
         "wsj.com",
@@ -228,14 +291,23 @@ class Settings:
         "WTA",
         "atptour",
     )
+    # Ordered so the first SEARCH_PROFILE_MAX_DOMAINS entries lead with
+    # settlement-grade exchanges (in SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS), with
+    # one crawlable spot-price aggregator (coingecko) in the searchable set —
+    # Jul 2026 logs showed exchange-only search returning "no spot price found"
+    # for ETH/SOL/DOGE dailies, forcing absence_only skips. Analytics/news
+    # sites that cannot satisfy a direct-evidence primary_source_url follow as
+    # fallback.
     CRYPTO_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "coinbase.com",
+        "kraken.com",
+        "binance.com",
         "coindesk.com",
+        "coingecko.com",
         "cointelegraph.com",
         "theblock.co",
         "decrypt.co",
         "messari.io",
-        "coinbase.com",
-        "kraken.com",
     )
     CRYPTO_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "coinbase",
@@ -301,12 +373,16 @@ class Settings:
         "LuminateData",
         "HitsDailyDouble",
     )
+    # aviationweather.gov (METAR observations for the airport stations NWS CLI
+    # reports settle on) sits in the searchable top-5; Jul 2026 logs showed
+    # "no observed METAR/ASOS value found" skips without it.
     WEATHER_ALLOWED_DOMAINS: tuple[str, ...] = (
         "weather.gov",
         "forecast.weather.gov",
         "noaa.gov",
-        "tropicaltidbits.com",
+        "aviationweather.gov",
         "wunderground.com",
+        "tropicaltidbits.com",
     )
     WEATHER_ALLOWED_X_HANDLES: tuple[str, ...] = (
         "NWS",
@@ -323,6 +399,7 @@ class Settings:
         "reuters.com",
         "apnews.com",
         "wsj.com",
+        "nasdaq.com",
         "ft.com",
         "economist.com",
     )
@@ -353,6 +430,36 @@ class Settings:
         "Variety",
         "THR",
         "DEADLINE",
+    )
+    # Commodity/index markets classify as the "generic" family but settle on
+    # exchange data, so they need a dedicated search profile whose first
+    # SEARCH_PROFILE_MAX_DOMAINS entries are reachable settlement-grade pages
+    # (CME/ICE/EIA + Tier-1 wires). Without this they inherit GENERIC_ALLOWED_DOMAINS
+    # (news wires) and can never cite the exchange settlement URL the commodities
+    # prompt requires, so direct evidence is impossible and edges are suppressed.
+    # Top-5 keeps the settlement-grade trio (CME/ICE/EIA) and adds crawlable
+    # live-price sources: tradingeconomics (Grok cites it successfully on index
+    # markets) and reuters (unpaywalled wire). Jul 2026 logs showed the prior
+    # paywalled top-5 (WSJ/Bloomberg) returning "no live price or settlement
+    # data found for Brent despite multiple searches", forcing absence_only
+    # skips on the whole commodity dailies flow.
+    COMMODITY_ALLOWED_DOMAINS: tuple[str, ...] = (
+        "cmegroup.com",
+        "theice.com",
+        "eia.gov",
+        "tradingeconomics.com",
+        "reuters.com",
+        "wsj.com",
+        "bloomberg.com",
+        "apnews.com",
+    )
+    COMMODITY_ALLOWED_X_HANDLES: tuple[str, ...] = (
+        "CMEGroup",
+        "EIAgov",
+        "Reuters",
+        "ReutersBiz",
+        "business",
+        "WSJmarkets",
     )
 
     # Kalshi
@@ -455,6 +562,24 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
+    # While the exchange-confirmed sports jurisdiction hold flag is set (order
+    # 403 with the Michigan sports message), throttle sports analysis slots to
+    # this probe cadence so freed slots flow to executable families. Jul 2026
+    # evidence: 657 sports analyses in 5 days produced 8 orders, all
+    # jurisdiction-rejected. Probes keep sports analysis-eligible and the flag
+    # auto-clears when the exchange accepts a sports order. 0 disables the
+    # throttle entirely (legacy behavior).
+    SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE: int = 1
+    # Generic is the catch-all family (speech/album/photo-count/macro/etc). A
+    # 15-cycle review found it dominated analysis (~48% of slots) yet was
+    # majority absence-only (no findable settlement data) and produced 0 fills.
+    # A positive value caps generic candidates per cycle so freed slots flow to
+    # direct-evidence families. Default 2 (Jul 2026 review: generic is the only
+    # net-negative family at -$318 lifetime yet was the only uncapped one).
+    # This is a per-cycle analysis-slot cap, not a family hard reject: generic
+    # markets remain post-filter eligible and compete on pre-analysis score.
+    # 0 disables the cap (legacy behavior).
+    MAX_GENERIC_CANDIDATES_PER_CYCLE: int = 2
     MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
@@ -478,13 +603,26 @@ class Settings:
     GROK_SELF_CONSISTENCY_ENABLED: bool = True
     GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD: float = 400.0
     GROK_SELF_CONSISTENCY_EDGE_THRESHOLD: float = 0.15
+    # When > 0, the second self-consistency pass only runs for the top-N
+    # candidates by pre-analysis score each cycle (the markets most likely to
+    # trade), sharply cutting Grok API cost. 0 keeps self-consistency eligible
+    # for every analyzed candidate.
+    GROK_SELF_CONSISTENCY_TOP_CANDIDATES: int = 0
     GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE: float = 0.3
     GROK_SELF_CONSISTENCY_SECONDARY_TEMPERATURE: float = 0.7
     EDGE_REPAIR_ENABLED: bool = True
     EDGE_BAND_CALIBRATION_ENABLED: bool = True
     CONVICTION_REPAIR_ENABLED: bool = True
-    CONVICTION_REPAIR_MIN_EDGE: float = 0.20
-    CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY: float = 0.90
+    # Aligned with the execution edge baseline (MIN_EDGE-tier) so repair
+    # eligibility matches the standard actually used to execute; 0.20 parked
+    # hundreds of repairable decisions as edge_below_repair_min.
+    CONVICTION_REPAIR_MIN_EDGE: float = 0.12
+    # Aligned with the validator's proxy evidence-quality cap (0.75). Jul 2026
+    # receipts: with the bar above the cap, repair evaluated 72 decisions in a
+    # session and triggered zero (miss reason evidence_quality_below_repair_min
+    # every time), so the deep re-research loop never ran for the
+    # settlement-aligned commodity/weather near-misses it was built for.
+    CONVICTION_REPAIR_MIN_EVIDENCE_QUALITY: float = 0.75
     CONVICTION_REPAIR_SCORE_GAP_MAX: float = 0.08
     CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR: float = 0.0
     DAILY_EXPECTANCY_ENABLED: bool = True
@@ -497,8 +635,13 @@ class Settings:
     # Position limits
     MAX_POSITION_PER_MARKET_USDC: float = 200.0
     MAX_POSITION_PCT_OF_BANKROLL: float = 0.15
-    MIN_CONFIDENCE_INCREASE_FOR_ADD: float = 0.10
-    MIN_PRICE_MOVE_FOR_READD: float = 0.05
+    # Relaxed 0.10/0.05 -> 0.05/0.03 (Jul 2026 review): position_adjustment
+    # was the only gate whose blocked trades would have WON (+$46.37
+    # counterfactual over 43 blocked re-entries). Re-adds still face every
+    # downstream gate plus MAX_POSITION_PER_MARKET_USDC and
+    # MAX_POSITION_PCT_OF_BANKROLL exposure caps.
+    MIN_CONFIDENCE_INCREASE_FOR_ADD: float = 0.05
+    MIN_PRICE_MOVE_FOR_READD: float = 0.03
     HIGH_CONFIDENCE_POSITION_OVERRIDE: float = 0.85  # Allow adding to position if conf >= this
     OPPOSITE_OUTCOME_STRATEGY: str = "block"  # block|hedge
 
@@ -510,6 +653,13 @@ class Settings:
     SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_ENABLED: bool = True
     SCORE_GATE_THRESHOLD_PROFITABLE_FAMILY_CONVERGENT: float = 0.08
     SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES: int = 30
+    # Weights for the Kelly / LMSR-inefficiency / Bayesian-posterior model-edge
+    # signals inside compute_final_score. These are the strategy signals the bot
+    # is meant to follow; they are now applied at both ranking and the execution
+    # score gate so genuine edge can clear the gate. See score_engine defaults.
+    SCORE_KELLY_COMPONENT_WEIGHT: float = 0.30
+    SCORE_INEFFICIENCY_COMPONENT_WEIGHT: float = 0.18
+    SCORE_BAYESIAN_COMPONENT_WEIGHT: float = 0.10
     SCORE_LOW_INFO_PENALTY_THRESHOLD: float = 0.60
     SCORE_LOW_INFO_PENALTY_BASE: float = 0.08
     SCORE_REPEATED_ANALYSIS_PENALTY_BASE: float = 0.025
@@ -531,7 +681,7 @@ class Settings:
     SCORE_EXTREME_CONFIDENCE_PENALTY_BASE: float = 0.08
     MENTION_MARKET_SCORE_PENALTY: float = 0.10
     WEATHER_SCORE_PENALTY: float = 0.12
-    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.80
+    WEATHER_MIN_EVIDENCE_QUALITY: float = 0.60
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_WEATHER: float = 0.72
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_SPORTS: float = 0.65
     DIRECT_SOURCE_MIN_EVIDENCE_QUALITY_DEFAULT: float = 0.75
@@ -628,9 +778,21 @@ class Settings:
     HISTORICAL_FAMILY_MIN_SAMPLES: int = 12
     HISTORICAL_FAMILY_PNL_CUTOFF: float = -12.0
     HISTORICAL_FAMILY_WIN_RATE_CUTOFF: float = 0.40
+    # Bayesian shrinkage on family PnL (independent of prefix shrinkage).
+    HISTORICAL_FAMILY_SHRINKAGE_ENABLED: bool = True
+    HISTORICAL_FAMILY_PRIOR_STRENGTH: float = 10.0
+    # Per-trade Bayesian-shrunk PnL cutoff for family hard-deny (distinct from
+    # HISTORICAL_TICKER_PREFIX_SHRUNK_PNL_CUTOFF so family/prefix bars can diverge).
+    HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF: float = -0.50
     HISTORICAL_FAMILY_SIGNAL_ENABLED: bool = True
     HISTORICAL_FAMILY_SCORE_SCALE: float = 0.06
     HISTORICAL_FAMILY_SIZE_SCALE_MAX: float = 0.25
+    # Downward size authority for families with a negative historical signal.
+    # Kept >= HISTORICAL_FAMILY_SIZE_SCALE_MAX so persistent losers can be
+    # shrunk more aggressively than winners are inflated (oversizing a losing
+    # family is the dominant drawdown risk). Defaults to the symmetric value;
+    # raise it in .env to harden the de-risk.
+    HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE: float = 0.25
     HISTORICAL_SHORT_PREFIX_LEN: int = 5
     HISTORICAL_SHORT_PREFIX_MIN_SAMPLES: int = 3
     HISTORICAL_SHORT_PREFIX_PNL_CUTOFF: float = -5.0
@@ -645,6 +807,14 @@ class Settings:
     STRONG_EVIDENCE_MIN_EVIDENCE_QUALITY: float = 0.85
     STRONG_EVIDENCE_PROXY_MIN_EVIDENCE_QUALITY: float = 0.95
     STRONG_EVIDENCE_PROXY_MIN_EDGE: float = 0.20
+    # Proxy markets whose market edge clears this bar bypass the preview/proxy
+    # validation blocks in grok_client. The downstream edge gate and per-family
+    # size multiplier still apply, so historically weak families are sized down
+    # rather than hard-blocked at validation. Set to 1.0 to disable.
+    PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE: float = 0.15
+    # Generic family historically underperforms on proxy evidence; require a
+    # higher market edge before the proxy high-edge participation override fires.
+    GENERIC_PROXY_HIGH_EDGE_MIN: float = 0.18
     GROK_PROXY_CONFIDENCE_CAP: float = 0.78
     GROK_LOW_INFO_CONFIDENCE_CAP: float = 0.70
     GROK_FALLBACK_MIN_EVIDENCE_QUALITY: float = 0.45
@@ -659,6 +829,24 @@ class Settings:
     HISTORICAL_CONFIDENCE_SHRINK_ENABLED: bool = True
     HISTORICAL_CONFIDENCE_SHRINK_MIN_SAMPLES: int = 15
     HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS: int = 30
+    # Cap on how far the historical-bucket shrink may pull confidence down in a
+    # single pass. Without it the bucket can deflate confidence so much (a
+    # 10-cycle review saw 0.57 -> 0.46 across 130/136 markets) that nothing
+    # clears MIN_CONFIDENCE / the score gate, which prevents the winning trades
+    # that would recalibrate the bucket -- a self-reinforcing no-trade spiral.
+    HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA: float = 0.05
+    # Only apply the historical shrink when stage-one confidence is above this
+    # band; below it there is no overconfidence to correct and shrinking only
+    # destroys tradeable edge. 0.0 disables the band (cap still applies).
+    HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE: float = 0.0
+    # Band-preserving clamp: a stage-one confidence at/above this floor cannot
+    # be shrunk below it. Jul 2026 evidence: the stacked shrink mapped raw
+    # 0.58-0.65 into 0.50-0.545 (zero decisions left in 0.55-0.60) while the
+    # 0.55-0.61 band was the best-calibrated pocket (70.4% win rate) and the
+    # post-shrink 0.5 bucket ran 69.9% -- the shrink was relocating decisions
+    # from the winning band into the losing one. Stage-one values below the
+    # floor keep the full shrink. 0.0 disables the clamp (legacy behavior).
+    HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR: float = 0.55
     RESEARCH_QUEUE_ENABLED: bool = True
     RESEARCH_QUEUE_PERSIST_TO_DB: bool = True
     RESEARCH_QUEUE_REUSE_LOOKBACK_HOURS: int = 6
@@ -670,22 +858,36 @@ class Settings:
     # large queue cycles or lower to reduce log payload size.
     RESEARCH_QUEUE_CYCLE_LOG_MAXLEN: int = 200
     # Periodically promote stale research-queued markets back to deep analysis so
-    # the queue is not a write-only black hole. Conservative defaults: at most one
-    # forced probe per cycle, only after the entry has aged at least an hour.
+    # the queue is not a write-only black hole. Raised 1 -> 2 (Jul 2026 review):
+    # per-cycle capture inflow ran 2-6 entries against a drain of 1, pinning the
+    # active backlog at ~80 while same-day markets expired unexamined.
     RESEARCH_QUEUE_DRAIN_ENABLED: bool = True
-    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 1
+    RESEARCH_QUEUE_DRAIN_PER_CYCLE: int = 2
     RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS: float = 1.0
     RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS: float = 12.0
     RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
     RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
     RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES: float = 45.0
+    # Waive the drain min-age for entries whose market closes within this many
+    # hours. Hourly/same-day markets (Jul 2026: hourly commodity strikes) close
+    # before the min-age elapses, so their near-miss entries expired
+    # unexamined. 0 disables the waiver.
+    RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS: float = 2.0
     RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS: int = 1
     RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX: int = 1
     RESEARCH_QUEUE_SCORE_PROMOTION_GAP: float = 0.05
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS: int = 4
     RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN: int = 8
+    # TTL stamped on new research-queue entries and the stale window used to
+    # purge legacy rows without an expiry. Jul 2026 review: 16,423 rows,
+    # median age 78.6 days, zero expirations — the queue was a write-only
+    # black hole. 0 disables expiry (legacy behavior).
+    RESEARCH_QUEUE_ENTRY_TTL_HOURS: float = 168.0
     EXTENDED_RESEARCH_AFTER_STREAK: int = 2
-    EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 5
+    EXTENDED_RESEARCH_COOLDOWN_CYCLES: int = 3
+    # Near-miss / research_queued after extended research uses a shorter cooldown
+    # so soft candidates re-enter the normal analysis pool sooner than hard skips.
+    EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES: int = 2
     DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR: float = 0.80
     # Edge cap for definitive-outcome and high-quality direct settled markets.
     # Raised from 0.40 to 0.50 alongside the MAX_REASONABLE_EDGE bump so the
@@ -717,7 +919,14 @@ class Settings:
     BAYESIAN_ENABLED: bool = False
     BAYESIAN_SKIP_STALE_UPDATES: bool = True
     BAYESIAN_PRIOR_DEFAULT: float = 0.50
-    BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 1
+    # Raised 1 -> 3: a single neutral update leaves the posterior ~= the 0.50
+    # prior, and that uninformative posterior was overwriting the model's
+    # calibrated confidence (collapsing it to 0.50) on fresh threshold markets.
+    BAYESIAN_MIN_UPDATES_FOR_TRADE: int = 3
+    # Do not apply the posterior when it is within this distance of the prior
+    # (uninformative). Keeps the model's calibrated confidence instead of
+    # reverting it to the prior. 0 disables the guard (legacy behavior).
+    BAYESIAN_MIN_POSTERIOR_DIVERGENCE: float = 0.05
     BAYESIAN_MAX_POSTERIOR: float = 0.90
     BAYESIAN_MAX_CONFIDENCE_BOOST: float = 0.15
     LMSR_ENABLED: bool = False
@@ -729,8 +938,23 @@ class Settings:
     KELLY_FRACTION_SHORT_HORIZON_HOURS: int = 1
     KELLY_FRACTION_SHORT_HORIZON: float = 0.10
     KELLY_FRACTION_WEATHER: float = 0.50
-    KELLY_MIN_BET_POLICY: str = "fallback_edge_scaling"  # skip|floor|fallback_edge_scaling
+    KELLY_MIN_BET_POLICY: str = "skip"  # skip|floor|fallback_edge_scaling
+    # When policy=skip and dynamic Kelly qualifies, floor bets within this
+    # fraction of MIN_BET instead of skipping (e.g. 0.60 → $1.20 of $2.00).
+    KELLY_MIN_BET_NEAR_MISS_RATIO: float = 0.60
     KELLY_MIN_BANKROLL_USDC: float = 30.0
+    # Stake dampeners for extreme claimed edges. Jul 2026 resolved-outcome
+    # review (n=558): claimed edge +0.37 -> 49% WR, +0.49 -> 31% WR,
+    # +0.82 -> 0% WR, while small edges (+0.01..0.09) ran 63-65% WR. Large
+    # model-vs-market disagreement is evidence the model is wrong, so
+    # 25pp+ claims are probe-sized instead of conviction-sized. Applied after
+    # Kelly/edge-scaling sizing so min-bet floors and the near-miss policy
+    # still decide execution. 1.0 disables a band. The 25-35pp band was added
+    # after sizing was observed to grow with claimed edge while win rate fell
+    # monotonically above ~0.20.
+    KELLY_EDGE_BAND_DAMPENER_25PP: float = 0.75
+    KELLY_EDGE_BAND_DAMPENER_35PP: float = 0.6
+    KELLY_EDGE_BAND_DAMPENER_45PP: float = 0.4
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -738,6 +962,13 @@ class Settings:
     FLIP_GUARD_MIN_CONF_GAIN: float = 0.08
     FLIP_GUARD_MIN_EDGE_GAIN: float = 0.03
     FLIP_GUARD_MIN_EVIDENCE_QUALITY: float = 0.60
+    # Direct-evidence flip bypass: fresh direct, settlement-aligned evidence with
+    # a strong edge legitimately overrides a stale anchor even when the new
+    # confidence is lower than the anchor's (negative conf_delta). Without this,
+    # a deliberate refinement flip on ground-truth evidence is wrongly blocked.
+    FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED: bool = True
+    FLIP_GUARD_DIRECT_MIN_EDGE: float = 0.15
+    FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO: float = 5.0
     FLIP_CIRCUIT_BREAKER_ENABLED: bool = True
     FLIP_CIRCUIT_BREAKER_MAX_FLIPS: int = 3
     EVIDENCE_QUALITY_HIGH_CONFIDENCE_OVERRIDE: bool = False
@@ -879,6 +1110,18 @@ def load_settings() -> Settings:
             "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE",
             Settings.CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE,
         ),
+        DIRECT_POSTERIOR_FLOOR_ENABLED=_read_env_bool(
+            "DIRECT_POSTERIOR_FLOOR_ENABLED",
+            Settings.DIRECT_POSTERIOR_FLOOR_ENABLED,
+        ),
+        DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY",
+            Settings.DIRECT_POSTERIOR_FLOOR_MIN_EVIDENCE_QUALITY,
+        ),
+        DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE=_read_env_float(
+            "DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE",
+            Settings.DIRECT_POSTERIOR_FLOOR_MAX_HOURS_TO_CLOSE,
+        ),
         MIN_EVIDENCE_QUALITY_FOR_TRADE=_read_env_float(
             "MIN_EVIDENCE_QUALITY_FOR_TRADE",
             Settings.MIN_EVIDENCE_QUALITY_FOR_TRADE,
@@ -909,6 +1152,18 @@ def load_settings() -> Settings:
         ),
         VERY_LOW_PRICE_THRESHOLD=_read_env_float(
             "VERY_LOW_PRICE_THRESHOLD", Settings.VERY_LOW_PRICE_THRESHOLD
+        ),
+        ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED=_read_env_bool(
+            "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED",
+            Settings.ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED,
+        ),
+        ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE=_read_env_float(
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE",
+            Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE,
+        ),
+        ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY",
+            Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY,
         ),
         HIGH_PRICE_THRESHOLD=_read_env_float(
             "HIGH_PRICE_THRESHOLD", Settings.HIGH_PRICE_THRESHOLD
@@ -945,9 +1200,40 @@ def load_settings() -> Settings:
         WEATHER_MIN_EDGE=_read_env_float(
             "WEATHER_MIN_EDGE", Settings.WEATHER_MIN_EDGE
         ),
+        WEATHER_HIGH_EQ_EDGE_MULTIPLIER=_read_env_float(
+            "WEATHER_HIGH_EQ_EDGE_MULTIPLIER",
+            Settings.WEATHER_HIGH_EQ_EDGE_MULTIPLIER,
+        ),
         WEATHER_FALLBACK_EDGE_MIN_EDGE=_read_env_float(
             "WEATHER_FALLBACK_EDGE_MIN_EDGE",
             Settings.WEATHER_FALLBACK_EDGE_MIN_EDGE,
+        ),
+        WEATHER_BLOCK_UNDERDOG_ENTRIES=_read_env_bool(
+            "WEATHER_BLOCK_UNDERDOG_ENTRIES",
+            Settings.WEATHER_BLOCK_UNDERDOG_ENTRIES,
+        ),
+        WEATHER_POSTERIOR_FLOOR_MAX_EDGE=_read_env_float(
+            "WEATHER_POSTERIOR_FLOOR_MAX_EDGE",
+            Settings.WEATHER_POSTERIOR_FLOOR_MAX_EDGE,
+        ),
+        WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK=_read_env_float(
+            "WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK",
+            Settings.WEATHER_CALIBRATION_GAP_FOR_KELLY_SHRINK,
+        ),
+        WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER=_read_env_float(
+            "WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER",
+            Settings.WEATHER_CALIBRATION_GAP_KELLY_MULTIPLIER,
+        ),
+        COMMODITY_MIN_EDGE=_read_env_float(
+            "COMMODITY_MIN_EDGE", Settings.COMMODITY_MIN_EDGE
+        ),
+        COMMODITY_HIGH_EQ_EDGE_MULTIPLIER=_read_env_float(
+            "COMMODITY_HIGH_EQ_EDGE_MULTIPLIER",
+            Settings.COMMODITY_HIGH_EQ_EDGE_MULTIPLIER,
+        ),
+        COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY=_read_env_float(
+            "COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY",
+            Settings.COMMODITY_HIGH_EQ_MIN_EVIDENCE_QUALITY,
         ),
         REQUIRE_IMPLIED_PRICE=_read_env_bool(
             "REQUIRE_IMPLIED_PRICE", Settings.REQUIRE_IMPLIED_PRICE
@@ -998,6 +1284,10 @@ def load_settings() -> Settings:
         NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL=_read_env_bool(
             "NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL",
             Settings.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL,
+        ),
+        PRIMARY_SOURCE_URL_EXEMPT_FAMILIES=_read_env_csv(
+            "PRIMARY_SOURCE_URL_EXEMPT_FAMILIES",
+            Settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES,
         ),
         MIN_LIQUIDITY_USDC=_read_env_float(
             "MIN_LIQUIDITY_USDC", Settings.MIN_LIQUIDITY_USDC
@@ -1174,6 +1464,12 @@ def load_settings() -> Settings:
             "ENTERTAINMENT_ALLOWED_X_HANDLES",
             Settings.ENTERTAINMENT_ALLOWED_X_HANDLES,
         ),
+        COMMODITY_ALLOWED_DOMAINS=_read_env_csv(
+            "COMMODITY_ALLOWED_DOMAINS", Settings.COMMODITY_ALLOWED_DOMAINS
+        ),
+        COMMODITY_ALLOWED_X_HANDLES=_read_env_csv(
+            "COMMODITY_ALLOWED_X_HANDLES", Settings.COMMODITY_ALLOWED_X_HANDLES
+        ),
         KALSHI_API_BASE_URL=_read_env_str(
             "KALSHI_API_BASE_URL", Settings.KALSHI_API_BASE_URL
         ),
@@ -1328,6 +1624,14 @@ def load_settings() -> Settings:
             "MAX_SPORTS_CANDIDATES_PER_CYCLE",
             Settings.MAX_SPORTS_CANDIDATES_PER_CYCLE,
         ),
+        SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE=_read_env_int(
+            "SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE",
+            Settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE,
+        ),
+        MAX_GENERIC_CANDIDATES_PER_CYCLE=_read_env_int(
+            "MAX_GENERIC_CANDIDATES_PER_CYCLE",
+            Settings.MAX_GENERIC_CANDIDATES_PER_CYCLE,
+        ),
         MAX_TRADES_PER_CYCLE=_read_env_int(
             "MAX_TRADES_PER_CYCLE",
             Settings.MAX_TRADES_PER_CYCLE,
@@ -1391,6 +1695,10 @@ def load_settings() -> Settings:
         GROK_SELF_CONSISTENCY_EDGE_THRESHOLD=_read_env_float(
             "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD",
             Settings.GROK_SELF_CONSISTENCY_EDGE_THRESHOLD,
+        ),
+        GROK_SELF_CONSISTENCY_TOP_CANDIDATES=_read_env_int(
+            "GROK_SELF_CONSISTENCY_TOP_CANDIDATES",
+            Settings.GROK_SELF_CONSISTENCY_TOP_CANDIDATES,
         ),
         GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE=_read_env_float(
             "GROK_SELF_CONSISTENCY_PRIMARY_TEMPERATURE",
@@ -1495,6 +1803,18 @@ def load_settings() -> Settings:
         SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES=_read_env_int(
             "SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES",
             Settings.SCORE_GATE_PROFITABLE_FAMILY_CONVERGENT_MIN_SAMPLES,
+        ),
+        SCORE_KELLY_COMPONENT_WEIGHT=_read_env_float(
+            "SCORE_KELLY_COMPONENT_WEIGHT",
+            Settings.SCORE_KELLY_COMPONENT_WEIGHT,
+        ),
+        SCORE_INEFFICIENCY_COMPONENT_WEIGHT=_read_env_float(
+            "SCORE_INEFFICIENCY_COMPONENT_WEIGHT",
+            Settings.SCORE_INEFFICIENCY_COMPONENT_WEIGHT,
+        ),
+        SCORE_BAYESIAN_COMPONENT_WEIGHT=_read_env_float(
+            "SCORE_BAYESIAN_COMPONENT_WEIGHT",
+            Settings.SCORE_BAYESIAN_COMPONENT_WEIGHT,
         ),
         SCORE_LOW_INFO_PENALTY_THRESHOLD=_read_env_float(
             "SCORE_LOW_INFO_PENALTY_THRESHOLD",
@@ -1818,6 +2138,18 @@ def load_settings() -> Settings:
             "HISTORICAL_FAMILY_WIN_RATE_CUTOFF",
             Settings.HISTORICAL_FAMILY_WIN_RATE_CUTOFF,
         ),
+        HISTORICAL_FAMILY_SHRINKAGE_ENABLED=_read_env_bool(
+            "HISTORICAL_FAMILY_SHRINKAGE_ENABLED",
+            Settings.HISTORICAL_FAMILY_SHRINKAGE_ENABLED,
+        ),
+        HISTORICAL_FAMILY_PRIOR_STRENGTH=_read_env_float(
+            "HISTORICAL_FAMILY_PRIOR_STRENGTH",
+            Settings.HISTORICAL_FAMILY_PRIOR_STRENGTH,
+        ),
+        HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF=_read_env_float(
+            "HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF",
+            Settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF,
+        ),
         HISTORICAL_FAMILY_SIGNAL_ENABLED=_read_env_bool(
             "HISTORICAL_FAMILY_SIGNAL_ENABLED",
             Settings.HISTORICAL_FAMILY_SIGNAL_ENABLED,
@@ -1829,6 +2161,10 @@ def load_settings() -> Settings:
         HISTORICAL_FAMILY_SIZE_SCALE_MAX=_read_env_float(
             "HISTORICAL_FAMILY_SIZE_SCALE_MAX",
             Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX,
+        ),
+        HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE=_read_env_float(
+            "HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE",
+            Settings.HISTORICAL_FAMILY_SIZE_SCALE_MAX_NEGATIVE,
         ),
         HISTORICAL_SHORT_PREFIX_LEN=_read_env_int(
             "HISTORICAL_SHORT_PREFIX_LEN",
@@ -1886,6 +2222,14 @@ def load_settings() -> Settings:
             "STRONG_EVIDENCE_PROXY_MIN_EDGE",
             Settings.STRONG_EVIDENCE_PROXY_MIN_EDGE,
         ),
+        PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE=_read_env_float(
+            "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE",
+            Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE,
+        ),
+        GENERIC_PROXY_HIGH_EDGE_MIN=_read_env_float(
+            "GENERIC_PROXY_HIGH_EDGE_MIN",
+            Settings.GENERIC_PROXY_HIGH_EDGE_MIN,
+        ),
         GROK_PROXY_CONFIDENCE_CAP=_read_env_float(
             "GROK_PROXY_CONFIDENCE_CAP",
             Settings.GROK_PROXY_CONFIDENCE_CAP,
@@ -1940,6 +2284,18 @@ def load_settings() -> Settings:
             "HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS",
             Settings.HISTORICAL_CONFIDENCE_SHRINK_LOOKBACK_DAYS,
         ),
+        HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=_read_env_float(
+            "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA",
+            Settings.HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA,
+        ),
+        HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE=_read_env_float(
+            "HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE",
+            Settings.HISTORICAL_CONFIDENCE_SHRINK_MIN_CONFIDENCE,
+        ),
+        HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR=_read_env_float(
+            "HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR",
+            Settings.HISTORICAL_CONFIDENCE_SHRINK_BAND_FLOOR,
+        ),
         RESEARCH_QUEUE_ENABLED=_read_env_bool(
             "RESEARCH_QUEUE_ENABLED",
             Settings.RESEARCH_QUEUE_ENABLED,
@@ -1988,6 +2344,10 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES",
             Settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES,
         ),
+        RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS",
+            Settings.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS,
+        ),
         RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS=_read_env_int(
             "RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS",
             Settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS,
@@ -2004,6 +2364,10 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS",
             Settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_ATTEMPTS,
         ),
+        RESEARCH_QUEUE_ENTRY_TTL_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_ENTRY_TTL_HOURS",
+            Settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS,
+        ),
         RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN=_read_env_int(
             "RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN",
             Settings.RESEARCH_QUEUE_LOW_YIELD_PLACEHOLDER_MIN_TIMES_SEEN,
@@ -2015,6 +2379,10 @@ def load_settings() -> Settings:
         EXTENDED_RESEARCH_COOLDOWN_CYCLES=_read_env_int(
             "EXTENDED_RESEARCH_COOLDOWN_CYCLES",
             Settings.EXTENDED_RESEARCH_COOLDOWN_CYCLES,
+        ),
+        EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES=_read_env_int(
+            "EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES",
+            Settings.EXTENDED_RESEARCH_QUEUE_COOLDOWN_CYCLES,
         ),
         DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR=_read_env_float(
             "DEFINITIVE_OUTCOME_EVIDENCE_QUALITY_FLOOR",
@@ -2083,6 +2451,10 @@ def load_settings() -> Settings:
                 Settings.BAYESIAN_MIN_UPDATES_FOR_TRADE,
             ),
         ),
+        BAYESIAN_MIN_POSTERIOR_DIVERGENCE=_read_env_float(
+            "BAYESIAN_MIN_POSTERIOR_DIVERGENCE",
+            Settings.BAYESIAN_MIN_POSTERIOR_DIVERGENCE,
+        ),
         BAYESIAN_MAX_POSTERIOR=_read_env_float(
             "BAYESIAN_MAX_POSTERIOR",
             Settings.BAYESIAN_MAX_POSTERIOR,
@@ -2131,9 +2503,25 @@ def load_settings() -> Settings:
             "KELLY_MIN_BET_POLICY",
             Settings.KELLY_MIN_BET_POLICY,
         ),
+        KELLY_MIN_BET_NEAR_MISS_RATIO=_read_env_float(
+            "KELLY_MIN_BET_NEAR_MISS_RATIO",
+            Settings.KELLY_MIN_BET_NEAR_MISS_RATIO,
+        ),
         KELLY_MIN_BANKROLL_USDC=_read_env_float(
             "KELLY_MIN_BANKROLL_USDC",
             Settings.KELLY_MIN_BANKROLL_USDC,
+        ),
+        KELLY_EDGE_BAND_DAMPENER_25PP=_read_env_float(
+            "KELLY_EDGE_BAND_DAMPENER_25PP",
+            Settings.KELLY_EDGE_BAND_DAMPENER_25PP,
+        ),
+        KELLY_EDGE_BAND_DAMPENER_35PP=_read_env_float(
+            "KELLY_EDGE_BAND_DAMPENER_35PP",
+            Settings.KELLY_EDGE_BAND_DAMPENER_35PP,
+        ),
+        KELLY_EDGE_BAND_DAMPENER_45PP=_read_env_float(
+            "KELLY_EDGE_BAND_DAMPENER_45PP",
+            Settings.KELLY_EDGE_BAND_DAMPENER_45PP,
         ),
         FLIP_GUARD_ENABLED=_read_env_bool(
             "FLIP_GUARD_ENABLED",
@@ -2154,6 +2542,18 @@ def load_settings() -> Settings:
         FLIP_GUARD_MIN_EVIDENCE_QUALITY=_read_env_float(
             "FLIP_GUARD_MIN_EVIDENCE_QUALITY",
             Settings.FLIP_GUARD_MIN_EVIDENCE_QUALITY,
+        ),
+        FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED=_read_env_bool(
+            "FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED",
+            Settings.FLIP_GUARD_DIRECT_EVIDENCE_OVERRIDE_ENABLED,
+        ),
+        FLIP_GUARD_DIRECT_MIN_EDGE=_read_env_float(
+            "FLIP_GUARD_DIRECT_MIN_EDGE",
+            Settings.FLIP_GUARD_DIRECT_MIN_EDGE,
+        ),
+        FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO=_read_env_float(
+            "FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO",
+            Settings.FLIP_GUARD_DIRECT_MIN_LIKELIHOOD_RATIO,
         ),
         FLIP_CIRCUIT_BREAKER_ENABLED=_read_env_bool(
             "FLIP_CIRCUIT_BREAKER_ENABLED",
@@ -2241,6 +2641,10 @@ def load_settings() -> Settings:
     kelly_min_bet_policy = settings.KELLY_MIN_BET_POLICY.strip().lower()
     if kelly_min_bet_policy not in {"skip", "floor", "fallback_edge_scaling"}:
         kelly_min_bet_policy = Settings.KELLY_MIN_BET_POLICY
+    kelly_near_miss_ratio = max(
+        0.0,
+        min(1.0, float(settings.KELLY_MIN_BET_NEAR_MISS_RATIO)),
+    )
 
     settings = Settings(
         **{
@@ -2248,6 +2652,7 @@ def load_settings() -> Settings:
             "OPPOSITE_OUTCOME_STRATEGY": strategy,
             "SCORE_GATE_MODE": score_mode,
             "KELLY_MIN_BET_POLICY": kelly_min_bet_policy,
+            "KELLY_MIN_BET_NEAR_MISS_RATIO": kelly_near_miss_ratio,
         }
     )
 

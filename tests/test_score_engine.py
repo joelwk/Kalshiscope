@@ -868,6 +868,42 @@ def test_compute_final_score_uses_kelly_and_inefficiency_signals() -> None:
     assert boosted.inefficiency_component > 0
 
 
+def test_compute_final_score_does_not_reward_negative_inefficiency_signal() -> None:
+    market = Market(
+        id="m6-negative-lmsr",
+        question="Test",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.55),
+            MarketOutcome(name="NO", price=0.45),
+        ],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=False,
+        outcome="YES",
+        confidence=0.45,
+        bet_size_pct=0.0,
+        reasoning="Chosen-side posterior is below the execution price.",
+        edge_external=-0.10,
+        evidence_quality=0.75,
+    )
+    baseline = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+    )
+    negative_signal = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.55,
+        inefficiency_signal=-0.18,
+    )
+
+    assert negative_signal.inefficiency_component == 0.0
+    assert negative_signal.final_score == pytest.approx(baseline.final_score)
+
+
 def test_compute_final_score_edge_signal_component_weights() -> None:
     market = Market(
         id="m6w",
@@ -899,6 +935,93 @@ def test_compute_final_score_edge_signal_component_weights() -> None:
     )
     assert result.bayesian_component == pytest.approx(
         _BAYESIAN_COMPONENT_WEIGHT * (0.72 - 0.5)
+    )
+
+
+def test_compute_final_score_component_weights_are_configurable() -> None:
+    """The Kelly/LMSR/Bayesian weights can be overridden so the strategy signals
+    can be tuned to clear the score gate (they were dead at ranking time)."""
+    market = Market(
+        id="m6cfg",
+        question="Test",
+        outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        liquidity_usdc=1200.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.66,
+        bet_size_pct=0.4,
+        reasoning="test",
+        edge_external=0.09,
+        evidence_quality=0.75,
+    )
+    result = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.45,
+        bayesian_posterior=0.72,
+        inefficiency_signal=0.18,
+        kelly_raw=0.35,
+        kelly_component_weight=0.50,
+        inefficiency_component_weight=0.40,
+        bayesian_component_weight=0.20,
+    )
+    assert result.kelly_component == pytest.approx(0.50 * 0.35)
+    assert result.inefficiency_component == pytest.approx(0.40 * 0.18)
+    assert result.bayesian_component == pytest.approx(0.20 * (0.72 - 0.5))
+
+
+def test_confidence_calibration_penalty_uses_raw_confidence_when_present() -> None:
+    """The calibration penalty must judge the model's ORIGINAL (raw) confidence,
+    not a value the calibration shrink already lowered, so it does not
+    double-count the shrink and push every shrunk market below the gate."""
+    market = Market(
+        id="m-rawcal",
+        question="Calibration raw test",
+        outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        liquidity_usdc=1000.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    # Calibrated confidence (0.50) is below the floor, but the raw model
+    # confidence (0.74) is above it -> no penalty (the gap is calibration's
+    # doing, not low model conviction).
+    shrunk = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.50,
+        raw_confidence=0.74,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_external=0.08,
+        evidence_quality=0.7,
+    )
+    shrunk_score = compute_final_score(
+        market, shrunk, implied_prob_market=0.45,
+        confidence_calibration_floor=0.60,
+        confidence_calibration_penalty_scale=0.50,
+    )
+    assert shrunk_score.confidence_calibration_penalty == pytest.approx(0.0, abs=1e-9)
+
+    # Genuinely low raw conviction is still penalized.
+    low_raw = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.50,
+        raw_confidence=0.50,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_external=0.08,
+        evidence_quality=0.7,
+    )
+    low_raw_score = compute_final_score(
+        market, low_raw, implied_prob_market=0.45,
+        confidence_calibration_floor=0.60,
+        confidence_calibration_penalty_scale=0.50,
+    )
+    assert low_raw_score.confidence_calibration_penalty == pytest.approx(
+        (0.60 - 0.50) * 0.50, abs=1e-4
     )
 
 
@@ -1328,6 +1451,68 @@ def test_compute_final_score_adds_computed_edge_bonus() -> None:
         evidence_quality=0.8,
     )
     score = compute_final_score(market, decision, implied_prob_market=0.55)
+    assert score.computed_edge_bonus > 0.0
+
+
+def test_compute_final_score_does_not_bonus_negative_computed_edge() -> None:
+    market = Market(
+        id="m-negative-computed-bonus",
+        question="Computed edge must be directional",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.60),
+            MarketOutcome(name="NO", price=0.40),
+        ],
+        liquidity_usdc=800.0,
+        resolution_criteria="Settlement docs",
+    )
+    decision = TradeDecision(
+        should_trade=False,
+        outcome="YES",
+        confidence=0.52,
+        bet_size_pct=0.0,
+        reasoning="Computed estimate is below the chosen-side market price.",
+        implied_prob_external=0.60,
+        my_prob=0.52,
+        edge_external=-0.08,
+        edge_source="computed",
+        evidence_quality=0.8,
+    )
+
+    score = compute_final_score(market, decision, implied_prob_market=0.60)
+
+    assert score.edge_market < 0.0
+    assert score.computed_edge_bonus == 0.0
+
+
+def test_compute_final_score_normalizes_external_edge_for_no_outcome() -> None:
+    market = Market(
+        id="m-no-edge-polarity",
+        question="Will the pitcher record eight or more strikeouts?",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.53),
+            MarketOutcome(name="NO", price=0.47),
+        ],
+        liquidity_usdc=800.0,
+        resolution_criteria="Official box score",
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="NO",
+        confidence=0.61,
+        probability_yes=0.39,
+        bet_size_pct=0.1,
+        reasoning="The YES estimate is 14 points below external YES odds.",
+        implied_prob_external=0.53,
+        my_prob=0.39,
+        edge_external=-0.14,
+        edge_source="computed",
+        evidence_quality=0.7,
+    )
+
+    score = compute_final_score(market, decision, implied_prob_market=0.47)
+
+    assert score.edge_external == -0.14
+    assert score.edge_external_chosen == 0.14
     assert score.computed_edge_bonus > 0.0
 
 
@@ -2338,4 +2523,151 @@ def test_generic_family_loss_drag_stronger_for_established_samples() -> None:
         historical_family_loss_drag_sample_min=30,
     )
     assert large_sample.historical_family_signal < small_sample.historical_family_signal
+
+
+def _losing_family_score(size_scale_max_negative: float):
+    market = Market(
+        id="KXGENERIC-SIZE",
+        question="Generic loser sizing",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.65,
+        bet_size_pct=0.2,
+        reasoning="Proxy signal",
+        edge_external=0.08,
+        edge_source="computed",
+        evidence_quality=0.55,
+        evidence_basis="proxy",
+    )
+    return compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.50,
+        market_family="generic",
+        historical_family_pnl_total=-50.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.45,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_size_scale_max=0.35,
+        historical_family_size_scale_max_negative=size_scale_max_negative,
+    )
+
+
+def test_negative_size_scale_hardens_loser_downsizing() -> None:
+    symmetric = _losing_family_score(0.35)
+    asymmetric = _losing_family_score(0.50)
+    assert symmetric.historical_family_signal < 0.0
+    assert asymmetric.historical_family_size_multiplier < symmetric.historical_family_size_multiplier
+    assert asymmetric.historical_family_size_multiplier >= 1.0 - 0.50
+    assert asymmetric.historical_family_size_multiplier < 1.0
+
+
+def test_edge_market_confidence_override_preserves_positive_edge() -> None:
+    market = Market(
+        id="KXHIGH-OVERRIDE",
+        question="Direct evidence market",
+        outcomes=[MarketOutcome(name="YES", price=0.66), MarketOutcome(name="NO", price=0.34)],
+        liquidity_usdc=600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    # Calibration crushed confidence to 0.545; real direct model edge is +0.22.
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.545,
+        bet_size_pct=0.3,
+        reasoning="direct settlement-aligned read",
+        edge_source="computed",
+        edge_external=0.22,
+        evidence_quality=1.0,
+        evidence_basis="direct",
+    )
+    without_override = compute_final_score(
+        market, decision, implied_prob_market=0.66, evidence_basis_class="direct"
+    )
+    with_override = compute_final_score(
+        market,
+        decision,
+        implied_prob_market=0.66,
+        evidence_basis_class="direct",
+        edge_market_confidence_override=0.88,
+    )
+    assert without_override.edge_market == pytest.approx(0.545 - 0.66)
+    assert without_override.edge_market < 0
+    assert with_override.edge_market == pytest.approx(0.88 - 0.66)
+    assert with_override.final_score > without_override.final_score
+
+
+def test_edge_market_confidence_override_never_lowers_confidence() -> None:
+    market = Market(
+        id="KXHIGH-NOOP",
+        question="Direct evidence market",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=600.0,
+        close_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.70,
+        bet_size_pct=0.3,
+        reasoning="test",
+        edge_source="computed",
+        edge_external=0.10,
+        evidence_quality=0.8,
+    )
+    # Override below the decision confidence must not lower edge_market.
+    result = compute_final_score(
+        market, decision, implied_prob_market=0.50, edge_market_confidence_override=0.55
+    )
+    assert result.edge_market == pytest.approx(0.70 - 0.50)
+
+
+def test_negative_size_scale_leaves_winner_unchanged() -> None:
+    market = Market(
+        id="KXMLB-SIZE",
+        question="Sports winner sizing",
+        outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        liquidity_usdc=500.0,
+        close_time=datetime.now(timezone.utc) + timedelta(hours=8),
+    )
+    decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.60,
+        bet_size_pct=0.2,
+        reasoning="Computed edge",
+        edge_external=0.10,
+        edge_source="computed",
+        evidence_quality=0.65,
+        evidence_basis="proxy",
+    )
+    kwargs = dict(
+        implied_prob_market=0.50,
+        market_family="sports",
+        historical_family_pnl_total=40.0,
+        historical_family_sample_size=40,
+        historical_family_win_rate=0.58,
+        historical_family_deployed_usdc=200.0,
+        historical_family_signal_enabled=True,
+        historical_family_size_scale_max=0.35,
+    )
+    low_negative = compute_final_score(
+        market, decision, historical_family_size_scale_max_negative=0.35, **kwargs
+    )
+    high_negative = compute_final_score(
+        market, decision, historical_family_size_scale_max_negative=0.50, **kwargs
+    )
+    assert low_negative.historical_family_signal > 0.0
+    assert low_negative.historical_family_size_multiplier > 1.0
+    assert (
+        high_negative.historical_family_size_multiplier
+        == pytest.approx(low_negative.historical_family_size_multiplier)
+    )
 

@@ -6,29 +6,32 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    "analyze": "82d922879c9825b60cdbea80d79d5ec74cc76bf40748ff5dcc36461da49c6b53",
-    "deep": "45ed84815c5d18e8d37cc8bc73ffbbdfc90eb3d8e7f9c995c65507bda9e924a6",
+    # Re-pinned Jul 28 2026: https URL hygiene examples, side-consistency rule,
+    # and crypto live-quote few-shot (execution-yield alignment).
+    "analyze": "7db641bc7aee12b95d30aaee4de88c20249a8fe56658d73dcf637af06e49ad2a",
+    "deep": "ea0c9f26bb4f9b1dcb492186239980483037c0ba60c05308aecde420bd2b6f1c",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    "commodities:deep_false": "38564eb54eb00390a2bb02dfa18c8ed60625a088f21d7abcc965630bb0c79c2c",
-    "commodities:deep_true": "90eabefb8d2025d4089f347302b56f611632509f6b912ffcf086b1a6e82d2430",
-    "crypto:deep_false": "e6733dda89e222611b6cf4d9d3aec418a302529085cba8c068355c82c391b277",
-    "crypto:deep_true": "258a262e5ab29618859866fc982e5b3068307a4e8aa9183474535a993518cae7",
-    "generic:deep_false": "6cab3e34150bab0aaaf4c9728669c6396115bee98f8585f333540d309ed30eb8",
-    "generic:deep_true": "b66efa020191233efaf6c1daaebc17b32cb8db4efeffbb6d5908c0a3ea95a4da",
-    "music:deep_false": "968f3ef54858161afcd2655f8dea85473b064c4b4d5f5ef7827bcc7978510fb9",
-    "music:deep_true": "d290e7604e2ce963b03e52083a20fb76e3d5406fe8b422d256bdb6fb60a2ad2a",
-    "politics:deep_false": "2da431f1b2f58ea7ec490d1b74246e70afdde90665eb9b6af000dc151fcf2e98",
-    "politics:deep_true": "8528ae8d3b1103e97800d54225082205c954048c30c693272ea3374997abedf5",
-    "speech:deep_false": "7450e4fe419e6e9a4e5e0dadd4ef5ae360d298e00dc5d9eb1b17bcb1500dfe88",
-    "speech:deep_true": "bdd23e00194f0ef062c403bd7c2273a7c867f3b24b463158baf30ec2e2ba463a",
-    "speech_mention:deep_false": "d9d6c65ce7d55646a15eb1531e0cc3c5b5a8c7a3e2509e05a73229da11edc5bd",
-    "speech_mention:deep_true": "fc8ce1fca9f8854d8306d649b2857f4714014b66671ce598ce0986a5fc97de37",
-    "sports:deep_false": "fe0dbbd28b8b597cad72470437da79ae7dc19f8f516e998feb7d85d2196c6234",
-    "sports:deep_true": "124db8a8dfd3c057d7699b6d2b8477fa7388935f171010ccaff1490f00a93909",
-    "weather:deep_false": "bca33a890b34d265e75899905e63dc40d364c8442791b3982070d6ce008a65d2",
-    "weather:deep_true": "e6cda107427fcc000b420a4161ca3ebfa7f64aad1f25d9940349d6dee753cbd6",
+    # Re-pinned Jul 29 2026: deep constraints repair-before-abstain lines.
+    "commodities:deep_false": "5ace0c9e5c8448d4ad6caad4a3e64d30b178078b63237bdc4a6b0aa1cb84650a",
+    "commodities:deep_true": "619ef9ec2575c891090092db00fdce3bf1e225e6e746bd187bbefebbbf1e789b",
+    "crypto:deep_false": "296581f0b94cf1a90e39fc0e6b981cf96283143a0f7fbb64aee5f8c5f895f553",
+    "crypto:deep_true": "7de5dbdef1c2fd6c1cc7db844aec15a71313bdeba6a2c3dc3bd12a5fecc950f4",
+    "generic:deep_false": "de34974965eea79e2a926963f5a7b444f12ab7f8621a5120d1879f26481c258d",
+    "generic:deep_true": "b6e5d0d3186eb8b32babf3fe3a943d78974eeacf61c983dd37507b82e8736dfc",
+    "music:deep_false": "a0d39c5d325a41abdd64dd72aa6662e7283fbc1c70b1272a10fe0c6b72a52b59",
+    "music:deep_true": "f74dce78195e106bf56220b4c29de25871b10b19721048d07187b2109a38c5ce",
+    "politics:deep_false": "877eb11281828ff2aade2c1253170f423539068a0c1f609bdb9ac03931cb2f47",
+    "politics:deep_true": "cd980413d86def36d37cf4f173e0ec75af9f9a64dd8b493475be3033d4254713",
+    "speech:deep_false": "a4dfa6c4e3d77f919a3ca7b9f454249f629e2b0e5df5cad8ad4e0783ba046473",
+    "speech:deep_true": "f904c60a2c1248799fe5fdc559e528041302b5f7433919be03ea58cca233ccdd",
+    "speech_mention:deep_false": "f15420e53452fbb09616a8bea172b6181d90e2f84584fbcbfa4c09b80860d9d2",
+    "speech_mention:deep_true": "ea76dc238b78eaec219b4c681c6ffb025ab61e19f9b95b87404afad671774ac2",
+    "sports:deep_false": "6d6783072a778b067bf364ed473c16226e0c4438fe891440ca67c8f56b5a42f9",
+    "sports:deep_true": "17b6e5c35259d837df3217c14bf662d6dfa05e9162735a4a79d736e765626476",
+    "weather:deep_false": "eeacbb3c933b623e93880a80f8bd27003800ec17393f78547b2357805b9e4db2",
+    "weather:deep_true": "e9a577927c76d9bc0bc5262b441b09b20c9a03525cbd54e3093f57a62b20ebf0",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -40,18 +43,18 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
     "confidence": "3993782437221b5549e1c1d527d246a5a9899919641c5bceb63a90a89d4ea137",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
-    "edge_external": "c85f0f881724bd6cb9c2626a4b3497e6540511c9dbbaef1b125b79c484ad16ad",
+    "edge_external": "af45ae57027c853dd040990e6be9dfe0b045772e14690dfc378f91ff56380e2a",
     "edge_source": "2901c6e3da6168e6b4205bf0660b22475968ecc6b946ebb1a66841b517cd2bce",
-    "evidence_basis": "ff492060d94fea1e70d1623d7bc0d3c4348302c9d19dda58e233aa703ec71682",
+    "evidence_basis": "fd09eed4586de60e1a994291d7b04a2de5603dc17a2b94dce732066888d389da",
     "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
     "evidence_quality": "476f825d5b7a15e377c7e8f53749beb0a39db6c6f965065a801ece51ff07b0b6",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",
-    "implied_prob_external": "db0b9497d1f31ef2601d3130975e4b4ea115c49758eedb266f4986410ef69765",
-    "key_sources": "655b9b2751cca8b59fee6971dfcb2d682165d25855a5d41a9fe4684fa9ca6690",
+    "implied_prob_external": "76bcee210033e309fd75807a13b8ec2cee01051ee4687b4d8dc70a433bf90848",
+    "key_sources": "3aa0cc5c44f0f8a2ee451eeb25844c11c7d34426c2a2627651c814e5a4f38747",
     "likelihood_ratio": "d2f282fd76a34dec00a06dbfafac1f4760b46dbab9020d2f690e61611cb26a75",
-    "my_prob": "5abe352ec13d685677213b1120c1914090c2eb9115cd8450156de34b1c8b31d0",
-    "outcome": "7642b21e60176506e653b20b3183cc5bc0c361804028e0a8a98a697e8b65f94c",
-    "primary_source_url": "6101dd4040210985d00f82c41313d2d69a513361eca215aeab2883f35387af70",
+    "my_prob": "752cdbc9aba6b7fdc735e8f3c81944467b6598eba3d139041430fd03afdec0c6",
+    "outcome": "67cf74e5d00e1ebece3635535fb09d9dc67b9a4a997a3246761c44ccd6198399",
+    "primary_source_url": "bdd16205b16f6b72d3c9228c2f90468953d813dca5f11c657f2000539c9c1fea",
     "probability_yes": "c23e1e0ff03c759f6c24ec0a60249568a7f2d449f3e16c6a0efa03d4b8b72802",
     "prompt_tokens": "49db0a66d30b18b71326920cd8ceea07a4c204889a27ad00bc6a275ca0c97b36",
     "raw_bet_size_pct": "8f72e04cf77115c2893583367d0f8ae98d15f7725ccca7072b3c9fa3308a0cce",
@@ -63,7 +66,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "reasoning": "d354569b3ae0b524436f727bd1d0ed5e3f56e5973a4952eff6d05d341cfaed31",
     "reasoning_tokens": "6b47f605e7844debc22ecbf3b199a6f581dd2a72a1ebdaaca8c06f282f7122b9",
     "self_critique": "ab2d939c15dcfe7ab68bd6af225432bdedfd4596e126f76a74ac6afde5bb7bbe",
-    "should_trade": "997fe2b7115c9a5af68197e3bb41b5e2d0e653d5b8ba8533b0e28a1233488e53",
+    "should_trade": "a3af674bf96502c698bea6b9e0d42968e98a39b106920cac9e0751f92ee67bef",
     "source_match_class": "8bca00a6b3b1f3d3edc79c9a23303957f8c3971dc39208283368c5b6c1f07efc",
     "uncertainty_note": "0c8956f9b9c3e8e792696a9e4f2ab4c901795cd01e5d9b963b1ae33093f7539f",
 }
@@ -191,4 +194,16 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "Self-consistency check" in _SYSTEM_PROMPT_ANALYZE
     assert "Treat live-price threshold evidence as direct when URL-cited" in _SYSTEM_PROMPT_ANALYZE
     assert "you MUST populate primary_source_url with the exact URL used" in _SYSTEM_PROMPT_ANALYZE
+    assert "primary_source_url must be a real https:// link" in _SYSTEM_PROMPT_ANALYZE
+    assert "Side consistency:" in _SYSTEM_PROMPT_ANALYZE
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE
+
+
+def test_deep_constraints_prefer_repair_before_abstain() -> None:
+    from prompts.loader import load_lines
+
+    lines = load_lines("user/fragments/constraints_deep")
+    joined = "\n".join(lines)
+    assert "Repair before abstain" in joined
+    assert "paste the real https primary_source_url" in joined
+    assert "Only abstain after repair attempts" in joined

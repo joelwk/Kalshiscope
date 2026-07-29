@@ -23,6 +23,41 @@ def test_applied_bayesian_posterior_respects_min_updates() -> None:
     assert _applied_bayesian_posterior(0.62, bayesian_update_count=2, min_updates_for_trade=2) == 0.62
 
 
+def test_applied_bayesian_posterior_near_prior_guard() -> None:
+    # An uninformative posterior (within epsilon of the prior) must NOT be applied,
+    # so it cannot overwrite calibrated confidence with the 0.50 prior.
+    assert (
+        _applied_bayesian_posterior(
+            0.52, bayesian_update_count=5, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        is None
+    )
+    assert (
+        _applied_bayesian_posterior(
+            0.50, bayesian_update_count=5, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        is None
+    )
+    # A sufficiently divergent posterior is applied.
+    assert (
+        _applied_bayesian_posterior(
+            0.62, bayesian_update_count=5, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        == 0.62
+    )
+    # Min-updates is still enforced even when divergent.
+    assert (
+        _applied_bayesian_posterior(
+            0.62, bayesian_update_count=2, min_updates_for_trade=3,
+            prior=0.5, min_posterior_divergence=0.05,
+        )
+        is None
+    )
+
+
 def test_cap_bayesian_confidence_boost_limits_uplift() -> None:
     capped = _cap_bayesian_confidence_boost(
         base_confidence=0.53,
@@ -113,6 +148,57 @@ def test_resolve_min_bet_floor_skips_sub_floor_kelly_by_default() -> None:
     )
     assert adjusted == 1.25
     assert adjusted_pct == 0.3125
+    assert floor_applied is False
+    assert sub_floor_skipped is True
+    assert policy == "skip"
+
+
+def test_resolve_min_bet_floor_near_miss_floors_when_dynamic_allowed() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.87,
+        min_bet_usdc=2.0,
+        max_bet_usdc=12.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        dynamic_kelly_floor_allowed=True,
+        near_miss_ratio=0.60,
+    )
+    assert adjusted == 2.0
+    assert abs(adjusted_pct - (2.0 / 12.0)) < 1e-9
+    assert floor_applied is True
+    assert sub_floor_skipped is False
+    assert policy == "near_miss_floor"
+
+
+def test_resolve_min_bet_floor_near_miss_floors_gold_style_60pct() -> None:
+    """EE gold case: $1.21 vs $2.00 (~0.605) floors at default near-miss ratio 0.60."""
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=1.21,
+        min_bet_usdc=2.0,
+        max_bet_usdc=12.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        dynamic_kelly_floor_allowed=True,
+        near_miss_ratio=0.60,
+    )
+    assert adjusted == 2.0
+    assert abs(adjusted_pct - (2.0 / 12.0)) < 1e-9
+    assert floor_applied is True
+    assert sub_floor_skipped is False
+    assert policy == "near_miss_floor"
+
+
+def test_resolve_min_bet_floor_deep_sub_floor_still_skips() -> None:
+    adjusted, adjusted_pct, floor_applied, sub_floor_skipped, policy = _resolve_min_bet_floor(
+        bet_amount=0.48,
+        min_bet_usdc=2.0,
+        max_bet_usdc=12.0,
+        kelly_path_active=True,
+        min_bet_policy="skip",
+        dynamic_kelly_floor_allowed=False,
+        near_miss_ratio=0.60,
+    )
+    assert adjusted == 0.48
     assert floor_applied is False
     assert sub_floor_skipped is True
     assert policy == "skip"

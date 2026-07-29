@@ -4,13 +4,17 @@ lines:
   - "Before classifying evidence: (1) fetch the primary settlement source for this market type, (2) record the observed value and URL, (3) then classify evidence_basis. Do not classify evidence as direct before searching."
   - "likelihood_ratio must be null (not 0) when no comparative evidence is available; use 1.0 when evidence is equally consistent with both outcomes."
   - "If your source is settlement-aligned (directly resolves the market's settlement criterion), classify it as direct and populate primary_source_url. Proxy is for sources that are adjacent, predictive, or indirectly relevant — not settlement-aligned."
+  - "Forecasts, projections, pregame previews, probable lineups, recent-form statistics, and sportsbook odds are proxy evidence even when hosted by an official or allowlisted domain. A trusted URL does not turn a prediction into an observed result."
+  - "Upgrade proxy to direct only after the settlement-relevant value/result is observed or final and the source is aligned to the market's exact resolution criterion."
   - "Aggregator sites (Trading Economics, Investing.com, Macrotrends, Kitco) are proxy-tier for any market, not just commodities. A primary_source_url from an aggregator does not make evidence direct; only official exchange, government, or Tier-1 wire-service pages qualify as settlement-grade."
-  - "evidence_quality must not exceed 0.75 when evidence_basis=proxy, unconditionally. Having a primary_source_url does NOT change this ceiling — only evidence_basis=direct may have eq > 0.75. If you find yourself awarding eq > 0.75 with evidence_basis=proxy, this is always an error: either reclassify to direct (requires a settlement-aligned URL) or lower eq to 0.75."
+  - "evidence_quality must not exceed 0.75 when evidence_basis=proxy. Having a primary_source_url does NOT change this ceiling. The sole category exception is sports backed by current, citable multi-book sportsbook/consensus odds, which may reach 0.80 as specified in the sports hint and output schema. Otherwise, if proxy eq exceeds 0.75, either reclassify to direct (requires an observed settlement-aligned result and URL) or lower eq to 0.75."
   - Classify your evidence basis as direct, proxy, or absence-only in reasoning.
   - Direct evidence means transcript-level, settlement-aligned, or official primary sources; for non-sports markets, include primary_source_url or classify the evidence as proxy/absence-only.
-  - If evidence is proxy or absence-only, treat this as a research gap, not a market judgment; default should_trade=false unless edge and source quality are both exceptional.
+  - "If evidence_basis=absence_only, edge_source=none, or evidence_quality=0.0, treat this as a research gap (not a market judgment) and set should_trade=false."
+  - "Ordinary weak proxy evidence defaults to should_trade=false. Exceptional proxy may still trade when system rules allow it: sportsbook/consensus odds with positive edge_market and pricing-in reasoning, or other settlement-predictive proxy called out in category hints."
+  - "Do not set should_trade=false solely because a prior cycle abstained when this pass has a settlement-aligned primary_source_url and positive edge_market."
   - Do not use absence of mentions alone as a high-confidence trading signal.
-  - If external odds are unavailable, keep evidence_quality < 0.50, set edge_source=none or fallback as appropriate, and default should_trade=false.
+  - If external odds are unavailable, keep evidence_quality < 0.50, set edge_source=none or fallback as appropriate, and default should_trade=false unless a primary settlement-aligned source already supports a positive edge_market.
   - If evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only, name what direct source or price signal is missing in reasoning.
   - Never treat evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only as an executable market judgment; classify it as a research failure or monitoring case.
   - For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.

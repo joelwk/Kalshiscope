@@ -35,6 +35,8 @@ DEFAULT_WINDOW_DAYS = 7
 DEFAULT_LOG_FILES = ("logs/predictbot.log", "logs/predictbot.log.1")
 SECTION_RULE = "=" * 78
 SUBSECTION_RULE = "-" * 78
+REPORT_DECISION_RECEIPTS_VIEW = "decision_receipts_report"
+LEGACY_JURISDICTION_REASON = "jurisdiction_sports_analysis_held"
 
 
 def _open_readonly(db_path: str) -> sqlite3.Connection:
@@ -50,6 +52,42 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     ).fetchone()
     return row is not None
+
+
+def _prepare_reporting_views(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "decision_receipts"):
+        return
+    conn.execute(f"DROP VIEW IF EXISTS temp.{REPORT_DECISION_RECEIPTS_VIEW}")
+    conn.execute(
+        f"""
+        CREATE TEMP VIEW {REPORT_DECISION_RECEIPTS_VIEW} AS
+        SELECT *
+        FROM main.decision_receipts
+        WHERE COALESCE(final_reason, '') != '{LEGACY_JURISDICTION_REASON}'
+        """,
+    )
+
+
+def section_legacy_receipts(conn: sqlite3.Connection, *, window_days: int) -> None:
+    if not _table_exists(conn, "decision_receipts"):
+        return
+    cutoff = _cutoff_iso(window_days)
+    row = conn.execute(
+        """
+        SELECT
+          COUNT(*) AS all_time,
+          SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS recent
+        FROM decision_receipts
+        WHERE COALESCE(final_reason, '') = ?
+        """,
+        (cutoff, LEGACY_JURISDICTION_REASON),
+    ).fetchone()
+    _print_header("LEGACY NON-ACTIONABLE RECEIPTS (excluded below)")
+    print(
+        "sports jurisdiction analysis holds: "
+        f"recent={int(row['recent'] or 0)} all_time={int(row['all_time'] or 0)}"
+    )
+    print("These synthetic parking rows are reported separately from participation.")
 
 
 def _fmt_pct(numerator: float, denominator: float) -> str:
@@ -144,7 +182,7 @@ def section_decision_outcome_mix(
     rows_recent = conn.execute(
         """
         SELECT COALESCE(final_action, 'unknown') AS final_action, COUNT(*) AS n
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
         GROUP BY final_action
         ORDER BY n DESC
@@ -154,7 +192,7 @@ def section_decision_outcome_mix(
     rows_all = conn.execute(
         """
         SELECT COALESCE(final_action, 'unknown') AS final_action, COUNT(*) AS n
-        FROM decision_receipts
+        FROM decision_receipts_report
         GROUP BY final_action
         ORDER BY n DESC
         """,
@@ -202,7 +240,7 @@ def section_blocked_conviction(
           SUM(CASE WHEN COALESCE(final_action,'') = 'order_submitted' THEN 1 ELSE 0 END) AS submitted,
           SUM(CASE WHEN COALESCE(final_action,'') = 'order_attempt' THEN 1 ELSE 0 END) AS attempted,
           SUM(CASE WHEN COALESCE(final_action,'') = 'dry_run' THEN 1 ELSE 0 END) AS dry_run
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
           AND COALESCE(json_extract(decision_json,'$.should_trade'), 0) = 1
         """,
@@ -229,7 +267,7 @@ def section_blocked_conviction(
           COALESCE(final_action,'unknown') AS final_action,
           COALESCE(final_reason,'unknown') AS final_reason,
           COUNT(*) AS n
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
           AND COALESCE(json_extract(decision_json,'$.should_trade'), 0) = 1
           AND COALESCE(final_action,'') NOT IN ('order_submitted','dry_run','order_attempt')
@@ -256,7 +294,7 @@ def section_blocked_conviction(
           SUM(CASE WHEN COALESCE(final_action,'') NOT IN ('order_submitted','dry_run','order_attempt')
                    THEN 1 ELSE 0 END) AS n_blocked,
           SUM(CASE WHEN COALESCE(final_action,'') = 'order_submitted' THEN 1 ELSE 0 END) AS n_submitted
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
           AND COALESCE(json_extract(decision_json,'$.should_trade'), 0) = 1
         GROUP BY family
@@ -313,7 +351,7 @@ def section_participation_demotions(
                            THEN 1 ELSE 0 END) AS demoted_total,
                   SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.participation_terminal_reject'),0)=1
                            THEN 1 ELSE 0 END) AS terminal_rejects
-                FROM decision_receipts
+                FROM decision_receipts_report
                 WHERE timestamp >= ?
                 """,
                 (cutoff_value,),
@@ -335,7 +373,7 @@ def section_participation_demotions(
                            THEN 1 ELSE 0 END) AS demoted_total,
                   SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.participation_terminal_reject'),0)=1
                            THEN 1 ELSE 0 END) AS terminal_rejects
-                FROM decision_receipts
+                FROM decision_receipts_report
                 """,
             ).fetchone()
         total = int(row["n"] or 0)
@@ -367,7 +405,7 @@ def section_participation_demotions(
         SELECT
           COALESCE(json_extract(audit_json,'$.participation_demotion_reason'),'unknown') AS reason,
           COUNT(*) AS n
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE json_extract(audit_json,'$.participation_demotion_reason') IS NOT NULL
           AND COALESCE(final_action,'') = 'research_queued'
         GROUP BY reason
@@ -387,7 +425,7 @@ def section_participation_demotions(
           COALESCE(json_extract(audit_json,'$.participation_tier'),'unknown') AS tier,
           COALESCE(final_action,'unknown') AS final_action,
           COUNT(*) AS n
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE json_extract(audit_json,'$.participation_tier') IS NOT NULL
         GROUP BY tier, final_action
         ORDER BY n DESC
@@ -421,7 +459,7 @@ def section_decision_field_distribution(
     rows = conn.execute(
         """
         SELECT decision_json, audit_json, final_action, final_reason
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
         """,
         (cutoff,),
@@ -600,7 +638,7 @@ def section_per_family_prefix(
           COALESCE(final_action,'unknown') AS final_action,
           CAST(json_extract(audit_json,'$.pre_execution_final_score') AS REAL) AS score,
           market_id
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
         """,
         (cutoff,),
@@ -825,6 +863,10 @@ def section_cycle_funnel(
     fields = [
         "fetched", "filtered", "analyzed", "decisions_made",
         "execution_candidates", "research_queue_size",
+        "research_queue_actionable_size",
+        "research_queue_priority_drain_candidates",
+        "research_queue_soft_placeholders",
+        "research_queue_legacy_holds",
         "research_queue_drained_count",
         "research_queue_drain_skipped_stale_count",
         "research_queue_drain_skipped_low_priority_count",
@@ -834,6 +876,7 @@ def section_cycle_funnel(
     ]
     series: dict[str, list[float]] = {field: [] for field in fields}
     rejection_total = Counter()
+    legacy_rejection_count = 0
     evidence_total = Counter()
     participation_tier_total = Counter()
     cycles_analyzed_pos_exec_zero_with_research_pos = 0
@@ -848,22 +891,54 @@ def section_cycle_funnel(
             payload.get("funnel_stage_counts")
             or {}
         )
+        rejection = payload.get("rejection_breakdown")
+        legacy_in_cycle = 0
+        if isinstance(rejection, dict):
+            try:
+                legacy_in_cycle = int(
+                    rejection.get(LEGACY_JURISDICTION_REASON, 0) or 0
+                )
+            except (TypeError, ValueError):
+                legacy_in_cycle = 0
+        research_backlog = payload.get("research_queue_backlog")
+        if not isinstance(research_backlog, dict):
+            research_backlog = {}
         for field in fields:
-            value = (
-                funnel.get(field)
-                if field in funnel
-                else payload.get(field)
-            )
+            if field == "research_queue_actionable_size":
+                raw_queue_size = funnel.get(
+                    "research_queue_size",
+                    payload.get("research_queue_size", 0),
+                )
+                try:
+                    value = max(0.0, float(raw_queue_size or 0.0) - legacy_in_cycle)
+                except (TypeError, ValueError):
+                    value = 0.0
+            elif field == "research_queue_priority_drain_candidates":
+                value = research_backlog.get("priority_drain_candidates", 0)
+            elif field == "research_queue_soft_placeholders":
+                value = research_backlog.get("soft_research_placeholders", 0)
+            elif field == "research_queue_legacy_holds":
+                value = research_backlog.get("legacy_jurisdiction_holds", 0)
+            else:
+                value = (
+                    funnel.get(field)
+                    if field in funnel
+                    else payload.get(field)
+                )
             try:
                 series[field].append(float(value if value is not None else 0.0))
             except (TypeError, ValueError):
                 pass
 
-        rejection = payload.get("rejection_breakdown")
         if isinstance(rejection, dict):
             for key, val in rejection.items():
                 try:
-                    rejection_total[str(key)] += int(val)
+                    normalized_key = str(key)
+                    normalized_value = int(val)
+                    if normalized_key == LEGACY_JURISDICTION_REASON:
+                        legacy_rejection_count += normalized_value
+                    else:
+                        rejection_total[normalized_key] += normalized_value
                 except (TypeError, ValueError):
                     continue
 
@@ -891,10 +966,12 @@ def section_cycle_funnel(
         execution_candidates = (
             payload.get("execution_candidates", 0)
         )
-        research_queue_size = (
-            payload.get("research_queue_size", 0)
-        )
         try:
+            research_queue_size = max(
+                0.0,
+                float(payload.get("research_queue_size", 0) or 0.0)
+                - legacy_in_cycle,
+            )
             analyzed_int = int(float(analyzed or 0))
             exec_int = int(float(execution_candidates or 0))
             rq_int = int(float(research_queue_size or 0))
@@ -937,6 +1014,11 @@ def section_cycle_funnel(
         f"{cycles_analyzed_pos_exec_zero_with_research_pos} "
         f"({_fmt_pct(cycles_analyzed_pos_exec_zero_with_research_pos, cycles_analyzed_pos)})"
     )
+    if legacy_rejection_count:
+        print(
+            "  legacy jurisdiction holds excluded from rejection mix: "
+            f"{legacy_rejection_count}"
+        )
 
     if rejection_total:
         _print_subheader("rejection_breakdown totals (top 20)")
@@ -1045,7 +1127,7 @@ def section_research_queued_settlement_review(
           tox.won AS internal_won,
           tox.resolved_winning_outcome AS internal_winning,
           tox.implied_prob AS internal_implied_prob
-        FROM decision_receipts dr
+        FROM decision_receipts_report dr
         LEFT JOIN exchange_settlements es ON es.market_id = dr.market_id
         LEFT JOIN trade_outcomes tox ON tox.market_id = dr.market_id
         WHERE dr.timestamp >= ?
@@ -1168,7 +1250,7 @@ def section_research_queued_settlement_review(
           dr.final_reason AS final_reason,
           es.winning_outcome AS exch_winning_outcome,
           es.pnl_realized AS exch_pnl_realized
-        FROM decision_receipts dr
+        FROM decision_receipts_report dr
         LEFT JOIN exchange_settlements es ON es.market_id = dr.market_id
         WHERE dr.timestamp >= ?
           AND COALESCE(dr.final_action,'') = 'research_queued'
@@ -1227,7 +1309,7 @@ def section_calibration_guard_receipts(
           COUNT(*) AS n,
           SUM(CASE WHEN COALESCE(final_action,'') IN ('order_attempt','order_submitted','dry_run') THEN 1 ELSE 0 END) AS attempted,
           SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.evidence_floor_suppressed_reason'), '') <> '' THEN 1 ELSE 0 END) AS floor_suppressed
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
         GROUP BY source_match_class
         ORDER BY n DESC
@@ -1253,7 +1335,7 @@ def section_calibration_guard_receipts(
           COUNT(*) AS n,
           SUM(CASE WHEN COALESCE(final_action,'') IN ('order_attempt','order_submitted','dry_run') THEN 1 ELSE 0 END) AS attempted,
           AVG(COALESCE(CAST(json_extract(audit_json,'$.pre_execution_final_score') AS REAL), 0.0)) AS avg_score
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
           AND json_extract(audit_json,'$.ranking_rank') IS NOT NULL
         GROUP BY ranking_rank
@@ -1290,7 +1372,7 @@ def section_calibration_guard_receipts(
           COUNT(*) AS n,
           SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.score_rejection_reasons'), '') LIKE '%high_edge_calibration_penalty%' THEN 1 ELSE 0 END) AS high_edge_penalty,
           SUM(CASE WHEN COALESCE(json_extract(audit_json,'$.score_rejection_reasons'), '') LIKE '%extreme_edge_learning_queue%' THEN 1 ELSE 0 END) AS learning_queue
-        FROM decision_receipts
+        FROM decision_receipts_report
         WHERE timestamp >= ?
           AND (
             json_extract(audit_json,'$.score_edge_market') IS NOT NULL
@@ -1389,6 +1471,7 @@ def main() -> None:
 
     conn = _open_readonly(args.db)
     try:
+        _prepare_reporting_views(conn)
         print(SECTION_RULE)
         print("PARTICIPATION QUALITY REPORT")
         print(f"Generated:  {datetime.now(timezone.utc).isoformat()}")
@@ -1397,6 +1480,7 @@ def main() -> None:
         print(SECTION_RULE)
 
         section_account_snapshot(conn)
+        section_legacy_receipts(conn, window_days=args.window_days)
         section_decision_outcome_mix(conn, window_days=args.window_days)
         section_blocked_conviction(conn, window_days=args.window_days)
         section_participation_demotions(conn, window_days=args.window_days)

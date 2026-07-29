@@ -11,6 +11,11 @@ from logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# kalshi_auth log values: passed | skipped | not_applicable
+KALSHI_AUTH_PASSED = "passed"
+KALSHI_AUTH_SKIPPED = "skipped"
+KALSHI_AUTH_NOT_APPLICABLE = "not_applicable"
+
 
 class BootstrapError(RuntimeError):
     """Raised when a startup health check fails."""
@@ -24,12 +29,16 @@ def run_bootstrap_checks(
     """Execute pre-flight checks; raise BootstrapError on any failure."""
     _check_tls_cert_bundle()
 
-    if not skip_api_checks and kalshi_client is not None:
-        _check_kalshi_auth(kalshi_client)
+    if skip_api_checks:
+        kalshi_auth = KALSHI_AUTH_SKIPPED
+    elif kalshi_client is None:
+        kalshi_auth = KALSHI_AUTH_NOT_APPLICABLE
+    else:
+        kalshi_auth = _check_kalshi_auth(kalshi_client)
 
     logger.info(
         "Bootstrap checks passed",
-        data={"tls_ok": True, "kalshi_ok": not skip_api_checks},
+        data={"tls_ok": True, "kalshi_auth": kalshi_auth},
     )
 
 
@@ -50,11 +59,11 @@ def _check_tls_cert_bundle() -> None:
     logger.debug("TLS cert bundle OK: %s", cert_path)
 
 
-def _check_kalshi_auth(kalshi_client: object) -> None:
-    get_balance = getattr(kalshi_client, "get_portfolio_balance", None)
+def _check_kalshi_auth(kalshi_client: object) -> str:
+    get_balance = getattr(kalshi_client, "get_balance", None)
     if get_balance is None:
-        logger.debug("Kalshi client has no get_portfolio_balance; skipping auth check")
-        return
+        logger.debug("Kalshi client has no get_balance; skipping auth check")
+        return KALSHI_AUTH_NOT_APPLICABLE
     try:
         balance = get_balance()
         logger.debug(
@@ -62,6 +71,7 @@ def _check_kalshi_auth(kalshi_client: object) -> None:
             balance,
             data={"balance": balance},
         )
+        return KALSHI_AUTH_PASSED
     except Exception as exc:
         raise BootstrapError(
             f"Kalshi API auth check failed: {exc}. "

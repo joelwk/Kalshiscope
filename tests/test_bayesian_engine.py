@@ -4,6 +4,7 @@ import math
 
 from bayesian_engine import (
     BayesianState,
+    binary_log_updates_from_ratio,
     compute_posterior,
     initial_state,
     log_likelihood_from_ratio,
@@ -40,12 +41,29 @@ def test_neutral_likelihood_preserves_posterior() -> None:
 
 def test_positive_likelihood_moves_posterior_toward_selected_outcome() -> None:
     states = initial_state(2, prior=0.5)
-    log_lr = log_likelihood_from_ratio(2.0)
-    updated_states = [update(states[0], log_lr), update(states[1], -log_lr)]
+    selected_update, alternative_update = binary_log_updates_from_ratio(2.0)
+    updated_states = [
+        update(states[0], selected_update),
+        update(states[1], alternative_update),
+    ]
     posterior = posterior_from_state(updated_states)
     assert posterior[0] > 0.5
     assert posterior[1] < 0.5
+    assert math.isclose(posterior[0], 2.0 / 3.0, rel_tol=1e-12, abs_tol=1e-12)
     assert math.isclose(sum(posterior), 1.0, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_binary_likelihood_ratio_multiplies_prior_odds_once() -> None:
+    states = initial_state(2, prior=0.6)
+    selected_update, alternative_update = binary_log_updates_from_ratio(2.0)
+    posterior = posterior_from_state(
+        [
+            update(states[0], selected_update),
+            update(states[1], alternative_update),
+        ]
+    )
+    # Prior odds 0.6/0.4 = 1.5; LR=2 produces odds 3 and p=0.75.
+    assert math.isclose(posterior[0], 0.75, rel_tol=1e-12, abs_tol=1e-12)
 
 
 def test_compute_posterior_stable_for_large_log_values() -> None:

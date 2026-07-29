@@ -5,7 +5,85 @@ import sqlite3
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 
-from analytics import run
+from analytics import _infer_market_family, run
+
+
+def test_infer_market_family_uses_question_and_category() -> None:
+    """Ticker-only text misclassifies edge cases that need question/category."""
+    assert _infer_market_family(market_id="1c") == "generic"
+    assert (
+        _infer_market_family(
+            market_id="1c",
+            question="Who wins this matchup?",
+            category="ncaa tournament",
+        )
+        == "sports"
+    )
+    assert (
+        _infer_market_family(
+            market_id="1b",
+            question="Olympics Ice Hockey FINAL: Canada vs USA",
+            category="",
+        )
+        == "sports"
+    )
+
+
+def test_analytics_family_pnl_joins_markets_metadata(tmp_path) -> None:
+    """Family P&L must classify via market_id + question + category like gates."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE trade_outcomes (
+                market_id TEXT,
+                confidence REAL,
+                implied_prob REAL,
+                won INTEGER,
+                resolution_state TEXT,
+                amount_usdc REAL,
+                pnl_estimate REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE markets (
+                id TEXT PRIMARY KEY,
+                question TEXT,
+                category TEXT,
+                last_terminal_outcome TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO markets (id, question, category, last_terminal_outcome)
+            VALUES ('1c', 'Who wins this matchup?', 'ncaa tournament', 'resolved')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO trade_outcomes (
+                market_id, confidence, implied_prob, won,
+                resolution_state, amount_usdc, pnl_estimate
+            )
+            VALUES ('1c', 0.80, 0.55, 1, 'resolved_valid', 5.0, 2.0)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        run(str(db_path))
+    output = output_buffer.getvalue()
+
+    assert "Resolved P&L by market family:" in output
+    assert "sports:" in output
+    assert "generic:" not in output
 
 
 def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:
@@ -108,3 +186,61 @@ def test_analytics_reports_cycle_api_and_score_gate_metrics(tmp_path) -> None:
     assert "volume_amplifier_discount=0.0100" in output
     assert "Kelly dynamic fraction >0.50: 1/2 (50.0%)" in output
     assert "Should-trade block rate by family" in output
+
+
+def test_analytics_skips_malformed_cycle_payload_json(tmp_path) -> None:
+    """Malformed cycle payloads must not crash quota-paused counting."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE trade_outcomes (
+                confidence REAL,
+                implied_prob REAL,
+                won INTEGER,
+                resolution_state TEXT,
+                amount_usdc REAL,
+                pnl_estimate REAL
+            )
+            """
+        )
+        conn.execute("CREATE TABLE markets (last_terminal_outcome TEXT)")
+        conn.execute(
+            """
+            CREATE TABLE decision_receipts (
+                audit_json TEXT,
+                decision_json TEXT,
+                timestamp TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE cycle_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO cycle_receipts (payload_json)
+            VALUES
+                ('not-valid-json{{{'),
+                ('{"api_tokens_consumed":100,"api_cost_estimate_usd":0.01,"order_attempts":0,"decisions_made":1,"xai_quota_paused":true}'),
+                ('{"api_tokens_consumed":50,"api_cost_estimate_usd":0.005,"order_attempts":0,"decisions_made":1}')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        run(str(db_path))
+    output = output_buffer.getvalue()
+
+    assert "Cycle API/score-gate summary" in output
+    assert "cycles=2" in output
+    assert "xai_quota_paused_cycles=1" in output

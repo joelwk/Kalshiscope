@@ -90,27 +90,47 @@ class TestGrokClient(unittest.TestCase):
         with self.assertRaises(ValueError):
             _extract_json("no-json")
 
+    def test_extract_json_recovers_truncated_object(self) -> None:
+        """Brent deep-failure pattern: opens `{` but truncates mid-string without `}`."""
+        truncated = (
+            '{ "should_trade": true, "outcome": "YES", "confidence": 0.70, '
+            '"reasoning": "Buffer supports edge from WSJ quote'
+        )
+        payload = _extract_json(truncated)
+        self.assertTrue(payload["should_trade"])
+        self.assertEqual(payload["outcome"], "YES")
+        self.assertAlmostEqual(float(payload["confidence"]), 0.70)
+
     def test_is_retriable_grok_error_classifies_fast_internal(self) -> None:
         err = RuntimeError("StatusCode.INTERNAL: internal server error")
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=20_000.0))
 
     def test_fast_empty_response_from_grok_is_retriable(self) -> None:
-        """A sub-_SLOW_FAILURE_THRESHOLD_MS empty response is treated as
-        upstream blip and retried (fix 5b). The 4707ms duration in the
-        recent error log is the canonical case."""
+        """Empty responses under _EMPTY_RESPONSE_RETRY_MAX_MS are upstream blips."""
         err = ValueError("Empty response from Grok")
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=350.0))
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=4707.46))
         self.assertTrue(_is_retriable_grok_error(err, duration_ms=14_999.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=21_519.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=29_999.0))
 
     def test_slow_empty_response_from_grok_stays_non_retriable(self) -> None:
-        """A slow empty response (>= _SLOW_FAILURE_THRESHOLD_MS) still falls
-        through to the slow-failure short-circuit so we don't burn budget on
-        genuine outages masquerading as empty streams."""
+        """Empty responses at/above _EMPTY_RESPONSE_RETRY_MAX_MS stay non-retriable."""
         err = ValueError("Empty response from Grok")
-        self.assertFalse(_is_retriable_grok_error(err, duration_ms=15_000.0))
+        self.assertFalse(_is_retriable_grok_error(err, duration_ms=30_000.0))
         self.assertFalse(_is_retriable_grok_error(err, duration_ms=60_000.0))
+
+    def test_grpc_stream_removed_is_retriable_even_when_slow(self) -> None:
+        err = RuntimeError(
+            '<_MultiThreadedRendezvous of RPC that terminated with:\n'
+            '\tstatus = StatusCode.UNKNOWN\n'
+            '\tdetails = "Stream removed"\n'
+            '\tdebug_error_string = "UNKNOWN:Error received from peer  '
+            '{grpc_message:"Stream removed", grpc_status:2}"\n>'
+        )
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=391.0))
+        self.assertTrue(_is_retriable_grok_error(err, duration_ms=60_000.0))
 
     def test_grpc_deadline_exceeded_is_retriable_regardless_of_duration(self) -> None:
         err = RuntimeError(
@@ -565,6 +585,92 @@ class TestGrokClient(unittest.TestCase):
         self.assertTrue(decision.abstain)
         self.assertIn("self_consistency_disagreement", decision.reasoning)
         self.assertIn("deep repair required", decision.self_critique or "")
+        # Disagreement merge must still persist YES-side polarity fields.
+        self.assertAlmostEqual(decision.probability_yes or 0.0, 0.58, places=2)
+        self.assertAlmostEqual(decision.my_prob or 0.0, 0.58, places=2)
+        self.assertAlmostEqual(decision.implied_prob_external or 0.0, 0.55, places=2)
+
+    def test_self_consistency_no_agreement_stores_yes_side_my_prob(self) -> None:
+        market = Market(
+            id="m-self-consistency-no",
+            question="Will the high be 85-86?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.47),
+                MarketOutcome(name="NO", price=0.53),
+            ],
+            liquidity_usdc=500.0,
+        )
+        first = (
+            '{"should_trade": true, "outcome": "NO", "confidence": 0.78, '
+            '"probability_yes": 0.22, "my_prob": 0.22, "bet_size_pct": 0.5, '
+            '"reasoning": "NWS favors below bin. Implied YES 47%, my YES 22%.", '
+            '"evidence_quality": 0.9, "primary_source_url": '
+            '"https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43", '
+            '"evidence_basis": "direct", "edge_source": "computed"}'
+        )
+        second = (
+            '{"should_trade": true, "outcome": "NO", "confidence": 0.82, '
+            '"probability_yes": 0.18, "my_prob": 0.18, "bet_size_pct": 0.5, '
+            '"reasoning": "NWS still favors below bin after counter-check.", '
+            '"evidence_quality": 0.9, "primary_source_url": '
+            '"https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43", '
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"self_critique": "Humidity residual uncertainty."}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient([first, second])
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(decision.outcome, "NO")
+        self.assertAlmostEqual(decision.probability_yes or 0.0, 0.20, places=2)
+        # Must store P(YES), not chosen-side confidence (~0.80).
+        self.assertAlmostEqual(decision.my_prob or 0.0, 0.20, places=2)
+        self.assertAlmostEqual(decision.implied_prob_external or 0.0, 0.47, places=2)
+        self.assertLess(decision.edge_external or 0.0, 0.0)
+
+    def test_validate_and_enrich_normalizes_chosen_side_no_to_yes_side(self) -> None:
+        market = Market(
+            id="KXHIGHTATL-26JUL14-B85.5",
+            question="Will the maximum temperature be 85-86 on Jul 14, 2026?",
+            category="climate",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.47),
+                MarketOutcome(name="NO", price=0.53),
+            ],
+        )
+        # ATL-shaped bug: model stored chosen-side my_prob=confidence with
+        # positive edge_external on a NO call.
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.82,
+            raw_confidence=0.82,
+            bet_size_pct=0.4,
+            reasoning=(
+                "NWS forecast.weather.gov as of Jul 14 favors high below 85. "
+                "Implied NO 53%, my NO 82%, edge 29%."
+            ),
+            my_prob=0.82,
+            implied_prob_external=0.53,
+            edge_external=0.29,
+            edge_source="computed",
+            evidence_basis="direct",
+            evidence_quality=1.0,
+            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertAlmostEqual(validated.my_prob or 0.0, 0.18, places=2)
+        self.assertAlmostEqual(validated.implied_prob_external or 0.0, 0.47, places=2)
+        self.assertAlmostEqual(validated.edge_external or 0.0, -0.29, places=2)
+        self.assertTrue(validated.should_trade)
 
     def test_self_consistency_skips_second_pass_below_thresholds(self) -> None:
         market = Market(
@@ -1111,15 +1217,15 @@ class TestGrokClient(unittest.TestCase):
         decision = TradeDecision(
             should_trade=True,
             outcome="YES",
-            confidence=0.66,
+            confidence=0.62,
             bet_size_pct=0.3,
             reasoning=(
                 "Reuters preview notes the matchup and probable starters. "
-                "No external odds found. Implied prob: unknown. My prob: 66%. Edge: 16%."
+                "No external odds found. Implied prob: unknown. My prob: 62%. Edge: 12%."
             ),
             implied_prob_external=None,
-            my_prob=0.66,
-            edge_external=0.16,
+            my_prob=0.62,
+            edge_external=0.12,
             edge_source="fallback",
             evidence_quality=0.10,
         )
@@ -1137,7 +1243,125 @@ class TestGrokClient(unittest.TestCase):
             "preview_or_proxy_source",
         )
         self.assertLessEqual(validated.evidence_quality, 0.50)
+        # Edge (0.12) is below the high-edge proxy participation floor (0.15),
+        # so a no-direct-source preview remains blocked.
         self.assertFalse(validated.should_trade)
+
+    def test_validate_and_enrich_allows_high_edge_proxy_via_override(self) -> None:
+        market = Market(
+            id="m9-highedge",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the matchup and probable starters. "
+                "No external odds found. Implied prob: unknown. My prob: 70%. Edge: 20%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.70,
+            edge_external=0.20,
+            edge_source="fallback",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        # Proxy + fallback edge would normally be blocked, but a market edge at
+        # or above the participation floor (0.15) lets it pass validation so the
+        # downstream edge gate and family sizing can size it.
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertTrue(validated.should_trade)
+
+    def test_validate_and_enrich_blocks_high_edge_proxy_below_floor(self) -> None:
+        market = Market(
+            id="m9-lowedge",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.60,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the matchup and probable starters. "
+                "No external odds found. Implied prob: unknown. My prob: 60%. Edge: 10%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.60,
+            edge_external=0.10,
+            edge_source="fallback",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+        # Edge (0.10) is below the participation floor (0.15), so the proxy block
+        # still applies even though evidence quality clears the cap.
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertFalse(validated.should_trade)
+
+    def test_validate_and_enrich_generic_requires_higher_proxy_edge(self) -> None:
+        market = Market(
+            id="KXGENERIC-TEST",
+            question="Will the Fed cut rates?",
+            category="economics",
+            outcomes=[MarketOutcome(name="YES", price=0.50), MarketOutcome(name="NO", price=0.50)],
+        )
+        # Mirror the sports high-edge proxy fixture so source_match_class is
+        # preview_or_proxy and the strong_proxy_edge_override path is exercised.
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.3,
+            reasoning=(
+                "Reuters preview notes the meeting outlook and probable path. "
+                "No external odds found. Implied prob: unknown. My prob: 66%. Edge: 16%."
+            ),
+            implied_prob_external=None,
+            my_prob=0.66,
+            edge_external=0.16,
+            edge_source="fallback",
+            evidence_quality=0.9,
+        )
+        client = GrokClient(api_key="x")
+        # 0.16 clears the global 0.15 floor but not GENERIC_PROXY_HIGH_EDGE_MIN=0.18.
+        blocked = client._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+        )
+        self.assertEqual(blocked.source_match_class, "preview_or_proxy")
+        self.assertFalse(blocked.should_trade)
+        allowed = client._validate_and_enrich_decision(
+            market,
+            decision.model_copy(
+                update={
+                    "confidence": 0.70,
+                    "my_prob": 0.70,
+                    "edge_external": 0.20,
+                    "reasoning": (
+                        "Reuters preview notes the meeting outlook and probable path. "
+                        "No external odds found. Implied prob: unknown. My prob: 70%. Edge: 20%."
+                    ),
+                }
+            ),
+            profile_name="generic",
+        )
+        self.assertTrue(allowed.should_trade)
 
     def test_validate_and_enrich_prefers_computed_edge_over_reasoning_text(self) -> None:
         market = Market(
@@ -1400,6 +1624,397 @@ class TestGrokClient(unittest.TestCase):
         self.assertNotEqual(validated.evidence_quality_floor_applied, "definitive_outcome_floor")
         self.assertEqual(validated.evidence_floor_suppressed_reason, "missing_primary_source_url")
         self.assertEqual(validated.evidence_basis, "proxy")
+
+    def test_weather_profile_exempt_from_primary_source_url_requirement(self) -> None:
+        # Same decision under two profiles isolates the exemption. The reasoning
+        # is reused from the generic suppression test above (it classifies as
+        # direct), so the only difference is profile_name.
+        market = Market(
+            id="KXHIGHDEN-26JUN20-B89.5",
+            question="Will the Denver daily high settle in the 89-90F bin?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.40), MarketOutcome(name="NO", price=0.60)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.85,
+            bet_size_pct=0.3,
+            reasoning="Final score in official recap from Reuters confirms settlement outcome.",
+            implied_prob_external=None,
+            my_prob=0.85,
+            edge_external=0.35,
+            edge_source="fallback",
+            likelihood_ratio=25.0,
+            evidence_quality=0.10,
+        )
+        client = GrokClient(api_key="x")
+        weather = client._validate_and_enrich_decision(market, decision, profile_name="weather")
+        generic = client._validate_and_enrich_decision(market, decision, profile_name="generic")
+        # Weather has a universal NWS settlement source -> exempt: stays direct,
+        # not suppressed for a missing URL. Generic still requires the URL.
+        self.assertEqual(weather.evidence_basis, "direct")
+        self.assertNotEqual(
+            weather.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+        self.assertEqual(generic.evidence_basis, "proxy")
+
+    def test_weather_missing_current_source_is_not_upgraded_by_source_keywords(self) -> None:
+        market = Market(
+            id="KXLOWTSATX-26JUL17-T77",
+            question="Will the minimum temperature be above 77F in San Antonio?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.74),
+                MarketOutcome(name="NO", price=0.26),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.52,
+            probability_yes=0.48,
+            bet_size_pct=0.0,
+            reasoning=(
+                "No NWS point forecast or station observation was found for the "
+                "current settlement day. The official climatological report is "
+                "pending. evidence_basis=absence_only; missing primary source."
+            ),
+            implied_prob_external=0.74,
+            my_prob=0.48,
+            edge_external=-0.26,
+            edge_source="computed",
+            evidence_basis="absence_only",
+            evidence_quality=0.0,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.source_match_class, "missing_or_absence_only")
+        self.assertEqual(validated.evidence_basis, "absence_only")
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+        self.assertFalse(validated.should_trade)
+
+    def test_weather_outdated_observation_url_does_not_override_current_data_gap(self) -> None:
+        market = Market(
+            id="KXHIGHTSEA-26JUL17-B74.5",
+            question="Will Seattle's maximum temperature be 74-75F?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.33),
+                MarketOutcome(name="NO", price=0.67),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.53,
+            probability_yes=0.53,
+            bet_size_pct=0.0,
+            reasoning=(
+                "No current NWS daily summary or observed maximum is available "
+                "yet. The cited station page only contains prior-day observations, "
+                "so the settlement-aligned source is still missing."
+            ),
+            key_sources=[
+                "https://tgftp.nws.noaa.gov/weather/current/KSEA.html (prior day)"
+            ],
+            implied_prob_external=0.33,
+            my_prob=0.53,
+            edge_external=0.20,
+            edge_source="computed",
+            evidence_basis="absence_only",
+            primary_source_url=(
+                "https://tgftp.nws.noaa.gov/weather/current/KSEA.html"
+            ),
+            evidence_quality=0.0,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.source_match_class, "missing_or_absence_only")
+        self.assertEqual(validated.evidence_basis, "absence_only")
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+        self.assertIsNone(validated.evidence_quality_floor_applied)
+
+    def test_weather_current_observation_with_url_remains_direct(self) -> None:
+        market = Market(
+            id="KXLOWTDEN-26JUL17-B64.5",
+            question="Will Denver's minimum temperature be 64-65F?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.39),
+                MarketOutcome(name="NO", price=0.61),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.81,
+            probability_yes=0.10,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Current NWS KDEN ASOS observations show today's daily minimum "
+                "was 66F at 05:53 MDT, above the bin. The observed value and "
+                "timestamp directly resolve the settlement criterion."
+            ),
+            implied_prob_external=0.39,
+            my_prob=0.10,
+            edge_external=-0.29,
+            edge_source="computed",
+            evidence_basis="direct",
+            primary_source_url=(
+                "https://forecast.weather.gov/data/obhistory/KDEN.html"
+            ),
+            evidence_quality=0.90,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertGreaterEqual(validated.evidence_quality, 0.75)
+
+    def test_weather_forecast_explicit_proxy_is_not_upgraded_to_direct(self) -> None:
+        market = Market(
+            id="KXHIGHTSEA-26JUL18-B74.5",
+            question="Will Seattle's maximum temperature be 74-75F?",
+            category="weather",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.43),
+                MarketOutcome(name="NO", price=0.57),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.68,
+            probability_yes=0.32,
+            bet_size_pct=0.0,
+            reasoning=(
+                "NWS forecasts show a high near 75-76F. Proxy evidence only; "
+                "the maximum has not been observed and the final climate report "
+                "is missing."
+            ),
+            implied_prob_external=0.43,
+            my_prob=0.32,
+            edge_external=-0.11,
+            edge_source="computed",
+            evidence_basis="proxy",
+            primary_source_url=(
+                "https://forecast.weather.gov/MapClick.php?lat=47.6062&lon=-122.3321"
+            ),
+            evidence_quality=0.65,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertLessEqual(validated.evidence_quality, 0.75)
+
+    def test_sports_pregame_props_remain_proxy(self) -> None:
+        market = Market(
+            id="KXMLBKS-26JUL181420MINCHC-MINTBRADLEY26-8",
+            question="Taj Bradley: 8+ strikeouts?",
+            category="sports",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.53),
+                MarketOutcome(name="NO", price=0.47),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.61,
+            probability_yes=0.39,
+            bet_size_pct=0.1,
+            reasoning=(
+                "Covers pregame player props and recent-start statistics imply "
+                "P(8+) near 39%. The game is scheduled but has not been played."
+            ),
+            implied_prob_external=0.53,
+            my_prob=0.39,
+            edge_external=-0.14,
+            edge_source="computed",
+            evidence_basis="proxy",
+            primary_source_url=(
+                "https://www.covers.com/sport/baseball/mlb/players/12617/taj-bradley"
+            ),
+            evidence_quality=0.60,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="sports",
+        )
+
+        self.assertEqual(validated.source_match_class, "preview_or_proxy")
+        self.assertEqual(validated.evidence_basis, "proxy")
+        self.assertLessEqual(validated.evidence_quality, 0.80)
+
+    def test_unpublished_settlement_chart_overrides_direct_keyword_match(self) -> None:
+        market = Market(
+            id="KXNETFLIXTOPVIEWSMOVIE-26JUL20-12",
+            question="Will the top Netflix movie exceed 12M views?",
+            category="entertainment",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=False,
+            outcome="YES",
+            confidence=0.50,
+            bet_size_pct=0.0,
+            reasoning=(
+                "No official Netflix Top 10 chart for the settlement period has "
+                "been published yet. The current chart covers the prior week, so "
+                "direct settlement data is unavailable."
+            ),
+            implied_prob_external=0.55,
+            my_prob=0.50,
+            edge_external=-0.05,
+            edge_source="computed",
+            evidence_basis="direct",
+            primary_source_url="https://www.netflix.com/tudum/top10",
+            evidence_quality=0.0,
+        )
+
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="entertainment",
+        )
+
+        self.assertEqual(validated.source_match_class, "missing_or_absence_only")
+        self.assertEqual(validated.evidence_basis, "absence_only")
+        self.assertLessEqual(validated.evidence_quality, 0.50)
+
+    def test_commodity_with_allowlisted_settlement_url_counts_as_direct(self) -> None:
+        # Core unblock: once a commodity market cites a reachable settlement-grade
+        # URL (cmegroup.com), settlement-aligned evidence counts as direct and the
+        # floor is not suppressed -- the same path weather already enjoys.
+        market = Market(
+            id="KXSILVERD-26JUN2217-T66.25",
+            question="Will the silver close price be above 66.25 on Jun 26?",
+            category="commodities",
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Official CME front-month settlement price shows silver spot price "
+                "at 67.10 as of the 1:30 PM ET COMEX close (observed value with "
+                "timestamp), above the 66.25 threshold."
+            ),
+            implied_prob_external=0.45,
+            my_prob=0.80,
+            edge_external=0.35,
+            edge_source="computed",
+            likelihood_ratio=20.0,
+            evidence_quality=0.10,
+            primary_source_url="https://www.cmegroup.com/markets/metals/precious/silver.quotes.html",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market, decision, profile_name="commodity"
+        )
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertNotEqual(
+            validated.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+
+    def test_commodity_without_allowlisted_url_still_suppressed(self) -> None:
+        # Safety preserved: an aggregator URL (not settlement-grade) is still
+        # rejected, so the fix does not loosen the evidence gate.
+        market = Market(
+            id="KXSILVERD-26JUN2217-T66.25",
+            question="Will the silver close price be above 66.25 on Jun 26?",
+            category="commodities",
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Official CME front-month settlement price shows silver spot price "
+                "at 67.10 as of the 1:30 PM ET COMEX close (observed value with "
+                "timestamp), above the 66.25 threshold."
+            ),
+            implied_prob_external=0.45,
+            my_prob=0.80,
+            edge_external=0.35,
+            edge_source="computed",
+            likelihood_ratio=20.0,
+            evidence_quality=0.10,
+            primary_source_url="https://www.investing.com/commodities/silver",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market, decision, profile_name="commodity"
+        )
+        self.assertEqual(
+            validated.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
+        self.assertEqual(validated.evidence_basis, "proxy")
+
+    def test_crypto_with_allowlisted_exchange_url_counts_as_direct(self) -> None:
+        market = Market(
+            id="KXETHD-26JUN2217-T1739.99",
+            question="Will ETH close above 1739.99 on Jun 22 17:00?",
+            category="crypto",
+            outcomes=[MarketOutcome(name="YES", price=0.45), MarketOutcome(name="NO", price=0.55)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.80,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Coinbase exchange spot price shows ETH at 1750 as of 17:00 UTC "
+                "(observed value with timestamp); settlement confirms above threshold."
+            ),
+            implied_prob_external=0.45,
+            my_prob=0.80,
+            edge_external=0.35,
+            edge_source="computed",
+            likelihood_ratio=20.0,
+            evidence_quality=0.10,
+            primary_source_url="https://www.coinbase.com/price/ethereum",
+        )
+        client = GrokClient(api_key="x")
+        validated = client._validate_and_enrich_decision(
+            market, decision, profile_name="crypto"
+        )
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertEqual(validated.evidence_basis, "direct")
+        self.assertNotEqual(
+            validated.evidence_floor_suppressed_reason, "missing_primary_source_url"
+        )
 
     def test_validate_and_enrich_caps_proxy_evidence_quality(self) -> None:
         market = Market(
@@ -1901,6 +2516,48 @@ class TestQuotaExhaustedClassification(unittest.TestCase):
         self.assertEqual(
             validated.evidence_quality_floor_applied,
             "convergent_evidence_floor",
+        )
+
+
+class SelfConsistencyShouldRunTest(unittest.TestCase):
+    def _market(self) -> Market:
+        return Market(
+            id="m-sc",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=5000.0,
+        )
+
+    def _decision(self) -> TradeDecision:
+        return TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.3,
+            reasoning="x",
+            implied_prob_external=0.45,
+            my_prob=0.70,
+            edge_external=0.25,
+        )
+
+    def test_allow_flag_gates_self_consistency(self) -> None:
+        client = GrokClient(api_key="x")
+        market = self._market()
+        decision = self._decision()
+        # High liquidity clears the threshold, so it runs when allowed.
+        self.assertTrue(
+            client._should_run_self_consistency(
+                market, decision, deep=False, allow_self_consistency=True
+            )
+        )
+        # Gated out for non-top candidates regardless of thresholds.
+        self.assertFalse(
+            client._should_run_self_consistency(
+                market, decision, deep=False, allow_self_consistency=False
+            )
         )
 
 

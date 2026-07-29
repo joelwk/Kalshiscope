@@ -5,6 +5,8 @@ import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from market_state import MarketStateManager
 
 
@@ -63,6 +65,56 @@ def test_research_queue_times_seen_defaults_for_new_entry() -> None:
     )
     entries = mgr.get_active_research_entries(lookback_hours=1)
     assert entries[0]["times_seen"] == 1
+
+
+def test_research_queue_backlog_summary_separates_actionable_and_legacy_rows() -> None:
+    mgr = _make_manager()
+    mgr.record_research_queue_entry(
+        market_id="KX-ACTIONABLE",
+        cycle_id="c1",
+        gate_name="edge",
+        reason="edge_gate_blocked",
+        threshold_gap=0.02,
+    )
+    mgr.record_research_queue_entry(
+        market_id="KX-SOFT",
+        cycle_id="c1",
+        gate_name="pre_analysis_movement_score",
+        reason="pre_analysis_score_soft_research",
+        threshold_gap=0.20,
+        last_decision_json=json.dumps(
+            {
+                "confidence": 0.50,
+                "evidence_quality": 0.0,
+                "edge_source": "none",
+                "audit": {
+                    "synthetic_decision": True,
+                    "research_drain_attempts": 4,
+                },
+            }
+        ),
+    )
+    mgr._conn.execute(
+        "UPDATE research_queue_entries SET times_seen = 8 WHERE market_id = ?",
+        ("KX-SOFT",),
+    )
+    mgr.record_research_queue_entry(
+        market_id="KX-LEGACY-SPORTS",
+        cycle_id="c1",
+        gate_name="jurisdiction_sports_hold",
+        reason="jurisdiction_sports_analysis_held",
+    )
+    mgr._conn.commit()
+
+    summary = mgr.get_research_queue_backlog_summary(lookback_hours=1)
+
+    assert summary == {
+        "active_total": 3,
+        "priority_drain_candidates": 1,
+        "soft_research_placeholders": 1,
+        "repeated_low_yield": 1,
+        "legacy_jurisdiction_holds": 1,
+    }
 
 
 def test_mark_research_queue_drain_attempt_updates_audit_payload() -> None:
@@ -528,4 +580,510 @@ def test_estimate_research_entry_priority_promotes_extended_cooldown_near_thresh
     assert priority is not None
     assert priority >= 0.47
 
+
+def test_estimate_research_entry_priority_boosts_conviction_repair_entries() -> None:
+    base_entry = {
+        "threshold_gap": 0.10,
+        "last_decision_json": '{"audit": {"research_priority": 0.30}}',
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    repair_priority = MarketStateManager.estimate_research_entry_priority(
+        {**base_entry, "gate_name": "conviction_repair"}
+    )
+
+    assert base_priority is not None and repair_priority is not None
+    assert repair_priority == pytest.approx(base_priority + 0.15)
+
+
+def test_estimate_research_entry_priority_boosts_missing_url_settlement_aligned() -> None:
+    """URL-repair near-misses (settlement_aligned + missing URL + score/edge) get +0.20."""
+    base_entry = {
+        "threshold_gap": 0.0,
+        "last_decision_json": json.dumps(
+            {
+                "audit": {
+                    "research_priority": 0.40,
+                    "source_match_class": "settlement_aligned",
+                    "pre_execution_final_score": 0.50,
+                    "edge_market": 0.18,
+                }
+            }
+        ),
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    repair_entry = {
+        "threshold_gap": 0.0,
+        "last_decision_json": json.dumps(
+            {
+                "audit": {
+                    "research_priority": 0.40,
+                    "source_match_class": "settlement_aligned",
+                    "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                    "pre_execution_final_score": 0.50,
+                    "edge_market": 0.18,
+                }
+            }
+        ),
+    }
+    repair_priority = MarketStateManager.estimate_research_entry_priority(repair_entry)
+    assert base_priority is not None and repair_priority is not None
+    assert repair_priority == pytest.approx(base_priority + 0.20)
+
+    # absence_only / low_information must not get the URL-repair boost.
+    low_info = MarketStateManager.estimate_research_entry_priority(
+        {
+            "threshold_gap": 0.0,
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_priority": 0.40,
+                        "source_match_class": "missing_or_absence_only",
+                        "evidence_floor_suppressed_reason": "low_information",
+                        "pre_execution_final_score": 0.50,
+                        "edge_market": 0.18,
+                    }
+                }
+            ),
+        }
+    )
+    assert low_info is not None
+    assert low_info < repair_priority
+    # Base research_priority 0.40 + near-miss gap boost (+0.10 for gap<=0.03);
+    # no settlement_aligned or URL-repair boosts.
+    assert low_info == pytest.approx(0.50)
+
+
+def test_is_url_repair_near_miss_detection() -> None:
+    repair = {
+        "last_decision_json": json.dumps(
+            {
+                "audit": {
+                    "source_match_class": "settlement_aligned",
+                    "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                    "pre_execution_final_score": 0.50,
+                    "edge_market": 0.18,
+                }
+            }
+        ),
+    }
+    assert MarketStateManager.is_url_repair_near_miss(repair) is True
+    assert (
+        MarketStateManager.is_url_repair_near_miss(
+            {
+                "last_decision_json": json.dumps(
+                    {
+                        "audit": {
+                            "source_match_class": "missing_or_absence_only",
+                            "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                            "edge_market": 0.18,
+                        }
+                    }
+                ),
+            }
+        )
+        is False
+    )
+
+
+def test_estimate_research_entry_priority_conviction_repair_signal_alone_is_sufficient() -> None:
+    # Repair entries are persisted with threshold_gap=0.0 and a full decision
+    # audit; even without other signals the gate alone must clear the drain
+    # priority floor (0.40) so parked repairs get retried.
+    priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "gate_name": "conviction_repair",
+            "reason": "conviction_repair_no_trade",
+            "threshold_gap": 0.0,
+            "last_decision_json": '{"audit": {"pre_analysis_score": 0.30}}',
+        }
+    )
+
+    assert priority is not None
+    assert priority >= 0.40
+
+
+def test_is_jurisdiction_sports_hold_entry_detects_gate_and_reason() -> None:
+    assert MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {"gate_name": "jurisdiction_sports_hold", "reason": "held"}
+    )
+    assert MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {
+            "gate_name": "research",
+            "reason": "jurisdiction_sports_analysis_held",
+        }
+    )
+    assert MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {
+            "gate_name": "other",
+            "reason": "other",
+            "last_decision_json": (
+                '{"audit": {"final_reason": "jurisdiction_sports_blocked"}}'
+            ),
+        }
+    )
+    assert not MarketStateManager.is_jurisdiction_sports_hold_entry(
+        {"gate_name": "conviction_repair", "reason": "conviction_repair_no_trade"}
+    )
+
+
+def test_estimate_research_entry_priority_zeros_jurisdiction_sports_holds() -> None:
+    priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            "gate_name": "jurisdiction_sports_hold",
+            "reason": "jurisdiction_sports_analysis_held",
+            "threshold_gap": 0.0,
+            "last_decision_json": '{"audit": {"research_priority": 0.90}}',
+        }
+    )
+    assert priority == 0.0
+
+
+def test_drainable_entries_exclude_jurisdiction_sports_holds() -> None:
+    mgr = _make_manager()
+    queued_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    for market_id, gate_name, reason in (
+        ("KXSPORTS-HOLD", "jurisdiction_sports_hold", "jurisdiction_sports_analysis_held"),
+        ("KXWEATHER-NEAR", "edge_gate", "edge_gate_blocked"),
+    ):
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id,
+                "c1",
+                queued_at,
+                gate_name,
+                reason,
+                0.02,
+                None,
+                queued_at,
+                None,
+                '{"audit": {"research_priority": 0.80}}',
+            ),
+        )
+    mgr._conn.commit()
+
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=5,
+    )
+    drained_ids = [entry["market_id"] for entry in drainable]
+    assert "KXSPORTS-HOLD" not in drained_ids
+    assert "KXWEATHER-NEAR" in drained_ids
+
+
+def test_is_soft_research_drain_placeholder_detects_soft_research_reasons() -> None:
+    assert MarketStateManager.is_soft_research_drain_placeholder(
+        {
+            "gate_name": "pre_analysis_movement_score",
+            "reason": "pre_analysis_score_soft_research",
+        }
+    )
+    assert MarketStateManager.is_soft_research_drain_placeholder(
+        {
+            "gate_name": "pre_analysis",
+            "reason": "pre_analysis_score_far_below_min",
+        }
+    )
+    assert not MarketStateManager.is_soft_research_drain_placeholder(
+        {
+            "gate_name": "edge_gate",
+            "reason": "edge_gate_blocked",
+            "threshold_gap": 0.02,
+            "last_decision_json": (
+                '{"should_trade": true, "confidence": 0.70, '
+                '"evidence_quality": 1.0, "edge_source": "computed", '
+                '"evidence_basis": "direct"}'
+            ),
+        }
+    )
+
+
+def test_estimate_research_entry_priority_boosts_edge_near_miss() -> None:
+    base_entry = {
+        "threshold_gap": 0.02,
+        "last_decision_json": '{"audit": {"research_priority": 0.30}}',
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    near_miss_priority = MarketStateManager.estimate_research_entry_priority(
+        {
+            **base_entry,
+            "gate_name": "edge",
+            "reason": "edge_gate_blocked",
+        }
+    )
+
+    assert base_priority is not None and near_miss_priority is not None
+    assert near_miss_priority == pytest.approx(base_priority + 0.15)
+
+
+def test_estimate_research_entry_priority_boosts_high_score_hallucinated_edge() -> None:
+    base_entry = {
+        "threshold_gap": 0.0,
+        "last_decision_json": (
+            '{"audit": {"research_priority": 0.30, '
+            '"pre_execution_final_score": 0.77}}'
+        ),
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    boosted = MarketStateManager.estimate_research_entry_priority(
+        {
+            **base_entry,
+            "gate_name": "score",
+            "reason": "hallucinated_edge",
+        }
+    )
+    assert base_priority is not None and boosted is not None
+    assert boosted == pytest.approx(base_priority + 0.20)
+
+
+def test_drainable_entries_exclude_soft_research_when_min_priority_set() -> None:
+    mgr = _make_manager()
+    older = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+    newer = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    soft_rows = [
+        (
+            f"KXSOFT-{idx}",
+            "pre_analysis_movement_score",
+            "pre_analysis_score_soft_research",
+            older,
+            0.05,
+            '{"audit": {"research_priority": 0.20}}',
+        )
+        for idx in range(12)
+    ]
+    soft_rows.append(
+        (
+            "KXEDGE-NEAR",
+            "edge_gate",
+            "edge_gate_blocked",
+            newer,
+            0.02,
+            '{"audit": {"research_priority": 0.45, "evidence_quality": 1.0}}',
+        )
+    )
+    for market_id, gate_name, reason, queued_at, gap, decision_json in soft_rows:
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id,
+                "c1",
+                queued_at,
+                gate_name,
+                reason,
+                gap,
+                None,
+                queued_at,
+                None,
+                decision_json,
+            ),
+        )
+    mgr._conn.commit()
+
+    drainable = mgr.get_drainable_research_entries(
+        min_age_hours=1.0,
+        max_age_hours=12.0,
+        limit=3,
+        min_priority=0.40,
+    )
+    drained_ids = [entry["market_id"] for entry in drainable]
+    assert "KXEDGE-NEAR" in drained_ids
+    assert all(not mid.startswith("KXSOFT-") for mid in drained_ids)
+
+
+def test_record_entry_stamps_default_ttl_expiry() -> None:
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    mgr = MarketStateManager(db_path=path, research_queue_entry_ttl_hours=48.0)
+    mgr.record_research_queue_entry(
+        market_id="KXTTL-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="r1",
+    )
+    row = mgr._conn.execute(
+        "SELECT expires_at FROM research_queue_entries WHERE market_id = ?",
+        ("KXTTL-001",),
+    ).fetchone()
+    assert row["expires_at"] is not None
+    expiry = datetime.fromisoformat(row["expires_at"])
+    delta_hours = (expiry - datetime.now(timezone.utc)).total_seconds() / 3600
+    assert 47.0 < delta_hours <= 48.0
+
+
+def test_record_entry_ttl_disabled_leaves_expiry_null() -> None:
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    mgr = MarketStateManager(db_path=path, research_queue_entry_ttl_hours=None)
+    mgr.record_research_queue_entry(
+        market_id="KXNOTTL-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="r1",
+    )
+    row = mgr._conn.execute(
+        "SELECT expires_at FROM research_queue_entries WHERE market_id = ?",
+        ("KXNOTTL-001",),
+    ).fetchone()
+    assert row["expires_at"] is None
+
+
+def test_record_entry_explicit_expiry_overrides_default_ttl() -> None:
+    mgr = _make_manager()
+    explicit = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    mgr.record_research_queue_entry(
+        market_id="KXEXPLICIT-001",
+        cycle_id="c1",
+        gate_name="g1",
+        reason="r1",
+        expires_at=explicit,
+    )
+    row = mgr._conn.execute(
+        "SELECT expires_at FROM research_queue_entries WHERE market_id = ?",
+        ("KXEXPLICIT-001",),
+    ).fetchone()
+    assert row["expires_at"] == explicit
+
+
+def _zombie_decision_json() -> str:
+    return json.dumps(
+        {
+            "should_trade": False,
+            "confidence": 0.50,
+            "evidence_quality": 0.0,
+            "edge_source": "none",
+            "audit": {"synthetic_decision": True},
+        }
+    )
+
+
+def test_low_yield_zombie_recapture_is_skipped() -> None:
+    """A repeated low-yield placeholder must not refresh last_seen forever."""
+    mgr = _make_manager()
+    recorded = mgr.record_research_queue_entry(
+        market_id="KXZOMBIE-001",
+        cycle_id="c1",
+        gate_name="pre_analysis_movement_score",
+        reason="pre_analysis_score_soft_research",
+        threshold_gap=0.20,
+        last_decision_json=_zombie_decision_json(),
+    )
+    assert recorded is True
+    mgr._conn.execute(
+        "UPDATE research_queue_entries SET times_seen = 31 WHERE market_id = ?",
+        ("KXZOMBIE-001",),
+    )
+    mgr._conn.commit()
+    before = mgr._conn.execute(
+        "SELECT last_seen, times_seen FROM research_queue_entries WHERE market_id = ?",
+        ("KXZOMBIE-001",),
+    ).fetchone()
+
+    recaptured = mgr.record_research_queue_entry(
+        market_id="KXZOMBIE-001",
+        cycle_id="c2",
+        gate_name="pre_analysis_movement_score",
+        reason="pre_analysis_score_soft_research",
+        threshold_gap=0.20,
+        last_decision_json=_zombie_decision_json(),
+    )
+    assert recaptured is False
+    after = mgr._conn.execute(
+        "SELECT last_seen, times_seen FROM research_queue_entries WHERE market_id = ?",
+        ("KXZOMBIE-001",),
+    ).fetchone()
+    assert after["times_seen"] == before["times_seen"] == 31
+    assert after["last_seen"] == before["last_seen"]
+
+
+def test_near_miss_recapture_still_allowed_despite_high_times_seen() -> None:
+    """Direct-evidence / near-threshold entries are never zombie-blocked."""
+    mgr = _make_manager()
+    near_miss_json = json.dumps(
+        {
+            "should_trade": True,
+            "confidence": 0.68,
+            "evidence_quality": 0.92,
+            "edge_source": "computed",
+            "evidence_basis": "direct",
+            "audit": {"source_match_class": "settlement_aligned"},
+        }
+    )
+    mgr.record_research_queue_entry(
+        market_id="KXNEARMISS-001",
+        cycle_id="c1",
+        gate_name="edge_gate",
+        reason="edge_gate_blocked",
+        threshold_gap=0.02,
+        last_decision_json=near_miss_json,
+    )
+    mgr._conn.execute(
+        "UPDATE research_queue_entries SET times_seen = 31 WHERE market_id = ?",
+        ("KXNEARMISS-001",),
+    )
+    mgr._conn.commit()
+
+    recaptured = mgr.record_research_queue_entry(
+        market_id="KXNEARMISS-001",
+        cycle_id="c2",
+        gate_name="edge_gate",
+        reason="edge_gate_blocked",
+        threshold_gap=0.02,
+        last_decision_json=near_miss_json,
+    )
+    assert recaptured is True
+    row = mgr._conn.execute(
+        "SELECT times_seen FROM research_queue_entries WHERE market_id = ?",
+        ("KXNEARMISS-001",),
+    ).fetchone()
+    assert row["times_seen"] == 32
+
+
+def test_prune_stale_legacy_rows_without_expiry() -> None:
+    """Rows recorded before TTL stamping (expires_at NULL) are purged once
+    their last_seen falls outside the stale window."""
+    mgr = _make_manager()
+    now = datetime.now(timezone.utc)
+    stale_seen = (now - timedelta(days=30)).isoformat()
+    fresh_seen = now.isoformat()
+    for market_id, last_seen in (
+        ("KXLEGACY-STALE", stale_seen),
+        ("KXLEGACY-FRESH", fresh_seen),
+    ):
+        mgr._conn.execute(
+            """
+            INSERT INTO research_queue_entries
+                (market_id, cycle_id, queued_at, gate_name, reason,
+                 threshold_gap, what_to_learn_next, last_seen, expires_at,
+                 last_decision_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_id, "c1", last_seen, "g1", "r1",
+                0.0, None, last_seen, None, None,
+            ),
+        )
+    mgr._conn.commit()
+
+    pruned = mgr.prune_expired_research_entries(stale_after_hours=168.0)
+    assert pruned == 1
+    remaining = [
+        row["market_id"]
+        for row in mgr._conn.execute(
+            "SELECT market_id FROM research_queue_entries"
+        ).fetchall()
+    ]
+    assert remaining == ["KXLEGACY-FRESH"]
 

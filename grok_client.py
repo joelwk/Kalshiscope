@@ -38,8 +38,36 @@ _RE_LOW_INFORMATION = re.compile(
     r"(?:evidence|information|data))",
     re.IGNORECASE,
 )
+_RE_MISSING_CURRENT_SOURCE = re.compile(
+    r"(?:"
+    r"no (?:current |direct |settlement[- ]aligned |official )?"
+    r"(?:nws |noaa |asos |metar |station )?"
+    r"(?:point |daily )?"
+    r"(?:source|report|summary|observation|observed (?:value|maximum|minimum)|"
+    r"forecast|quote|price)[^.]{0,80}"
+    r"(?:found|available|released|published)"
+    r"|(?:source|report|summary|observation|observed (?:value|maximum|minimum)|"
+    r"forecast|quote|price)[^.]{0,80}"
+    r"(?:is |was )?(?:still )?"
+    r"(?:missing|pending|unavailable|not (?:yet )?available)"
+    r"|missing (?:a |the )?(?:primary|direct|settlement[- ]aligned|official)"
+    r"(?: source| url| report| summary)?"
+    r"|search(?:es)? (?:returned|found) (?:only )?(?:unrelated|outdated|no )"
+    r"|no [^.]{0,120}(?:settlement|official|current|exact)[^.]{0,120}"
+    r"(?:published|available|found|supports?)"
+    r"|no [^.]{0,160}(?:settlement[- ]aligned|official)[^.]{0,160}\byet\b"
+    r"|(?:settlement[- ]aligned|official|current|exact)[^.]{0,120}"
+    r"(?:not (?:yet )?(?:published|available|found)|"
+    r"(?:is |was )?(?:missing|unavailable|pending))"
+    r"|evidence (?:is )?(?:absent|missing)"
+    r"|absence of (?:settlement|direct|current)"
+    r")",
+    re.IGNORECASE,
+)
 _RE_PREVIEW_OR_PROXY_SOURCE = re.compile(
-    r"\b(preview|probable|probables|projected|projection|expected|matchup|form|"
+    r"\b(preview|probable|probables|projected|projection|"
+    r"forecast(?:s|ed|ing)?(?!\.)|"
+    r"expected|matchup|form|"
     r"pre-game|pregame|lineup preview|odds preview|scheduled)\b",
     re.IGNORECASE,
 )
@@ -74,7 +102,8 @@ _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL = re.compile(
     r"game (?:completed|concluded|final)|weather\.gov|nws|noaa|asos|metar|"
     r"observation|observed|official station|exchange bulletin|confirmed outcome|"
     r"threshold (?:already )?(?:met|exceeded)|live quote|quote page|spot price|"
-    r"current spot|current price|observed value|timestamp)",
+    r"current spot|current price|observed value|timestamp|official close|"
+    r"official settlement|front-month|comex)",
     re.IGNORECASE,
 )
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
@@ -118,6 +147,9 @@ _VERIFIABLE_EVIDENCE_KEYWORDS = (
     "resolved",
     "settlement",
     "exchange",
+    "spot price",
+    "front-month",
+    "comex",
 )
 _MAX_MODEL_RESPONSE_LOG_CHARS = 500
 _ANALYSIS_MAX_ATTEMPTS = 3
@@ -156,16 +188,66 @@ def _default_search_config(settings: Settings | None = None) -> SearchConfig:
     )
 
 
+def _attempt_close_truncated_json(snippet: str) -> str | None:
+    """Best-effort repair when a response opens `{` but truncates before `}`."""
+    if not snippet or "{" not in snippet:
+        return None
+    in_string = False
+    escape = False
+    depth = 0
+    for ch in snippet:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+    if depth <= 0 and not in_string:
+        return None
+    repaired = snippet
+    if in_string:
+        repaired += '"'
+    if depth > 0:
+        repaired += "}" * depth
+    return repaired
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     """Extract JSON object from potentially mixed text response."""
     if not text:
         raise ValueError("Empty response from Grok")
     start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
         raise ValueError("No JSON object found in Grok response")
-    snippet = text[start : end + 1]
-    return json.loads(snippet)
+    end = text.rfind("}")
+    candidates: list[str] = []
+    if end != -1 and end > start:
+        candidates.append(text[start : end + 1])
+    # Truncated deep responses (Brent: preview starts with `{` but no closing `}`).
+    closed = _attempt_close_truncated_json(text[start:])
+    if closed and closed not in candidates:
+        candidates.append(closed)
+    last_error: Exception | None = None
+    for snippet in candidates:
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            repaired = _repair_common_json_key_issues(snippet)
+            if repaired != snippet:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError as repair_exc:
+                    last_error = repair_exc
+    raise ValueError("No JSON object found in Grok response") from last_error
 
 
 def _normalize_model_response_text(text: str) -> str:
@@ -207,6 +289,8 @@ def _extract_first_url_from_text(text: str) -> str | None:
 
 _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
     "rst_stream",
+    "stream removed",
+    "grpc_status:2",
     "statuscode.unavailable",
     "unavailable",
     "connection reset",
@@ -215,6 +299,9 @@ _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
     "broken pipe",
     "eof occurred",
 )
+# Empty responses at 17-27s in production were still upstream blips; allow one
+# retry via max_attempts even when the attempt exceeded the fast-fail window.
+_EMPTY_RESPONSE_RETRY_MAX_MS = 30_000
 
 
 def _is_transport_reset_error(exc: Exception) -> bool:
@@ -237,22 +324,22 @@ def _is_retriable_grok_error(exc: Exception, duration_ms: float) -> bool:
     """Classify transient failures that should be retried.
 
     Timeout-class errors (gRPC DEADLINE_EXCEEDED and our own stream timeout)
-    and transport-layer resets (RST_STREAM / UNAVAILABLE) are always retriable
-    regardless of duration, since they indicate an interrupted stream rather
-    than a content failure.
+    and transport-layer resets (RST_STREAM / Stream removed / UNAVAILABLE) are
+    always retriable regardless of duration, since they indicate an interrupted
+    stream rather than a content failure.
 
-    A fast "Empty response from Grok" (sub-_SLOW_FAILURE_THRESHOLD_MS) is
-    treated as transient: a stream that finishes in single-digit seconds with
-    zero content is far more consistent with an upstream blip than a real
-    content failure. Slow empty responses still fall through to the slow-
-    failure short-circuit so we don't burn budget retrying genuine outages.
+    "Empty response from Grok" is treated as transient up to
+    ``_EMPTY_RESPONSE_RETRY_MAX_MS`` (covers the observed 17-27s empty blips);
+    slower empties still fall through to the slow-failure short-circuit so we
+    do not burn budget retrying genuine outages. Retry count remains bounded
+    by ``max_attempts``.
     """
     if _is_timeout_class_error(exc) or _is_transport_reset_error(exc):
         return True
     error_text = str(exc).lower()
     if (
         "empty response from grok" in error_text
-        and duration_ms < _SLOW_FAILURE_THRESHOLD_MS
+        and duration_ms < _EMPTY_RESPONSE_RETRY_MAX_MS
     ):
         return True
     if duration_ms >= _SLOW_FAILURE_THRESHOLD_MS:
@@ -637,6 +724,112 @@ class GrokClient:
             return max(-1.0, min(1.0, fallback_edge)), "fallback"
         return None, "none"
 
+    def _normalize_yes_side_probability_fields(
+        self,
+        market: Market,
+        *,
+        outcome: str,
+        my_prob: float | None,
+        implied: float | None,
+        confidence: float | None,
+        explicit_edge: float | None,
+        probability_yes: float | None = None,
+    ) -> tuple[float | None, float | None, float | None]:
+        """Normalize ``my_prob`` / implied / edge onto the YES probability scale.
+
+        Downstream gates (notably ``_direct_evidence_posterior_floor``) treat
+        ``edge_external`` as YES-side (``my_prob_YES - implied_YES``). Model
+        outputs and self-consistency merges sometimes store chosen-side values
+        for NO bets (``my_prob ≈ confidence``), which flips the floor's sign and
+        silently blocks otherwise-valid trades after calibration shrink.
+        """
+        normalized_outcome = self._normalize_outcome_label(outcome)
+        outcome_is_no = normalized_outcome in {"no", "false", "0"}
+        yes_outcome = self._canonical_outcome_for_market(market, "YES")
+        no_outcome = self._canonical_outcome_for_market(market, "NO")
+        yes_implied = (
+            self._market_implied_probability(market, yes_outcome)
+            if yes_outcome
+            else None
+        )
+        no_implied = (
+            self._market_implied_probability(market, no_outcome)
+            if no_outcome
+            else None
+        )
+        confidence_value = self._bounded_probability(confidence)
+        my_prob_value = self._bounded_probability(my_prob)
+        implied_value = self._bounded_probability(implied)
+        yes_prob_explicit = self._bounded_probability(probability_yes)
+
+        chosen_side_fingerprint = (
+            outcome_is_no
+            and my_prob_value is not None
+            and confidence_value is not None
+            and abs(my_prob_value - confidence_value) <= _PROB_CONSISTENCY_TOLERANCE
+        )
+
+        my_prob_yes = my_prob_value
+        if yes_prob_explicit is not None and (
+            my_prob_yes is None
+            or chosen_side_fingerprint
+            or (
+                outcome_is_no
+                and my_prob_yes is not None
+                and abs(my_prob_yes - yes_prob_explicit) > _PROB_CONSISTENCY_TOLERANCE
+                and abs((1.0 - my_prob_yes) - yes_prob_explicit)
+                <= _PROB_CONSISTENCY_TOLERANCE
+            )
+        ):
+            my_prob_yes = yes_prob_explicit
+        elif chosen_side_fingerprint and confidence_value is not None:
+            my_prob_yes = max(0.0, min(1.0, 1.0 - confidence_value))
+        elif (
+            outcome_is_no
+            and my_prob_yes is not None
+            and confidence_value is not None
+            and abs(my_prob_yes - confidence_value) <= _PROB_CONSISTENCY_TOLERANCE
+        ):
+            my_prob_yes = max(0.0, min(1.0, 1.0 - my_prob_yes))
+
+        implied_yes = implied_value
+        if chosen_side_fingerprint or (
+            outcome_is_no
+            and my_prob_value is not None
+            and my_prob_yes is not None
+            and abs(my_prob_value - (1.0 - my_prob_yes)) <= _PROB_CONSISTENCY_TOLERANCE
+        ):
+            if (
+                implied_value is not None
+                and no_implied is not None
+                and abs(implied_value - no_implied) <= _PROB_CONSISTENCY_TOLERANCE
+            ):
+                implied_yes = yes_implied
+            elif (
+                implied_value is not None
+                and yes_implied is not None
+                and abs(implied_value - yes_implied) <= _PROB_CONSISTENCY_TOLERANCE
+            ):
+                implied_yes = yes_implied
+            elif implied_value is None:
+                implied_yes = yes_implied
+
+        edge_yes: float | None = None
+        if my_prob_yes is not None and implied_yes is not None:
+            edge_yes = max(-1.0, min(1.0, my_prob_yes - implied_yes))
+        elif (
+            explicit_edge is not None
+            and chosen_side_fingerprint
+            and outcome_is_no
+            and explicit_edge > 0.0
+        ):
+            # Chosen-side positive edge on a NO call is the YES-side negation.
+            edge_yes = max(-1.0, min(1.0, -float(explicit_edge)))
+        elif explicit_edge is not None and not chosen_side_fingerprint:
+            edge_yes = max(-1.0, min(1.0, float(explicit_edge)))
+
+        return my_prob_yes, implied_yes, edge_yes
+
     @staticmethod
     def _has_verifiable_source_signal(reasoning: str) -> bool:
         normalized_reasoning = (reasoning or "").lower()
@@ -675,8 +868,19 @@ class GrokClient:
         has_verifiable_signal: bool,
         low_information: bool,
         source_match_class: str = "",
+        explicit_evidence_basis: str = "",
+        definitive_or_observed: bool = False,
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
+        normalized_explicit_basis = str(explicit_evidence_basis or "").strip().lower()
+        if normalized_explicit_basis == "absence_only":
+            return "absence_only"
+        if normalized_explicit_basis == "proxy":
+            if source_match_class == "settlement_aligned" and definitive_or_observed:
+                return "direct"
+            return "proxy"
+        if low_information:
+            return "absence_only"
         has_absence_signal = any(
             token in normalized_reasoning
             for token in (
@@ -763,13 +967,40 @@ class GrokClient:
         if my_prob is None:
             my_prob = self._extract_metric_from_reasoning(decision.reasoning, _RE_MY_PROB)
 
+        # Confidence used only for chosen-side fingerprint detection; keep raw
+        # when present so post-calibration re-validation does not invent a gap.
+        confidence_basis_for_polarity = (
+            decision.raw_confidence
+            if decision.raw_confidence is not None
+            else decision.confidence
+        )
+        my_prob, implied, normalized_edge = self._normalize_yes_side_probability_fields(
+            market,
+            outcome=canonical_outcome,
+            my_prob=my_prob,
+            implied=implied,
+            confidence=confidence_basis_for_polarity,
+            explicit_edge=explicit_edge,
+            probability_yes=decision.probability_yes,
+        )
+
         edge, edge_source = self._derive_edge(
             implied=implied,
             my_prob=my_prob,
-            explicit_edge=explicit_edge,
+            explicit_edge=(
+                normalized_edge if normalized_edge is not None else explicit_edge
+            ),
             reasoning=decision.reasoning,
             market_id=market.id,
         )
+        if (
+            edge_source == "computed"
+            and normalized_edge is not None
+            and my_prob is not None
+            and implied is not None
+        ):
+            # Prefer the YES-normalized edge when both probs are YES-aligned.
+            edge = normalized_edge
 
         consistency_ok = True
         if implied is not None and my_prob is not None and edge is not None:
@@ -778,13 +1009,37 @@ class GrokClient:
                 consistency_ok = False
 
         prob_consistency_ok = True
-        if my_prob is not None and abs(my_prob - decision.confidence) > _PROB_CONSISTENCY_TOLERANCE:
+        # After YES-side normalization, my_prob is P(YES) while confidence remains
+        # the chosen-outcome probability. Compare against the YES-equivalent of
+        # raw/chosen confidence so legitimate NO bets are not marked inconsistent.
+        confidence_basis_for_consistency = confidence_basis_for_polarity
+        yes_equivalent_confidence = self._decision_yes_probability(
+            market,
+            decision.model_copy(
+                update={
+                    "outcome": canonical_outcome,
+                    "confidence": confidence_basis_for_consistency,
+                    "my_prob": my_prob,
+                    "probability_yes": decision.probability_yes,
+                }
+            ),
+        )
+        if (
+            my_prob is not None
+            and yes_equivalent_confidence is not None
+            and abs(my_prob - yes_equivalent_confidence) > _PROB_CONSISTENCY_TOLERANCE
+        ):
             prob_consistency_ok = False
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
         primary_source_url = self._extract_primary_source_url(decision)
+        explicit_evidence_basis = str(decision.evidence_basis or "").strip().lower()
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
-        low_information = bool(_RE_LOW_INFORMATION.search(decision.reasoning or ""))
+        low_information = bool(
+            _RE_LOW_INFORMATION.search(decision.reasoning or "")
+            or _RE_MISSING_CURRENT_SOURCE.search(decision.reasoning or "")
+            or explicit_evidence_basis == "absence_only"
+        )
         source_text_for_validation = " ".join(
             part
             for part in (
@@ -856,6 +1111,14 @@ class GrokClient:
             has_verifiable_signal=has_verifiable_signal,
             low_information=low_information,
             source_match_class=source_match_class,
+            explicit_evidence_basis=explicit_evidence_basis,
+            definitive_or_observed=(
+                has_definitive_outcome_signal
+                or _weather_obs_locked_reasoning_ok(
+                    market_id=market.id or "",
+                    reasoning=decision.reasoning or "",
+                )
+            ),
         )
         active_settings = self.settings or Settings()
         proxy_confidence_cap = max(0.0, min(1.0, active_settings.GROK_PROXY_CONFIDENCE_CAP))
@@ -897,7 +1160,9 @@ class GrokClient:
             if market_implied is not None
             else None
         )
-        primary_source_required_for_direct = profile_name != "sports"
+        primary_source_required_for_direct = (
+            profile_name not in active_settings.PRIMARY_SOURCE_URL_EXEMPT_FAMILIES
+        )
         primary_source_is_settlement_grade = self._primary_source_is_settlement_grade(
             primary_source_url,
             active_settings.SETTLEMENT_SOURCE_ALLOWLIST_DOMAINS,
@@ -910,7 +1175,10 @@ class GrokClient:
             evidence_basis_class = "proxy"
         evidence_quality_floor_applied: str | None = None
         evidence_floor_suppressed_reason: str | None = None
-        if active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED:
+        if (
+            active_settings.EVIDENCE_QUALITY_CONVERGENT_FLOOR_ENABLED
+            and not low_information
+        ):
             settlement_aligned = source_match_class == "settlement_aligned"
             convergent_signals = sum(
                 [
@@ -1035,6 +1303,42 @@ class GrokClient:
             and source_match_class == "settlement_aligned"
             and evidence_quality >= _DIRECT_FALLBACK_GATE_OVERRIDE_MIN_EVIDENCE
         )
+        # A proxy market with a strong market edge and non-trivial evidence
+        # quality is allowed past the preview/proxy validation blocks below.
+        # EV protection is preserved downstream: the adaptive edge gate and the
+        # per-family size multiplier still apply, so historically weak families
+        # are sized down rather than hard-blocked here.
+        proxy_high_edge_participation_min = max(
+            0.0,
+            float(
+                getattr(
+                    active_settings,
+                    "PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE",
+                    Settings.PROXY_HIGH_EDGE_PARTICIPATION_MIN_EDGE,
+                )
+            ),
+        )
+        if profile_name == "generic":
+            generic_proxy_min = max(
+                0.0,
+                float(
+                    getattr(
+                        active_settings,
+                        "GENERIC_PROXY_HIGH_EDGE_MIN",
+                        Settings.GENERIC_PROXY_HIGH_EDGE_MIN,
+                    )
+                ),
+            )
+            proxy_high_edge_participation_min = max(
+                proxy_high_edge_participation_min,
+                generic_proxy_min,
+            )
+        strong_proxy_edge_override = (
+            evidence_basis_class == "proxy"
+            and market_edge is not None
+            and market_edge >= proxy_high_edge_participation_min
+            and evidence_quality >= _LOW_QUALITY_EVIDENCE_THRESHOLD
+        )
 
         should_trade = decision.should_trade
         gate_reasons: list[str] = []
@@ -1042,6 +1346,9 @@ class GrokClient:
             if market_edge is None:
                 should_trade = False
                 gate_reasons.append("missing_market_implied")
+            elif market_edge <= 0.0:
+                should_trade = False
+                gate_reasons.append("nonpositive_chosen_side_edge")
             elif market_edge < _MIN_MARKET_EDGE_FOR_TRADE:
                 should_trade = False
                 gate_reasons.append("market_edge_below_min")
@@ -1069,6 +1376,7 @@ class GrokClient:
             if (
                 source_match_class == "preview_or_proxy"
                 and edge_source in {"fallback", "none"}
+                and not strong_proxy_edge_override
             ):
                 should_trade = False
                 gate_reasons.append("preview_proxy_without_direct_source")
@@ -1076,9 +1384,29 @@ class GrokClient:
                 edge_source in {"fallback", "none"}
                 and evidence_quality < fallback_min_evidence_quality
                 and not direct_fallback_gate_override
+                and not strong_proxy_edge_override
             ):
                 should_trade = False
                 gate_reasons.append("fallback_edge_without_verifiable_signal")
+            if (
+                strong_proxy_edge_override
+                and should_trade
+                and source_match_class == "preview_or_proxy"
+            ):
+                logger.debug(
+                    "Proxy high-edge participation override applied: market=%s edge=%.4f eq=%.2f min=%.4f",
+                    market.id,
+                    market_edge if market_edge is not None else 0.0,
+                    evidence_quality,
+                    proxy_high_edge_participation_min,
+                    data={
+                        "market_id": market.id,
+                        "market_edge": market_edge,
+                        "evidence_quality": evidence_quality,
+                        "proxy_high_edge_participation_min": proxy_high_edge_participation_min,
+                        "edge_source": edge_source,
+                    },
+                )
 
         gate_status = "allow" if should_trade else "block"
         reason_code = ",".join(gate_reasons) if gate_reasons else "ok"
@@ -1480,8 +1808,11 @@ class GrokClient:
         decision: TradeDecision,
         *,
         deep: bool,
+        allow_self_consistency: bool = True,
     ) -> bool:
         if deep or not bool(getattr(self.settings, "GROK_SELF_CONSISTENCY_ENABLED", True)):
+            return False
+        if not allow_self_consistency:
             return False
         liquidity = float(market.liquidity_usdc or 0.0)
         liquidity_threshold = max(
@@ -1541,6 +1872,11 @@ class GrokClient:
 
         merged_sources = list(dict.fromkeys([*(first.key_sources or []), *(second.key_sources or [])]))[:4]
         critique = second.self_critique or second.uncertainty_note or second.reasoning
+        yes_implied = (
+            self._market_implied_probability(market, yes_outcome)
+            if yes_outcome
+            else self._market_implied_probability(market, "YES")
+        )
         if trade_disagree or side_disagree or probability_disagree:
             repair_critique = (
                 "self_consistency_disagreement: "
@@ -1565,10 +1901,14 @@ class GrokClient:
                     "outcome": merged_outcome,
                     "confidence": conservative_confidence,
                     "probability_yes": averaged_yes,
-                    "my_prob": conservative_confidence,
-                    "implied_prob_external": self._market_implied_probability(
-                        market,
-                        merged_outcome,
+                    # Persist YES-side probability fields so the posterior floor
+                    # and edge gate see a coherent NO edge after calibration.
+                    "my_prob": averaged_yes,
+                    "implied_prob_external": yes_implied,
+                    "edge_external": (
+                        max(-1.0, min(1.0, averaged_yes - yes_implied))
+                        if yes_implied is not None
+                        else None
                     ),
                     "key_sources": merged_sources,
                     "uncertainty_note": second.uncertainty_note or first.uncertainty_note,
@@ -1594,10 +1934,12 @@ class GrokClient:
                 "outcome": merged_outcome,
                 "confidence": max(0.0, min(1.0, merged_confidence)),
                 "probability_yes": averaged_yes,
-                "my_prob": max(0.0, min(1.0, merged_confidence)),
-                "implied_prob_external": self._market_implied_probability(
-                    market,
-                    merged_outcome,
+                "my_prob": averaged_yes,
+                "implied_prob_external": yes_implied,
+                "edge_external": (
+                    max(-1.0, min(1.0, averaged_yes - yes_implied))
+                    if yes_implied is not None
+                    else None
                 ),
                 "key_sources": merged_sources,
                 "base_rate_used": (
@@ -1769,6 +2111,7 @@ class GrokClient:
         previous_analysis: TradeDecision | None,
         deep: bool,
         family_is_profitable: bool = False,
+        allow_self_consistency: bool = True,
     ) -> TradeDecision:
         self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
@@ -1938,7 +2281,12 @@ class GrokClient:
                 f"Grok analysis budget exhausted for market {market.id}"
             ) from last_error
 
-        if self._should_run_self_consistency(market, first_decision, deep=deep):
+        if self._should_run_self_consistency(
+            market,
+            first_decision,
+            deep=deep,
+            allow_self_consistency=allow_self_consistency,
+        ):
             budget_remaining_ms = max(0.0, (budget_deadline - time.monotonic()) * 1000)
             if budget_remaining_ms >= _MIN_STREAM_ATTEMPT_SECONDS * 1000.0:
                 try:
@@ -2310,6 +2658,7 @@ class GrokClient:
         previous_analysis: TradeDecision | None = None,
         *,
         family_is_profitable: bool = False,
+        allow_self_consistency: bool = True,
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
@@ -2317,6 +2666,7 @@ class GrokClient:
             previous_analysis=previous_analysis,
             deep=False,
             family_is_profitable=family_is_profitable,
+            allow_self_consistency=allow_self_consistency,
         )
 
     def analyze_market_deep(

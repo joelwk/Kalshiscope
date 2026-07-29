@@ -114,3 +114,16 @@ def log_likelihood_from_ratio(likelihood_ratio: float) -> float:
     if not math.isfinite(ratio) or ratio <= 0:
         raise ValueError("likelihood_ratio must be a positive finite value.")
     return math.log(ratio)
+
+
+def binary_log_updates_from_ratio(likelihood_ratio: float) -> tuple[float, float]:
+    """Return chosen/alternative log updates whose odds multiplier is ``LR``.
+
+    A likelihood ratio constrains the *difference* between the two outcome log
+    likelihoods. Using ``(+log(LR), -log(LR))`` doubles that difference and
+    therefore multiplies posterior odds by ``LR**2``. Splitting the log-ratio
+    symmetrically preserves the stated likelihood-ratio semantics while
+    retaining the existing per-outcome storage shape.
+    """
+    half_log_ratio = 0.5 * log_likelihood_from_ratio(likelihood_ratio)
+    return half_log_ratio, -half_log_ratio

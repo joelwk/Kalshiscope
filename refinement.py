@@ -267,16 +267,27 @@ class RefinementStrategy:
                             "flip_has_direct_source": _flip_has_direct_source,
                         },
                     )
-                    return TradeDecision(
-                        should_trade=initial.should_trade and initial.confidence >= 0.60,
-                        outcome=initial_outcome,
-                        confidence=max(initial.confidence - 0.05, 0.50),
-                        bet_size_pct=initial.bet_size_pct * 0.8,
-                        implied_prob_external=initial.implied_prob_external,
-                        my_prob=initial.my_prob,
-                        edge_external=initial.edge_external,
-                        evidence_quality=max(0.0, min(initial.evidence_quality, 0.5)),
-                        reasoning=f"Refinement showed uncertainty (flip to {new_decision.outcome} rejected). {initial.reasoning}",
+                    # Retain the validated probability/source/audit payload from
+                    # the initial pass. Reconstructing a minimal TradeDecision
+                    # here silently discarded probability_yes, sources, LR,
+                    # critique, raw fields, and token usage precisely when the
+                    # disagreement made that context most important.
+                    return initial.model_copy(
+                        update={
+                            "should_trade": (
+                                initial.should_trade and initial.confidence >= 0.60
+                            ),
+                            "confidence": max(initial.confidence - 0.05, 0.50),
+                            "bet_size_pct": initial.bet_size_pct * 0.8,
+                            "evidence_quality": max(
+                                0.0, min(initial.evidence_quality, 0.5)
+                            ),
+                            "reasoning": (
+                                "Refinement showed uncertainty "
+                                f"(flip to {new_decision.outcome} rejected). "
+                                f"{initial.reasoning}"
+                            ),
+                        }
                     )
                 if (
                     current_edge is not None

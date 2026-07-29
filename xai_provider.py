@@ -60,6 +60,9 @@ class XAIProvider:
         temperature: float | None = None,
     ):
         client = self._client_for_timeout(timeout_seconds)
+        # Agent Tools API: the model drives web/x search via these tools. xAI's
+        # Live Search (chat.create search_parameters) is deprecated and rejected
+        # server-side with UNIMPLEMENTED, so it must not be used here.
         tools: list[Any] = [
             web_search(
                 allowed_domains=config.allowed_domains,

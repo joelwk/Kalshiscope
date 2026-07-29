@@ -17,7 +17,31 @@ from research_profiles import family_from_text
 logger = get_logger(__name__)
 
 _CONFIDENCE_TREND_WINDOW = 5
+_BAYESIAN_LR_SEMANTICS_FLAG = "bayesian_lr_semantics_version"
+_BAYESIAN_LR_SEMANTICS_VERSION = "single_odds_v1"
+_PARTICIPATION_TIER_REPR_FLAG = "participation_tier_repr_normalized"
+_PARTICIPATION_TIER_REPR_VERSION = "v1"
+# Historical receipts written before the StrEnum shim serialized the enum repr
+# ("ParticipationTier.X") instead of its value; map used by the one-time
+# normalization migration (315 leaked rows found in the Jul 2026 review).
+_PARTICIPATION_TIER_REPR_MAP = {
+    "ParticipationTier.EXECUTION_ELIGIBLE": "execution_eligible",
+    "ParticipationTier.DEEP_RESEARCH_REQUIRED": "deep_research_required",
+    "ParticipationTier.RESEARCH_ONLY_LEARNING_QUEUE": "research_only_learning_queue",
+    "ParticipationTier.MONITOR_ONLY": "monitor_only",
+    "ParticipationTier.SKIP_FOR_NOW_WITH_REASON": "skip_for_now_with_reason",
+    "ParticipationTier.OPERATIONAL_ERROR_RETRY": "operational_error_retry",
+    "ParticipationTier.TERMINAL_REJECT": "terminal_reject",
+}
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
+_ACTIVE_PENDING_ORDER_STATUSES = {
+    "accepted",
+    "open",
+    "partially_filled",
+    "partial",
+    "pending",
+    "resting",
+}
 _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
     "analysis_failure",
     "analysis_only_insufficient_balance",
@@ -42,9 +66,22 @@ _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
 class MarketStateManager:
     """SQLite-backed state manager for market analyses and positions."""
 
-    def __init__(self, db_path: str = "data/market_state.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/market_state.db",
+        *,
+        research_queue_entry_ttl_hours: float | None = 168.0,
+        research_queue_skip_low_yield_recapture: bool = True,
+    ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Default TTL stamped on research-queue entries recorded without an
+        # explicit expiry; None/<=0 disables stamping (legacy behavior, which
+        # produced a 16k-row queue with zero expirations by Jul 2026).
+        self.research_queue_entry_ttl_hours = research_queue_entry_ttl_hours
+        self.research_queue_skip_low_yield_recapture = (
+            research_queue_skip_low_yield_recapture
+        )
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
@@ -101,6 +138,26 @@ class MarketStateManager:
                     outcome TEXT,
                     order_id TEXT,
                     timestamp TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_orders (
+                    order_id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    submitted_amount_usdc REAL NOT NULL,
+                    requested_shares REAL,
+                    limit_price REAL,
+                    confidence REAL,
+                    implied_prob REAL,
+                    status TEXT NOT NULL,
+                    filled_shares REAL NOT NULL DEFAULT 0,
+                    filled_amount_usdc REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    raw_json TEXT
                 )
                 """
             )
@@ -219,6 +276,12 @@ class MarketStateManager:
                 "CREATE INDEX IF NOT EXISTS idx_trade_log_market_id ON trade_log (market_id)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_orders_market_id ON pending_orders (market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_orders_status ON pending_orders (status)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_outcomes_market_id ON trade_outcomes (market_id)"
             )
             self._conn.execute(
@@ -258,6 +321,15 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rq_last_seen ON research_queue_entries (last_seen)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_flags (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
             )
             self._run_migrations()
             self._backfill_resolution_state()
@@ -358,7 +430,13 @@ class MarketStateManager:
 
         meta = self._conn.execute(
             """
-            SELECT COUNT(*) AS trade_count,
+                SELECT COUNT(
+                           DISTINCT CASE
+                               WHEN order_id IS NOT NULL AND TRIM(order_id) <> ''
+                                   THEN order_id
+                               ELSE 'local:' || id
+                           END
+                       ) AS trade_count,
                    MIN(timestamp) AS first_trade,
                    MAX(timestamp) AS last_trade
             FROM trade_log
@@ -629,6 +707,46 @@ class MarketStateManager:
                 (market_id, terminal_outcome, next_streak),
             )
 
+    def record_market_winning_outcome(
+        self,
+        market_id: str,
+        winning_outcome: str,
+    ) -> bool:
+        """Persist the actual settled winner for a market the bot has seen.
+
+        UPDATE-only by design: rows exist for markets with local decision
+        history, so writes stay bounded to markets worth auditing. Distinct
+        from ``last_terminal_outcome`` (the bot's decision reason) — this is
+        the exchange-side YES/NO result, enabling counterfactual analysis of
+        blocked ``should_trade`` decisions.
+        """
+        normalized_market_id = str(market_id or "").strip()
+        normalized_outcome = str(winning_outcome or "").strip()
+        if not normalized_market_id or not normalized_outcome:
+            return False
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE markets
+                SET resolved_winning_outcome = ?,
+                    resolved_winning_outcome_at = COALESCE(
+                        resolved_winning_outcome_at, ?
+                    )
+                WHERE id = ?
+                  AND (
+                    resolved_winning_outcome IS NULL
+                    OR resolved_winning_outcome != ?
+                  )
+                """,
+                (
+                    normalized_outcome,
+                    datetime.now(timezone.utc).isoformat(),
+                    normalized_market_id,
+                    normalized_outcome,
+                ),
+            )
+        return cursor.rowcount > 0
+
     def set_market_cooldown_cycle(self, market_id: str, next_eligible_cycle: int) -> None:
         normalized_market_id = str(market_id or "").strip()
         if not normalized_market_id:
@@ -892,6 +1010,19 @@ class MarketStateManager:
                 position_row["order_ids"] if position_row else None
             )
             existing_outcome = position_row["outcome"] if position_row else None
+            order_already_recorded = False
+            if order_id:
+                order_already_recorded = (
+                    self._conn.execute(
+                        """
+                        SELECT 1 FROM trade_log
+                        WHERE order_id = ?
+                        LIMIT 1
+                        """,
+                        (order_id,),
+                    ).fetchone()
+                    is not None
+                )
 
             if not outcome:
                 outcome = existing_outcome or "UNKNOWN"
@@ -917,16 +1048,30 @@ class MarketStateManager:
                 existing_order_ids.append(order_id)
 
             trade_count_row = self._conn.execute(
-                "SELECT COUNT(*) AS trade_count FROM trade_log WHERE market_id = ?",
+                """
+                SELECT COUNT(
+                           DISTINCT CASE
+                               WHEN order_id IS NOT NULL AND TRIM(order_id) <> ''
+                                   THEN order_id
+                               ELSE 'local:' || id
+                           END
+                       ) AS trade_count
+                FROM trade_log
+                WHERE market_id = ?
+                """,
                 (market_id,),
             ).fetchone()
             trade_count = trade_count_row["trade_count"] if trade_count_row else 0
 
             latest_confidence = self._get_latest_confidence(market_id)
-            new_avg_confidence = _update_avg_confidence(
-                existing_avg,
-                trade_count,
-                latest_confidence,
+            new_avg_confidence = (
+                existing_avg
+                if order_already_recorded
+                else _update_avg_confidence(
+                    existing_avg,
+                    trade_count,
+                    latest_confidence,
+                )
             )
             new_total = existing_total + amount
 
@@ -998,11 +1143,246 @@ class MarketStateManager:
         ).fetchall()
         return [row["market_id"] for row in rows]
 
+    def record_pending_order(
+        self,
+        *,
+        order_id: str,
+        market_id: str,
+        outcome: str,
+        submitted_amount_usdc: float,
+        requested_shares: float | None,
+        limit_price: float | None,
+        confidence: float | None,
+        implied_prob: float | None,
+        status: str,
+        raw: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_order_id = str(order_id or "").strip()
+        normalized_market_id = str(market_id or "").strip()
+        if not normalized_order_id or not normalized_market_id:
+            raise ValueError("order_id and market_id must be non-empty")
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO pending_orders (
+                    order_id, market_id, outcome, submitted_amount_usdc,
+                    requested_shares, limit_price, confidence, implied_prob,
+                    status, filled_shares, filled_amount_usdc, created_at,
+                    updated_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    market_id = excluded.market_id,
+                    outcome = excluded.outcome,
+                    submitted_amount_usdc = excluded.submitted_amount_usdc,
+                    requested_shares = excluded.requested_shares,
+                    limit_price = excluded.limit_price,
+                    confidence = excluded.confidence,
+                    implied_prob = excluded.implied_prob,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    normalized_order_id,
+                    normalized_market_id,
+                    str(outcome or "UNKNOWN").strip().upper(),
+                    max(0.0, float(submitted_amount_usdc or 0.0)),
+                    (
+                        max(0.0, float(requested_shares))
+                        if requested_shares is not None
+                        else None
+                    ),
+                    (
+                        max(0.0, min(1.0, float(limit_price)))
+                        if limit_price is not None
+                        else None
+                    ),
+                    (
+                        max(0.0, min(1.0, float(confidence)))
+                        if confidence is not None
+                        else None
+                    ),
+                    (
+                        max(0.0, min(1.0, float(implied_prob)))
+                        if implied_prob is not None
+                        else None
+                    ),
+                    str(status or "pending").strip().lower(),
+                    timestamp,
+                    timestamp,
+                    json.dumps(raw or {}, default=str),
+                ),
+            )
+
+    def get_pending_order(self, order_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM pending_orders WHERE order_id = ?",
+            (str(order_id or "").strip(),),
+        ).fetchone()
+        return _pending_order_row_to_dict(row)
+
+    def get_pending_orders(self, *, active_only: bool = True) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM pending_orders ORDER BY created_at ASC"
+        ).fetchall()
+        results = [
+            pending
+            for row in rows
+            if (pending := _pending_order_row_to_dict(row)) is not None
+        ]
+        if not active_only:
+            return results
+        return [
+            pending
+            for pending in results
+            if str(pending.get("status") or "").lower()
+            in _ACTIVE_PENDING_ORDER_STATUSES
+            and (
+                pending.get("requested_shares") is None
+                or float(pending.get("filled_shares") or 0.0)
+                < float(pending.get("requested_shares") or 0.0) - 1e-9
+            )
+        ]
+
+    def get_pending_market_ids(self) -> set[str]:
+        return {
+            str(pending["market_id"])
+            for pending in self.get_pending_orders()
+            if pending.get("market_id")
+        }
+
+    def apply_pending_order_fill(
+        self,
+        *,
+        order_id: str,
+        cumulative_filled_shares: float,
+        fill_price: float | None,
+        status: str,
+        raw: dict[str, Any] | None = None,
+        record_trade_order: OrderResponse | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_order_id = str(order_id or "").strip()
+        if not normalized_order_id:
+            return None
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM pending_orders WHERE order_id = ?",
+                (normalized_order_id,),
+            ).fetchone()
+            pending = _pending_order_row_to_dict(row)
+            if pending is None:
+                return None
+
+            previous_shares = max(0.0, float(pending["filled_shares"] or 0.0))
+            next_shares = max(
+                previous_shares,
+                float(cumulative_filled_shares or 0.0),
+            )
+            requested_shares = pending.get("requested_shares")
+            if requested_shares is not None and float(requested_shares) > 0.0:
+                next_shares = min(next_shares, float(requested_shares))
+            delta_shares = max(0.0, next_shares - previous_shares)
+            normalized_fill_price = (
+                max(0.0, min(1.0, float(fill_price)))
+                if fill_price is not None
+                else float(pending.get("limit_price") or 0.0)
+            )
+            delta_amount = delta_shares * normalized_fill_price
+            next_amount = (
+                max(0.0, float(pending["filled_amount_usdc"] or 0.0))
+                + delta_amount
+            )
+            normalized_status = str(status or pending["status"]).strip().lower()
+            if (
+                requested_shares is not None
+                and float(requested_shares) > 0.0
+                and next_shares >= float(requested_shares) - 1e-9
+            ):
+                normalized_status = "filled"
+            timestamp = datetime.now(timezone.utc).isoformat()
+            self._conn.execute(
+                """
+                UPDATE pending_orders
+                SET status = ?, filled_shares = ?, filled_amount_usdc = ?,
+                    updated_at = ?, raw_json = ?
+                WHERE order_id = ?
+                """,
+                (
+                    normalized_status,
+                    next_shares,
+                    next_amount,
+                    timestamp,
+                    json.dumps(raw or pending.get("raw") or {}, default=str),
+                    normalized_order_id,
+                ),
+            )
+            if delta_shares > 0.0 and record_trade_order is not None:
+                self.record_trade(
+                    str(pending["market_id"]),
+                    record_trade_order,
+                    delta_amount,
+                    outcome=str(pending["outcome"]),
+                    entry_price=normalized_fill_price,
+                    implied_prob=(
+                        float(pending["implied_prob"])
+                        if pending.get("implied_prob") is not None
+                        else None
+                    ),
+                    confidence=(
+                        float(pending["confidence"])
+                        if pending.get("confidence") is not None
+                        else None
+                    ),
+                    shares=delta_shares,
+                )
+
+        pending.update(
+            {
+                "status": normalized_status,
+                "filled_shares": next_shares,
+                "filled_amount_usdc": next_amount,
+                "updated_at": timestamp,
+                "raw": raw or pending.get("raw") or {},
+                "delta_filled_shares": round(delta_shares, 8),
+                "delta_filled_amount_usdc": round(delta_amount, 8),
+                "fill_price": normalized_fill_price,
+            }
+        )
+        return pending
+
+    def update_pending_order_status(
+        self,
+        order_id: str,
+        status: str,
+        *,
+        raw: dict[str, Any] | None = None,
+    ) -> bool:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE pending_orders
+                SET status = ?, updated_at = ?, raw_json = COALESCE(?, raw_json)
+                WHERE order_id = ?
+                """,
+                (
+                    str(status or "unknown").strip().lower(),
+                    timestamp,
+                    json.dumps(raw, default=str) if raw is not None else None,
+                    str(order_id or "").strip(),
+                ),
+            )
+        return int(cursor.rowcount or 0) > 0
+
     def get_known_order_ids(self) -> set[str]:
         rows = self._conn.execute(
             """
-            SELECT DISTINCT order_id
-            FROM trade_log
+            SELECT order_id FROM trade_log
+            WHERE order_id IS NOT NULL AND TRIM(order_id) <> ''
+            UNION
+            SELECT order_id FROM pending_orders
             WHERE order_id IS NOT NULL AND TRIM(order_id) <> ''
             """
         ).fetchall()
@@ -1365,12 +1745,23 @@ class MarketStateManager:
                         else 0.0
                     ),
                 }
+        # Resolved trade_outcomes are the unique, auditable observations for
+        # the requested window. The online table is an EMA of those same
+        # settlements, so summing it into this snapshot double-counts every
+        # outcome (and historically amplified settlement replays). Keep the
+        # online aggregate only as a fallback when the window has no exact
+        # observations at all.
+        if snapshot:
+            return snapshot
+
         online_rows = self._conn.execute(
             """
             SELECT family, bucket, win_rate, sample_size
             FROM confidence_calibration_online
             WHERE sample_size > 0
-            """
+              AND updated_at >= ?
+            """,
+            (cutoff,),
         ).fetchall()
         for row in online_rows:
             family_key = str(row["family"] or "all")
@@ -1479,6 +1870,84 @@ class MarketStateManager:
                 changed = True
         return changed
 
+    def get_runtime_flag(self, key: str) -> str | None:
+        """Return a persisted runtime flag value, or None if unset."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return None
+        row = self._conn.execute(
+            "SELECT value FROM runtime_flags WHERE key = ?",
+            (normalized_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def set_runtime_flag(self, key: str, value: str) -> None:
+        """Persist a runtime flag across bot restarts."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            raise ValueError("runtime flag key must be non-empty")
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO runtime_flags (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_key, str(value), timestamp),
+            )
+
+    def clear_runtime_flag(self, key: str) -> bool:
+        """Delete a runtime flag. Returns True when a row was removed."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return False
+        with self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM runtime_flags WHERE key = ?",
+                (normalized_key,),
+            )
+        return int(cursor.rowcount or 0) > 0
+
+    def neutralize_pathological_online_calibration(
+        self,
+        *,
+        family: str,
+        win_rate_floor: float = 0.01,
+        win_rate_ceiling: float = 0.99,
+        min_samples: int = 30,
+        neutral_win_rate: float = 0.50,
+    ) -> int:
+        """Reset extreme online calibration buckets toward a neutral prior.
+
+        Pathological entries (e.g. sports@0.7 with ~0% WR at high sample count)
+        otherwise permanently crush confidence via historical shrink.
+        """
+        family_key = str(family or "").strip().lower()
+        if not family_key:
+            return 0
+        floor = max(0.0, min(1.0, float(win_rate_floor)))
+        ceiling = max(floor, min(1.0, float(win_rate_ceiling)))
+        sample_floor = max(1, int(min_samples))
+        neutral = max(0.0, min(1.0, float(neutral_win_rate)))
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE confidence_calibration_online
+                SET win_rate = ?, updated_at = ?
+                WHERE family = ?
+                  AND sample_size >= ?
+                  AND (win_rate < ? OR win_rate > ?)
+                """,
+                (neutral, timestamp, family_key, sample_floor, floor, ceiling),
+            )
+        return int(cursor.rowcount or 0)
+
     def record_online_confidence_calibration_from_trade(
         self,
         market_id: str,
@@ -1549,6 +2018,35 @@ class MarketStateManager:
             return 0.0
         return float(row["pnl_total"] or 0.0)
 
+    def get_attributed_daily_realized_pnl(self, since: datetime) -> float:
+        """Realized PnL since *since*, restricted to markets entered since *since*.
+
+        Daily risk gates need today's decision quality, not settlement timing:
+        positions opened on earlier days can settle in a batch today and would
+        otherwise dominate a balance-delta drawdown measure. Only settlements
+        whose market also has a trade_log entry inside the window count.
+        """
+        since_utc = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
+        since_iso = since_utc.astimezone(timezone.utc).isoformat()
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(s.pnl_realized), 0.0) AS pnl_total
+            FROM exchange_settlements s
+            WHERE s.settled_at IS NOT NULL
+              AND s.settled_at >= ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM trade_log t
+                  WHERE t.market_id = s.market_id
+                    AND t.timestamp >= ?
+              )
+            """,
+            (since_iso, since_iso),
+        ).fetchone()
+        if not row:
+            return 0.0
+        return float(row["pnl_total"] or 0.0)
+
     def get_prefix_pnl_stats(self, prefix: str) -> dict[str, float | int]:
         """Aggregate settlement PnL for markets whose id starts with *prefix*.
 
@@ -1597,8 +2095,34 @@ class MarketStateManager:
         what_to_learn_next: str | None = None,
         expires_at: str | None = None,
         last_decision_json: str | None = None,
-    ) -> None:
-        now_iso = datetime.now(timezone.utc).isoformat()
+    ) -> bool:
+        """Upsert a research-queue entry; returns False when capture is skipped.
+
+        Re-capture of repeated low-yield placeholders is skipped so zombie
+        markets (Jul 2026: 96 markets re-queued 31+ times with no evidence and
+        ~0.50 confidence) stop refreshing ``last_seen`` and age out of the
+        active window instead of consuming analysis budget forever.
+        """
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        if self.research_queue_skip_low_yield_recapture:
+            existing = self._conn.execute(
+                """
+                SELECT market_id, gate_name, reason, threshold_gap,
+                       last_decision_json, COALESCE(times_seen, 1) AS times_seen
+                FROM research_queue_entries
+                WHERE market_id = ?
+                """,
+                (market_id,),
+            ).fetchone()
+            if existing is not None and self.is_repeated_low_yield_research_entry(
+                dict(existing)
+            ):
+                return False
+        if expires_at is None:
+            ttl_hours = self.research_queue_entry_ttl_hours
+            if ttl_hours is not None and float(ttl_hours) > 0.0:
+                expires_at = (now + timedelta(hours=float(ttl_hours))).isoformat()
         self._conn.execute(
             """
             INSERT INTO research_queue_entries
@@ -1631,6 +2155,7 @@ class MarketStateManager:
             ),
         )
         self._conn.commit()
+        return True
 
     def mark_research_queue_drain_attempt(
         self,
@@ -1843,14 +2368,151 @@ class MarketStateManager:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def prune_expired_research_entries(self) -> int:
-        now_iso = datetime.now(timezone.utc).isoformat()
+    def get_research_queue_backlog_summary(
+        self,
+        *,
+        lookback_hours: int = 12,
+    ) -> dict[str, int]:
+        now = datetime.now(timezone.utc)
+        cutoff = (
+            now - timedelta(hours=max(1, int(lookback_hours)))
+        ).isoformat()
+        rows = self._conn.execute(
+            """
+            SELECT market_id, cycle_id, queued_at, gate_name, reason,
+                   threshold_gap, what_to_learn_next, last_seen, expires_at,
+                   last_decision_json, COALESCE(times_seen, 1) AS times_seen
+            FROM research_queue_entries
+            WHERE last_seen >= ?
+              AND (expires_at IS NULL OR expires_at >= ?)
+            """,
+            (cutoff, now.isoformat()),
+        ).fetchall()
+        entries = [dict(row) for row in rows]
+        legacy_jurisdiction = sum(
+            1
+            for entry in entries
+            if self.is_jurisdiction_sports_hold_entry(entry)
+        )
+        soft_placeholders = sum(
+            1
+            for entry in entries
+            if self.is_soft_research_drain_placeholder(entry)
+        )
+        repeated_low_yield = sum(
+            1
+            for entry in entries
+            if self.is_repeated_low_yield_research_entry(entry)
+        )
+        priority_drain_candidates = sum(
+            1
+            for entry in entries
+            if not self.is_jurisdiction_sports_hold_entry(entry)
+            and not self.is_soft_research_drain_placeholder(entry)
+        )
+        return {
+            "active_total": len(entries),
+            "priority_drain_candidates": priority_drain_candidates,
+            "soft_research_placeholders": soft_placeholders,
+            "repeated_low_yield": repeated_low_yield,
+            "legacy_jurisdiction_holds": legacy_jurisdiction,
+        }
+
+    def prune_expired_research_entries(
+        self,
+        *,
+        stale_after_hours: float | None = None,
+    ) -> int:
+        """Delete expired queue rows; optionally also stale legacy rows.
+
+        ``stale_after_hours`` additionally removes rows recorded before TTL
+        stamping existed (``expires_at IS NULL``) whose ``last_seen`` is older
+        than the window, draining the historical backlog progressively.
+        """
+        now = datetime.now(timezone.utc)
         cursor = self._conn.execute(
             "DELETE FROM research_queue_entries WHERE expires_at IS NOT NULL AND expires_at < ?",
-            (now_iso,),
+            (now.isoformat(),),
         )
+        pruned = cursor.rowcount
+        if stale_after_hours is not None and float(stale_after_hours) > 0.0:
+            stale_cutoff = (
+                now - timedelta(hours=float(stale_after_hours))
+            ).isoformat()
+            stale_cursor = self._conn.execute(
+                """
+                DELETE FROM research_queue_entries
+                WHERE expires_at IS NULL AND last_seen < ?
+                """,
+                (stale_cutoff,),
+            )
+            pruned += stale_cursor.rowcount
         self._conn.commit()
-        return cursor.rowcount
+        return pruned
+
+    _JURISDICTION_SPORTS_HOLD_MARKERS = (
+        "jurisdiction_sports_hold",
+        "jurisdiction_sports_analysis_held",
+        "jurisdiction_sports_blocked",
+    )
+
+    @staticmethod
+    def is_jurisdiction_sports_hold_entry(entry: dict[str, Any]) -> bool:
+        """True when a queue row is a legacy sports jurisdiction parking entry.
+
+        New runs keep jurisdiction errors order-scoped, but historical rows must
+        remain excluded so they cannot waste probe slots intended for
+        edge/conviction near-misses.
+        """
+        gate_name = str(entry.get("gate_name") or "").strip().lower()
+        reason = str(entry.get("reason") or "").strip().lower()
+        markers = MarketStateManager._JURISDICTION_SPORTS_HOLD_MARKERS
+        if any(marker in gate_name for marker in markers):
+            return True
+        if any(marker in reason for marker in markers):
+            return True
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                payload = json.loads(decision_json)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                audit = payload.get("audit")
+                if isinstance(audit, dict):
+                    final_reason = str(audit.get("final_reason") or "").strip().lower()
+                    if any(marker in final_reason for marker in markers):
+                        return True
+        return False
+
+    _SOFT_RESEARCH_DRAIN_PLACEHOLDER_MARKERS = (
+        "soft_research",
+        "pre_analysis_score_soft_research",
+        "pre_analysis_score_far_below_min",
+        "pre_analysis_score_below_min",
+    )
+
+    @staticmethod
+    def is_soft_research_drain_placeholder(entry: dict[str, Any]) -> bool:
+        """True for pre-analysis soft-research placeholders that starve drain.
+
+        Soft-research rows dominate the queue by age. When priority filtering is
+        active they should not consume the over-fetch window ahead of edge /
+        conviction near-misses (score-promotion still resurfaces soft-research).
+        """
+        if MarketStateManager.is_repeated_low_yield_research_entry(entry):
+            return True
+        gate_name = str(entry.get("gate_name") or "").strip().lower()
+        reason = str(entry.get("reason") or "").strip().lower()
+        markers = MarketStateManager._SOFT_RESEARCH_DRAIN_PLACEHOLDER_MARKERS
+        if any(marker in gate_name for marker in markers):
+            return True
+        if any(marker in reason for marker in markers):
+            return True
+        # Movement-score soft band uses gate_name=pre_analysis_movement_score.
+        if "pre_analysis" in gate_name and "soft_research" in reason:
+            return True
+        return False
 
     def get_drainable_research_entries(
         self,
@@ -1869,9 +2531,12 @@ class MarketStateManager:
         candidate list, already-traded markets, or recently-resolved markets) so
         we don't double-promote. ``included_market_ids`` optionally restricts
         drain candidates to the current filtered market set, preventing stale
-        queue rows from consuming the over-fetch pool. Results are ordered
-        oldest-first to give the longest-waiting entries a turn before fresher
-        ones.
+        queue rows from consuming the over-fetch pool.
+
+        When ``min_priority`` is set, soft-research / pre-analysis placeholders
+        are excluded from the candidate set and remaining rows are ranked by
+        estimated priority (desc) then age (oldest first) so aged soft-research
+        cannot starve edge/conviction near-misses in the over-fetch window.
 
         ``min_priority`` (optional) filters out entries whose proxied priority is
         below the cutoff. Priority is read from
@@ -1879,10 +2544,12 @@ class MarketStateManager:
         .pre_analysis_score`` when present, otherwise ``1.0 - threshold_gap``.
         Entries without enough metadata to estimate a priority are kept (treated
         as "unknown" rather than penalized). When the filter is active the
-        function over-fetches so the oldest-first ordering still yields enough
+        function over-fetches so priority ranking still yields enough
         qualifying rows after pruning. Callers that need per-cycle telemetry
         on how many were skipped should call ``estimate_research_entry_priority``
         themselves; this entry point only returns the qualifying rows.
+
+        Legacy sports jurisdiction holds are excluded from drain promotion.
         """
         now = datetime.now(timezone.utc)
         max_cutoff_iso = (
@@ -1907,8 +2574,11 @@ class MarketStateManager:
                 return []
         effective_limit = max(0, int(limit))
         fetch_limit = effective_limit
-        if min_priority is not None and effective_limit > 0:
-            fetch_limit = max(effective_limit, effective_limit * 4)
+        # Over-fetch when post-filters (priority / jurisdiction / soft-research)
+        # may drop rows. Fetch a wider window so priority ranking can surface
+        # high-value near-misses buried behind aged soft-research.
+        if effective_limit > 0:
+            fetch_limit = max(effective_limit, effective_limit * 8)
         where_clauses = [
             "queued_at >= ?",
             "queued_at <= ?",
@@ -1927,6 +2597,17 @@ class MarketStateManager:
             placeholders = ",".join("?" * len(excluded))
             where_clauses.append(f"market_id NOT IN ({placeholders})")
             params_list.extend(excluded)
+        # When priority filtering is active, exclude soft-research placeholders
+        # in SQL so they cannot fill the over-fetch window.
+        if min_priority is not None:
+            soft_markers = MarketStateManager._SOFT_RESEARCH_DRAIN_PLACEHOLDER_MARKERS
+            soft_clauses = []
+            for marker in soft_markers:
+                soft_clauses.append("lower(coalesce(gate_name, '')) NOT LIKE ?")
+                params_list.append(f"%{marker}%")
+                soft_clauses.append("lower(coalesce(reason, '')) NOT LIKE ?")
+                params_list.append(f"%{marker}%")
+            where_clauses.append("(" + " AND ".join(soft_clauses) + ")")
         sql = f"""
             SELECT market_id, cycle_id, queued_at, gate_name, reason,
                    threshold_gap, what_to_learn_next, last_seen, expires_at,
@@ -1939,18 +2620,100 @@ class MarketStateManager:
         params_list.append(fetch_limit)
         params: tuple[Any, ...] = tuple(params_list)
         rows = self._conn.execute(sql, params).fetchall()
-        results = [dict(row) for row in rows]
-        if min_priority is None or not results:
+        results = [
+            dict(row)
+            for row in rows
+            if not MarketStateManager.is_jurisdiction_sports_hold_entry(dict(row))
+            and not (
+                min_priority is not None
+                and MarketStateManager.is_soft_research_drain_placeholder(dict(row))
+            )
+        ]
+        if not results:
+            return []
+        if min_priority is None:
             return results[:effective_limit] if effective_limit else results
+
         cutoff = float(min_priority)
+
+        def _drain_rank_key(entry: dict[str, Any]) -> tuple[float, str]:
+            priority = self.estimate_research_entry_priority(entry)
+            # Unknown priority ranks as admissible (0.0 sort key inverted via
+            # treating None as meeting cutoff and sorting just below cutoff).
+            rank_priority = float(cutoff) if priority is None else float(priority)
+            queued_at = str(entry.get("queued_at") or "")
+            return (-rank_priority, queued_at)
+
+        ranked = sorted(results, key=_drain_rank_key)
         filtered: list[dict[str, Any]] = []
-        for entry in results:
+        for entry in ranked:
             priority = self.estimate_research_entry_priority(entry)
             if priority is None or priority >= cutoff:
                 filtered.append(entry)
             if len(filtered) >= effective_limit:
                 break
         return filtered
+
+    @staticmethod
+    def is_url_repair_near_miss(entry: dict[str, Any]) -> bool:
+        """True when a settlement-aligned quote is parked only for a missing https URL.
+
+        These are the highest-value zero-yield drain targets: a real edge/source
+        match already exists and one field repair can unlock execution.
+        """
+        payload: dict[str, Any] | None = None
+        audit: dict[str, Any] = {}
+        decision_json = entry.get("last_decision_json")
+        if decision_json:
+            try:
+                loaded = json.loads(decision_json)
+            except (TypeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                payload = loaded
+                raw_audit = loaded.get("audit")
+                if isinstance(raw_audit, dict):
+                    audit = raw_audit
+        source_match = str(
+            audit.get("source_match_class")
+            or (payload or {}).get("source_match_class")
+            or entry.get("source_match_class")
+            or ""
+        ).strip().lower()
+        floor_suppressed = str(
+            audit.get("evidence_floor_suppressed_reason")
+            or (payload or {}).get("evidence_floor_suppressed_reason")
+            or entry.get("evidence_floor_suppressed_reason")
+            or ""
+        ).strip().lower()
+        if (
+            floor_suppressed != "missing_primary_source_url"
+            or source_match != "settlement_aligned"
+        ):
+            return False
+        final_score = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            raw_score = source.get("pre_execution_final_score")
+            if isinstance(raw_score, (int, float)):
+                final_score = float(raw_score)
+                break
+        material_edge = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            for edge_key in ("edge_market", "chosen_side_edge", "market_edge"):
+                raw_edge = source.get(edge_key)
+                if isinstance(raw_edge, (int, float)):
+                    material_edge = float(raw_edge)
+                    break
+            if material_edge is not None:
+                break
+        return (
+            (isinstance(final_score, (int, float)) and float(final_score) >= 0.20)
+            or (isinstance(material_edge, (int, float)) and float(material_edge) >= 0.08)
+        )
 
     @staticmethod
     def estimate_research_entry_priority(entry: dict[str, Any]) -> float | None:
@@ -2047,6 +2810,81 @@ class MarketStateManager:
             or source_match == "settlement_aligned"
         ):
             priority = (priority if priority is not None else 0.0) + 0.08
+            signals_present = True
+        gate_name = str(entry.get("gate_name") or "").strip().lower()
+        if MarketStateManager.is_jurisdiction_sports_hold_entry(entry):
+            # Legacy jurisdiction parking rows are not drain candidates.
+            return 0.0
+        if gate_name == "conviction_repair":
+            # Repair passes already found strong edge/evidence but produced no
+            # executable decision; these are the highest-value retry candidates
+            # in the queue (June 2026: 197 parked with zero prioritized drains).
+            priority = (priority if priority is not None else 0.0) + 0.15
+            signals_present = True
+        # Edge near-misses within 3pp of the gate are high-value drain targets
+        # (Jul 2026: weather EQ=1.0 setups parked at 0.12 vs 0.14 WEATHER_MIN_EDGE).
+        _EDGE_NEAR_MISS_MARKERS = (
+            "edge_gate_blocked",
+            "edge_below_min",
+            "edge below min",
+            "weather_evidence_quality_below_min",
+        )
+        edge_near_miss_boosted = False
+        if any(marker in reason_text for marker in _EDGE_NEAR_MISS_MARKERS) and (
+            isinstance(threshold_gap, (int, float)) and float(threshold_gap) <= 0.03
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.15
+            signals_present = True
+            edge_near_miss_boosted = True
+        # High-score false blocks (hallucinated_edge / kelly_sub_floor / critical
+        # score reject) should outrank soft-research placeholders in drain.
+        _HIGH_SCORE_FALSE_BLOCK_MARKERS = (
+            "hallucinated_edge",
+            "kelly_sub_floor_skip",
+            "score_gate_critical_rejection",
+        )
+        final_score = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            raw_score = source.get("pre_execution_final_score")
+            if isinstance(raw_score, (int, float)):
+                final_score = float(raw_score)
+                break
+        edge_shortfall = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            raw_shortfall = source.get("edge_shortfall")
+            if isinstance(raw_shortfall, (int, float)):
+                edge_shortfall = float(raw_shortfall)
+                break
+        high_score_block = (
+            isinstance(final_score, (int, float)) and float(final_score) >= 0.50
+        )
+        tight_edge_shortfall = (
+            isinstance(edge_shortfall, (int, float)) and float(edge_shortfall) < 0.05
+        )
+        # Settlement-aligned quote parked only for missing https URL: prioritize
+        # source-repair drain over soft pre-analysis placeholders (Jul 2026:
+        # KXSOLD score 0.50 / edge 0.18 with floor_suppressed=missing_primary_source_url).
+        if MarketStateManager.is_url_repair_near_miss(entry):
+            priority = (priority if priority is not None else 0.0) + 0.20
+            signals_present = True
+        if any(marker in reason_text for marker in _HIGH_SCORE_FALSE_BLOCK_MARKERS) and (
+            high_score_block or tight_edge_shortfall
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.20
+            signals_present = True
+        elif "edge_gate_blocked" in reason_text and high_score_block:
+            priority = (priority if priority is not None else 0.0) + 0.20
+            signals_present = True
+        elif (
+            "edge_gate_blocked" in reason_text
+            and tight_edge_shortfall
+            and not edge_near_miss_boosted
+        ):
+            priority = (priority if priority is not None else 0.0) + 0.15
             signals_present = True
         if MarketStateManager.is_repeated_low_yield_research_entry(entry):
             if priority is None:
@@ -2184,6 +3022,21 @@ class MarketStateManager:
             if normalized_winning_outcome is not None
             else "unresolved_exchange"
         )
+        existing_settlement = self._conn.execute(
+            """
+            SELECT winning_outcome
+            FROM exchange_settlements
+            WHERE settlement_id = ?
+            """,
+            (normalized_settlement_id,),
+        ).fetchone()
+        first_resolved_import = bool(
+            normalized_winning_outcome is not None
+            and (
+                existing_settlement is None
+                or not str(existing_settlement["winning_outcome"] or "").strip()
+            )
+        )
         with self._conn:
             self._conn.execute(
                 """
@@ -2254,7 +3107,7 @@ class MarketStateManager:
                     resolution_state,
                 ),
             )
-        if online_calibration_enabled:
+        if online_calibration_enabled and first_resolved_import:
             self.record_online_confidence_calibration_from_trade(
                 normalized_market_id,
                 alpha=online_calibration_alpha,
@@ -2351,9 +3204,56 @@ class MarketStateManager:
         shares: float | None,
         timestamp: str,
     ) -> None:
+        existing = self._conn.execute(
+            """
+            SELECT entry_price, implied_prob, amount_usdc, shares
+            FROM trade_outcome_events
+            WHERE market_id = ? AND order_id = ?
+            """,
+            (market_id, order_id),
+        ).fetchone()
+        if existing is not None:
+            existing_amount = max(0.0, float(existing["amount_usdc"] or 0.0))
+            existing_shares = max(0.0, float(existing["shares"] or 0.0))
+            added_amount = max(0.0, float(amount_usdc or 0.0))
+            added_shares = max(0.0, float(shares or 0.0))
+            total_amount = existing_amount + added_amount
+            total_shares = existing_shares + added_shares
+            weighted_price = _weighted_average(
+                current=existing["entry_price"],
+                current_weight=existing_shares,
+                new=entry_price,
+                new_weight=added_shares,
+            )
+            weighted_implied = _weighted_average(
+                current=existing["implied_prob"],
+                current_weight=existing_shares,
+                new=implied_prob,
+                new_weight=added_shares,
+            )
+            self._conn.execute(
+                """
+                UPDATE trade_outcome_events
+                SET predicted_outcome = ?, entry_price = ?, implied_prob = ?,
+                    confidence = ?, amount_usdc = ?, shares = ?, timestamp = ?
+                WHERE market_id = ? AND order_id = ?
+                """,
+                (
+                    predicted_outcome,
+                    weighted_price,
+                    weighted_implied,
+                    confidence,
+                    total_amount,
+                    total_shares,
+                    timestamp,
+                    market_id,
+                    order_id,
+                ),
+            )
+            return
         self._conn.execute(
             """
-            INSERT OR REPLACE INTO trade_outcome_events (
+            INSERT INTO trade_outcome_events (
                 market_id, order_id, predicted_outcome, entry_price, implied_prob, confidence,
                 amount_usdc, shares, timestamp, resolved_winning_outcome, won, pnl_estimate, resolved_at, resolution_state
             )
@@ -2417,6 +3317,9 @@ class MarketStateManager:
         trade_outcome_events = _rows_to_dicts(
             self._conn.execute("SELECT * FROM trade_outcome_events").fetchall()
         )
+        pending_orders = _rows_to_dicts(
+            self._conn.execute("SELECT * FROM pending_orders").fetchall()
+        )
         bayesian_state = _rows_to_dicts(
             self._conn.execute("SELECT * FROM bayesian_state").fetchall()
         )
@@ -2441,6 +3344,7 @@ class MarketStateManager:
             "trade_log": trade_log,
             "trade_outcomes": trade_outcomes,
             "trade_outcome_events": trade_outcome_events,
+            "pending_orders": pending_orders,
             "bayesian_state": bayesian_state,
             "cycle_receipts": cycle_receipts,
             "decision_receipts": decision_receipts,
@@ -2536,6 +3440,12 @@ class MarketStateManager:
         self._ensure_column("markets", "non_actionable_streak", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "fill_failure_count", "INTEGER DEFAULT 0")
         self._ensure_column("markets", "next_eligible_cycle", "INTEGER DEFAULT 0")
+        # Actual settled YES/NO winner, distinct from last_terminal_outcome
+        # (which stores the bot's decision reason). Enables counterfactual
+        # audits of blocked should_trade decisions: the Jul 2026 review found
+        # 91.4% of blocked markets had no observable resolution locally.
+        self._ensure_column("markets", "resolved_winning_outcome", "TEXT")
+        self._ensure_column("markets", "resolved_winning_outcome_at", "TEXT")
         self._ensure_column("decision_receipts", "score_json", "TEXT")
         self._ensure_column(
             "research_queue_entries",
@@ -2547,6 +3457,81 @@ class MarketStateManager:
             "resolution_state",
             "TEXT DEFAULT 'unresolved'",
         )
+        self._migrate_binary_bayesian_likelihood_ratios()
+        self._normalize_participation_tier_repr_leak()
+
+    def _migrate_binary_bayesian_likelihood_ratios(self) -> None:
+        """Correct legacy binary states whose odds were multiplied by LR twice."""
+        row = self._conn.execute(
+            "SELECT value FROM runtime_flags WHERE key = ?",
+            (_BAYESIAN_LR_SEMANTICS_FLAG,),
+        ).fetchone()
+        if row is not None and str(row["value"] or "") == _BAYESIAN_LR_SEMANTICS_VERSION:
+            return
+        self._conn.execute(
+            """
+            UPDATE bayesian_state
+            SET log_likelihood_sum = log_likelihood_sum * 0.5
+            WHERE market_id IN (
+                SELECT market_id
+                FROM bayesian_state
+                GROUP BY market_id
+                HAVING COUNT(*) = 2
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            INSERT INTO runtime_flags (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _BAYESIAN_LR_SEMANTICS_FLAG,
+                _BAYESIAN_LR_SEMANTICS_VERSION,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    def _normalize_participation_tier_repr_leak(self) -> None:
+        """One-time repair of receipts storing the enum repr instead of value."""
+        row = self._conn.execute(
+            "SELECT value FROM runtime_flags WHERE key = ?",
+            (_PARTICIPATION_TIER_REPR_FLAG,),
+        ).fetchone()
+        if row is not None and str(row["value"] or "") == _PARTICIPATION_TIER_REPR_VERSION:
+            return
+        with self._conn:
+            for column in ("decision_json", "audit_json"):
+                for repr_text, value_text in _PARTICIPATION_TIER_REPR_MAP.items():
+                    self._conn.execute(
+                        f"""
+                        UPDATE decision_receipts
+                        SET {column} = REPLACE({column}, ?, ?)
+                        WHERE {column} LIKE ?
+                        """,
+                        (
+                            f'"{repr_text}"',
+                            f'"{value_text}"',
+                            f'%"{repr_text}"%',
+                        ),
+                    )
+            self._conn.execute(
+                """
+                INSERT INTO runtime_flags (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    _PARTICIPATION_TIER_REPR_FLAG,
+                    _PARTICIPATION_TIER_REPR_VERSION,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         columns = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -2651,6 +3636,20 @@ def _build_reasoning_hash(reasoning: str | None, outcome: str | None, confidence
 
 def _rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def _pending_order_row_to_dict(
+    row: sqlite3.Row | None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    pending = dict(row)
+    raw_json = pending.pop("raw_json", None)
+    try:
+        pending["raw"] = json.loads(raw_json) if raw_json else {}
+    except (json.JSONDecodeError, TypeError):
+        pending["raw"] = {}
+    return pending
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
