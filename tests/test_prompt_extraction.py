@@ -6,26 +6,21 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Jul 27 2026: shared_output_rules gained the observed
-    # settlement-aligned value -> evidence_basis=direct classification rule
-    # (max-profit near-miss review).
-    "analyze": "846ccb2714352edebe77ba0dc4e8e94b8fbd74c955db4d346b8877a839c97165",
+    # Re-pinned Jul 28 2026: https URL hygiene examples, side-consistency rule,
+    # and crypto live-quote few-shot (execution-yield alignment).
+    "analyze": "7db641bc7aee12b95d30aaee4de88c20249a8fe56658d73dcf637af06e49ad2a",
     "deep": "ea0c9f26bb4f9b1dcb492186239980483037c0ba60c05308aecde420bd2b6f1c",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    # Commodities + sports re-pinned Jul 24 2026: prompt updates from the
-    # prior session landed without refreshing these hashes (stale at HEAD).
-    "commodities:deep_false": "77ea11ef4220ca8abad3d3120d982f4a616dd91d79415972a526d59376410fd0",
-    "commodities:deep_true": "2e6146183e3cf8e773117eb4f9ad2092d58f44335b0c504d207319356b7532b7",
-    # Updated after strengthening the crypto category hint to mandate citing a
-    # settlement-grade exchange primary_source_url (coinbase/kraken/binance/coindesk)
-    # with observed price + timestamp, with a proxy/EQ<=0.60 fallback otherwise.
-    "crypto:deep_false": "82358542becae2e29846b30622e6ff293681426febe4509fb7941f7c04996a72",
-    "crypto:deep_true": "fb936dc86ab95ad432d7f41d287bad9bb8754b1efa669b98e354b2afbf969fb8",
-    # Updated after generic Kelly-sized primary_source_url guidance + deep repair action.
-    "generic:deep_false": "dc228fd21953dd8247e5eced28605105cd8bd5867d95b106975305c37ae7c7a1",
-    "generic:deep_true": "668938a60350b7e8d3a56454cc131e7948a05bf60caa248c43f59dc6d21ef3e4",
+    # Re-pinned Jul 28 2026: crypto/commodities/generic URL+should_trade guidance,
+    # weather MapClick underdog discipline, sports odds-URL-before-absence_only.
+    "commodities:deep_false": "5ace0c9e5c8448d4ad6caad4a3e64d30b178078b63237bdc4a6b0aa1cb84650a",
+    "commodities:deep_true": "1c75b0a8c7381d14475e650aaa5a29c5549c86d4c0d889c460545d784fff4535",
+    "crypto:deep_false": "296581f0b94cf1a90e39fc0e6b981cf96283143a0f7fbb64aee5f8c5f895f553",
+    "crypto:deep_true": "0438160e8a3e2d397c031d96d307b355cc17c418d1c9be7a654b2fe5df8f62d3",
+    "generic:deep_false": "de34974965eea79e2a926963f5a7b444f12ab7f8621a5120d1879f26481c258d",
+    "generic:deep_true": "025ab15385c459c735d3c251b49a8d2998e3834faf5d5f553aa00fffc82ad5db",
     "music:deep_false": "a0d39c5d325a41abdd64dd72aa6662e7283fbc1c70b1272a10fe0c6b72a52b59",
     "music:deep_true": "d72de80ce67f2cda44fc9919df27bf8d0e697ee8d8679fd3c6e0d85acb9f02e0",
     "politics:deep_false": "877eb11281828ff2aade2c1253170f423539068a0c1f609bdb9ac03931cb2f47",
@@ -34,17 +29,10 @@ EXPECTED_MARKET_PROMPT_HASHES = {
     "speech:deep_true": "2c30597de08dfc29c4900f6e8ac42aadb3ccb26c412c5e86c5617867cfa40952",
     "speech_mention:deep_false": "f15420e53452fbb09616a8bea172b6181d90e2f84584fbcbfa4c09b80860d9d2",
     "speech_mention:deep_true": "3fc0a9b8a5691bc6b4843ef5e451b770da517266705c919ee4480b081199545f",
-    # Updated after enriching the sports category hint to mirror weather/commodity:
-    # verify game status first, cite an official box-score/result primary_source_url
-    # for settled props (direct evidence), ground pre-game edges in a cited sportsbook
-    # line via implied_prob_external/edge_external (edge_source=computed not none), and
-    # abstain at evidence_quality<=0.55 when neither odds nor result is citable.
-    "sports:deep_false": "8c5b8648394a196ddeeeffa834d1e5df7728577c5364caff714956781fcbd483",
-    "sports:deep_true": "143a8bfb5eae1f6298add98f936fc74d2667cc4981a9db9de090653047c8ec27",
-    # Weather re-pinned Jul 27 2026: category hint now instructs classifying
-    # observed NWS/NOAA CLI/METAR reads that resolve the threshold as direct.
-    "weather:deep_false": "ff12127144f053ad19f375a4d692dc9bdab4c5b8625c27bc4dfd202ee2b56fcd",
-    "weather:deep_true": "9e8e0dc0da8916337d2c460b5e71c45fb78bf510e6bb8e02b2a945fc66fb80b0",
+    "sports:deep_false": "6d6783072a778b067bf364ed473c16226e0c4438fe891440ca67c8f56b5a42f9",
+    "sports:deep_true": "e77971b37851f106dc134ff3c2f2d2336e45dbe49c1c8c5a2158b046ca9c5521",
+    "weather:deep_false": "eeacbb3c933b623e93880a80f8bd27003800ec17393f78547b2357805b9e4db2",
+    "weather:deep_true": "683b8b54051bc5fe58fe9191eacb4a51cb9b02fc704c29de4fa09cc1063d7e14",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -63,11 +51,11 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "evidence_quality": "476f825d5b7a15e377c7e8f53749beb0a39db6c6f965065a801ece51ff07b0b6",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",
     "implied_prob_external": "76bcee210033e309fd75807a13b8ec2cee01051ee4687b4d8dc70a433bf90848",
-    "key_sources": "655b9b2751cca8b59fee6971dfcb2d682165d25855a5d41a9fe4684fa9ca6690",
+    "key_sources": "3aa0cc5c44f0f8a2ee451eeb25844c11c7d34426c2a2627651c814e5a4f38747",
     "likelihood_ratio": "d2f282fd76a34dec00a06dbfafac1f4760b46dbab9020d2f690e61611cb26a75",
     "my_prob": "752cdbc9aba6b7fdc735e8f3c81944467b6598eba3d139041430fd03afdec0c6",
-    "outcome": "7642b21e60176506e653b20b3183cc5bc0c361804028e0a8a98a697e8b65f94c",
-    "primary_source_url": "6101dd4040210985d00f82c41313d2d69a513361eca215aeab2883f35387af70",
+    "outcome": "67cf74e5d00e1ebece3635535fb09d9dc67b9a4a997a3246761c44ccd6198399",
+    "primary_source_url": "bdd16205b16f6b72d3c9228c2f90468953d813dca5f11c657f2000539c9c1fea",
     "probability_yes": "c23e1e0ff03c759f6c24ec0a60249568a7f2d449f3e16c6a0efa03d4b8b72802",
     "prompt_tokens": "49db0a66d30b18b71326920cd8ceea07a4c204889a27ad00bc6a275ca0c97b36",
     "raw_bet_size_pct": "8f72e04cf77115c2893583367d0f8ae98d15f7725ccca7072b3c9fa3308a0cce",
@@ -79,7 +67,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "reasoning": "d354569b3ae0b524436f727bd1d0ed5e3f56e5973a4952eff6d05d341cfaed31",
     "reasoning_tokens": "6b47f605e7844debc22ecbf3b199a6f581dd2a72a1ebdaaca8c06f282f7122b9",
     "self_critique": "ab2d939c15dcfe7ab68bd6af225432bdedfd4596e126f76a74ac6afde5bb7bbe",
-    "should_trade": "997fe2b7115c9a5af68197e3bb41b5e2d0e653d5b8ba8533b0e28a1233488e53",
+    "should_trade": "a3af674bf96502c698bea6b9e0d42968e98a39b106920cac9e0751f92ee67bef",
     "source_match_class": "8bca00a6b3b1f3d3edc79c9a23303957f8c3971dc39208283368c5b6c1f07efc",
     "uncertainty_note": "0c8956f9b9c3e8e792696a9e4f2ab4c901795cd01e5d9b963b1ae33093f7539f",
 }
@@ -207,4 +195,6 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "Self-consistency check" in _SYSTEM_PROMPT_ANALYZE
     assert "Treat live-price threshold evidence as direct when URL-cited" in _SYSTEM_PROMPT_ANALYZE
     assert "you MUST populate primary_source_url with the exact URL used" in _SYSTEM_PROMPT_ANALYZE
+    assert "primary_source_url must be a real https:// link" in _SYSTEM_PROMPT_ANALYZE
+    assert "Side consistency:" in _SYSTEM_PROMPT_ANALYZE
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE

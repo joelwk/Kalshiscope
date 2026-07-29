@@ -595,6 +595,64 @@ def test_estimate_research_entry_priority_boosts_conviction_repair_entries() -> 
     assert repair_priority == pytest.approx(base_priority + 0.15)
 
 
+def test_estimate_research_entry_priority_boosts_missing_url_settlement_aligned() -> None:
+    """URL-repair near-misses (settlement_aligned + missing URL + score/edge) get +0.20."""
+    base_entry = {
+        "threshold_gap": 0.0,
+        "last_decision_json": json.dumps(
+            {
+                "audit": {
+                    "research_priority": 0.40,
+                    "source_match_class": "settlement_aligned",
+                    "pre_execution_final_score": 0.50,
+                    "edge_market": 0.18,
+                }
+            }
+        ),
+    }
+    base_priority = MarketStateManager.estimate_research_entry_priority(dict(base_entry))
+    repair_entry = {
+        "threshold_gap": 0.0,
+        "last_decision_json": json.dumps(
+            {
+                "audit": {
+                    "research_priority": 0.40,
+                    "source_match_class": "settlement_aligned",
+                    "evidence_floor_suppressed_reason": "missing_primary_source_url",
+                    "pre_execution_final_score": 0.50,
+                    "edge_market": 0.18,
+                }
+            }
+        ),
+    }
+    repair_priority = MarketStateManager.estimate_research_entry_priority(repair_entry)
+    assert base_priority is not None and repair_priority is not None
+    assert repair_priority == pytest.approx(base_priority + 0.20)
+
+    # absence_only / low_information must not get the URL-repair boost.
+    low_info = MarketStateManager.estimate_research_entry_priority(
+        {
+            "threshold_gap": 0.0,
+            "last_decision_json": json.dumps(
+                {
+                    "audit": {
+                        "research_priority": 0.40,
+                        "source_match_class": "missing_or_absence_only",
+                        "evidence_floor_suppressed_reason": "low_information",
+                        "pre_execution_final_score": 0.50,
+                        "edge_market": 0.18,
+                    }
+                }
+            ),
+        }
+    )
+    assert low_info is not None
+    assert low_info < repair_priority
+    # Base research_priority 0.40 + near-miss gap boost (+0.10 for gap<=0.03);
+    # no settlement_aligned or URL-repair boosts.
+    assert low_info == pytest.approx(0.50)
+
+
 def test_estimate_research_entry_priority_conviction_repair_signal_alone_is_sufficient() -> None:
     # Repair entries are persisted with threshold_gap=0.0 and a full decision
     # audit; even without other signals the gate alone must clear the drain

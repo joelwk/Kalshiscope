@@ -2798,12 +2798,50 @@ class MarketStateManager:
             if isinstance(raw_shortfall, (int, float)):
                 edge_shortfall = float(raw_shortfall)
                 break
+        # Material chosen-side / market edge from audit (URL-repair near-misses).
+        material_edge = None
+        for source in (audit, payload or {}, entry):
+            if not isinstance(source, dict):
+                continue
+            for edge_key in ("edge_market", "chosen_side_edge", "market_edge"):
+                raw_edge = source.get(edge_key)
+                if isinstance(raw_edge, (int, float)):
+                    material_edge = float(raw_edge)
+                    break
+            if material_edge is not None:
+                break
+        floor_suppressed = str(
+            (audit or {}).get("evidence_floor_suppressed_reason")
+            or (payload or {}).get("evidence_floor_suppressed_reason")
+            or entry.get("evidence_floor_suppressed_reason")
+            or ""
+        ).strip().lower()
         high_score_block = (
             isinstance(final_score, (int, float)) and float(final_score) >= 0.50
         )
         tight_edge_shortfall = (
             isinstance(edge_shortfall, (int, float)) and float(edge_shortfall) < 0.05
         )
+        # Settlement-aligned quote parked only for missing https URL: prioritize
+        # source-repair drain over soft pre-analysis placeholders (Jul 2026:
+        # KXSOLD score 0.50 / edge 0.18 with floor_suppressed=missing_primary_source_url).
+        url_repair_near_miss = (
+            floor_suppressed == "missing_primary_source_url"
+            and source_match == "settlement_aligned"
+            and (
+                (
+                    isinstance(final_score, (int, float))
+                    and float(final_score) >= 0.20
+                )
+                or (
+                    isinstance(material_edge, (int, float))
+                    and float(material_edge) >= 0.08
+                )
+            )
+        )
+        if url_repair_near_miss:
+            priority = (priority if priority is not None else 0.0) + 0.20
+            signals_present = True
         if any(marker in reason_text for marker in _HIGH_SCORE_FALSE_BLOCK_MARKERS) and (
             high_score_block or tight_edge_shortfall
         ):
