@@ -504,14 +504,16 @@ class Settings:
     DRY_RUN: bool = True
     # Opt-in run-level forced-order target. When positive, ordinary submissions
     # are suppressed until the plan completes: lock N distinct markets (prefer
-    # highest analyzed confidence), run initial + deep research on each, then
-    # force a sized order from the researched side. Ordinary score/edge/EQ
-    # gates are audit-only for these slots. Unexecutable markets (closed,
-    # price band, jurisdiction) may be replaced up to
+    # conf×EQ with event/family diversity; reuse cycle analysis when present),
+    # deep-research each slot, prefer replacing weak evidence, then force a
+    # sized order from the researched side. Ordinary score/edge/EQ gates are
+    # audit-only for these slots. Unexecutable markets (closed, price band,
+    # jurisdiction) and weak-evidence slots may be replaced up to
     # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. A bounded run that never
-    # locks/completes the target fails loudly.
+    # locks/completes the target fails loudly; a bounded run exits early once
+    # the target is complete.
     GUARANTEED_ORDERS_N: int = 0
-    # Cap on unexecutable-slot replacements per run (closed/price/jurisdiction).
+    # Cap on slot replacements per run (weak evidence + unexecutable markets).
     # Prevents infinite thrash when GUARANTEED_ORDERS_N > 0.
     GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS: int = 6
     ORDER_RECONCILIATION_ENABLED: bool = True

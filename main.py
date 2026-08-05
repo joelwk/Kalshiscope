@@ -4281,6 +4281,7 @@ class GuaranteedOrderSlot:
     needs_replacement: bool = False
     replacement_count: int = 0
     replacement_reason: str | None = None
+    force_despite_research_gap: bool = False
 
 
 @dataclass
@@ -4397,7 +4398,26 @@ class GuaranteedOrderCycleResult:
     reasoning_tokens: int = 0
     cached_tokens: int = 0
     attempts_by_family: dict[str, int] = field(default_factory=dict)
+    family_execution: dict[str, dict[str, float]] = field(default_factory=dict)
     failures: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _guaranteed_family_execution_bucket(
+    family_execution: dict[str, dict[str, float]],
+    family_name: str,
+) -> dict[str, float]:
+    return family_execution.setdefault(
+        family_name,
+        {
+            "order_attempts": 0.0,
+            "orders_filled": 0.0,
+            "orders_partially_filled": 0.0,
+            "orders_resting_unfilled": 0.0,
+            "orders_canceled_unfilled": 0.0,
+            "usd_submitted": 0.0,
+            "usd_deployed": 0.0,
+        },
+    )
 
 
 def _load_execution_market_snapshot(
@@ -4512,10 +4532,10 @@ def _load_execution_market_snapshot(
 def _guaranteed_order_priority_scores(
     analysis_results: dict[str, Any] | None,
 ) -> dict[str, float]:
-    """Map market_id -> priority from this cycle's analyzed confidence.
+    """Map market_id -> lock priority from this cycle's analyzed decisions.
 
-    Guaranteed locks prefer markets the agent was already most confident about.
-    Score is a small tie-breaker so equal-confidence markets still order stably.
+    Prefers confidence scaled by evidence quality so coin-flip absence_only
+    weather does not outrank stronger evidence at similar confidence.
     """
     priorities: dict[str, float] = {}
     if not analysis_results:
@@ -4525,20 +4545,56 @@ def _guaranteed_order_priority_scores(
             continue
         decision = result.get("decision")
         confidence = 0.0
+        evidence_quality = 0.0
+        evidence_basis = ""
+        should_trade_signal = False
         if decision is not None:
-            raw_confidence = getattr(decision, "confidence", None)
-            if raw_confidence is None and isinstance(decision, dict):
-                raw_confidence = decision.get("confidence")
+            def _attr(name: str) -> Any:
+                value = getattr(decision, name, None)
+                if value is None and isinstance(decision, dict):
+                    value = decision.get(name)
+                return value
+
             try:
-                confidence = float(raw_confidence or 0.0)
+                confidence = float(_attr("confidence") or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
+            try:
+                evidence_quality = float(_attr("evidence_quality") or 0.0)
+            except (TypeError, ValueError):
+                evidence_quality = 0.0
+            evidence_basis = str(_attr("evidence_basis") or "").strip().lower()
+            raw_should = _attr("raw_should_trade")
+            should = _attr("should_trade")
+            should_trade_signal = bool(raw_should) or bool(should)
         try:
             final_score = float(result.get("pre_execution_final_score", 0.0) or 0.0)
         except (TypeError, ValueError):
             final_score = 0.0
-        priorities[str(market_id)] = confidence + (0.01 * final_score)
+        priority = confidence * max(evidence_quality, 0.01)
+        if should_trade_signal:
+            priority += 0.15
+        if evidence_basis == "absence_only":
+            priority -= 0.25
+        priority += 0.05 * final_score
+        priorities[str(market_id)] = priority
     return priorities
+
+
+def _guaranteed_order_seed_decisions(
+    analysis_results: dict[str, Any] | None,
+) -> dict[str, TradeDecision]:
+    """Extract cycle TradeDecision objects for reseeding guaranteed locks."""
+    seeds: dict[str, TradeDecision] = {}
+    if not analysis_results:
+        return seeds
+    for market_id, result in analysis_results.items():
+        if not market_id or not isinstance(result, dict):
+            continue
+        decision = result.get("decision")
+        if isinstance(decision, TradeDecision):
+            seeds[str(market_id)] = decision
+    return seeds
 
 
 def _is_guaranteed_order_market_candidate(
@@ -4602,6 +4658,7 @@ def _lock_guaranteed_order_markets(
     excluded_market_ids: set[str],
     excluded_market_families: set[str] | None = None,
     priority_by_market_id: dict[str, float] | None = None,
+    seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
     settings: Settings,
     cycle_number: int,
 ) -> list[GuaranteedOrderSlot]:
@@ -4614,6 +4671,7 @@ def _lock_guaranteed_order_markets(
         for family in (excluded_market_families or set())
         if str(family or "").strip()
     }
+    seed_decisions = seed_decisions_by_market_id or {}
     current_by_id = {market.id: market for market in markets if market.id}
     for slot in plan.slots:
         if slot.needs_replacement:
@@ -4627,6 +4685,16 @@ def _lock_guaranteed_order_markets(
 
     locked_ids = {
         slot.market_id for slot in plan.slots if not slot.needs_replacement
+    }
+    locked_event_prefixes = {
+        _event_ticker_prefix(slot.market)
+        for slot in plan.slots
+        if not slot.needs_replacement and slot.market is not None
+    }
+    locked_families = {
+        market_family(slot.market)
+        for slot in plan.slots
+        if not slot.needs_replacement and slot.market is not None
     }
     candidates = [
         market
@@ -4645,13 +4713,35 @@ def _lock_guaranteed_order_markets(
         reverse=True,
     )
 
+    def _pick_next_candidate() -> Market | None:
+        nonlocal candidates
+        # Prefer unique event + unique family, then unique event only, then any.
+        for require_unique_family in (True, False):
+            for index, market in enumerate(candidates):
+                event_prefix = _event_ticker_prefix(market)
+                if event_prefix and event_prefix in locked_event_prefixes:
+                    continue
+                family = market_family(market)
+                if require_unique_family and family in locked_families:
+                    continue
+                candidates.pop(index)
+                return market
+        return None
+
+    def _apply_seed(slot: GuaranteedOrderSlot, market: Market) -> None:
+        seeded = seed_decisions.get(market.id)
+        if seeded is not None:
+            slot.decision = seeded
+            slot.research_completed = False
+        else:
+            slot.decision = None
+            slot.research_completed = False
+
     newly_locked: list[GuaranteedOrderSlot] = []
-    candidate_index = 0
     for slot in (slot for slot in plan.slots if slot.needs_replacement):
-        if candidate_index >= len(candidates):
+        market = _pick_next_candidate()
+        if market is None:
             break
-        market = candidates[candidate_index]
-        candidate_index += 1
         slot.replacement_count += 1
         slot.market_id = market.id
         slot.market = market
@@ -4660,8 +4750,7 @@ def _lock_guaranteed_order_markets(
             f"BOT-GUAR-{plan.run_id}-{slot.slot_number:03d}"
             f"-R{slot.replacement_count:03d}"
         )
-        slot.decision = None
-        slot.research_completed = False
+        _apply_seed(slot, market)
         slot.completed = False
         slot.abandoned = False
         slot.submission_attempts = 0
@@ -4669,11 +4758,19 @@ def _lock_guaranteed_order_markets(
         slot.order_id = None
         slot.needs_replacement = False
         slot.replacement_reason = None
+        slot.force_despite_research_gap = False
         locked_ids.add(market.id)
+        event_prefix = _event_ticker_prefix(market)
+        if event_prefix:
+            locked_event_prefixes.add(event_prefix)
+        locked_families.add(market_family(market))
         newly_locked.append(slot)
 
     slots_needed = max(0, plan.target - len(plan.slots))
-    for market in candidates[candidate_index : candidate_index + slots_needed]:
+    for _ in range(slots_needed):
+        market = _pick_next_candidate()
+        if market is None:
+            break
         slot = GuaranteedOrderSlot(
             slot_number=len(plan.slots) + 1,
             market_id=market.id,
@@ -4683,7 +4780,13 @@ def _lock_guaranteed_order_markets(
                 f"BOT-GUAR-{plan.run_id}-{len(plan.slots) + 1:03d}"
             ),
         )
+        _apply_seed(slot, market)
         plan.slots.append(slot)
+        locked_ids.add(market.id)
+        event_prefix = _event_ticker_prefix(market)
+        if event_prefix:
+            locked_event_prefixes.add(event_prefix)
+        locked_families.add(market_family(market))
         newly_locked.append(slot)
     return newly_locked
 
@@ -4878,8 +4981,14 @@ def _attempt_guaranteed_order_slot(
     kalshi_client: KalshiClient,
     state_manager: MarketStateManager,
     settings: Settings,
+    replace_weak_evidence: bool = False,
 ) -> GuaranteedOrderAttemptResult:
-    """Research a locked slot intensely and make its one forced order attempt."""
+    """Research a locked slot intensely and make its one forced order attempt.
+
+    When replace_weak_evidence is True and deep research is still a research gap,
+    return status=research_gap_replaceable so the phase can swap markets before
+    forcing. When False (or no replacement available), force the researched side.
+    """
     intense_research_performed = False
     sizing_audit: dict[str, Any] = {}
     token_usage = {
@@ -4895,6 +5004,27 @@ def _attempt_guaranteed_order_slot(
                 getattr(analyzed_decision, usage_key, 0) or 0
             )
 
+    def _force_from_research(
+        researched: TradeDecision,
+        research_market: Market,
+        *,
+        gap_reason: str | None,
+    ) -> TradeDecision:
+        nonlocal amount_usdc, sizing_audit
+        amount_usdc, sizing_audit = _guaranteed_order_sized_amount_usdc(
+            decision=researched,
+            market=research_market,
+            settings=settings,
+        )
+        if gap_reason is not None:
+            sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
+        return _forced_execution_decision(
+            researched,
+            research_market,
+            amount_usdc=amount_usdc,
+            max_bet_usdc=settings.MAX_BET_USDC,
+        )
+
     decision = slot.decision
     amount_usdc = max(0.0, float(settings.MIN_BET_USDC))
     if settings.MAX_BET_USDC > 0:
@@ -4904,20 +5034,24 @@ def _attempt_guaranteed_order_slot(
         slot.last_error = error
         return GuaranteedOrderAttemptResult(status="invalid_bet_size", error=error)
 
-    if decision is None:
+    if decision is None or not slot.research_completed:
         try:
             research_market = slot.market
             search_config = _build_extended_reanalysis_search_config(
                 build_market_search_config(settings, research_market),
                 settings,
             )
-            initial_decision = grok_client.analyze_market(
-                research_market,
-                search_config=search_config,
-                previous_analysis=None,
-                allow_self_consistency=True,
-            )
-            _capture_usage(initial_decision)
+            if decision is None:
+                initial_decision = grok_client.analyze_market(
+                    research_market,
+                    search_config=search_config,
+                    previous_analysis=None,
+                    allow_self_consistency=True,
+                )
+                _capture_usage(initial_decision)
+            else:
+                # Seeded from this cycle's analysis: skip re-initial, deep only.
+                initial_decision = decision
             deep_decision = grok_client.analyze_market_deep(
                 research_market,
                 previous_analysis=initial_decision,
@@ -4925,23 +5059,28 @@ def _attempt_guaranteed_order_slot(
             )
             _capture_usage(deep_decision)
             gap_reason = _guaranteed_order_research_gap_reason(deep_decision, settings)
-            amount_usdc, sizing_audit = _guaranteed_order_sized_amount_usdc(
-                decision=deep_decision,
-                market=research_market,
-                settings=settings,
-            )
-            if gap_reason is not None:
-                sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
-            decision = _forced_execution_decision(
+            intense_research_performed = True
+            if gap_reason is not None and replace_weak_evidence:
+                slot.decision = deep_decision
+                slot.research_completed = True
+                slot.last_error = gap_reason
+                return GuaranteedOrderAttemptResult(
+                    status="research_gap_replaceable",
+                    decision=deep_decision,
+                    amount_usdc=0.0,
+                    intense_research_performed=True,
+                    token_usage=token_usage,
+                    error=gap_reason,
+                    sizing_audit={"guaranteed_order_research_gap_bypassed": gap_reason},
+                )
+            decision = _force_from_research(
                 deep_decision,
                 research_market,
-                amount_usdc=amount_usdc,
-                max_bet_usdc=settings.MAX_BET_USDC,
+                gap_reason=gap_reason,
             )
             slot.decision = decision
             slot.research_completed = True
             slot.last_error = None
-            intense_research_performed = True
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             slot.last_error = error
@@ -4953,18 +5092,21 @@ def _attempt_guaranteed_order_slot(
             )
     else:
         gap_reason = _guaranteed_order_research_gap_reason(decision, settings)
-        amount_usdc, sizing_audit = _guaranteed_order_sized_amount_usdc(
-            decision=decision,
-            market=slot.market,
-            settings=settings,
-        )
-        if gap_reason is not None:
-            sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
-        decision = _forced_execution_decision(
+        if gap_reason is not None and replace_weak_evidence:
+            slot.last_error = gap_reason
+            return GuaranteedOrderAttemptResult(
+                status="research_gap_replaceable",
+                decision=decision,
+                amount_usdc=0.0,
+                intense_research_performed=intense_research_performed,
+                token_usage=token_usage,
+                error=gap_reason,
+                sizing_audit={"guaranteed_order_research_gap_bypassed": gap_reason},
+            )
+        decision = _force_from_research(
             decision,
             slot.market,
-            amount_usdc=amount_usdc,
-            max_bet_usdc=settings.MAX_BET_USDC,
+            gap_reason=gap_reason,
         )
         slot.decision = decision
 
@@ -5088,6 +5230,7 @@ def _run_guaranteed_order_phase(
     log_decision: Any,
     extended_research_market_ids: set[str],
     priority_by_market_id: dict[str, float] | None = None,
+    seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
 ) -> GuaranteedOrderCycleResult:
     result = GuaranteedOrderCycleResult()
     sports_jurisdiction_hold = (
@@ -5125,6 +5268,7 @@ def _run_guaranteed_order_phase(
             excluded_market_ids=excluded_market_ids,
             excluded_market_families=excluded_market_families,
             priority_by_market_id=priority_by_market_id,
+            seed_decisions_by_market_id=seed_decisions_by_market_id,
             settings=settings,
             cycle_number=cycle_number,
         )
@@ -5145,9 +5289,45 @@ def _run_guaranteed_order_phase(
                     ],
                     "excluded_market_families": sorted(excluded_market_families),
                     "priority_scores_applied": bool(priority_by_market_id),
+                    "seeded_decision_count": sum(
+                        1
+                        for slot in new_slots
+                        if slot.decision is not None and not slot.research_completed
+                    ),
                 },
             )
         return new_slots
+
+    def _record_family_attempt(
+        family: str,
+        *,
+        amount_usdc: float,
+        status: str,
+        lifecycle: OrderLifecycleMetrics | None = None,
+        deployed_usdc: float = 0.0,
+    ) -> None:
+        result.attempts_by_family[family] = (
+            result.attempts_by_family.get(family, 0) + 1
+        )
+        bucket = _guaranteed_family_execution_bucket(result.family_execution, family)
+        bucket["order_attempts"] += 1.0
+        bucket["usd_submitted"] += float(amount_usdc or 0.0)
+        bucket["usd_deployed"] += float(deployed_usdc or 0.0)
+        if status == "dry_run":
+            return
+        if lifecycle is None:
+            return
+        if lifecycle.fully_filled:
+            bucket["orders_filled"] += 1.0
+        elif lifecycle.partially_filled:
+            bucket["orders_partially_filled"] += 1.0
+        elif lifecycle.resting_unfilled:
+            bucket["orders_resting_unfilled"] += 1.0
+        elif (
+            lifecycle.status in {"cancelled", "canceled"}
+            and lifecycle.fill_count <= 0
+        ):
+            bucket["orders_canceled_unfilled"] += 1.0
 
     _lock_available_slots()
     if not plan.is_fully_locked:
@@ -5167,12 +5347,20 @@ def _run_guaranteed_order_phase(
     ]
     while pending_slots:
         slot = pending_slots.pop(0)
+        max_gap_replacements = int(
+            settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
+        )
+        replace_weak_evidence = (
+            plan.research_gap_replacements < max_gap_replacements
+            and not slot.force_despite_research_gap
+        )
         attempt = _attempt_guaranteed_order_slot(
             slot,
             grok_client=grok_client,
             kalshi_client=kalshi_client,
             state_manager=state_manager,
             settings=settings,
+            replace_weak_evidence=replace_weak_evidence,
         )
         result.prompt_tokens += int(attempt.token_usage.get("prompt_tokens", 0))
         result.completion_tokens += int(
@@ -5233,6 +5421,80 @@ def _run_guaranteed_order_phase(
                 data={**audit, "market_id": slot.market_id, "error": attempt.error},
             )
             continue
+        if attempt.status == "research_gap_replaceable":
+            result.failures.append(
+                {
+                    "slot_number": slot.slot_number,
+                    "market_id": slot.market_id,
+                    "status": attempt.status,
+                    "error": attempt.error,
+                }
+            )
+            replacement_reason = (
+                str(attempt.error or "").strip() or "guaranteed_order_research_gap"
+            )
+            plan.research_gap_replacements += 1
+            retired_market_id = slot.market_id
+            retired_question = slot.market.question
+            _mark_guaranteed_order_slot_for_replacement(
+                plan,
+                slot,
+                reason=replacement_reason,
+            )
+            replacement_slots = _lock_available_slots()
+            if slot.needs_replacement:
+                # No diversified replacement: force the researched side anyway.
+                slot.needs_replacement = False
+                slot.replacement_reason = None
+                slot.abandoned = False
+                slot.last_error = None
+                slot.force_despite_research_gap = True
+                logger.warning(
+                    "Guaranteed-order research gap with no replacement; "
+                    "forcing researched side for slot %d market=%s",
+                    slot.slot_number,
+                    retired_market_id,
+                    data={
+                        **audit,
+                        "market_id": retired_market_id,
+                        "force_after_research_gap": True,
+                        "gap_reason": replacement_reason,
+                    },
+                )
+                if decision is not None:
+                    log_decision(
+                        market_id=retired_market_id,
+                        question=retired_question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="guaranteed_order_research_gap",
+                            decision_terminal=False,
+                            final_action="skip",
+                            final_reason=f"{replacement_reason}_force_no_replacement",
+                            guaranteed_order_retry_pending=True,
+                            order_error=attempt.error,
+                            **audit,
+                        ),
+                    )
+                pending_slots.insert(0, slot)
+                continue
+            if decision is not None:
+                log_decision(
+                    market_id=retired_market_id,
+                    question=retired_question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase="guaranteed_order_research_gap",
+                        decision_terminal=False,
+                        final_action="skip",
+                        final_reason=replacement_reason,
+                        guaranteed_order_retry_pending=True,
+                        order_error=attempt.error,
+                        **audit,
+                    ),
+                )
+            pending_slots.extend(replacement_slots)
+            continue
         if attempt.status == "market_validation_failed":
             result.failures.append(
                 {
@@ -5245,9 +5507,6 @@ def _run_guaranteed_order_phase(
             replacement_reason = (
                 str(attempt.error or "").strip()
                 or "guaranteed_order_market_validation_failed"
-            )
-            max_gap_replacements = int(
-                settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
             )
             if plan.research_gap_replacements >= max_gap_replacements:
                 _abandon_guaranteed_order_slot(
@@ -5353,9 +5612,6 @@ def _run_guaranteed_order_phase(
         audit["market_family"] = family
         if attempt.status == "dry_run" or attempt.submission_attempted:
             result.attempted += 1
-            result.attempts_by_family[family] = (
-                result.attempts_by_family.get(family, 0) + 1
-            )
         if attempt.status == "submission_failed":
             jurisdiction_sports_blocked = _is_michigan_sports_jurisdiction_error(
                 attempt.error or ""
@@ -5432,6 +5688,12 @@ def _run_guaranteed_order_phase(
         slot.last_error = None
         result.completed += 1
         if attempt.status == "dry_run":
+            result.usd_submitted += attempt.amount_usdc
+            _record_family_attempt(
+                family,
+                amount_usdc=attempt.amount_usdc,
+                status="dry_run",
+            )
             logger.warning(
                 "GUARANTEED DRY_RUN: slot=%d/%d market=%s outcome=%s amount=$%.2f",
                 slot.slot_number,
@@ -5466,6 +5728,10 @@ def _run_guaranteed_order_phase(
             continue
         slot.order_id = response.id
         result.usd_submitted += attempt.amount_usdc
+        deployed_usdc = float(
+            (attempt.order_persistence or {}).get("recorded_fill_notional_usdc", 0.0)
+            or 0.0
+        )
         if lifecycle.fully_filled:
             result.filled += 1
         elif lifecycle.partially_filled:
@@ -5474,9 +5740,13 @@ def _run_guaranteed_order_phase(
             result.resting_unfilled += 1
         elif lifecycle.status in {"cancelled", "canceled"} and lifecycle.fill_count <= 0:
             result.canceled_unfilled += 1
-        result.usd_deployed += float(
-            (attempt.order_persistence or {}).get("recorded_fill_notional_usdc", 0.0)
-            or 0.0
+        result.usd_deployed += deployed_usdc
+        _record_family_attempt(
+            family,
+            amount_usdc=attempt.amount_usdc,
+            status="submitted",
+            lifecycle=lifecycle,
+            deployed_usdc=deployed_usdc,
         )
         log_decision(
             market_id=slot.market_id,
@@ -18430,6 +18700,9 @@ def main(max_cycles: int | None = None) -> None:
                     priority_by_market_id=_guaranteed_order_priority_scores(
                         analysis_results
                     ),
+                    seed_decisions_by_market_id=_guaranteed_order_seed_decisions(
+                        analysis_results
+                    ),
                 )
                 guaranteed_orders_locked_this_cycle = guaranteed_cycle_result.locked
                 guaranteed_orders_attempted_this_cycle = (
@@ -18459,6 +18732,33 @@ def main(max_cycles: int | None = None) -> None:
                         guaranteed_family,
                     )
                     family_stats["order_attempts"] += family_attempts
+                for guaranteed_family, family_exec in (
+                    guaranteed_cycle_result.family_execution.items()
+                ):
+                    family_stats = _execution_family_stats_bucket(
+                        execution_family_stats,
+                        guaranteed_family,
+                    )
+                    # attempts_by_family already merged order_attempts above;
+                    # merge USD/fill counters from guaranteed family_execution.
+                    family_stats["usd_submitted"] += float(
+                        family_exec.get("usd_submitted", 0.0) or 0.0
+                    )
+                    family_stats["usd_deployed"] += float(
+                        family_exec.get("usd_deployed", 0.0) or 0.0
+                    )
+                    family_stats["orders_filled"] += int(
+                        family_exec.get("orders_filled", 0) or 0
+                    )
+                    family_stats["orders_partially_filled"] += int(
+                        family_exec.get("orders_partially_filled", 0) or 0
+                    )
+                    family_stats["orders_resting_unfilled"] += int(
+                        family_exec.get("orders_resting_unfilled", 0) or 0
+                    )
+                    family_stats["orders_canceled_unfilled"] += int(
+                        family_exec.get("orders_canceled_unfilled", 0) or 0
+                    )
                 if guaranteed_cycle_result.usd_submitted > 0:
                     _refresh_last_known_balance()
             elif (
@@ -19447,6 +19747,26 @@ def main(max_cycles: int | None = None) -> None:
                 exc,
                 data={"cycle": cycle_count, "error": str(exc), "error_type": type(exc).__name__},
             )
+
+        if (
+            guaranteed_order_plan.target > 0
+            and guaranteed_order_plan.is_complete
+            and max_cycles is not None
+        ):
+            logger.info(
+                "Guaranteed-order target complete (%d/%d); "
+                "exiting bounded run early after cycle %d",
+                guaranteed_order_plan.completed_count,
+                guaranteed_order_plan.target,
+                cycle_count,
+                data={
+                    "cycle_count": cycle_count,
+                    "max_cycles": max_cycles,
+                    "guaranteed_orders_n": guaranteed_order_plan.target,
+                    "guaranteed_orders_complete": True,
+                },
+            )
+            break
 
         logger.debug(
             "Sleeping for %d seconds before next cycle",

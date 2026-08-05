@@ -73,15 +73,17 @@ python main.py
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
 continues its normal analysis loop but reserves exactly that many distinct
-markets (preferring highest analyzed confidence) for an additional
-initial-plus-deep research pass and forced sized execution from the researched
-side. Ordinary gate-cleared submissions are suppressed in this mode so the run
-cannot exceed the target. Dry runs persist exactly that many attempted-order
-receipts; bounded live runs fail explicitly if Kalshi does not accept all
-target submissions. Live guarantee plans exclude sports while an
-exchange-confirmed jurisdiction hold is active. If that restriction is first
-discovered during forced submission, the rejected sports slot is retired and
-replaced with a non-sports market using a new idempotency key.
+markets (preferring confidence × evidence quality, with event/family diversity)
+for forced sized execution from the researched side. Cycle analysis is reused
+when available (deep-only); weak evidence prefers a diversified replacement
+before forcing. Ordinary gate-cleared submissions are suppressed in this mode
+so the run cannot exceed the target. Dry runs persist exactly that many
+attempted-order receipts; bounded live runs fail explicitly if Kalshi does not
+accept all target submissions and exit early once the target is complete. Live
+guarantee plans exclude sports while an exchange-confirmed jurisdiction hold is
+active. If that restriction is first discovered during forced submission, the
+rejected sports slot is retired and replaced with a non-sports market using a
+new idempotency key.
 
 Start in dry run and switch to live only after reviewing behavior in logs.
 
