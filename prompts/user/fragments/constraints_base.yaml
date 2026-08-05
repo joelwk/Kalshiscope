@@ -2,11 +2,14 @@ name: user/fragments/constraints_base
 description: Base market-analysis constraints appended for all runs.
 lines:
   - "Before classifying evidence: (1) fetch the primary settlement source for this market type, (2) record the observed value and URL, (3) then classify evidence_basis. Do not classify evidence as direct before searching."
-  - "likelihood_ratio must be null (not 0) when no comparative evidence is available; use 1.0 when evidence is equally consistent with both outcomes."
+  - "Edge honesty: my_prob, probability_yes, and confidence must agree after self-critique; chosen-side edge_market vs Kalshi must use that final confidence — not a separate optimistic my_prob."
+  - "implied_prob_external must be a non-Kalshi external YES probability, or null. Never copy Kalshi yes_price into implied_prob_external; without a true external, use edge_source=fallback or none."
+  - "If primary_source_url is a live quote, CLI/METAR, official result, or sportsbook line page, evidence_basis must not be absence_only."
+  - "likelihood_ratio must be null (not 0) when no comparative evidence is available; prefer null over a reflexive 1.0; use 1.0 only when evidence is genuinely equally consistent with both outcomes."
   - "If your source is settlement-aligned (directly resolves the market's settlement criterion), classify it as direct and populate primary_source_url. Proxy is for sources that are adjacent, predictive, or indirectly relevant — not settlement-aligned."
   - "Forecasts, projections, pregame previews, probable lineups, recent-form statistics, and sportsbook odds are proxy evidence even when hosted by an official or allowlisted domain. A trusted URL does not turn a prediction into an observed result."
   - "Upgrade proxy to direct only after the settlement-relevant value/result is observed or final and the source is aligned to the market's exact resolution criterion."
-  - "Aggregator sites (Trading Economics, Investing.com, Macrotrends, Kitco) are proxy-tier for any market, not just commodities. A primary_source_url from an aggregator does not make evidence direct; only official exchange, government, or Tier-1 wire-service pages qualify as settlement-grade."
+  - "Aggregator sites (Trading Economics, Investing.com, Macrotrends, Kitco, CoinGecko, TradingView) are proxy-tier for any market. Cap my_prob/confidence at 0.70 on aggregator-only reads; never claim already-resolved or set definitive_outcome_detected=true from them."
   - "evidence_quality must not exceed 0.75 when evidence_basis=proxy. Having a primary_source_url does NOT change this ceiling. The sole category exception is sports backed by current, citable multi-book sportsbook/consensus odds, which may reach 0.80 as specified in the sports hint and output schema. Otherwise, if proxy eq exceeds 0.75, either reclassify to direct (requires an observed settlement-aligned result and URL) or lower eq to 0.75."
   - Classify your evidence basis as direct, proxy, or absence-only in reasoning.
   - Direct evidence means transcript-level, settlement-aligned, or official primary sources; for non-sports markets, include primary_source_url or classify the evidence as proxy/absence-only.

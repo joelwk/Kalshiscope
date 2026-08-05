@@ -300,7 +300,7 @@ _PRE_ANALYSIS_SOURCE_DIFFICULTY_PENALTIES = {
     "generic": 0.06,
     "politics": 0.08,
     "speech": 0.12,
-    "weather": 0.10,
+    "weather": 0.14,
 }
 _PRE_ANALYSIS_AMBIGUOUS_MARKET_PENALTY = 0.08
 _PRE_ANALYSIS_PROFITABLE_HISTORY_BONUS = 0.06
@@ -308,23 +308,20 @@ _PRE_ANALYSIS_POSITIVE_FAMILY_VOLUME_BONUS = 0.03
 _PRE_ANALYSIS_POSITIVE_FAMILY_PNL_BONUS = 0.02
 _PRE_ANALYSIS_NEGATIVE_PREFIX_PENALTY = 0.08
 # Nudge selection toward families where settlement-aligned DIRECT evidence is
-# reliably obtainable AND actually converts to fills. Calibrated from a 15-cycle
-# review: weather (NWS/NOAA daily highs/lows) was the only family to produce a
-# fill, so it leads. Music was 81% absence-only in practice (no findable
-# settlement data within the analysis window) and is dropped. Entertainment
-# finds evidence but has not converted to trades, so it keeps only a small nudge.
-# Sports is excluded: direct sources but efficiently priced; it is throttled
-# separately via MAX_SPORTS_CANDIDATES_PER_CYCLE.
+# reliably obtainable AND actually converts to fills. Soft affinity only —
+# weather remains eligible but is deprioritized vs sports/crypto after
+# trade-time PnL showed weather as a large hidden loss center.
 _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY = {
-    "weather": 0.12,
+    "weather": 0.04,
     "entertainment": 0.03,
+    "crypto": 0.06,
 }
 # While Michigan sports jurisdiction hold blocks the only historically
 # profitable family, nudge analysis toward executable live-quote families
 # (crypto/generic) and ease weather dominance that mostly recirculates as
 # research_gap / EQ-floor misses. Soft affinity only — never a hard block.
 _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY_SPORTS_HOLD = {
-    "weather": 0.06,
+    "weather": 0.03,
     "crypto": 0.08,
     "generic": 0.04,
     "entertainment": 0.03,
@@ -4277,6 +4274,7 @@ class GuaranteedOrderSlot:
     decision: TradeDecision | None = None
     research_completed: bool = False
     completed: bool = False
+    abandoned: bool = False
     submission_attempts: int = 0
     last_error: str | None = None
     order_id: str | None = None
@@ -4296,6 +4294,7 @@ class GuaranteedOrderPlan:
     slots: list[GuaranteedOrderSlot] = field(default_factory=list)
     normal_execution_suppressed: int = 0
     retired_market_ids: set[str] = field(default_factory=set)
+    research_gap_replacements: int = 0
 
     @property
     def locked_count(self) -> int:
@@ -4304,6 +4303,10 @@ class GuaranteedOrderPlan:
     @property
     def completed_count(self) -> int:
         return sum(1 for slot in self.slots if slot.completed)
+
+    @property
+    def abandoned_count(self) -> int:
+        return sum(1 for slot in self.slots if slot.abandoned)
 
     @property
     def remaining_count(self) -> int:
@@ -4317,14 +4320,28 @@ class GuaranteedOrderPlan:
     def is_complete(self) -> bool:
         return self.completed_count == self.target
 
+    @property
+    def is_resolved(self) -> bool:
+        """True when every target slot is filled or abandoned (no more GO work)."""
+        if self.target <= 0:
+            return True
+        return (self.completed_count + self.abandoned_count) >= self.target
+
+    @property
+    def suppresses_normal_execution(self) -> bool:
+        return self.target > 0 and not self.is_resolved
+
     def summary(self) -> dict[str, Any]:
         return {
             "target": self.target,
             "run_id": self.run_id,
             "locked_count": self.locked_count,
             "completed_count": self.completed_count,
+            "abandoned_count": self.abandoned_count,
             "remaining_count": self.remaining_count,
             "is_complete": self.is_complete,
+            "is_resolved": self.is_resolved,
+            "research_gap_replacements": self.research_gap_replacements,
             "normal_execution_suppressed": self.normal_execution_suppressed,
             "slots": [
                 {
@@ -4334,6 +4351,7 @@ class GuaranteedOrderPlan:
                     "client_order_id": slot.client_order_id,
                     "research_completed": slot.research_completed,
                     "completed": slot.completed,
+                    "abandoned": slot.abandoned,
                     "submission_attempts": slot.submission_attempts,
                     "last_error": slot.last_error,
                     "order_id": slot.order_id,
@@ -4360,6 +4378,7 @@ class GuaranteedOrderAttemptResult:
     intense_research_performed: bool = False
     token_usage: dict[str, int] = field(default_factory=dict)
     error: str | None = None
+    sizing_audit: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -4490,6 +4509,38 @@ def _load_execution_market_snapshot(
     )
 
 
+def _guaranteed_order_priority_scores(
+    analysis_results: dict[str, Any] | None,
+) -> dict[str, float]:
+    """Map market_id -> priority from this cycle's analyzed confidence.
+
+    Guaranteed locks prefer markets the agent was already most confident about.
+    Score is a small tie-breaker so equal-confidence markets still order stably.
+    """
+    priorities: dict[str, float] = {}
+    if not analysis_results:
+        return priorities
+    for market_id, result in analysis_results.items():
+        if not market_id or not isinstance(result, dict):
+            continue
+        decision = result.get("decision")
+        confidence = 0.0
+        if decision is not None:
+            raw_confidence = getattr(decision, "confidence", None)
+            if raw_confidence is None and isinstance(decision, dict):
+                raw_confidence = decision.get("confidence")
+            try:
+                confidence = float(raw_confidence or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+        try:
+            final_score = float(result.get("pre_execution_final_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            final_score = 0.0
+        priorities[str(market_id)] = confidence + (0.01 * final_score)
+    return priorities
+
+
 def _is_guaranteed_order_market_candidate(
     market: Market,
     settings: Settings,
@@ -4521,11 +4572,22 @@ def _is_guaranteed_order_market_candidate(
     return True
 
 
-def _guaranteed_order_market_rank(market: Market) -> tuple[float, float, float, str]:
-    """Prefer liquid, active, information-rich markets for forced research."""
+def _guaranteed_order_market_rank(
+    market: Market,
+    *,
+    priority_by_market_id: dict[str, float] | None = None,
+) -> tuple[float, float, float, float, str]:
+    """Prefer high-confidence analyzed markets, then liquid/active ones."""
+    priority = 0.0
+    if priority_by_market_id:
+        try:
+            priority = float(priority_by_market_id.get(market.id, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            priority = 0.0
     yes_price = _get_outcome_entry_price(market, "YES")
     price_quality = 0.0 if yes_price is None else 1.0 - abs(yes_price - 0.5)
     return (
+        priority,
         float(market.liquidity_usdc or 0.0),
         float(market.volume_24h or market.volume or 0.0),
         price_quality,
@@ -4539,6 +4601,7 @@ def _lock_guaranteed_order_markets(
     *,
     excluded_market_ids: set[str],
     excluded_market_families: set[str] | None = None,
+    priority_by_market_id: dict[str, float] | None = None,
     settings: Settings,
     cycle_number: int,
 ) -> list[GuaranteedOrderSlot]:
@@ -4574,7 +4637,13 @@ def _lock_guaranteed_order_markets(
         and market_family(market) not in normalized_excluded_families
         and _is_guaranteed_order_market_candidate(market, settings)
     ]
-    candidates.sort(key=_guaranteed_order_market_rank, reverse=True)
+    candidates.sort(
+        key=lambda market: _guaranteed_order_market_rank(
+            market,
+            priority_by_market_id=priority_by_market_id,
+        ),
+        reverse=True,
+    )
 
     newly_locked: list[GuaranteedOrderSlot] = []
     candidate_index = 0
@@ -4594,6 +4663,7 @@ def _lock_guaranteed_order_markets(
         slot.decision = None
         slot.research_completed = False
         slot.completed = False
+        slot.abandoned = False
         slot.submission_attempts = 0
         slot.last_error = None
         slot.order_id = None
@@ -4625,13 +4695,137 @@ def _mark_guaranteed_order_slot_for_replacement(
     reason: str,
 ) -> None:
     """Retire an unexecutable market while preserving its fixed plan slot."""
-    if slot.completed:
+    if slot.completed or slot.abandoned:
         return
     plan.retired_market_ids.add(slot.market_id)
     slot.needs_replacement = True
     slot.replacement_reason = reason
     if not slot.last_error:
         slot.last_error = reason
+
+
+def _abandon_guaranteed_order_slot(
+    plan: GuaranteedOrderPlan,
+    slot: GuaranteedOrderSlot,
+    *,
+    reason: str,
+) -> None:
+    """Close a slot after research without a forced fill (conditional-fill mode)."""
+    if slot.completed or slot.abandoned:
+        return
+    plan.retired_market_ids.add(slot.market_id)
+    slot.abandoned = True
+    slot.needs_replacement = False
+    slot.replacement_reason = reason
+    slot.last_error = reason
+
+
+def _guaranteed_order_research_gap_reason(
+    decision: TradeDecision,
+    settings: Settings,
+) -> str | None:
+    """Return an audit label when deep research would fail ordinary evidence gates.
+
+    Guaranteed mode still forces a fill after research; this label is stamped
+    into sizing/audit metadata so operators can see weak-evidence forced slots.
+    """
+    basis = str(decision.evidence_basis or "").strip().lower()
+    edge_src = str(decision.edge_source or "").strip().lower()
+    try:
+        evidence_quality = float(decision.evidence_quality or 0.0)
+    except (TypeError, ValueError):
+        evidence_quality = 0.0
+    source_url = str(decision.primary_source_url or "").strip()
+    if basis == "absence_only":
+        return "guaranteed_order_research_gap_absence_only"
+    if evidence_quality < float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE):
+        return "guaranteed_order_research_gap_low_evidence_quality"
+    if edge_src == "none":
+        if basis in {"proxy", "direct"} and source_url:
+            return None
+        return "guaranteed_order_research_gap_edge_source_none"
+    return None
+
+
+def _guaranteed_order_sized_amount_usdc(
+    *,
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> tuple[float, dict[str, Any]]:
+    """Kelly-size a non-gap guaranteed order, floored at MIN_BET and capped at MAX_BET."""
+    min_bet = max(0.0, float(settings.MIN_BET_USDC))
+    max_bet = max(0.0, float(settings.MAX_BET_USDC))
+    if max_bet > 0:
+        min_bet = min(min_bet, max_bet)
+    sizing_audit: dict[str, Any] = {
+        "guaranteed_order_sizing_mode": "min_bet_floor",
+        "kelly_raw": None,
+        "kelly_fraction_value": None,
+        "extreme_edge_size_dampener": 1.0,
+    }
+    amount_usdc = min_bet
+    outcome = str(decision.outcome or "").strip().upper()
+    implied_prob = _get_implied_probability(market, outcome)
+    posterior: float | None = None
+    for candidate in (decision.my_prob, decision.confidence):
+        if candidate is None:
+            continue
+        try:
+            posterior = float(candidate)
+            break
+        except (TypeError, ValueError):
+            continue
+    if (
+        settings.KELLY_SIZING_ENABLED
+        and implied_prob is not None
+        and posterior is not None
+        and max_bet > 0
+    ):
+        edge_value = float(posterior) - float(implied_prob)
+        kelly_fraction_value = _kelly_fraction_for_decision(
+            market,
+            settings,
+            decision,
+            float(posterior),
+        )
+        min_edge = _edge_threshold_for_market(
+            float(implied_prob),
+            settings,
+            market=market,
+            decision=decision,
+        )
+        kelly_raw_value = kelly_fraction(
+            posterior=float(posterior),
+            market_price=float(implied_prob),
+        )
+        bet_pct = kelly_bet_pct(
+            posterior=float(posterior),
+            market_price=float(implied_prob),
+            fraction=kelly_fraction_value,
+            min_edge=min_edge,
+            edge=edge_value,
+            dynamic_enabled=True,
+        )
+        dampener = _extreme_edge_size_dampener(edge_value, settings)
+        if dampener < 1.0 and bet_pct > 0.0:
+            bet_pct = max(0.0, min(1.0, bet_pct * dampener))
+        kelly_amount = max_bet * float(bet_pct)
+        amount_usdc = max(min_bet, kelly_amount) if kelly_amount > 0.0 else min_bet
+        amount_usdc = min(amount_usdc, max_bet)
+        sizing_audit.update(
+            {
+                "guaranteed_order_sizing_mode": "kelly",
+                "kelly_raw": kelly_raw_value,
+                "kelly_fraction_value": kelly_fraction_value,
+                "extreme_edge_size_dampener": dampener,
+                "kelly_bet_pct": bet_pct,
+                "posterior_for_kelly": posterior,
+                "implied_prob_for_kelly": implied_prob,
+                "min_edge_for_kelly": min_edge,
+            }
+        )
+    return amount_usdc, sizing_audit
 
 
 def _forced_execution_decision(
@@ -4660,19 +4854,21 @@ def _forced_execution_decision(
     bet_size_pct = 1.0
     if max_bet_usdc > 0:
         bet_size_pct = max(0.0, min(1.0, amount_usdc / max_bet_usdc))
-    return decision.model_copy(
-        update={
-            "should_trade": True,
-            "abstain": False,
-            "outcome": outcome,
-            "bet_size_pct": bet_size_pct,
-            "reasoning": (
-                "[GuaranteedOrder forced after initial+deep research; "
-                "ordinary execution gates are audit-only for this slot] "
-                f"{decision.reasoning}"
-            ),
-        }
-    )
+    updates: dict[str, Any] = {
+        "should_trade": True,
+        "abstain": False,
+        "outcome": outcome,
+        "bet_size_pct": bet_size_pct,
+        "reasoning": (
+            "[GuaranteedOrder forced after initial+deep research; "
+            "ordinary execution gates are audit-only for this slot] "
+            f"{decision.reasoning}"
+        ),
+    }
+    if str(decision.edge_source or "").strip().lower() == "none":
+        # Research cleared via proxy/direct+URL; stamp computed for Kelly audit.
+        updates["edge_source"] = "computed"
+    return decision.model_copy(update=updates)
 
 
 def _attempt_guaranteed_order_slot(
@@ -4685,6 +4881,7 @@ def _attempt_guaranteed_order_slot(
 ) -> GuaranteedOrderAttemptResult:
     """Research a locked slot intensely and make its one forced order attempt."""
     intense_research_performed = False
+    sizing_audit: dict[str, Any] = {}
     token_usage = {
         "prompt_tokens": 0,
         "completion_tokens": 0,
@@ -4727,6 +4924,14 @@ def _attempt_guaranteed_order_slot(
                 search_config=search_config,
             )
             _capture_usage(deep_decision)
+            gap_reason = _guaranteed_order_research_gap_reason(deep_decision, settings)
+            amount_usdc, sizing_audit = _guaranteed_order_sized_amount_usdc(
+                decision=deep_decision,
+                market=research_market,
+                settings=settings,
+            )
+            if gap_reason is not None:
+                sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
             decision = _forced_execution_decision(
                 deep_decision,
                 research_market,
@@ -4746,6 +4951,22 @@ def _attempt_guaranteed_order_slot(
                 token_usage=token_usage,
                 error=error,
             )
+    else:
+        gap_reason = _guaranteed_order_research_gap_reason(decision, settings)
+        amount_usdc, sizing_audit = _guaranteed_order_sized_amount_usdc(
+            decision=decision,
+            market=slot.market,
+            settings=settings,
+        )
+        if gap_reason is not None:
+            sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
+        decision = _forced_execution_decision(
+            decision,
+            slot.market,
+            amount_usdc=amount_usdc,
+            max_bet_usdc=settings.MAX_BET_USDC,
+        )
+        slot.decision = decision
 
     try:
         execution_snapshot = _load_execution_market_snapshot(
@@ -4778,6 +4999,7 @@ def _attempt_guaranteed_order_slot(
             intense_research_performed=intense_research_performed,
             token_usage=token_usage,
             error=error,
+            sizing_audit=sizing_audit,
         )
 
     if settings.DRY_RUN:
@@ -4789,6 +5011,7 @@ def _attempt_guaranteed_order_slot(
             amount_usdc=amount_usdc,
             intense_research_performed=intense_research_performed,
             token_usage=token_usage,
+            sizing_audit=sizing_audit,
         )
 
     order = _build_order_request_from_market(active_market, decision, amount_usdc)
@@ -4812,6 +5035,7 @@ def _attempt_guaranteed_order_slot(
             intense_research_performed=intense_research_performed,
             token_usage=token_usage,
             error=error,
+            sizing_audit=sizing_audit,
         )
 
     lifecycle = _order_lifecycle_metrics(
@@ -4847,6 +5071,7 @@ def _attempt_guaranteed_order_slot(
         submission_attempted=True,
         intense_research_performed=intense_research_performed,
         token_usage=token_usage,
+        sizing_audit=sizing_audit,
     )
 
 
@@ -4862,6 +5087,7 @@ def _run_guaranteed_order_phase(
     state_manager: MarketStateManager,
     log_decision: Any,
     extended_research_market_ids: set[str],
+    priority_by_market_id: dict[str, float] | None = None,
 ) -> GuaranteedOrderCycleResult:
     result = GuaranteedOrderCycleResult()
     sports_jurisdiction_hold = (
@@ -4898,6 +5124,7 @@ def _run_guaranteed_order_phase(
             markets,
             excluded_market_ids=excluded_market_ids,
             excluded_market_families=excluded_market_families,
+            priority_by_market_id=priority_by_market_id,
             settings=settings,
             cycle_number=cycle_number,
         )
@@ -4917,6 +5144,7 @@ def _run_guaranteed_order_phase(
                         if slot.replacement_count > 0
                     ],
                     "excluded_market_families": sorted(excluded_market_families),
+                    "priority_scores_applied": bool(priority_by_market_id),
                 },
             )
         return new_slots
@@ -4935,7 +5163,7 @@ def _run_guaranteed_order_phase(
     pending_slots = [
         slot
         for slot in plan.slots
-        if not slot.completed and not slot.needs_replacement
+        if not slot.completed and not slot.abandoned and not slot.needs_replacement
     ]
     while pending_slots:
         slot = pending_slots.pop(0)
@@ -4985,6 +5213,8 @@ def _run_guaranteed_order_phase(
             "deep_research_used": slot.research_completed,
             "normal_execution_gates_bypassed": True,
             "forced_bet_amount_usdc": attempt.amount_usdc,
+            "market_family": market_family(slot.market),
+            **(attempt.sizing_audit or {}),
         }
         if attempt.status in {"research_failed", "invalid_bet_size"}:
             result.failures.append(
@@ -5012,27 +5242,107 @@ def _run_guaranteed_order_phase(
                     "error": attempt.error,
                 }
             )
+            replacement_reason = (
+                str(attempt.error or "").strip()
+                or "guaranteed_order_market_validation_failed"
+            )
+            max_gap_replacements = int(
+                settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
+            )
+            if plan.research_gap_replacements >= max_gap_replacements:
+                _abandon_guaranteed_order_slot(
+                    plan,
+                    slot,
+                    reason=f"{replacement_reason}_replace_cap",
+                )
+                logger.warning(
+                    "Guaranteed-order unexecutable replace cap reached "
+                    "(%d); abandoning slot %d market=%s",
+                    max_gap_replacements,
+                    slot.slot_number,
+                    slot.market_id,
+                    data={
+                        **audit,
+                        "market_id": slot.market_id,
+                        "research_gap_replacements": plan.research_gap_replacements,
+                        "guaranteed_order_abandoned": True,
+                        "abandon_reason": slot.last_error,
+                    },
+                )
+                if decision is not None:
+                    log_decision(
+                        market_id=slot.market_id,
+                        question=slot.market.question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="guaranteed_order_market_validation",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="guaranteed_order_market_validation_replace_cap",
+                            guaranteed_order_abandoned=True,
+                            order_error=attempt.error,
+                            **audit,
+                        ),
+                    )
+                continue
+            plan.research_gap_replacements += 1
+            retired_market_id = slot.market_id
+            retired_question = slot.market.question
+            _mark_guaranteed_order_slot_for_replacement(
+                plan,
+                slot,
+                reason=replacement_reason,
+            )
+            replacement_slots = _lock_available_slots()
+            if slot.needs_replacement:
+                _abandon_guaranteed_order_slot(
+                    plan,
+                    slot,
+                    reason=f"{replacement_reason}_no_replacement",
+                )
+                logger.warning(
+                    "Guaranteed-order market validation failed with no replacement; "
+                    "abandoning slot %d market=%s",
+                    slot.slot_number,
+                    retired_market_id,
+                    data={
+                        **audit,
+                        "market_id": retired_market_id,
+                        "guaranteed_order_abandoned": True,
+                        "abandon_reason": slot.last_error,
+                    },
+                )
+                if decision is not None:
+                    log_decision(
+                        market_id=retired_market_id,
+                        question=retired_question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="guaranteed_order_market_validation",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason="guaranteed_order_market_validation_no_replacement",
+                            guaranteed_order_abandoned=True,
+                            order_error=attempt.error,
+                            **audit,
+                        ),
+                    )
+                continue
             if decision is not None:
                 log_decision(
-                    market_id=slot.market_id,
-                    question=slot.market.question,
+                    market_id=retired_market_id,
+                    question=retired_question,
                     decision=decision.model_dump(),
                     execution_audit=_build_execution_audit(
                         decision_phase="guaranteed_order_market_validation",
                         decision_terminal=False,
                         final_action="skip",
-                        final_reason="guaranteed_order_market_validation_failed",
+                        final_reason=replacement_reason,
                         guaranteed_order_retry_pending=True,
                         order_error=attempt.error,
                         **audit,
                     ),
                 )
-            _mark_guaranteed_order_slot_for_replacement(
-                plan,
-                slot,
-                reason="guaranteed_order_market_validation_failed",
-            )
-            replacement_slots = _lock_available_slots()
             pending_slots.extend(replacement_slots)
             continue
         if decision is None:
@@ -5040,6 +5350,7 @@ def _run_guaranteed_order_phase(
 
         active_market = attempt.active_market or slot.market
         family = market_family(active_market)
+        audit["market_family"] = family
         if attempt.status == "dry_run" or attempt.submission_attempted:
             result.attempted += 1
             result.attempts_by_family[family] = (
@@ -9095,6 +9406,57 @@ def _research_queue_execution_near_miss_tier(entry: dict[str, Any]) -> int:
     return 0 if gate_name in _RESEARCH_QUEUE_EXECUTION_NEAR_MISS_GATES else 1
 
 
+def _research_queue_entry_score_and_kelly(
+    entry: dict[str, Any],
+) -> tuple[float | None, float | None]:
+    """Best-effort pre_execution score and kelly_raw from queue entry metadata."""
+    payload: dict[str, Any] | None = None
+    audit: dict[str, Any] = {}
+    decision_json = entry.get("last_decision_json")
+    if decision_json:
+        try:
+            payload = json.loads(decision_json)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            raw_audit = payload.get("audit")
+            if isinstance(raw_audit, dict):
+                audit = raw_audit
+    final_score: float | None = None
+    kelly_raw: float | None = None
+    for source in (entry, audit, payload or {}):
+        if not isinstance(source, dict):
+            continue
+        if final_score is None:
+            raw_score = source.get("pre_execution_final_score")
+            if isinstance(raw_score, (int, float)):
+                final_score = float(raw_score)
+        if kelly_raw is None:
+            raw_kelly = source.get("score_kelly_raw")
+            if raw_kelly is None:
+                raw_kelly = source.get("kelly_raw")
+            if isinstance(raw_kelly, (int, float)):
+                kelly_raw = float(raw_kelly)
+        if final_score is not None and kelly_raw is not None:
+            break
+    return final_score, kelly_raw
+
+
+def _research_queue_entry_is_high_priority_drain(
+    entry: dict[str, Any],
+    settings: Settings,
+) -> bool:
+    """True when score/Kelly near-miss warrants early drain (min-age waiver)."""
+    final_score, kelly_raw = _research_queue_entry_score_and_kelly(entry)
+    score_threshold = float(settings.RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD)
+    kelly_threshold = float(settings.RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD)
+    if final_score is not None and final_score >= score_threshold:
+        return True
+    if kelly_raw is not None and kelly_raw >= kelly_threshold:
+        return True
+    return False
+
+
 def _research_queue_drain_sort_key(
     entry: dict[str, Any],
 ) -> tuple[int, float, float, int, str, str]:
@@ -9878,11 +10240,16 @@ def main(max_cycles: int | None = None) -> None:
     )
     if guaranteed_order_plan.target > 0:
         logger.warning(
-            "Guaranteed-order mode enabled: exactly %d forced order(s) will be "
-            "submitted/attempted; ordinary gate-cleared executions are suppressed",
+            "Guaranteed-order mode enabled: %d forced order(s) after "
+            "initial+deep research on highest-confidence locks; ordinary executions "
+            "suppressed until the plan completes (unexecutable replace cap=%d)",
             guaranteed_order_plan.target,
+            settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS,
             data={
                 "guaranteed_orders_n": guaranteed_order_plan.target,
+                "guaranteed_order_max_research_gap_replacements": (
+                    settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
+                ),
                 "dry_run": settings.DRY_RUN,
                 "normal_execution_suppressed": True,
             },
@@ -11161,6 +11528,34 @@ def main(max_cycles: int | None = None) -> None:
                                 waiver_row["near_close_drain_waiver"] = True
                                 drain_rows.append(waiver_row)
                                 known_drain_ids.add(waiver_mid)
+                    high_priority_min_age = max(
+                        0.0,
+                        float(settings.RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS),
+                    )
+                    if high_priority_min_age < float(
+                        settings.RESEARCH_QUEUE_DRAIN_MIN_AGE_HOURS
+                    ):
+                        high_priority_rows = state_manager.get_drainable_research_entries(
+                            min_age_hours=high_priority_min_age,
+                            max_age_hours=settings.RESEARCH_QUEUE_DRAIN_MAX_AGE_HOURS,
+                            limit=drain_pool_limit,
+                            excluded_market_ids=excluded_ids,
+                            included_market_ids=tuple(current_market_ids),
+                        )
+                        known_drain_ids = {
+                            str(row.get("market_id") or "") for row in drain_rows
+                        }
+                        for hp_row in high_priority_rows:
+                            hp_mid = str(hp_row.get("market_id") or "")
+                            if not hp_mid or hp_mid in known_drain_ids:
+                                continue
+                            if not _research_queue_entry_is_high_priority_drain(
+                                hp_row, settings
+                            ):
+                                continue
+                            hp_row["high_priority_drain_waiver"] = True
+                            drain_rows.append(hp_row)
+                            known_drain_ids.add(hp_mid)
                     drain_rows = sorted(
                         drain_rows,
                         key=_research_queue_drain_sort_key,
@@ -14893,13 +15288,62 @@ def main(max_cycles: int | None = None) -> None:
                     and (decision.evidence_quality or 0.0)
                     >= settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY
                 )
+                mid_band_width = max(
+                    0.0, float(settings.ENTRY_PRICE_FLOOR_MID_BAND_WIDTH)
+                )
+                mid_band_floor = max(
+                    0.0, float(settings.VERY_LOW_PRICE_THRESHOLD) - mid_band_width
+                )
+                required_edge_for_mid_band = (
+                    _edge_threshold_for_market(
+                        implied_prob,
+                        settings,
+                        market=active_market,
+                        decision=decision,
+                    )
+                    if implied_prob is not None
+                    else None
+                )
+                primary_source_url = str(
+                    getattr(decision, "primary_source_url", None) or ""
+                ).strip()
+                evidence_basis_normalized = str(
+                    decision.evidence_basis or ""
+                ).strip().lower()
+                entry_price_floor_mid_band_override = (
+                    settings.ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED
+                    and not entry_price_floor_override
+                    and bool(decision.should_trade)
+                    and entry_price is not None
+                    and mid_band_floor <= float(entry_price) < float(
+                        settings.VERY_LOW_PRICE_THRESHOLD
+                    )
+                    and evidence_basis_normalized in {"proxy", "direct"}
+                    and primary_source_url.lower().startswith(("http://", "https://"))
+                    and (decision.evidence_quality or 0.0)
+                    >= float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE)
+                    and _floor_edge is not None
+                    and required_edge_for_mid_band is not None
+                    and float(_floor_edge) >= float(required_edge_for_mid_band)
+                )
+                if entry_price_floor_mid_band_override:
+                    entry_price_floor_override = True
+                    audit_context["entry_price_floor_mid_band_override"] = True
+                    audit_context["entry_price_floor_mid_band_size_multiplier"] = float(
+                        settings.ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER
+                    )
                 audit_context["entry_price_floor_override"] = entry_price_floor_override
                 if entry_price_floor_override and (
                     entry_price is not None
                     and entry_price < settings.VERY_LOW_PRICE_THRESHOLD
                 ):
                     logger.info(
-                        "Entry-price floor bypassed (direct high-edge): market=%s entry=%.3f floor=%.3f edge=%.3f eq=%.2f",
+                        "Entry-price floor bypassed (%s): market=%s entry=%.3f floor=%.3f edge=%.3f eq=%.2f",
+                        (
+                            "mid-band source-backed"
+                            if audit_context.get("entry_price_floor_mid_band_override")
+                            else "direct high-edge"
+                        ),
                         market.id,
                         entry_price,
                         settings.VERY_LOW_PRICE_THRESHOLD,
@@ -14913,6 +15357,9 @@ def main(max_cycles: int | None = None) -> None:
                             "evidence_basis": decision.evidence_basis,
                             "source_match_class": getattr(decision, "source_match_class", None),
                             "evidence_quality": decision.evidence_quality,
+                            "entry_price_floor_mid_band_override": bool(
+                                audit_context.get("entry_price_floor_mid_band_override")
+                            ),
                         },
                     )
                 if (
@@ -16221,6 +16668,21 @@ def main(max_cycles: int | None = None) -> None:
                         0.0,
                         min(1.0, adjusted_bet_pct * extreme_edge_dampener),
                     )
+                mid_band_size_multiplier = audit_context.get(
+                    "entry_price_floor_mid_band_size_multiplier"
+                )
+                if (
+                    isinstance(mid_band_size_multiplier, (int, float))
+                    and float(mid_band_size_multiplier) < 1.0
+                    and adjusted_bet_pct > 0.0
+                ):
+                    audit_context["entry_price_floor_mid_band_original_bet_pct"] = (
+                        adjusted_bet_pct
+                    )
+                    adjusted_bet_pct = max(
+                        0.0,
+                        min(1.0, adjusted_bet_pct * float(mid_band_size_multiplier)),
+                    )
                 family_size_multiplier = float(
                     getattr(score_result, "historical_family_size_multiplier", 1.0)
                     or 1.0
@@ -16836,7 +17298,7 @@ def main(max_cycles: int | None = None) -> None:
                         expected_value_usdc=expected_value_usdc,
                     ),
                 }
-                if guaranteed_order_plan.target > 0:
+                if guaranteed_order_plan.suppresses_normal_execution:
                     guaranteed_order_plan.normal_execution_suppressed += 1
                     logger.info(
                         "Guaranteed-order mode: normal execution suppressed after "
@@ -16847,6 +17309,12 @@ def main(max_cycles: int | None = None) -> None:
                             "guaranteed_orders_n": guaranteed_order_plan.target,
                             "guaranteed_orders_completed": (
                                 guaranteed_order_plan.completed_count
+                            ),
+                            "guaranteed_orders_abandoned": (
+                                guaranteed_order_plan.abandoned_count
+                            ),
+                            "guaranteed_orders_resolved": (
+                                guaranteed_order_plan.is_resolved
                             ),
                             "normal_execution_suppressed": True,
                         },
@@ -17945,7 +18413,7 @@ def main(max_cycles: int | None = None) -> None:
 
             if (
                 guaranteed_order_plan.target > 0
-                and not guaranteed_order_plan.is_complete
+                and not guaranteed_order_plan.is_resolved
                 and not reconciliation_live_blocked
             ):
                 guaranteed_cycle_result = _run_guaranteed_order_phase(
@@ -17959,6 +18427,9 @@ def main(max_cycles: int | None = None) -> None:
                     state_manager=state_manager,
                     log_decision=log_trade_decision,
                     extended_research_market_ids=extended_research_market_ids,
+                    priority_by_market_id=_guaranteed_order_priority_scores(
+                        analysis_results
+                    ),
                 )
                 guaranteed_orders_locked_this_cycle = guaranteed_cycle_result.locked
                 guaranteed_orders_attempted_this_cycle = (
@@ -17992,7 +18463,7 @@ def main(max_cycles: int | None = None) -> None:
                     _refresh_last_known_balance()
             elif (
                 guaranteed_order_plan.target > 0
-                and not guaranteed_order_plan.is_complete
+                and not guaranteed_order_plan.is_resolved
                 and reconciliation_live_blocked
             ):
                 guaranteed_order_failures_this_cycle.append(
@@ -18302,8 +18773,13 @@ def main(max_cycles: int | None = None) -> None:
                 "guaranteed_orders_target": guaranteed_order_plan.target,
                 "guaranteed_orders_locked": guaranteed_order_plan.locked_count,
                 "guaranteed_orders_completed": guaranteed_order_plan.completed_count,
+                "guaranteed_orders_abandoned": guaranteed_order_plan.abandoned_count,
                 "guaranteed_orders_remaining": guaranteed_order_plan.remaining_count,
                 "guaranteed_orders_complete": guaranteed_order_plan.is_complete,
+                "guaranteed_orders_resolved": guaranteed_order_plan.is_resolved,
+                "guaranteed_order_research_gap_replacements": (
+                    guaranteed_order_plan.research_gap_replacements
+                ),
                 "guaranteed_orders_locked_this_cycle": (
                     guaranteed_orders_locked_this_cycle
                 ),
@@ -18989,22 +19465,34 @@ def main(max_cycles: int | None = None) -> None:
 
     if guaranteed_order_plan.target > 0:
         guarantee_summary = guaranteed_order_plan.summary()
-        if not guaranteed_order_plan.is_complete:
+        if not guaranteed_order_plan.is_resolved:
             message = (
                 "Guaranteed-order run incomplete: "
                 f"completed={guaranteed_order_plan.completed_count}/"
                 f"{guaranteed_order_plan.target}, "
+                f"abandoned={guaranteed_order_plan.abandoned_count}, "
                 f"locked={guaranteed_order_plan.locked_count}. "
                 "The run is not considered completed."
             )
             logger.critical(message, data=guarantee_summary)
             raise GuaranteedOrdersIncompleteError(message)
-        logger.warning(
-            "Guaranteed-order run completed exactly at target: %d/%d",
-            guaranteed_order_plan.completed_count,
-            guaranteed_order_plan.target,
-            data=guarantee_summary,
-        )
+        if not guaranteed_order_plan.is_complete:
+            logger.warning(
+                "Guaranteed-order run resolved under target: "
+                "completed=%d/%d abandoned=%d unexecutable_replacements=%d",
+                guaranteed_order_plan.completed_count,
+                guaranteed_order_plan.target,
+                guaranteed_order_plan.abandoned_count,
+                guaranteed_order_plan.research_gap_replacements,
+                data=guarantee_summary,
+            )
+        else:
+            logger.warning(
+                "Guaranteed-order run completed exactly at target: %d/%d",
+                guaranteed_order_plan.completed_count,
+                guaranteed_order_plan.target,
+                data=guarantee_summary,
+            )
 
 
 if __name__ == "__main__":

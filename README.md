@@ -72,12 +72,13 @@ python main.py
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
-continues its normal analysis and gating loop but reserves exactly that many
-distinct markets for an additional initial-plus-deep research pass and forced
-minimum-size execution. Ordinary gate-cleared submissions are suppressed in
-this mode so the run cannot exceed the target. Dry runs persist exactly that
-many attempted-order receipts; bounded live runs fail explicitly if Kalshi does
-not accept all target submissions. Live guarantee plans exclude sports while an
+continues its normal analysis loop but reserves exactly that many distinct
+markets (preferring highest analyzed confidence) for an additional
+initial-plus-deep research pass and forced sized execution from the researched
+side. Ordinary gate-cleared submissions are suppressed in this mode so the run
+cannot exceed the target. Dry runs persist exactly that many attempted-order
+receipts; bounded live runs fail explicitly if Kalshi does not accept all
+target submissions. Live guarantee plans exclude sports while an
 exchange-confirmed jurisdiction hold is active. If that restriction is first
 discovered during forced submission, the rejected sports slot is retired and
 replaced with a non-sports market using a new idempotency key.

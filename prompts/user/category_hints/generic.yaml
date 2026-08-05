@@ -3,7 +3,13 @@ description: Fallback guidance for unclassified markets.
 content: >-
   Generic guidance: these markets cover macro, policy, indices, and unclassified events. Apply a higher evidence bar than domain-specific categories — require a primary source URL that directly addresses the settlement criterion before setting should_trade=true.
 
-  Source hierarchy: (1) Official government or regulator release (Fed statements, BLS/BEA reports, official filings). (2) Tier-1 wire service with dateline (Reuters, AP, Bloomberg). (3) Exchange or platform settlement page. Do not use opinion commentary, aggregator sites, or secondary analysis as direct evidence.
+  Source hierarchy: (1) Official government or regulator release (Fed statements, BLS/BEA reports, FRED, official filings). (2) Tier-1 wire service with dateline (Reuters, AP, Bloomberg, WSJ live quote). (3) Exchange or platform settlement page. Do not use opinion commentary, aggregator sites, or secondary analysis as direct evidence.
+
+  Aggregator discipline: Trading Economics, Investing.com, Macrotrends, and similar are proxy-tier only. Never write that the market "already resolves" from an aggregator print; cap my_prob and confidence at 0.70, keep evidence_basis=proxy, and leave definitive_outcome_detected=false. Prefer FRED / Treasury / WSJ / Reuters quote pages for rates and indexes.
+
+  Edge honesty: do not set my_prob near 0.95+ on a thin aggregator or stale prior close while Kalshi prices a coin-flip — that edge will be treated as hallucinated. Keep my_prob aligned with confidence after self-critique.
+
+  External odds hygiene: never copy Kalshi yes_price into implied_prob_external. Without a true external feed, leave implied_prob_external null and use edge_source=fallback or none.
 
   Before setting confidence above 0.65: cite the specific sentence or data point from the primary source that addresses the settlement criterion. If you cannot identify one sentence, evidence_basis is proxy or absence_only — lower confidence accordingly.
 

@@ -656,19 +656,68 @@ def _print_confidence_tier_breakdown(db_path: str) -> None:
         conn.close()
 
 
-def _print_category_breakdown(rows: list[sqlite3.Row]) -> None:
+def _load_order_attempt_market_families(
+    db_path: str,
+    market_ids: list[str],
+) -> dict[str, str]:
+    """Map market_id -> trade-time market_family from the latest order_attempt receipt."""
+    if not market_ids:
+        return {}
+    conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in market_ids)
+        rows = conn.execute(
+            f"""
+            SELECT dr.market_id AS market_id,
+                   json_extract(dr.audit_json, '$.market_family') AS market_family
+            FROM decision_receipts dr
+            JOIN (
+                SELECT market_id, MAX(id) AS id
+                FROM decision_receipts
+                WHERE final_action = 'order_attempt'
+                  AND market_id IN ({placeholders})
+                GROUP BY market_id
+            ) latest ON latest.id = dr.id
+            """,
+            market_ids,
+        ).fetchall()
+        out: dict[str, str] = {}
+        for row in rows:
+            fam = str(row["market_family"] or "").strip().lower()
+            mid = str(row["market_id"] or "").strip()
+            if mid and fam and fam not in {"none", "null", "unknown"}:
+                out[mid] = fam
+        return out
+    finally:
+        conn.close()
+
+
+def _print_category_breakdown(rows: list[sqlite3.Row], *, db_path: str) -> None:
     _print_section("PnL by Category")
     if not rows:
         print("No category breakdown available (no settlements).")
         return
 
+    market_ids = sorted(
+        {
+            str(row["market_id"] or "").strip()
+            for row in rows
+            if str(row["market_id"] or "").strip()
+        }
+    )
+    trade_time_families = _load_order_attempt_market_families(db_path, market_ids)
+
     grouped: dict[str, dict[str, float]] = {}
     for row in rows:
-        family = MarketStateManager._infer_family_from_state_row(
-            market_id=str(row["market_id"] or ""),
-            question=str(row["question"] or ""),
-            category=str(row["category"] or ""),
-        )
+        market_id = str(row["market_id"] or "").strip()
+        family = trade_time_families.get(market_id)
+        if not family:
+            family = MarketStateManager._infer_family_from_state_row(
+                market_id=market_id,
+                question=str(row["question"] or ""),
+                category=str(row["category"] or ""),
+            )
         bucket = grouped.setdefault(
             family,
             {
@@ -923,7 +972,7 @@ def main() -> None:
         )
         _print_total_realized_pnl(report_rows, state_manager)
         _print_daily_run_history(report_rows, rolling_days=max(1, args.rolling_days))
-        _print_category_breakdown(report_rows)
+        _print_category_breakdown(report_rows, db_path=args.db)
         _print_confidence_tier_breakdown(args.db)
         _print_conversion_funnel(args.db)
         _print_monthly_breakdown(report_rows)

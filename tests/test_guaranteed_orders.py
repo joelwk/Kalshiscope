@@ -113,15 +113,25 @@ def _market(
     )
 
 
-def _decision() -> TradeDecision:
+def _decision(
+    *,
+    evidence_basis: str = "proxy",
+    edge_source: str = "computed",
+    evidence_quality: float = 0.8,
+    primary_source_url: str | None = "https://example.com/source",
+) -> TradeDecision:
     return TradeDecision(
         should_trade=False,
         outcome="YES",
         probability_yes=0.72,
         confidence=0.72,
+        my_prob=0.72,
         bet_size_pct=0.0,
         reasoning="Deep evidence favors YES.",
-        evidence_quality=0.8,
+        evidence_quality=evidence_quality,
+        evidence_basis=evidence_basis,
+        edge_source=edge_source,
+        primary_source_url=primary_source_url,
         abstain=True,
         prompt_tokens=10,
         completion_tokens=5,
@@ -222,6 +232,109 @@ def test_guaranteed_dry_run_forces_deep_side_and_counts_one_attempt(tmp_path) ->
         "reasoning_tokens": 4,
         "cached_tokens": 2,
     }
+
+
+def test_guaranteed_forces_absence_only_after_deep_research(tmp_path) -> None:
+    market = _market("gap-forced")
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-gap-001",
+    )
+    grok = _GuaranteedGrok(
+        _decision(evidence_basis="absence_only", edge_source="none", evidence_quality=0.2)
+    )
+    kalshi = _GuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            settings=main.Settings(
+                DRY_RUN=True,
+                GUARANTEED_ORDERS_N=1,
+                MIN_BET_USDC=5.0,
+                MAX_BET_USDC=12.0,
+            ),
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.decision is not None
+    assert result.decision.should_trade is True
+    assert result.amount_usdc == 5.0
+    assert result.sizing_audit["guaranteed_order_research_gap_bypassed"] == (
+        "guaranteed_order_research_gap_absence_only"
+    )
+    assert slot.submission_attempts == 1
+    assert kalshi.submitted_market_ids == []
+
+
+def test_guaranteed_phase_forces_weak_evidence_without_replacement(tmp_path) -> None:
+    gap_market = _market("gap-high", liquidity=900.0)
+    good_market = _market("good-low", liquidity=100.0)
+    gap_decision = _decision(
+        evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
+    )
+
+    grok = _GuaranteedGrok(gap_decision)
+    kalshi = _LiveGuaranteedKalshi([gap_market, good_market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="gap-force")
+    decisions: list[dict] = []
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[gap_market, good_market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(
+                DRY_RUN=False,
+                GUARANTEED_ORDERS_N=1,
+                MIN_BET_USDC=5.0,
+                MAX_BET_USDC=12.0,
+            ),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            log_decision=lambda **kwargs: decisions.append(kwargs),
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert plan.is_complete
+    # Highest liquidity lock is forced even with absence_only research.
+    assert plan.slots[0].market_id == "gap-high"
+    assert kalshi.submitted_market_ids == ["gap-high"]
+    assert decisions[-1]["execution_audit"]["final_reason"] == "order_submitted"
+    assert decisions[-1]["execution_audit"][
+        "guaranteed_order_research_gap_bypassed"
+    ] == "guaranteed_order_research_gap_absence_only"
+
+
+def test_lock_guaranteed_markets_prefers_analyzed_confidence() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    low_liq_confident = _market("confident", liquidity=50.0)
+    high_liq_weak = _market("liquid", liquidity=900.0)
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [high_liq_weak, low_liq_confident],
+        excluded_market_ids=set(),
+        priority_by_market_id={"confident": 0.91, "liquid": 0.40},
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["confident"]
 
 
 def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> None:
@@ -396,6 +509,150 @@ def test_bounded_main_dry_run_records_exact_guaranteed_target(
     assert cycle_receipt is not None
     assert '"guaranteed_orders_complete": true' in cycle_receipt["payload_json"]
     assert kalshi.submitted_market_ids == []
+
+
+def test_guaranteed_allows_edge_source_none_with_proxy_url_and_eq(tmp_path) -> None:
+    market = _market("proxy-forced")
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-proxy-001",
+    )
+    grok = _GuaranteedGrok(
+        _decision(evidence_basis="proxy", edge_source="none", evidence_quality=0.8)
+    )
+    kalshi = _GuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            settings=main.Settings(
+                DRY_RUN=True,
+                GUARANTEED_ORDERS_N=1,
+                MIN_BET_USDC=5.0,
+                MAX_BET_USDC=12.0,
+            ),
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.decision is not None
+    assert result.decision.edge_source == "computed"
+    assert result.decision.should_trade is True
+    assert slot.submission_attempts == 1
+
+
+def test_guaranteed_phase_forces_fill_despite_weak_evidence_across_candidates(
+    tmp_path,
+) -> None:
+    markets = [
+        _market(f"gap-{idx}", liquidity=1000.0 - idx) for idx in range(4)
+    ]
+    gap_decision = _decision(
+        evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
+    )
+
+    class _AllGapGrok:
+        def __init__(self) -> None:
+            self.deep_calls: list[str] = []
+
+        def analyze_market(self, market, **kwargs):
+            return gap_decision
+
+        def analyze_market_deep(self, market, **kwargs):
+            self.deep_calls.append(market.id)
+            return gap_decision
+
+    grok = _AllGapGrok()
+    kalshi = _LiveGuaranteedKalshi(markets)
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="gap-force-cap")
+    decisions: list[dict] = []
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=markets,
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(
+                DRY_RUN=False,
+                GUARANTEED_ORDERS_N=1,
+                GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=2,
+                MIN_BET_USDC=5.0,
+                MAX_BET_USDC=12.0,
+            ),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            log_decision=lambda **kwargs: decisions.append(kwargs),
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert plan.is_complete is True
+    assert plan.abandoned_count == 0
+    assert len(grok.deep_calls) == 1
+    assert kalshi.submitted_market_ids == ["gap-0"]
+    assert decisions[-1]["execution_audit"]["final_reason"] == "order_submitted"
+    assert plan.suppresses_normal_execution is False
+
+
+def test_bounded_main_completes_guaranteed_target_with_weak_evidence(
+    monkeypatch,
+    dummy_settings,
+) -> None:
+    markets = [_market(f"gap-{idx}", liquidity=500.0 - idx) for idx in range(3)]
+    gap_decision = _decision(
+        evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
+    )
+    grok = _GuaranteedGrok(gap_decision)
+    kalshi = _GuaranteedKalshi(markets)
+    settings = replace(
+        dummy_settings,
+        GUARANTEED_ORDERS_N=1,
+        GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=1,
+        DRY_RUN=True,
+        MIN_VOLUME_24H=0.0,
+        MIN_OPEN_INTEREST=0.0,
+        MARKET_MIN_CLOSE_DAYS=None,
+        MARKET_MAX_CLOSE_DAYS=None,
+        POLL_INTERVAL_SEC=0,
+    )
+    monkeypatch.setattr(main, "load_settings", lambda: settings)
+    monkeypatch.setattr(main, "GrokClient", lambda *args, **kwargs: grok)
+    monkeypatch.setattr(main, "KalshiClient", lambda *args, **kwargs: kalshi)
+    monkeypatch.setattr(main.time, "sleep", lambda _: None)
+
+    main.main(max_cycles=1)
+
+    verifier = MarketStateManager(settings.STATE_DB_PATH)
+    try:
+        cycle_receipt = verifier._conn.execute(
+            "SELECT payload_json FROM cycle_receipts ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        attempts = verifier._conn.execute(
+            """
+            SELECT market_id
+            FROM decision_receipts
+            WHERE final_action = 'order_attempt'
+              AND final_reason = 'dry_run'
+            """
+        ).fetchall()
+    finally:
+        verifier.close()
+
+    assert cycle_receipt is not None
+    assert '"guaranteed_orders_resolved": true' in cycle_receipt["payload_json"]
+    assert '"guaranteed_orders_complete": true' in cycle_receipt["payload_json"]
+    assert len(attempts) == 1
 
 
 def test_bounded_main_fails_when_target_cannot_be_fully_locked(

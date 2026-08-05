@@ -972,6 +972,21 @@ class MarketStateManager:
                     else None,
                 ),
             )
+            # Persist trade-time family into markets.category when missing so
+            # settlement-era reports do not collapse everything to "generic".
+            family = None
+            if isinstance(execution_audit, dict):
+                family = str(execution_audit.get("market_family") or "").strip().lower()
+            if family and family not in {"none", "null", "unknown"}:
+                self._conn.execute(
+                    """
+                    INSERT INTO markets (id, category)
+                    VALUES (?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        category = COALESCE(markets.category, excluded.category)
+                    """,
+                    (market_id, family),
+                )
 
     def get_daily_order_attempt_summary(
         self,

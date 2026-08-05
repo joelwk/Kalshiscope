@@ -6,32 +6,31 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Jul 28 2026: https URL hygiene examples, side-consistency rule,
-    # and crypto live-quote few-shot (execution-yield alignment).
-    "analyze": "7db641bc7aee12b95d30aaee4de88c20249a8fe56658d73dcf637af06e49ad2a",
-    "deep": "ea0c9f26bb4f9b1dcb492186239980483037c0ba60c05308aecde420bd2b6f1c",
+    # Re-pinned Aug 4 2026: edge honesty, external-odds hygiene, aggregator/MapClick caps.
+    "analyze": "03d857e58c10a71f64b8da7c6ac49b84ee30fb1d7f0fd0577687960be1044c58",
+    "deep": "d04c2d3565b836fac6a8f42fb1bc2e992d1eac1aceba1e119857929910edfc9e",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    # Re-pinned Jul 29 2026: deep constraints repair-before-abstain lines.
-    "commodities:deep_false": "5ace0c9e5c8448d4ad6caad4a3e64d30b178078b63237bdc4a6b0aa1cb84650a",
-    "commodities:deep_true": "619ef9ec2575c891090092db00fdce3bf1e225e6e746bd187bbefebbbf1e789b",
-    "crypto:deep_false": "296581f0b94cf1a90e39fc0e6b981cf96283143a0f7fbb64aee5f8c5f895f553",
-    "crypto:deep_true": "7de5dbdef1c2fd6c1cc7db844aec15a71313bdeba6a2c3dc3bd12a5fecc950f4",
-    "generic:deep_false": "de34974965eea79e2a926963f5a7b444f12ab7f8621a5120d1879f26481c258d",
-    "generic:deep_true": "b6e5d0d3186eb8b32babf3fe3a943d78974eeacf61c983dd37507b82e8736dfc",
-    "music:deep_false": "a0d39c5d325a41abdd64dd72aa6662e7283fbc1c70b1272a10fe0c6b72a52b59",
-    "music:deep_true": "f74dce78195e106bf56220b4c29de25871b10b19721048d07187b2109a38c5ce",
-    "politics:deep_false": "877eb11281828ff2aade2c1253170f423539068a0c1f609bdb9ac03931cb2f47",
-    "politics:deep_true": "cd980413d86def36d37cf4f173e0ec75af9f9a64dd8b493475be3033d4254713",
-    "speech:deep_false": "a4dfa6c4e3d77f919a3ca7b9f454249f629e2b0e5df5cad8ad4e0783ba046473",
-    "speech:deep_true": "f904c60a2c1248799fe5fdc559e528041302b5f7433919be03ea58cca233ccdd",
-    "speech_mention:deep_false": "f15420e53452fbb09616a8bea172b6181d90e2f84584fbcbfa4c09b80860d9d2",
-    "speech_mention:deep_true": "ea76dc238b78eaec219b4c681c6ffb025ab61e19f9b95b87404afad671774ac2",
-    "sports:deep_false": "6d6783072a778b067bf364ed473c16226e0c4438fe891440ca67c8f56b5a42f9",
-    "sports:deep_true": "17b6e5c35259d837df3217c14bf662d6dfa05e9162735a4a79d736e765626476",
-    "weather:deep_false": "eeacbb3c933b623e93880a80f8bd27003800ec17393f78547b2357805b9e4db2",
-    "weather:deep_true": "e9a577927c76d9bc0bc5262b441b09b20c9a03525cbd54e3093f57a62b20ebf0",
+    # Re-pinned Aug 4 2026: category/constraint field-hygiene updates.
+    "commodities:deep_false": "49ff9f19b3a207180d690fb26bfacbe9710de56992d33f07fc89eaae1582e5d4",
+    "commodities:deep_true": "f2d19e7c8290ba76a36a3ad778c8acd94421d402804984ac6eba2be01e66cef8",
+    "crypto:deep_false": "7e6c1956a717c9f845cc80f44f48bf8120a33c851a78e4917587c210f7bbfbca",
+    "crypto:deep_true": "85d821b8e4c4f06f1d4adb6fc583913d67e18bcb09389072053df9c10dbefa58",
+    "generic:deep_false": "6849bff3192109e4bdb5cc79e64b796db8bc0cf7333030a6807d9ae4e78e09ed",
+    "generic:deep_true": "a98ff2d218e0beb6fb5cfd81eb08139a60feb117367e7fec3fd0f36d2302a18c",
+    "music:deep_false": "7303d1797ea93804fe6eb871789970967ccbc36b8cafe6a6463321130efc340a",
+    "music:deep_true": "d1e933d58c00c77d63e08e7217617fc8044f3f091467b24192c9303204699339",
+    "politics:deep_false": "82721d5546da9a9a4443eb6f6afcbbcf739e75dcae3a25b8a8cb577c6c65d59f",
+    "politics:deep_true": "c50baf88c2b94ab274e5c06fdb8d6e138435542b3291bba2e5d035e40e17a74d",
+    "speech:deep_false": "a2b9ac7999318002b4b51b71c74b5c92416107cce77d6ac6b131322f14dd81d1",
+    "speech:deep_true": "e7e0fc1dff8c7e6c3ba9dfbf857dffbd474738ff430a37a7375d8111eac55ebf",
+    "speech_mention:deep_false": "d46ab7b93a8010202e09129168c99394bed3ec1914d23847a9c7a9b7418934b6",
+    "speech_mention:deep_true": "a3bd7e3ffcdc91a03ea0016cd999be6f58c649add310be5dbeeba99416ee8552",
+    "sports:deep_false": "66bf19af75717e70c6e9914848d155c2314e684220c024efe47a42faec910d91",
+    "sports:deep_true": "b5664f285b1390718ad1cd7d5b2ebb6e434bd87ec23922f155d0b5103961d54c",
+    "weather:deep_false": "cf722d0988eb77f560b3bac1a13cc39c4952584e0030519fe5bd37417b06a997",
+    "weather:deep_true": "770f9b1214b7ef8f0051181cfaf9ffa707763f098c731697814a5cacf163c4d1",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -41,21 +40,21 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "cached_tokens": "17c3feb94f70c94185ca5932f3717f8808124cb104f6a59ca433d72b6970a180",
     "code_execution_used": "01fa8db002c20f439e072fdc6edbb98dd81754b999e3cd1ae3e763ddb84956a0",
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
-    "confidence": "3993782437221b5549e1c1d527d246a5a9899919641c5bceb63a90a89d4ea137",
+    "confidence": "04b522eca80f69fed0bcb20dfee763f111f267ef6693886f4e9f91f80405271c",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
-    "edge_external": "af45ae57027c853dd040990e6be9dfe0b045772e14690dfc378f91ff56380e2a",
-    "edge_source": "2901c6e3da6168e6b4205bf0660b22475968ecc6b946ebb1a66841b517cd2bce",
-    "evidence_basis": "fd09eed4586de60e1a994291d7b04a2de5603dc17a2b94dce732066888d389da",
+    "edge_external": "f282db8b1f7a551cd97b4d59c60a19c4b081c6dc016a6a302b347376897862b6",
+    "edge_source": "b9776d71fbfe07f42694983863a13414ab896d3e57b689559af48d367499daee",
+    "evidence_basis": "f95084f2b5778968536af2848391348a95eac3b52869a7b065975a69dcbe5d0b",
     "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
     "evidence_quality": "476f825d5b7a15e377c7e8f53749beb0a39db6c6f965065a801ece51ff07b0b6",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",
-    "implied_prob_external": "76bcee210033e309fd75807a13b8ec2cee01051ee4687b4d8dc70a433bf90848",
+    "implied_prob_external": "bcee52dd7b4d7128147948661abcf9b8c71f040a12bfb61123b5f147ce544cdd",
     "key_sources": "3aa0cc5c44f0f8a2ee451eeb25844c11c7d34426c2a2627651c814e5a4f38747",
-    "likelihood_ratio": "d2f282fd76a34dec00a06dbfafac1f4760b46dbab9020d2f690e61611cb26a75",
-    "my_prob": "752cdbc9aba6b7fdc735e8f3c81944467b6598eba3d139041430fd03afdec0c6",
+    "likelihood_ratio": "665e8eb8c191397f65c92dc151a02aca85b7638f3c2c640751da9d89c69917d8",
+    "my_prob": "fe7f5f44a678d62caa666e93054cf80e20cbf465c650ed67984deab8209f5a2f",
     "outcome": "67cf74e5d00e1ebece3635535fb09d9dc67b9a4a997a3246761c44ccd6198399",
     "primary_source_url": "bdd16205b16f6b72d3c9228c2f90468953d813dca5f11c657f2000539c9c1fea",
-    "probability_yes": "c23e1e0ff03c759f6c24ec0a60249568a7f2d449f3e16c6a0efa03d4b8b72802",
+    "probability_yes": "b539166cc0a6aa8aa9d5f77845fd0c94631914dd2834648a0b5c27c26272dcf6",
     "prompt_tokens": "49db0a66d30b18b71326920cd8ceea07a4c204889a27ad00bc6a275ca0c97b36",
     "raw_bet_size_pct": "8f72e04cf77115c2893583367d0f8ae98d15f7725ccca7072b3c9fa3308a0cce",
     "raw_confidence": "e44485c16aeb9954bc3709398af748c4126ff9b1eff3c46fce31f81f28ec30d9",
@@ -63,10 +62,10 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "raw_outcome": "907648115ca3f1fb58fa62d08cbce43ea30930d19ce410f3c1e39031aebd0c53",
     "raw_reasoning": "a26f9a108c792b0d03e1ba7626b7a8d5f68f9c1a48fd1875818ae23d4d1eecc3",
     "raw_should_trade": "4e06a691859874c81a7e47e8eb005df24c905457147959d13b924f507df9027e",
-    "reasoning": "d354569b3ae0b524436f727bd1d0ed5e3f56e5973a4952eff6d05d341cfaed31",
+    "reasoning": "247e17a3b1e2943c08f8ca99cfe0422652a66c814b0b29443d3d57dd21639b7f",
     "reasoning_tokens": "6b47f605e7844debc22ecbf3b199a6f581dd2a72a1ebdaaca8c06f282f7122b9",
     "self_critique": "ab2d939c15dcfe7ab68bd6af225432bdedfd4596e126f76a74ac6afde5bb7bbe",
-    "should_trade": "a3af674bf96502c698bea6b9e0d42968e98a39b106920cac9e0751f92ee67bef",
+    "should_trade": "215fad0b1f319687dc14c538d174d5c12dccdfb0dac72b7af305004f73f8c82c",
     "source_match_class": "8bca00a6b3b1f3d3edc79c9a23303957f8c3971dc39208283368c5b6c1f07efc",
     "uncertainty_note": "0c8956f9b9c3e8e792696a9e4f2ab4c901795cd01e5d9b963b1ae33093f7539f",
 }
@@ -199,6 +198,33 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE
 
 
+def test_system_prompt_contains_edge_honesty_and_field_hygiene() -> None:
+    assert "Edge honesty" in _SYSTEM_PROMPT_ANALYZE
+    assert "External odds hygiene" in _SYSTEM_PROMPT_ANALYZE
+    assert "Never copy Kalshi yes_price into implied_prob_external" in _SYSTEM_PROMPT_ANALYZE
+    assert "Absence vs quote" in _SYSTEM_PROMPT_ANALYZE
+    assert "Aggregator discipline" in _SYSTEM_PROMPT_ANALYZE
+    assert "Prefer null over a reflexive 1.0" in _SYSTEM_PROMPT_ANALYZE
+
+
+def test_weather_hint_blocks_mapclick_optimism() -> None:
+    from prompts.loader import load_prompt
+
+    weather = load_prompt("user/category_hints/weather")
+    assert "MapClick edge honesty" in weather
+    assert "Same-day KXHIGHT" in weather
+    assert "never invent my_prob far from the Kalshi price" in weather or "do not invent my_prob far from the Kalshi price" in weather
+
+
+def test_crypto_hint_blocks_absence_with_quote_url() -> None:
+    from prompts.loader import load_prompt
+
+    crypto = load_prompt("user/category_hints/crypto")
+    assert "never absence_only" in crypto
+    assert "15-minute / ultra-short direction markets" in crypto
+    assert "Do not set evidence_basis=direct merely because an exchange URL exists" in crypto
+
+
 def test_deep_constraints_prefer_repair_before_abstain() -> None:
     from prompts.loader import load_lines
 
@@ -207,3 +233,4 @@ def test_deep_constraints_prefer_repair_before_abstain() -> None:
     assert "Repair before abstain" in joined
     assert "paste the real https primary_source_url" in joined
     assert "Only abstain after repair attempts" in joined
+    assert "Edge honesty on deep pass" in joined
