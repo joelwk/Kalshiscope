@@ -75,6 +75,12 @@ class Settings:
     # strong-edge gates already make this a high bar; the market must still clear
     # the separate evidence-quality and edge gates downstream.
     ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY: float = 0.60
+    # Narrow mid-band override for source-backed proxy/direct trades just below
+    # the hard floor (e.g. entry 0.20-0.25). Deep longshots (< band floor) still
+    # require the strict direct+settlement_aligned override above.
+    ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED: bool = True
+    ENTRY_PRICE_FLOOR_MID_BAND_WIDTH: float = 0.05
+    ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER: float = 0.75
     HIGH_PRICE_THRESHOLD: float = 0.65
     LOW_PRICE_MIN_EDGE: float = 0.18
     VERY_LOW_PRICE_MIN_EDGE: float = 0.28
@@ -496,6 +502,21 @@ class Settings:
 
     # Execution
     DRY_RUN: bool = True
+    # Opt-in run-level forced-order target. When positive, ordinary submissions
+    # are suppressed until the plan completes: lock N distinct markets (prefer
+    # conf×EQ with event/family diversity; reuse cycle analysis when present),
+    # deep-research each slot, prefer replacing weak evidence, then force a
+    # sized order from the researched side. Ordinary score/edge/EQ gates are
+    # audit-only for these slots. Unexecutable markets (closed, price band,
+    # jurisdiction) and weak-evidence slots may be replaced up to
+    # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. A bounded run that never
+    # locks/completes the target fails loudly; a bounded run exits early once
+    # the target is complete.
+    GUARANTEED_ORDERS_N: int = 0
+    # Cap on slot replacements per run (weak evidence + unexecutable markets).
+    # Prevents infinite thrash when GUARANTEED_ORDERS_N > 0.
+    GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS: int = 6
+    ORDER_RECONCILIATION_ENABLED: bool = True
     POSITION_SYNC_ENABLED: bool = True
     POSITION_SYNC_INTERVAL_CYCLES: int = 3
     PRE_ORDER_MARKET_REFRESH: bool = True
@@ -521,6 +542,8 @@ class Settings:
     STATE_DB_PATH: str = "data/market_state.db"
     STATE_JSON_EXPORT_PATH: str = "data/market_state.json"
     EXPORT_STATE_JSON: bool = True
+    STATE_JSON_EXPORT_INTERVAL_CYCLES: int = 1
+    STATE_JSON_RECENT_DECISIONS_LIMIT: int = 500
 
     # Definitive side override
     MAX_DEFINITIVE_OVERRIDES_PER_CYCLE: int = 2
@@ -673,7 +696,7 @@ class Settings:
     SCORE_PROXY_EVIDENCE_PENALTY_BASE: float = 0.11
     SCORE_GENERIC_BIN_PENALTY_BASE: float = 0.015
     SCORE_AMBIGUOUS_RESOLUTION_PENALTY_BASE: float = 0.08
-    SCORE_HALLUCINATED_EDGE_PENALTY_BASE: float = 0.08
+    SCORE_HALLUCINATED_EDGE_PENALTY_BASE: float = 0.16
     SCORE_VOLUME_AMPLIFIER_ENABLED: bool = True
     SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE: float = 0.08
     SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE: float = 0.12
@@ -868,6 +891,11 @@ class Settings:
     RESEARCH_QUEUE_DRAIN_MIN_PRIORITY: float = 0.40
     RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH: bool = True
     RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES: float = 45.0
+    # High-score / high-Kelly near-misses (KBO-class) may drain before the
+    # normal min-age so the queue converts instead of parking until expiry.
+    RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS: float = 0.0
+    RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD: float = 0.15
+    RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD: float = 0.10
     # Waive the drain min-age for entries whose market closes within this many
     # hours. Hourly/same-day markets (Jul 2026: hourly commodity strikes) close
     # before the min-age elapses, so their near-miss entries expired
@@ -952,9 +980,9 @@ class Settings:
     # still decide execution. 1.0 disables a band. The 25-35pp band was added
     # after sizing was observed to grow with claimed edge while win rate fell
     # monotonically above ~0.20.
-    KELLY_EDGE_BAND_DAMPENER_25PP: float = 0.75
-    KELLY_EDGE_BAND_DAMPENER_35PP: float = 0.6
-    KELLY_EDGE_BAND_DAMPENER_45PP: float = 0.4
+    KELLY_EDGE_BAND_DAMPENER_25PP: float = 0.55
+    KELLY_EDGE_BAND_DAMPENER_35PP: float = 0.40
+    KELLY_EDGE_BAND_DAMPENER_45PP: float = 0.25
 
     # Side-flip guardrails
     FLIP_GUARD_ENABLED: bool = True
@@ -1164,6 +1192,18 @@ def load_settings() -> Settings:
         ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY=_read_env_float(
             "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY",
             Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY,
+        ),
+        ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED=_read_env_bool(
+            "ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED",
+            Settings.ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED,
+        ),
+        ENTRY_PRICE_FLOOR_MID_BAND_WIDTH=_read_env_float(
+            "ENTRY_PRICE_FLOOR_MID_BAND_WIDTH",
+            Settings.ENTRY_PRICE_FLOOR_MID_BAND_WIDTH,
+        ),
+        ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER=_read_env_float(
+            "ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER",
+            Settings.ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER,
         ),
         HIGH_PRICE_THRESHOLD=_read_env_float(
             "HIGH_PRICE_THRESHOLD", Settings.HIGH_PRICE_THRESHOLD
@@ -1497,6 +1537,17 @@ def load_settings() -> Settings:
             Settings.KALSHI_FETCH_TOPUP_ENABLED,
         ),
         DRY_RUN=_read_env_bool("DRY_RUN", Settings.DRY_RUN),
+        GUARANTEED_ORDERS_N=_read_env_int(
+            "GUARANTEED_ORDERS_N", Settings.GUARANTEED_ORDERS_N
+        ),
+        GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=_read_env_int(
+            "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS",
+            Settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS,
+        ),
+        ORDER_RECONCILIATION_ENABLED=_read_env_bool(
+            "ORDER_RECONCILIATION_ENABLED",
+            Settings.ORDER_RECONCILIATION_ENABLED,
+        ),
         POSITION_SYNC_ENABLED=_read_env_bool(
             "POSITION_SYNC_ENABLED", Settings.POSITION_SYNC_ENABLED
         ),
@@ -1578,6 +1629,14 @@ def load_settings() -> Settings:
         ),
         EXPORT_STATE_JSON=_read_env_bool(
             "EXPORT_STATE_JSON", Settings.EXPORT_STATE_JSON
+        ),
+        STATE_JSON_EXPORT_INTERVAL_CYCLES=_read_env_int(
+            "STATE_JSON_EXPORT_INTERVAL_CYCLES",
+            Settings.STATE_JSON_EXPORT_INTERVAL_CYCLES,
+        ),
+        STATE_JSON_RECENT_DECISIONS_LIMIT=_read_env_int(
+            "STATE_JSON_RECENT_DECISIONS_LIMIT",
+            Settings.STATE_JSON_RECENT_DECISIONS_LIMIT,
         ),
         REANALYSIS_COOLDOWN_HOURS=_read_env_int(
             "REANALYSIS_COOLDOWN_HOURS",
@@ -2344,6 +2403,18 @@ def load_settings() -> Settings:
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES",
             Settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES,
         ),
+        RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS=_read_env_float(
+            "RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS",
+            Settings.RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS,
+        ),
+        RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD=_read_env_float(
+            "RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD",
+            Settings.RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD,
+        ),
+        RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD=_read_env_float(
+            "RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD",
+            Settings.RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD,
+        ),
         RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS=_read_env_float(
             "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS",
             Settings.RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS,
@@ -2657,6 +2728,25 @@ def load_settings() -> Settings:
     )
 
     _validate_required(settings)
+    if settings.GUARANTEED_ORDERS_N < 0:
+        raise ValueError("GUARANTEED_ORDERS_N must be greater than or equal to zero")
+    if settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS < 0:
+        raise ValueError(
+            "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS must be greater "
+            "than or equal to zero"
+        )
+    if settings.POSITION_SYNC_INTERVAL_CYCLES < 0:
+        raise ValueError(
+            "POSITION_SYNC_INTERVAL_CYCLES must be greater than or equal to zero"
+        )
+    if settings.STATE_JSON_EXPORT_INTERVAL_CYCLES < 0:
+        raise ValueError(
+            "STATE_JSON_EXPORT_INTERVAL_CYCLES must be greater than or equal to zero"
+        )
+    if settings.STATE_JSON_RECENT_DECISIONS_LIMIT <= 0:
+        raise ValueError(
+            "STATE_JSON_RECENT_DECISIONS_LIMIT must be greater than zero"
+        )
     return settings
 
 

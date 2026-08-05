@@ -420,11 +420,112 @@ class KalshiClient:
             raw_payload=payload,
         )
 
-    def get_positions(self) -> dict[str, Any]:
-        response = self._request("GET", "/portfolio/positions")
+    def get_positions(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        count_filter: str | None = None,
+        subaccount: int | None = 0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if limit is not None and limit > 0:
+            params["limit"] = int(limit)
+        if cursor:
+            params["cursor"] = cursor
+        if count_filter:
+            params["count_filter"] = count_filter
+        if subaccount is not None:
+            params["subaccount"] = int(subaccount)
+        response = self._request("GET", "/portfolio/positions", params=params or None)
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Positions response is not a JSON object")
+        return payload
+
+    def get_orders(
+        self,
+        *,
+        status: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        subaccount: int | None = 0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if limit is not None and limit > 0:
+            params["limit"] = int(limit)
+        if cursor:
+            params["cursor"] = cursor
+        if subaccount is not None:
+            params["subaccount"] = int(subaccount)
+        response = self._request("GET", "/portfolio/orders", params=params or None)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Orders response is not a JSON object")
+        return payload
+
+    def get_order(self, order_id: str, *, subaccount: int = 0) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            f"/portfolio/orders/{order_id}",
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Order response is not a JSON object")
+        return payload
+
+    def get_historical_orders(
+        self,
+        *,
+        ticker: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        if limit is not None and limit > 0:
+            params["limit"] = int(limit)
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        response = self._request("GET", "/historical/orders", params=params or None)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Historical orders response is not a JSON object")
+        return payload
+
+    def get_historical_fills(
+        self,
+        *,
+        ticker: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        max_ts: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if ticker:
+            params["ticker"] = ticker
+        if limit is not None and limit > 0:
+            params["limit"] = int(limit)
+        if cursor:
+            params["cursor"] = cursor
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        response = self._request("GET", "/historical/fills", params=params or None)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Historical fills response is not a JSON object")
         return payload
 
     def get_settlements(
@@ -432,12 +533,21 @@ class KalshiClient:
         *,
         limit: int | None = None,
         cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+        subaccount: int | None = 0,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if limit is not None and limit > 0:
             params["limit"] = int(limit)
         if cursor:
             params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        if subaccount is not None:
+            params["subaccount"] = int(subaccount)
         response = self._request("GET", "/portfolio/settlements", params=params or None)
         payload = response.json()
         if not isinstance(payload, dict):
@@ -449,12 +559,24 @@ class KalshiClient:
         *,
         limit: int | None = None,
         cursor: str | None = None,
+        order_id: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+        subaccount: int | None = 0,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if limit is not None and limit > 0:
             params["limit"] = int(limit)
         if cursor:
             params["cursor"] = cursor
+        if order_id:
+            params["order_id"] = order_id
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        if subaccount is not None:
+            params["subaccount"] = int(subaccount)
         response = self._request("GET", "/portfolio/fills", params=params or None)
         payload = response.json()
         if not isinstance(payload, dict):
@@ -470,6 +592,7 @@ class KalshiClient:
         market: Market | None = None,
         *,
         retry_suffix: str | None = None,
+        client_order_id: str | None = None,
     ) -> OrderResponse:
         """Submit a buy/sell order in Kalshi format."""
         side = _to_kalshi_side(order.outcome)
@@ -543,9 +666,8 @@ class KalshiClient:
 
         payload = {
             "ticker": order.market_id,
-            "client_order_id": _build_client_order_id(
-                order.market_id or "",
-                suffix=retry_suffix,
+            "client_order_id": client_order_id or _build_client_order_id(
+                order.market_id or "", suffix=retry_suffix
             ),
             "side": book_side,
             "count": str(count),

@@ -268,6 +268,11 @@ class Position(BaseModel):
     trade_count: int
     first_trade: datetime
     last_trade: datetime
+    status: str = "open"
+    contracts: float | None = None
+    source: str | None = None
+    last_synced_at: datetime | None = None
+    closed_at: datetime | None = None
 
 
 class InsufficientBalanceError(Exception):

@@ -158,9 +158,12 @@ def test_market_family_cricket_kbo_and_isl_tickers_from_logs() -> None:
         "KXT20MATCH-26MAY10COOPNG-COO",
         "KXKBOGAME-26MAY100100KIALOT-KIA",
         "KXISLGAME-26APR291230HAHHGE-HGE",
+        "KXNPBGAME-26AUG050500HOKFUK-FUK",
+        "KXARGNACBTOTAL-26AUG03GUETRI-5",
+        "KXARGNACBSPREAD-26AUG03GUETRI-TRI2",
     ):
         market = Market(id=ticker, question="Will the home team win?", category=None)
-        assert market_family(market) == "sports"
+        assert market_family(market) == "sports", ticker
 
 
 def test_market_family_crypto() -> None:

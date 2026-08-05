@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,7 +13,7 @@ from typing import Any, Iterable
 
 from bayesian_engine import BayesianState
 from logging_config import get_logger
-from models import MarketState, OrderResponse, Position, TradeDecision
+from models import Market, MarketState, OrderResponse, Position, TradeDecision
 from research_profiles import family_from_text
 
 logger = get_logger(__name__)
@@ -21,6 +23,8 @@ _BAYESIAN_LR_SEMANTICS_FLAG = "bayesian_lr_semantics_version"
 _BAYESIAN_LR_SEMANTICS_VERSION = "single_odds_v1"
 _PARTICIPATION_TIER_REPR_FLAG = "participation_tier_repr_normalized"
 _PARTICIPATION_TIER_REPR_VERSION = "v1"
+_STATE_RECONCILIATION_SCHEMA_FLAG = "state_reconciliation_schema_version"
+_STATE_RECONCILIATION_SCHEMA_VERSION = "v1"
 # Historical receipts written before the StrEnum shim serialized the enum repr
 # ("ParticipationTier.X") instead of its value; map used by the one-time
 # normalization migration (315 leaked rows found in the Jul 2026 review).
@@ -41,6 +45,14 @@ _ACTIVE_PENDING_ORDER_STATUSES = {
     "partial",
     "pending",
     "resting",
+}
+_TERMINAL_ORDER_STATUSES = {
+    "canceled",
+    "cancelled",
+    "canceled_partially_filled",
+    "expired",
+    "filled",
+    "rejected",
 }
 _NON_ACTIONABLE_TERMINAL_OUTCOMES = {
     "analysis_failure",
@@ -96,6 +108,11 @@ class MarketStateManager:
                     question TEXT,
                     close_time TEXT,
                     category TEXT,
+                    event_ticker TEXT,
+                    series_ticker TEXT,
+                    market_status TEXT,
+                    last_seen_at TEXT,
+                    last_seen_cycle_id TEXT,
                     last_terminal_outcome TEXT,
                     non_actionable_streak INTEGER DEFAULT 0,
                     fill_failure_count INTEGER DEFAULT 0,
@@ -125,7 +142,12 @@ class MarketStateManager:
                     outcome TEXT,
                     total_amount REAL,
                     avg_confidence REAL,
-                    order_ids TEXT
+                    order_ids TEXT,
+                    status TEXT NOT NULL DEFAULT 'unverified',
+                    contracts REAL,
+                    source TEXT,
+                    last_synced_at TEXT,
+                    closed_at TEXT
                 )
                 """
             )
@@ -149,6 +171,7 @@ class MarketStateManager:
                     outcome TEXT NOT NULL,
                     submitted_amount_usdc REAL NOT NULL,
                     requested_shares REAL,
+                    remaining_shares REAL,
                     limit_price REAL,
                     confidence REAL,
                     implied_prob REAL,
@@ -157,7 +180,25 @@ class MarketStateManager:
                     filled_amount_usdc REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    raw_json TEXT
+                    raw_json TEXT,
+                    exchange_status TEXT,
+                    exchange_updated_at TEXT,
+                    last_synced_at TEXT,
+                    terminal_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_fill_events (
+                    fill_id TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    price REAL,
+                    amount_usdc REAL NOT NULL,
+                    filled_at TEXT,
+                    raw_json TEXT NOT NULL
                 )
                 """
             )
@@ -282,6 +323,12 @@ class MarketStateManager:
                 "CREATE INDEX IF NOT EXISTS idx_pending_orders_status ON pending_orders (status)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_order_fill_events_order_id ON order_fill_events (order_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_order_fill_events_filled_at ON order_fill_events (filled_at)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_outcomes_market_id ON trade_outcomes (market_id)"
             )
             self._conn.execute(
@@ -295,6 +342,9 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_decision_receipts_market_id ON decision_receipts (market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_decision_receipts_cycle_id ON decision_receipts (cycle_id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_exchange_settlements_market_id ON exchange_settlements (market_id)"
@@ -328,6 +378,19 @@ class MarketStateManager:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exchange_sync_state (
+                    stream TEXT PRIMARY KEY,
+                    last_attempt_at TEXT NOT NULL,
+                    last_success_at TEXT,
+                    high_watermark_ts TEXT,
+                    cursor_exhausted INTEGER NOT NULL DEFAULT 0,
+                    rows_seen INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
                 )
                 """
             )
@@ -416,14 +479,21 @@ class MarketStateManager:
             next_eligible_cycle=next_eligible_cycle,
         )
 
-    def get_position(self, market_id: str) -> Position | None:
+    def get_position(
+        self,
+        market_id: str,
+        *,
+        include_closed: bool = False,
+    ) -> Position | None:
         row = self._conn.execute(
             """
-            SELECT market_id, outcome, total_amount, avg_confidence, order_ids
+            SELECT market_id, outcome, total_amount, avg_confidence, order_ids,
+                   status, contracts, source, last_synced_at, closed_at
             FROM positions
             WHERE market_id = ?
+              AND (? = 1 OR status = 'open')
             """,
-            (market_id,),
+            (market_id, 1 if include_closed else 0),
         ).fetchone()
         if not row:
             return None
@@ -466,6 +536,15 @@ class MarketStateManager:
             trade_count=trade_count,
             first_trade=first_trade,
             last_trade=last_trade,
+            status=str(row["status"] or "unverified"),
+            contracts=(
+                float(row["contracts"])
+                if row["contracts"] is not None
+                else None
+            ),
+            source=str(row["source"]) if row["source"] else None,
+            last_synced_at=_parse_timestamp(row["last_synced_at"]),
+            closed_at=_parse_timestamp(row["closed_at"]),
         )
 
     def get_open_position_market_ids_for_event(self, event_ticker_prefix: str) -> list[str]:
@@ -477,6 +556,7 @@ class MarketStateManager:
             SELECT market_id
             FROM positions
             WHERE total_amount > 0
+              AND status = 'open'
               AND UPPER(COALESCE(market_id, '')) LIKE ?
             """,
             (f"{normalized_prefix}%",),
@@ -679,6 +759,57 @@ class MarketStateManager:
             refinement_reason or "-",
         )
 
+    def upsert_market_snapshots(
+        self,
+        markets: Iterable[Market],
+        *,
+        cycle_id: str,
+        seen_at: datetime | None = None,
+    ) -> int:
+        """Persist current exchange metadata for the markets considered in a cycle."""
+        timestamp = (seen_at or datetime.now(timezone.utc)).isoformat()
+        rows: list[tuple[Any, ...]] = []
+        for market in markets:
+            market_id = str(market.id or market.ticker or "").strip()
+            if not market_id:
+                continue
+            rows.append(
+                (
+                    market_id,
+                    str(market.question or "").strip() or None,
+                    market.close_time.isoformat() if market.close_time else None,
+                    str(market.category or "").strip() or None,
+                    str(market.event_ticker or "").strip() or None,
+                    str(market.series_ticker or "").strip() or None,
+                    str(market.status) if market.status is not None else None,
+                    timestamp,
+                    str(cycle_id or "").strip() or None,
+                )
+            )
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT INTO markets (
+                    id, question, close_time, category, event_ticker, series_ticker,
+                    market_status, last_seen_at, last_seen_cycle_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    question = COALESCE(excluded.question, markets.question),
+                    close_time = COALESCE(excluded.close_time, markets.close_time),
+                    category = COALESCE(excluded.category, markets.category),
+                    event_ticker = COALESCE(excluded.event_ticker, markets.event_ticker),
+                    series_ticker = COALESCE(excluded.series_ticker, markets.series_ticker),
+                    market_status = COALESCE(excluded.market_status, markets.market_status),
+                    last_seen_at = excluded.last_seen_at,
+                    last_seen_cycle_id = excluded.last_seen_cycle_id
+                """,
+                rows,
+            )
+        return len(rows)
+
     def record_terminal_outcome(self, market_id: str, terminal_outcome: str) -> None:
         normalized = (terminal_outcome or "").strip().lower()
         with self._conn:
@@ -841,6 +972,21 @@ class MarketStateManager:
                     else None,
                 ),
             )
+            # Persist trade-time family into markets.category when missing so
+            # settlement-era reports do not collapse everything to "generic".
+            family = None
+            if isinstance(execution_audit, dict):
+                family = str(execution_audit.get("market_family") or "").strip().lower()
+            if family and family not in {"none", "null", "unknown"}:
+                self._conn.execute(
+                    """
+                    INSERT INTO markets (id, category)
+                    VALUES (?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        category = COALESCE(markets.category, excluded.category)
+                    """,
+                    (market_id, family),
+                )
 
     def get_daily_order_attempt_summary(
         self,
@@ -914,6 +1060,9 @@ class MarketStateManager:
         market_id: str,
         outcome: str,
         total_amount_usdc: float,
+        contracts: float | None = None,
+        source: str = "exchange",
+        synced_at: datetime | None = None,
     ) -> None:
         normalized_market_id = str(market_id or "").strip()
         if not normalized_market_id:
@@ -922,6 +1071,10 @@ class MarketStateManager:
         if normalized_outcome not in {"YES", "NO"}:
             return
         normalized_total = max(0.0, float(total_amount_usdc or 0.0))
+        normalized_contracts = (
+            max(0.0, float(contracts)) if contracts is not None else None
+        )
+        timestamp = (synced_at or datetime.now(timezone.utc)).isoformat()
         with self._conn:
             row = self._conn.execute(
                 """
@@ -935,13 +1088,21 @@ class MarketStateManager:
             order_ids_raw = row["order_ids"] if row else "[]"
             self._conn.execute(
                 """
-                INSERT INTO positions (market_id, outcome, total_amount, avg_confidence, order_ids)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO positions (
+                    market_id, outcome, total_amount, avg_confidence, order_ids,
+                    status, contracts, source, last_synced_at, closed_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL)
                 ON CONFLICT(market_id) DO UPDATE SET
                     outcome = excluded.outcome,
                     total_amount = excluded.total_amount,
                     avg_confidence = excluded.avg_confidence,
-                    order_ids = excluded.order_ids
+                    order_ids = excluded.order_ids,
+                    status = 'open',
+                    contracts = excluded.contracts,
+                    source = excluded.source,
+                    last_synced_at = excluded.last_synced_at,
+                    closed_at = NULL
                 """,
                 (
                     normalized_market_id,
@@ -949,8 +1110,92 @@ class MarketStateManager:
                     normalized_total,
                     avg_confidence,
                     order_ids_raw if order_ids_raw else "[]",
+                    normalized_contracts,
+                    str(source or "exchange").strip().lower(),
+                    timestamp,
                 ),
             )
+
+    def apply_complete_position_snapshot(
+        self,
+        snapshots: Iterable[dict[str, Any]],
+        *,
+        synced_at: datetime | None = None,
+    ) -> tuple[int, int]:
+        """Apply a cursor-complete exchange snapshot and close unseen local rows."""
+        timestamp = (synced_at or datetime.now(timezone.utc)).isoformat()
+        normalized: dict[str, dict[str, Any]] = {}
+        for snapshot in snapshots:
+            market_id = str(snapshot.get("market_id") or "").strip()
+            outcome = str(snapshot.get("outcome") or "").strip().upper()
+            if not market_id or outcome not in {"YES", "NO"}:
+                continue
+            normalized[market_id] = {
+                "outcome": outcome,
+                "total_amount_usdc": max(
+                    0.0,
+                    float(snapshot.get("total_amount_usdc") or 0.0),
+                ),
+                "contracts": max(0.0, float(snapshot.get("contracts") or 0.0)),
+            }
+
+        with self._conn:
+            for market_id, snapshot in normalized.items():
+                row = self._conn.execute(
+                    "SELECT avg_confidence, order_ids FROM positions WHERE market_id = ?",
+                    (market_id,),
+                ).fetchone()
+                self._conn.execute(
+                    """
+                    INSERT INTO positions (
+                        market_id, outcome, total_amount, avg_confidence, order_ids,
+                        status, contracts, source, last_synced_at, closed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'open', ?, 'exchange', ?, NULL)
+                    ON CONFLICT(market_id) DO UPDATE SET
+                        outcome = excluded.outcome,
+                        total_amount = excluded.total_amount,
+                        status = 'open',
+                        contracts = excluded.contracts,
+                        source = 'exchange',
+                        last_synced_at = excluded.last_synced_at,
+                        closed_at = NULL
+                    """,
+                    (
+                        market_id,
+                        snapshot["outcome"],
+                        snapshot["total_amount_usdc"],
+                        float(row["avg_confidence"] or 0.0) if row else 0.0,
+                        row["order_ids"] if row and row["order_ids"] else "[]",
+                        snapshot["contracts"],
+                        timestamp,
+                    ),
+                )
+
+            market_ids = sorted(normalized)
+            if market_ids:
+                placeholders = ",".join("?" for _ in market_ids)
+                cursor = self._conn.execute(
+                    f"""
+                    UPDATE positions
+                    SET status = 'closed', closed_at = COALESCE(closed_at, ?),
+                        last_synced_at = ?, source = COALESCE(source, 'exchange')
+                    WHERE status IN ('open', 'unverified')
+                      AND market_id NOT IN ({placeholders})
+                    """,
+                    (timestamp, timestamp, *market_ids),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE positions
+                    SET status = 'closed', closed_at = COALESCE(closed_at, ?),
+                        last_synced_at = ?, source = COALESCE(source, 'exchange')
+                    WHERE status IN ('open', 'unverified')
+                    """,
+                    (timestamp, timestamp),
+                )
+        return len(normalized), int(cursor.rowcount or 0)
 
     def increment_fill_failure_count(self, market_id: str) -> None:
         with self._conn:
@@ -997,19 +1242,36 @@ class MarketStateManager:
         with self._conn:
             position_row = self._conn.execute(
                 """
-                SELECT outcome, total_amount, avg_confidence, order_ids
+                SELECT outcome, total_amount, avg_confidence, order_ids,
+                       status, contracts
                 FROM positions
                 WHERE market_id = ?
                 """,
                 (market_id,),
             ).fetchone()
 
-            existing_total = float(position_row["total_amount"] or 0.0) if position_row else 0.0
-            existing_avg = float(position_row["avg_confidence"] or 0.0) if position_row else 0.0
+            position_was_open = bool(
+                position_row and str(position_row["status"] or "") == "open"
+            )
+            existing_total = (
+                float(position_row["total_amount"] or 0.0)
+                if position_was_open
+                else 0.0
+            )
+            existing_avg = (
+                float(position_row["avg_confidence"] or 0.0)
+                if position_was_open
+                else 0.0
+            )
             existing_order_ids = _parse_order_ids(
                 position_row["order_ids"] if position_row else None
             )
             existing_outcome = position_row["outcome"] if position_row else None
+            existing_contracts = (
+                float(position_row["contracts"] or 0.0)
+                if position_was_open
+                else 0.0
+            )
             order_already_recorded = False
             if order_id:
                 order_already_recorded = (
@@ -1074,12 +1336,14 @@ class MarketStateManager:
                 )
             )
             new_total = existing_total + amount
+            new_contracts = existing_contracts + max(0.0, float(shares or 0.0))
 
             if position_row:
                 self._conn.execute(
                     """
                     UPDATE positions
-                    SET outcome = ?, total_amount = ?, avg_confidence = ?, order_ids = ?
+                    SET outcome = ?, total_amount = ?, avg_confidence = ?, order_ids = ?,
+                        status = 'open', contracts = ?, source = 'local', closed_at = NULL
                     WHERE market_id = ?
                     """,
                     (
@@ -1087,6 +1351,7 @@ class MarketStateManager:
                         new_total,
                         new_avg_confidence,
                         json.dumps(existing_order_ids),
+                        new_contracts if new_contracts > 0.0 else None,
                         market_id,
                     ),
                 )
@@ -1094,9 +1359,10 @@ class MarketStateManager:
                 self._conn.execute(
                     """
                     INSERT INTO positions (
-                        market_id, outcome, total_amount, avg_confidence, order_ids
+                        market_id, outcome, total_amount, avg_confidence, order_ids,
+                        status, contracts, source, closed_at
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'open', ?, 'local', NULL)
                     """,
                     (
                         market_id,
@@ -1104,6 +1370,7 @@ class MarketStateManager:
                         new_total,
                         new_avg_confidence,
                         json.dumps(existing_order_ids),
+                        new_contracts if new_contracts > 0.0 else None,
                     ),
                 )
 
@@ -1162,16 +1429,36 @@ class MarketStateManager:
         if not normalized_order_id or not normalized_market_id:
             raise ValueError("order_id and market_id must be non-empty")
         timestamp = datetime.now(timezone.utc).isoformat()
+        normalized_status = str(status or "pending").strip().lower()
+        terminal_at = timestamp if normalized_status in _TERMINAL_ORDER_STATUSES else None
         with self._conn:
+            existing = self._conn.execute(
+                "SELECT status FROM pending_orders WHERE order_id = ?",
+                (normalized_order_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and str(existing["status"] or "").strip().lower()
+                in _TERMINAL_ORDER_STATUSES
+                and normalized_status in _ACTIVE_PENDING_ORDER_STATUSES
+            ):
+                logger.warning(
+                    "Ignored terminal-to-active order status regression: order=%s previous=%s next=%s",
+                    normalized_order_id,
+                    existing["status"],
+                    normalized_status,
+                )
+                return
             self._conn.execute(
                 """
                 INSERT INTO pending_orders (
                     order_id, market_id, outcome, submitted_amount_usdc,
                     requested_shares, limit_price, confidence, implied_prob,
                     status, filled_shares, filled_amount_usdc, created_at,
-                    updated_at, raw_json
+                    updated_at, raw_json, exchange_status, exchange_updated_at,
+                    last_synced_at, terminal_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     market_id = excluded.market_id,
                     outcome = excluded.outcome,
@@ -1180,9 +1467,22 @@ class MarketStateManager:
                     limit_price = excluded.limit_price,
                     confidence = excluded.confidence,
                     implied_prob = excluded.implied_prob,
-                    status = excluded.status,
+                    status = CASE
+                        WHEN pending_orders.status IN (
+                            'filled', 'canceled', 'cancelled',
+                            'canceled_partially_filled', 'expired', 'rejected'
+                        ) AND excluded.status IN (
+                            'accepted', 'open', 'partially_filled', 'partial',
+                            'pending', 'resting'
+                        ) THEN pending_orders.status
+                        ELSE excluded.status
+                    END,
                     updated_at = excluded.updated_at,
-                    raw_json = excluded.raw_json
+                    raw_json = excluded.raw_json,
+                    exchange_status = excluded.exchange_status,
+                    exchange_updated_at = excluded.exchange_updated_at,
+                    last_synced_at = excluded.last_synced_at,
+                    terminal_at = COALESCE(pending_orders.terminal_at, excluded.terminal_at)
                 """,
                 (
                     normalized_order_id,
@@ -1209,10 +1509,14 @@ class MarketStateManager:
                         if implied_prob is not None
                         else None
                     ),
-                    str(status or "pending").strip().lower(),
+                    normalized_status,
                     timestamp,
                     timestamp,
                     json.dumps(raw or {}, default=str),
+                    normalized_status,
+                    timestamp,
+                    timestamp,
+                    terminal_at,
                 ),
             )
 
@@ -1240,11 +1544,23 @@ class MarketStateManager:
             if str(pending.get("status") or "").lower()
             in _ACTIVE_PENDING_ORDER_STATUSES
             and (
-                pending.get("requested_shares") is None
-                or float(pending.get("filled_shares") or 0.0)
-                < float(pending.get("requested_shares") or 0.0) - 1e-9
+                (
+                    pending.get("remaining_shares") is not None
+                    and float(pending.get("remaining_shares") or 0.0) > 1e-9
+                )
+                or (
+                    pending.get("remaining_shares") is None
+                    and (
+                        pending.get("requested_shares") is None
+                        or float(pending.get("filled_shares") or 0.0)
+                        < float(pending.get("requested_shares") or 0.0) - 1e-9
+                    )
+                )
             )
         ]
+
+    def get_order_history(self) -> list[dict[str, Any]]:
+        return self.get_pending_orders(active_only=False)
 
     def get_pending_market_ids(self) -> set[str]:
         return {
@@ -1260,6 +1576,11 @@ class MarketStateManager:
         cumulative_filled_shares: float,
         fill_price: float | None,
         status: str,
+        exchange_requested_shares: float | None = None,
+        exchange_remaining_shares: float | None = None,
+        cumulative_filled_amount_usdc: float | None = None,
+        exchange_status: str | None = None,
+        exchange_updated_at: str | None = None,
         raw: dict[str, Any] | None = None,
         record_trade_order: OrderResponse | None = None,
     ) -> dict[str, Any] | None:
@@ -1280,7 +1601,11 @@ class MarketStateManager:
                 previous_shares,
                 float(cumulative_filled_shares or 0.0),
             )
-            requested_shares = pending.get("requested_shares")
+            requested_shares = (
+                max(0.0, float(exchange_requested_shares))
+                if exchange_requested_shares is not None
+                else pending.get("requested_shares")
+            )
             if requested_shares is not None and float(requested_shares) > 0.0:
                 next_shares = min(next_shares, float(requested_shares))
             delta_shares = max(0.0, next_shares - previous_shares)
@@ -1289,11 +1614,19 @@ class MarketStateManager:
                 if fill_price is not None
                 else float(pending.get("limit_price") or 0.0)
             )
-            delta_amount = delta_shares * normalized_fill_price
-            next_amount = (
-                max(0.0, float(pending["filled_amount_usdc"] or 0.0))
-                + delta_amount
+            previous_amount = max(
+                0.0,
+                float(pending["filled_amount_usdc"] or 0.0),
             )
+            if cumulative_filled_amount_usdc is not None:
+                next_amount = max(
+                    previous_amount,
+                    float(cumulative_filled_amount_usdc or 0.0),
+                )
+                delta_amount = max(0.0, next_amount - previous_amount)
+            else:
+                delta_amount = delta_shares * normalized_fill_price
+                next_amount = previous_amount + delta_amount
             normalized_status = str(status or pending["status"]).strip().lower()
             if (
                 requested_shares is not None
@@ -1302,19 +1635,56 @@ class MarketStateManager:
             ):
                 normalized_status = "filled"
             timestamp = datetime.now(timezone.utc).isoformat()
+            previous_status = str(pending.get("status") or "").strip().lower()
+            if (
+                previous_status in _TERMINAL_ORDER_STATUSES
+                and normalized_status in _ACTIVE_PENDING_ORDER_STATUSES
+            ):
+                logger.warning(
+                    "Ignored terminal-to-active order status regression: order=%s previous=%s next=%s",
+                    normalized_order_id,
+                    previous_status,
+                    normalized_status,
+                )
+                pending.update(
+                    {
+                        "delta_filled_shares": 0.0,
+                        "delta_filled_amount_usdc": 0.0,
+                    }
+                )
+                return pending
+            terminal_at = (
+                pending.get("terminal_at") or timestamp
+                if normalized_status in _TERMINAL_ORDER_STATUSES
+                else None
+            )
             self._conn.execute(
                 """
                 UPDATE pending_orders
-                SET status = ?, filled_shares = ?, filled_amount_usdc = ?,
-                    updated_at = ?, raw_json = ?
+                SET status = ?, requested_shares = ?,
+                    remaining_shares = COALESCE(?, remaining_shares),
+                    filled_shares = ?, filled_amount_usdc = ?,
+                    updated_at = ?, raw_json = ?, exchange_status = ?,
+                    exchange_updated_at = COALESCE(?, exchange_updated_at),
+                    last_synced_at = ?, terminal_at = COALESCE(terminal_at, ?)
                 WHERE order_id = ?
                 """,
                 (
                     normalized_status,
+                    requested_shares,
+                    (
+                        max(0.0, float(exchange_remaining_shares))
+                        if exchange_remaining_shares is not None
+                        else None
+                    ),
                     next_shares,
                     next_amount,
                     timestamp,
                     json.dumps(raw or pending.get("raw") or {}, default=str),
+                    str(exchange_status or status or "").strip().lower() or None,
+                    exchange_updated_at,
+                    timestamp,
+                    terminal_at,
                     normalized_order_id,
                 ),
             )
@@ -1341,9 +1711,19 @@ class MarketStateManager:
         pending.update(
             {
                 "status": normalized_status,
+                "requested_shares": requested_shares,
+                "remaining_shares": (
+                    max(0.0, float(exchange_remaining_shares))
+                    if exchange_remaining_shares is not None
+                    else pending.get("remaining_shares")
+                ),
                 "filled_shares": next_shares,
                 "filled_amount_usdc": next_amount,
                 "updated_at": timestamp,
+                "exchange_status": str(exchange_status or status or "").strip().lower(),
+                "exchange_updated_at": exchange_updated_at,
+                "last_synced_at": timestamp,
+                "terminal_at": terminal_at,
                 "raw": raw or pending.get("raw") or {},
                 "delta_filled_shares": round(delta_shares, 8),
                 "delta_filled_amount_usdc": round(delta_amount, 8),
@@ -1357,21 +1737,95 @@ class MarketStateManager:
         order_id: str,
         status: str,
         *,
+        exchange_status: str | None = None,
+        exchange_updated_at: str | None = None,
         raw: dict[str, Any] | None = None,
     ) -> bool:
         timestamp = datetime.now(timezone.utc).isoformat()
+        order_id_text = str(order_id or "").strip()
+        normalized_status = str(status or "unknown").strip().lower()
         with self._conn:
+            row = self._conn.execute(
+                "SELECT status, terminal_at FROM pending_orders WHERE order_id = ?",
+                (order_id_text,),
+            ).fetchone()
+            if row is None:
+                return False
+            previous_status = str(row["status"] or "").strip().lower()
+            if (
+                previous_status in _TERMINAL_ORDER_STATUSES
+                and normalized_status in _ACTIVE_PENDING_ORDER_STATUSES
+            ):
+                logger.warning(
+                    "Ignored terminal-to-active order status regression: order=%s previous=%s next=%s",
+                    order_id_text,
+                    previous_status,
+                    normalized_status,
+                )
+                return False
+            terminal_at = (
+                row["terminal_at"] or timestamp
+                if normalized_status in _TERMINAL_ORDER_STATUSES
+                else None
+            )
             cursor = self._conn.execute(
                 """
                 UPDATE pending_orders
-                SET status = ?, updated_at = ?, raw_json = COALESCE(?, raw_json)
+                SET status = ?, updated_at = ?, raw_json = COALESCE(?, raw_json),
+                    exchange_status = ?, exchange_updated_at = COALESCE(?, exchange_updated_at),
+                    last_synced_at = ?, terminal_at = COALESCE(terminal_at, ?)
                 WHERE order_id = ?
                 """,
                 (
-                    str(status or "unknown").strip().lower(),
+                    normalized_status,
                     timestamp,
                     json.dumps(raw, default=str) if raw is not None else None,
+                    str(exchange_status or status or "").strip().lower() or None,
+                    exchange_updated_at,
+                    timestamp,
+                    terminal_at,
+                    order_id_text,
+                ),
+            )
+        return int(cursor.rowcount or 0) > 0
+
+    def record_order_fill_event(
+        self,
+        *,
+        fill_id: str,
+        order_id: str,
+        market_id: str,
+        quantity: float,
+        price: float | None,
+        amount_usdc: float,
+        filled_at: str | None,
+        raw: dict[str, Any],
+    ) -> bool:
+        normalized_fill_id = str(fill_id or "").strip()
+        if not normalized_fill_id:
+            return False
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO order_fill_events (
+                    fill_id, order_id, market_id, quantity, price,
+                    amount_usdc, filled_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_fill_id,
                     str(order_id or "").strip(),
+                    str(market_id or "").strip(),
+                    max(0.0, float(quantity or 0.0)),
+                    (
+                        max(0.0, min(1.0, float(price)))
+                        if price is not None
+                        else None
+                    ),
+                    max(0.0, float(amount_usdc or 0.0)),
+                    filled_at,
+                    json.dumps(raw or {}, sort_keys=True, default=str),
                 ),
             )
         return int(cursor.rowcount or 0) > 0
@@ -1387,6 +1841,67 @@ class MarketStateManager:
             """
         ).fetchall()
         return {str(row["order_id"]) for row in rows if row["order_id"]}
+
+    def record_exchange_sync_state(
+        self,
+        stream: str,
+        *,
+        success: bool,
+        cursor_exhausted: bool,
+        rows_seen: int,
+        high_watermark_ts: str | None = None,
+        error: str | None = None,
+        attempted_at: datetime | None = None,
+    ) -> None:
+        normalized_stream = str(stream or "").strip().lower()
+        if not normalized_stream:
+            raise ValueError("exchange sync stream must be non-empty")
+        timestamp = (attempted_at or datetime.now(timezone.utc)).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO exchange_sync_state (
+                    stream, last_attempt_at, last_success_at, high_watermark_ts,
+                    cursor_exhausted, rows_seen, last_error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stream) DO UPDATE SET
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = CASE
+                        WHEN excluded.last_success_at IS NOT NULL
+                        THEN excluded.last_success_at
+                        ELSE exchange_sync_state.last_success_at
+                    END,
+                    high_watermark_ts = COALESCE(
+                        excluded.high_watermark_ts,
+                        exchange_sync_state.high_watermark_ts
+                    ),
+                    cursor_exhausted = excluded.cursor_exhausted,
+                    rows_seen = excluded.rows_seen,
+                    last_error = excluded.last_error
+                """,
+                (
+                    normalized_stream,
+                    timestamp,
+                    timestamp if success else None,
+                    high_watermark_ts,
+                    1 if cursor_exhausted else 0,
+                    max(0, int(rows_seen or 0)),
+                    None if success else str(error or "sync failed")[:2000],
+                ),
+            )
+
+    def get_exchange_sync_state(self, stream: str | None = None) -> list[dict[str, Any]]:
+        if stream:
+            rows = self._conn.execute(
+                "SELECT * FROM exchange_sync_state WHERE stream = ? ORDER BY stream",
+                (str(stream).strip().lower(),),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM exchange_sync_state ORDER BY stream"
+            ).fetchall()
+        return _rows_to_dicts(rows)
 
     def get_unresolved_traded_market_ids(self) -> list[str]:
         rows = self._conn.execute(
@@ -2985,7 +3500,7 @@ class MarketStateManager:
         winning_outcome: str | None,
         predicted_outcome: str | None,
         pnl_realized: float | None,
-        contracts: int | None,
+        contracts: float | None,
         avg_price: float | None,
         settled_at: datetime | None,
         raw: dict[str, Any],
@@ -3008,7 +3523,7 @@ class MarketStateManager:
             won = int(normalized_winning_outcome == normalized_predicted_outcome)
         timestamp = (settled_at or datetime.now(timezone.utc)).isoformat()
         realized_pnl = float(pnl_realized or 0.0)
-        normalized_contracts = int(contracts or 0)
+        normalized_contracts = max(0.0, float(contracts or 0.0))
         normalized_avg_price = (
             max(0.0, min(1.0, float(avg_price)))
             if avg_price is not None
@@ -3106,6 +3621,33 @@ class MarketStateManager:
                     datetime.now(timezone.utc).isoformat(),
                     resolution_state,
                 ),
+            )
+            if normalized_winning_outcome is not None:
+                self._conn.execute(
+                    """
+                    INSERT INTO markets (
+                        id, resolved_winning_outcome, resolved_winning_outcome_at,
+                        market_status
+                    )
+                    VALUES (?, ?, ?, 'finalized')
+                    ON CONFLICT(id) DO UPDATE SET
+                        resolved_winning_outcome = excluded.resolved_winning_outcome,
+                        resolved_winning_outcome_at = COALESCE(
+                            markets.resolved_winning_outcome_at,
+                            excluded.resolved_winning_outcome_at
+                        ),
+                        market_status = 'finalized'
+                    """,
+                    (normalized_market_id, normalized_winning_outcome, timestamp),
+                )
+            self._conn.execute(
+                """
+                UPDATE positions
+                SET status = 'closed', closed_at = COALESCE(closed_at, ?),
+                    last_synced_at = ?, source = COALESCE(source, 'exchange')
+                WHERE market_id = ?
+                """,
+                (timestamp, datetime.now(timezone.utc).isoformat(), normalized_market_id),
             )
         if online_calibration_enabled and first_resolved_import:
             self.record_online_confidence_calibration_from_trade(
@@ -3295,65 +3837,199 @@ class MarketStateManager:
 
         return [row["market_id"] for row in rows]
 
-    def export_to_json(self, path: str) -> None:
+    def export_to_json(
+        self,
+        path: str,
+        *,
+        cycle_id: str | None = None,
+        recent_decisions_limit: int = 500,
+    ) -> None:
+        """Atomically export a bounded current-state snapshot (schema version 2)."""
         export_path = Path(path)
         export_path.parent.mkdir(parents=True, exist_ok=True)
 
-        markets = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM markets").fetchall()
-        )
-        analyses = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM analyses").fetchall()
-        )
-        positions = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM positions").fetchall()
-        )
-        trade_log = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM trade_log").fetchall()
-        )
-        trade_outcomes = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM trade_outcomes").fetchall()
-        )
-        trade_outcome_events = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM trade_outcome_events").fetchall()
-        )
-        pending_orders = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM pending_orders").fetchall()
-        )
-        bayesian_state = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM bayesian_state").fetchall()
-        )
-        cycle_receipts = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM cycle_receipts ORDER BY id ASC").fetchall()
-        )
-        decision_receipts = _rows_to_dicts(
-            self._conn.execute("SELECT * FROM decision_receipts ORDER BY id ASC").fetchall()
+        latest_cycle_row = self._conn.execute(
+            """
+            SELECT * FROM cycle_receipts
+            WHERE (? IS NULL OR cycle_id = ?)
+            ORDER BY id DESC LIMIT 1
+            """,
+            (cycle_id, cycle_id),
+        ).fetchone()
+        effective_cycle_id = (
+            str(latest_cycle_row["cycle_id"])
+            if latest_cycle_row is not None and latest_cycle_row["cycle_id"]
+            else cycle_id
         )
 
-        for row in positions:
+        if effective_cycle_id:
+            market_rows = self._conn.execute(
+                """
+                SELECT * FROM markets
+                WHERE last_seen_cycle_id = ?
+                ORDER BY id
+                """,
+                (effective_cycle_id,),
+            ).fetchall()
+        else:
+            market_rows = self._conn.execute(
+                """
+                SELECT * FROM markets
+                WHERE last_seen_at IS NOT NULL
+                ORDER BY last_seen_at DESC, id
+                LIMIT 1000
+                """
+            ).fetchall()
+
+        open_positions = _rows_to_dicts(
+            self._conn.execute(
+                "SELECT * FROM positions WHERE status = 'open' ORDER BY market_id"
+            ).fetchall()
+        )
+        for row in open_positions:
             row["order_ids"] = _parse_order_ids(row.get("order_ids"))
 
-        for row in analyses:
-            if "is_refined" in row:
-                row["is_refined"] = bool(row["is_refined"])
+        active_pending_orders = self.get_pending_orders(active_only=True)
+        unresolved_trade_outcomes = _rows_to_dicts(
+            self._conn.execute(
+                """
+                SELECT * FROM trade_outcomes
+                WHERE COALESCE(resolution_state, 'unresolved') = 'unresolved'
+                ORDER BY last_updated DESC, market_id
+                """
+            ).fetchall()
+        )
+        recent_settlements = _rows_to_dicts(
+            self._conn.execute(
+                "SELECT * FROM exchange_settlements ORDER BY settled_at DESC LIMIT 100"
+            ).fetchall()
+        )
+        for row in recent_settlements:
+            row["raw"] = _safe_json_load(row.pop("raw_json", None), {})
+
+        online_calibration = _rows_to_dicts(
+            self._conn.execute(
+                "SELECT * FROM confidence_calibration_online ORDER BY family, bucket"
+            ).fetchall()
+        )
+        active_research_queue = _rows_to_dicts(
+            self._conn.execute(
+                """
+                SELECT * FROM research_queue_entries
+                WHERE expires_at IS NULL OR expires_at >= ?
+                ORDER BY last_seen DESC LIMIT 200
+                """,
+                (datetime.now(timezone.utc).isoformat(),),
+            ).fetchall()
+        )
+        for row in active_research_queue:
+            row["last_decision"] = _safe_json_load(
+                row.pop("last_decision_json", None),
+                None,
+            )
+
+        runtime_flags = _rows_to_dicts(
+            self._conn.execute("SELECT * FROM runtime_flags ORDER BY key").fetchall()
+        )
+        sync_state = self.get_exchange_sync_state()
+
+        latest_cycle_receipt = dict(latest_cycle_row) if latest_cycle_row else None
+        if latest_cycle_receipt is not None:
+            latest_cycle_receipt["payload"] = _safe_json_load(
+                latest_cycle_receipt.pop("payload_json", None),
+                {},
+            )
+
+        if effective_cycle_id:
+            decision_rows = self._conn.execute(
+                """
+                SELECT * FROM decision_receipts
+                WHERE cycle_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (effective_cycle_id, max(1, int(recent_decisions_limit))),
+            ).fetchall()
+        else:
+            decision_rows = self._conn.execute(
+                "SELECT * FROM decision_receipts ORDER BY id DESC LIMIT ?",
+                (max(1, int(recent_decisions_limit)),),
+            ).fetchall()
+        decision_receipts = _rows_to_dicts(reversed(decision_rows))
+        for row in decision_receipts:
+            for column, target, default in (
+                ("decision_json", "decision", {}),
+                ("order_json", "order", None),
+                ("audit_json", "audit", None),
+                ("score_json", "score", None),
+            ):
+                row[target] = _safe_json_load(row.pop(column, None), default)
+
+        table_names = (
+            "analyses",
+            "bayesian_state",
+            "confidence_calibration_online",
+            "cycle_receipts",
+            "decision_receipts",
+            "exchange_settlements",
+            "markets",
+            "order_fill_events",
+            "pending_orders",
+            "positions",
+            "research_queue_entries",
+            "trade_log",
+            "trade_outcome_events",
+            "trade_outcomes",
+        )
+        historical_counts = {
+            table: int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in table_names
+        }
+        checkpoints = self._conn.execute(
+            """
+            SELECT
+                (SELECT MAX(id) FROM cycle_receipts) AS cycle_receipt_id,
+                (SELECT MAX(id) FROM decision_receipts) AS decision_receipt_id
+            """
+        ).fetchone()
 
         payload = {
-            "markets": markets,
-            "analyses": analyses,
-            "positions": positions,
-            "trade_log": trade_log,
-            "trade_outcomes": trade_outcomes,
-            "trade_outcome_events": trade_outcome_events,
-            "pending_orders": pending_orders,
-            "bayesian_state": bayesian_state,
-            "cycle_receipts": cycle_receipts,
+            "schema_version": 2,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "cycle_id": effective_cycle_id,
+            "source_checkpoint": dict(checkpoints) if checkpoints else {},
+            "markets": _rows_to_dicts(market_rows),
+            "open_positions": open_positions,
+            "active_pending_orders": active_pending_orders,
+            "unresolved_trade_outcomes": unresolved_trade_outcomes,
+            "recent_settlements": recent_settlements,
+            "online_calibration": online_calibration,
+            "active_research_queue": active_research_queue,
+            "runtime_flags": runtime_flags,
+            "exchange_sync_state": sync_state,
+            "latest_cycle_receipt": latest_cycle_receipt,
             "decision_receipts": decision_receipts,
+            "historical_counts": historical_counts,
         }
 
-        export_path.write_text(
-            json.dumps(payload, indent=2, default=str),
-            encoding="utf-8",
-        )
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=export_path.parent,
+                prefix=f".{export_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                json.dump(payload, handle, indent=2, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, export_path)
+        except Exception:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            raise
         logger.debug("Exported market state to %s", export_path)
 
     def close(self) -> None:
@@ -3446,6 +4122,25 @@ class MarketStateManager:
         # 91.4% of blocked markets had no observable resolution locally.
         self._ensure_column("markets", "resolved_winning_outcome", "TEXT")
         self._ensure_column("markets", "resolved_winning_outcome_at", "TEXT")
+        self._ensure_column("markets", "event_ticker", "TEXT")
+        self._ensure_column("markets", "series_ticker", "TEXT")
+        self._ensure_column("markets", "market_status", "TEXT")
+        self._ensure_column("markets", "last_seen_at", "TEXT")
+        self._ensure_column("markets", "last_seen_cycle_id", "TEXT")
+        self._ensure_column(
+            "positions",
+            "status",
+            "TEXT NOT NULL DEFAULT 'unverified'",
+        )
+        self._ensure_column("positions", "contracts", "REAL")
+        self._ensure_column("positions", "source", "TEXT")
+        self._ensure_column("positions", "last_synced_at", "TEXT")
+        self._ensure_column("positions", "closed_at", "TEXT")
+        self._ensure_column("pending_orders", "exchange_status", "TEXT")
+        self._ensure_column("pending_orders", "remaining_shares", "REAL")
+        self._ensure_column("pending_orders", "exchange_updated_at", "TEXT")
+        self._ensure_column("pending_orders", "last_synced_at", "TEXT")
+        self._ensure_column("pending_orders", "terminal_at", "TEXT")
         self._ensure_column("decision_receipts", "score_json", "TEXT")
         self._ensure_column(
             "research_queue_entries",
@@ -3457,8 +4152,141 @@ class MarketStateManager:
             "resolution_state",
             "TEXT DEFAULT 'unresolved'",
         )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_status ON positions (status)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_markets_last_seen_cycle ON markets (last_seen_cycle_id)"
+        )
+        self._create_order_lifecycle_views()
+        # Normalize legacy outcome rows before classifying positions so a
+        # resolved trade without an exchange-settlement row is still closed.
+        self._backfill_resolution_state()
+        self._migrate_state_reconciliation_schema()
         self._migrate_binary_bayesian_likelihood_ratios()
         self._normalize_participation_tier_repr_leak()
+
+    def _create_order_lifecycle_views(self) -> None:
+        """Expose unambiguous read-only views for operators and diagnostics."""
+        self._conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS active_pending_orders AS
+            SELECT *
+            FROM pending_orders
+            WHERE LOWER(COALESCE(status, '')) IN (
+                    'accepted', 'open', 'partially_filled',
+                    'partial', 'pending', 'resting'
+                )
+              AND (
+                    remaining_shares > 1e-9
+                    OR (
+                        remaining_shares IS NULL
+                        AND (
+                            requested_shares IS NULL
+                            OR COALESCE(filled_shares, 0) < requested_shares - 1e-9
+                        )
+                    )
+                )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS order_lifecycle_history AS
+            SELECT * FROM pending_orders
+            """
+        )
+
+    def _migrate_state_reconciliation_schema(self) -> None:
+        row = self._conn.execute(
+            "SELECT value FROM runtime_flags WHERE key = ?",
+            (_STATE_RECONCILIATION_SCHEMA_FLAG,),
+        ).fetchone()
+        if row is not None and str(row["value"] or "") == _STATE_RECONCILIATION_SCHEMA_VERSION:
+            return
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE pending_orders
+                SET terminal_at = COALESCE(terminal_at, updated_at),
+                    exchange_status = COALESCE(exchange_status, status)
+                WHERE LOWER(COALESCE(status, '')) IN (
+                    'filled', 'canceled', 'cancelled',
+                    'canceled_partially_filled', 'expired', 'rejected'
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                UPDATE positions
+                SET status = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM exchange_settlements s
+                            WHERE s.market_id = positions.market_id
+                        ) OR EXISTS (
+                            SELECT 1 FROM trade_outcomes t
+                            WHERE t.market_id = positions.market_id
+                              AND COALESCE(t.resolution_state, 'unresolved') LIKE 'resolved%'
+                        ) THEN 'closed'
+                        ELSE 'unverified'
+                    END,
+                    closed_at = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM exchange_settlements s
+                            WHERE s.market_id = positions.market_id
+                        ) THEN COALESCE(
+                            closed_at,
+                            (SELECT MAX(s.settled_at) FROM exchange_settlements s
+                             WHERE s.market_id = positions.market_id),
+                            ?
+                        )
+                        WHEN EXISTS (
+                            SELECT 1 FROM trade_outcomes t
+                            WHERE t.market_id = positions.market_id
+                              AND COALESCE(t.resolution_state, 'unresolved') LIKE 'resolved%'
+                        ) THEN COALESCE(
+                            closed_at,
+                            (SELECT t.resolved_at FROM trade_outcomes t
+                             WHERE t.market_id = positions.market_id),
+                            ?
+                        )
+                        ELSE closed_at
+                    END
+                """,
+                (timestamp, timestamp),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO markets (
+                    id, resolved_winning_outcome, resolved_winning_outcome_at,
+                    market_status
+                )
+                SELECT s.market_id, s.winning_outcome, s.settled_at, 'finalized'
+                FROM exchange_settlements s
+                WHERE s.winning_outcome IN ('YES', 'NO')
+                ON CONFLICT(id) DO UPDATE SET
+                    resolved_winning_outcome = excluded.resolved_winning_outcome,
+                    resolved_winning_outcome_at = COALESCE(
+                        markets.resolved_winning_outcome_at,
+                        excluded.resolved_winning_outcome_at
+                    ),
+                    market_status = 'finalized'
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO runtime_flags (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    _STATE_RECONCILIATION_SCHEMA_FLAG,
+                    _STATE_RECONCILIATION_SCHEMA_VERSION,
+                    timestamp,
+                ),
+            )
 
     def _migrate_binary_bayesian_likelihood_ratios(self) -> None:
         """Correct legacy binary states whose odds were multiplied by LR twice."""
@@ -3636,6 +4464,15 @@ def _build_reasoning_hash(reasoning: str | None, outcome: str | None, confidence
 
 def _rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def _safe_json_load(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return default
 
 
 def _pending_order_row_to_dict(

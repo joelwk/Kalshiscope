@@ -92,6 +92,54 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
         self.assertEqual(settings.MAX_MARKET_DATA_AGE_SECONDS, 120)
 
+    def test_guaranteed_orders_defaults_disabled_and_parses_override(self) -> None:
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.GUARANTEED_ORDERS_N, 0)
+        self.assertEqual(defaults.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
+
+        env = {
+            **self._required_env(),
+            "GUARANTEED_ORDERS_N": "3",
+            "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS": "2",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GUARANTEED_ORDERS_N, 3)
+        self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 2)
+
+    def test_guaranteed_orders_rejects_negative_target(self) -> None:
+        env = {**self._required_env(), "GUARANTEED_ORDERS_N": "-1"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "GUARANTEED_ORDERS_N"):
+                config.load_settings()
+
+    def test_guaranteed_order_replace_cap_rejects_negative(self) -> None:
+        env = {
+            **self._required_env(),
+            "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS": "-1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS"
+            ):
+                config.load_settings()
+
+    def test_state_reconciliation_and_export_settings(self) -> None:
+        env = {
+            **self._required_env(),
+            "ORDER_RECONCILIATION_ENABLED": "false",
+            "POSITION_SYNC_INTERVAL_CYCLES": "4",
+            "STATE_JSON_EXPORT_INTERVAL_CYCLES": "3",
+            "STATE_JSON_RECENT_DECISIONS_LIMIT": "250",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertFalse(settings.ORDER_RECONCILIATION_ENABLED)
+        self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 4)
+        self.assertEqual(settings.STATE_JSON_EXPORT_INTERVAL_CYCLES, 3)
+        self.assertEqual(settings.STATE_JSON_RECENT_DECISIONS_LIMIT, 250)
+
     def test_missing_required_env_raises(self) -> None:
         env = {"XAI_API_KEY": "xai-key"}
         with patch.dict(os.environ, env, clear=True):
@@ -230,8 +278,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.SCORE_GATE_THRESHOLD, 0.52)
         self.assertEqual(config.Settings.KELLY_MIN_BET_POLICY, "skip")
         self.assertEqual(config.Settings.KELLY_MIN_BET_NEAR_MISS_RATIO, 0.60)
-        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_35PP, 0.6)
-        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_45PP, 0.4)
+        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_35PP, 0.40)
+        self.assertEqual(config.Settings.KELLY_EDGE_BAND_DAMPENER_45PP, 0.25)
         self.assertEqual(config.Settings.MIN_CONFIDENCE_INCREASE_FOR_ADD, 0.05)
         self.assertEqual(config.Settings.MIN_PRICE_MOVE_FOR_READD, 0.03)
 
@@ -287,6 +335,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE, 0.20)
         self.assertEqual(
             config.Settings.ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY, 0.60
+        )
+        self.assertTrue(config.Settings.ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED)
+        self.assertEqual(config.Settings.ENTRY_PRICE_FLOOR_MID_BAND_WIDTH, 0.05)
+        self.assertEqual(
+            config.Settings.ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER, 0.75
         )
 
     def test_flip_guard_direct_override_defaults(self) -> None:
@@ -360,7 +413,7 @@ class TestConfig(unittest.TestCase):
             "CONFIDENCE_GATE_MIN_EDGE=0.08",
             "CONFIDENCE_GATE_MIN_EVIDENCE_QUALITY=0.60",
             "MAX_GENERIC_CANDIDATES_PER_CYCLE=2",
-            "KELLY_EDGE_BAND_DAMPENER_25PP=0.75",
+            "KELLY_EDGE_BAND_DAMPENER_25PP=0.55",
             "CONFIDENCE_GATE_OVERRIDE_MIN_CONFIDENCE=0.55",
             "MIN_EVIDENCE_QUALITY_FOR_TRADE=0.55",
             "SCORE_GATE_THRESHOLD=0.15",
@@ -372,6 +425,8 @@ class TestConfig(unittest.TestCase):
             "MIN_BET_USDC=5.0",
             "MAX_BET_USDC=12.0",
             "DRY_RUN=true",
+            "GUARANTEED_ORDERS_N=0",
+            "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=6",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
@@ -381,6 +436,9 @@ class TestConfig(unittest.TestCase):
             "ENTRY_PRICE_FLOOR_EDGE_OVERRIDE_ENABLED=true",
             "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EDGE=0.20",
             "ENTRY_PRICE_FLOOR_OVERRIDE_MIN_EVIDENCE_QUALITY=0.60",
+            "ENTRY_PRICE_FLOOR_MID_BAND_OVERRIDE_ENABLED=true",
+            "ENTRY_PRICE_FLOOR_MID_BAND_WIDTH=0.05",
+            "ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER=0.75",
             "MAX_TRADES_PER_CYCLE=4",
             "MAX_TRADES_PER_DAY=4",
             "MAX_DAILY_DRAWDOWN_USDC=15.0",
@@ -408,6 +466,9 @@ class TestConfig(unittest.TestCase):
             "RESEARCH_QUEUE_DRAIN_MIN_PRIORITY=0.40",
             "RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH=true",
             "RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES=45",
+            "RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS=0",
+            "RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD=0.15",
+            "RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD=0.10",
             "SCORE_SOURCE_CONFIRMED_EDGE_BONUS=0.06",
             "RESEARCH_QUEUE_SCORE_PROMOTION_GAP=0.05",
             "RESEARCH_QUEUE_NEAR_CLOSE_DRAIN_WAIVER_HOURS=2.0",
@@ -759,6 +820,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
         self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
+        self.assertEqual(settings.GUARANTEED_ORDERS_N, 0)
+        self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
         self.assertTrue(settings.POSITION_SYNC_ENABLED)
         self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
         self.assertEqual(settings.ORDER_PRICE_IMPROVEMENT_CENTS, 1)
@@ -834,7 +897,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.HISTORICAL_FAMILY_SHRINKAGE_ENABLED)
         self.assertEqual(settings.HISTORICAL_FAMILY_PRIOR_STRENGTH, 10.0)
         self.assertEqual(settings.HISTORICAL_FAMILY_SHRUNK_PNL_CUTOFF, -0.50)
-        self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.08)
+        self.assertEqual(settings.SCORE_HALLUCINATED_EDGE_PENALTY_BASE, 0.16)
         self.assertEqual(settings.SCORE_EXTREME_MARKET_EDGE_PENALTY_BASE, 0.08)
         self.assertEqual(settings.SCORE_LATE_STAGE_OVERCONFIDENCE_PENALTY_BASE, 0.12)
         self.assertEqual(settings.MAX_SPEECH_CONFIDENCE, 0.65)
@@ -907,7 +970,7 @@ class TestConfig(unittest.TestCase):
         # Generic soft slot cap (analysis-slot allocation, not a hard reject).
         self.assertEqual(defaults.MAX_GENERIC_CANDIDATES_PER_CYCLE, 2)
         # New 25-35pp probe-sizing band.
-        self.assertEqual(defaults.KELLY_EDGE_BAND_DAMPENER_25PP, 0.75)
+        self.assertEqual(defaults.KELLY_EDGE_BAND_DAMPENER_25PP, 0.55)
 
     def test_kelly_edge_band_dampener_25pp_env_override(self) -> None:
         env = {
@@ -1059,6 +1122,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_MIN_PRIORITY, 0.40)
         self.assertTrue(settings.RESEARCH_QUEUE_DRAIN_FORCE_EXTENDED_RESEARCH)
         self.assertEqual(settings.RESEARCH_QUEUE_DRAIN_RETRY_COOLDOWN_MINUTES, 45.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_HIGH_PRIORITY_DRAIN_MIN_AGE_HOURS, 0.0)
+        self.assertEqual(settings.RESEARCH_QUEUE_HIGH_PRIORITY_SCORE_THRESHOLD, 0.15)
+        self.assertEqual(settings.RESEARCH_QUEUE_HIGH_PRIORITY_KELLY_THRESHOLD, 0.10)
         self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS, 1)
         self.assertEqual(settings.RESEARCH_QUEUE_SCORE_PROMOTION_GAP, 0.05)
         self.assertEqual(settings.RESEARCH_QUEUE_ZERO_YIELD_PROMOTIONS_MAX, 1)

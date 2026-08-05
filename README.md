@@ -71,6 +71,20 @@ python main.py
 - `DRY_RUN=true`: analyze and log candidate trades only.
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
+`GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
+continues its normal analysis loop but reserves exactly that many distinct
+markets (preferring confidence × evidence quality, with event/family diversity)
+for forced sized execution from the researched side. Cycle analysis is reused
+when available (deep-only); weak evidence prefers a diversified replacement
+before forcing. Ordinary gate-cleared submissions are suppressed in this mode
+so the run cannot exceed the target. Dry runs persist exactly that many
+attempted-order receipts; bounded live runs fail explicitly if Kalshi does not
+accept all target submissions and exit early once the target is complete. Live
+guarantee plans exclude sports while an exchange-confirmed jurisdiction hold is
+active. If that restriction is first discovered during forced submission, the
+rejected sports slot is retired and replaced with a non-sports market using a
+new idempotency key.
+
 Start in dry run and switch to live only after reviewing behavior in logs.
 
 ## Environment Variables
@@ -104,7 +118,12 @@ See `.env.example` for the full set of runtime controls.
 
 ## State and Logging
 
-- State persistence: `STATE_DB_PATH` (SQLite) and optional JSON export (`STATE_JSON_EXPORT_PATH`).
+- State persistence: `STATE_DB_PATH` (SQLite) remains the complete audit store.
+- `STATE_JSON_EXPORT_PATH` is an atomic, bounded schema-version-2 snapshot. It contains current-cycle markets, open positions, active orders, unresolved outcomes, recent settlements, calibration/research state, sync checkpoints, the current cycle receipt, and at most `STATE_JSON_RECENT_DECISIONS_LIMIT` decisions from that cycle. It intentionally excludes full receipt and trade history.
+- `STATE_JSON_EXPORT_INTERVAL_CYCLES` controls snapshot frequency (default `1`). A cycle receipt is committed before its snapshot is replaced.
+- Export complete history on demand without changing SQLite: `poetry run python scripts/export_state_audit.py --table decision_receipts --since 2026-07-01T00:00:00+00:00 --format ndjson --output decisions.ndjson`. Repeat `--table` to select multiple tables; omit it for every audit table.
+- Exchange order/position reconciliation runs before execution. Live submissions are suppressed when either snapshot is incomplete or when an exchange resting order is not represented locally.
+- `pending_orders` is retained as the compatibility-backed order lifecycle table; terminal rows are intentionally preserved. For direct SQLite inspection use `SELECT * FROM active_pending_orders` for actionable orders and `SELECT * FROM order_lifecycle_history` for the complete audit history.
 - Resolution tracking runs on a configurable cycle interval.
 - Logs are written under `LOG_DIR` (default `logs/`), including standard and error-focused outputs.
 

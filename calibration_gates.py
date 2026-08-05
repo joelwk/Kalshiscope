@@ -17,9 +17,11 @@ class PerformanceStats:
 
 
 class GateTier:
-    # HARD_DENY is retained as a historical telemetry label. The evaluator no
-    # longer makes prefix/family history categorically ineligible for Grok.
+    # HARD_DENY blocks execution (allowed=False) but does not demote markets
+    # out of Grok analysis — pre-analysis still researches them for learning.
     HARD_DENY = "hard_deny"
+    # SOFT_DEMOTE keeps execution eligible (allowed=True) and applies a score
+    # penalty so weak small-sample prefixes are deprioritized, not rejected.
     SOFT_DEMOTE = "soft_demote"
     NEUTRAL = "neutral"
 
@@ -301,7 +303,7 @@ def evaluate_market_tiered(
             ):
                 return EvaluateMarketResult(
                     tier=GateTier.HARD_DENY,
-                    allowed=True,
+                    allowed=False,
                     reason="historical_prefix_pnl_block",
                     metrics=metrics,
                     wilson_win_rate_lower_bound=wlb,
@@ -311,7 +313,8 @@ def evaluate_market_tiered(
                         f"Prefix '{market_prefix}' has {n} samples, "
                         f"observed win_rate={prefix_snapshot.win_rate:.2f}, "
                         f"Wilson LB={wlb:.2f}, shrunk PnL/trade={shrunk_pnl:.2f}; "
-                        "treat as research priority and sizing context, not a categorical block."
+                        "block execution while keeping the market eligible for "
+                        "research and sizing diagnostics."
                     ),
                 )
 
@@ -389,7 +392,7 @@ def evaluate_market_tiered(
             ):
                 return EvaluateMarketResult(
                     tier=GateTier.HARD_DENY,
-                    allowed=True,
+                    allowed=False,
                     reason="historical_family_pnl_block",
                     metrics=metrics,
                     wilson_win_rate_lower_bound=wlb_fam,
@@ -398,7 +401,8 @@ def evaluate_market_tiered(
                     what_to_learn_next=(
                         f"Family '{normalized_family}' has {n_fam} samples, "
                         f"Wilson LB={wlb_fam:.2f}, shrunk PnL/trade={shrunk_pnl_fam:.2f}; "
-                        "use as calibration/ranking context while preserving market eligibility."
+                        "block execution while preserving research eligibility "
+                        "for calibration and ranking context."
                     ),
                 )
 

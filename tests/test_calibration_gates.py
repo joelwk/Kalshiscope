@@ -64,7 +64,7 @@ def test_evaluate_market_respects_min_sample_guard() -> None:
     assert reason is None
 
 
-def test_evaluate_market_flags_losing_family_without_blocking() -> None:
+def test_evaluate_market_flags_losing_family_and_blocks_execution() -> None:
     allowed, reason, metrics = evaluate_market(
         market_id="ZZZZZZ999999-TEST",
         family="crypto",
@@ -83,11 +83,12 @@ def test_evaluate_market_flags_losing_family_without_blocking() -> None:
         family_pnl_cutoff=-12.0,
         family_win_rate_cutoff=0.40,
     )
-    assert allowed is True
+    assert allowed is False
     assert reason == "historical_family_pnl_block"
     assert metrics["historical_gate_market_family"] == "crypto"
     assert metrics["historical_family_samples"] == 30
     assert metrics["historical_family_pnl_total"] == -40.0
+    assert metrics["historical_gate_tier"] == GateTier.HARD_DENY
 
 
 def test_evaluate_market_does_not_block_zero_win_prefix_without_pnl_cutoff() -> None:
@@ -274,9 +275,9 @@ def test_tiered_sample_just_below_hard_block_floor_stays_soft() -> None:
     assert result.allowed is True
 
 
-def test_tiered_n12_low_wilson_is_historical_signal_not_block() -> None:
-    """With n=12 >= hard_block_min_samples and low Wilson LB, the tiered
-    evaluator should produce HARD_DENY."""
+def test_tiered_n12_low_wilson_is_hard_deny_blocks_execution() -> None:
+    """With n=12 >= hard_block_min_samples and low Wilson LB, HARD_DENY
+    blocks execution (allowed=False) while soft demote stays eligible."""
     result = evaluate_market_tiered(
         market_id="KXTESTHIT-26A-TEST",
         family="generic",
@@ -299,7 +300,7 @@ def test_tiered_n12_low_wilson_is_historical_signal_not_block() -> None:
     )
     assert result.tier == GateTier.HARD_DENY
     assert result.reason == "historical_prefix_pnl_block"
-    assert result.allowed is True
+    assert result.allowed is False
 
 
 def test_high_win_rate_negative_pnl_is_entry_price_caution_not_hard_deny() -> None:
@@ -534,6 +535,7 @@ def test_hard_deny_requires_wilson_lb_below_cutoff() -> None:
     # observed win_rate == cutoff, WLB ~ 0.17 (well below cutoff), shrunk PnL
     # well below cutoff, raw PnL below cutoff. All conditions met -> HARD_DENY.
     assert result.tier == GateTier.HARD_DENY
+    assert result.allowed is False
     assert result.wilson_win_rate_lower_bound is not None
     assert result.wilson_win_rate_lower_bound < 0.40
 
@@ -562,6 +564,7 @@ def test_family_hard_deny_requires_wilson_lb_below_cutoff() -> None:
     )
     # n=30, wins=10 (33.3%), WLB ~ 0.19 < 0.40, shrunk PnL ~ -1.0 < -0.5.
     assert result.tier == GateTier.HARD_DENY
+    assert result.allowed is False
     assert result.reason == "historical_family_pnl_block"
     assert result.wilson_win_rate_lower_bound is not None
     assert result.wilson_win_rate_lower_bound < 0.40
@@ -609,6 +612,7 @@ def test_family_hard_deny_uses_family_shrunk_pnl_cutoff_not_prefix() -> None:
         family_shrunk_pnl_cutoff=-0.50,
     )
     assert tight.tier == GateTier.HARD_DENY
+    assert tight.allowed is False
     assert tight.reason == "historical_family_pnl_block"
 
 
@@ -649,4 +653,5 @@ def test_family_shrinkage_independent_of_prefix_shrinkage() -> None:
         family_shrinkage_enabled=False,
     )
     assert shrunk_off.tier == GateTier.HARD_DENY
+    assert shrunk_off.allowed is False
     assert shrunk_off.reason == "historical_family_pnl_block"

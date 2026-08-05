@@ -260,24 +260,17 @@ def test_export_to_json(tmp_path) -> None:
         manager.export_to_json(str(export_path))
 
         payload = json.loads(export_path.read_text(encoding="utf-8"))
-        assert set(payload.keys()) == {
-            "markets",
-            "analyses",
-            "positions",
-            "trade_log",
-            "trade_outcomes",
-            "trade_outcome_events",
-            "pending_orders",
-            "bayesian_state",
-            "cycle_receipts",
-            "decision_receipts",
+        assert payload["schema_version"] == 2
+        assert payload["source_checkpoint"] == {
+            "cycle_receipt_id": None,
+            "decision_receipt_id": None,
         }
-        assert payload["analyses"]
-        assert payload["positions"]
-        assert payload["trade_log"]
-        assert payload["trade_outcomes"]
-        assert payload["trade_outcome_events"]
-        assert payload["positions"][0]["order_ids"] == ["o9"]
+        assert payload["open_positions"][0]["order_ids"] == ["o9"]
+        assert payload["active_pending_orders"] == []
+        assert payload["historical_counts"]["trade_log"] == 1
+        assert payload["historical_counts"]["trade_outcomes"] == 1
+        assert "analyses" not in payload
+        assert "trade_log" not in payload
     finally:
         manager.close()
 
