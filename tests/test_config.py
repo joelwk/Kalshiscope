@@ -448,6 +448,7 @@ class TestConfig(unittest.TestCase):
             "DRY_RUN=true",
             "GUARANTEED_ORDERS_N=0",
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=6",
+            "MAX_POSITION_PER_MARKET_USDC=200.0",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
