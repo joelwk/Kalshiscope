@@ -184,7 +184,7 @@ _ENTERTAINMENT_TICKER_PATTERN = re.compile(
 _SPORTS_TICKER_PATTERN = re.compile(
     # NPB / ARGNACB / KBOGAME-style prefixes: exchange sports products that
     # otherwise fall through to "generic" when the question omits league names.
-    r"\bKX(?:MLB|NBA|NFL|NHL|NCAA|EPL|UCL|UEFA|MLS|WNBA|AFL|ATP|WTA|UFC|MMA|BOX|F1|IPL|T20|KBO|ISL|NPB|ARGNACB|NCAAF|NCAAB|CFB|CBB)",
+    r"\bKX(?:MLB|NBA|NFL|NHL|NCAA|EPL|UCL|UEFA|MLS|WNBA|AFL|ATP|WTA|UFC|MMA|BOX|F1|IPL|T20|KBO|ISL|NPB|ARGNACB|NCAAF|NCAAB|CFB|CBB|VALORANT|CS2|CSGO|DOTA|LOL|ESPORT)",
     re.IGNORECASE,
 )
 _CRYPTO_TICKER_PATTERN = re.compile(
@@ -328,8 +328,10 @@ def family_from_text(text: str) -> str:
     if _CRYPTO_TICKER_PATTERN.search(text or ""):
         return "crypto"
     normalized = (text or "").lower()
-    if _has_keyword_match(normalized, _SPORTS_KEYWORDS) or _has_keyword_match(
-        normalized, _ESPORTS_KEYWORDS
+    if (
+        _has_keyword_match(normalized, _SPORTS_KEYWORDS)
+        or _has_keyword_match(normalized, _ESPORTS_KEYWORDS)
+        or _has_esports_ticker_substring(text or "")
     ):
         return "sports"
     if _has_keyword_match(normalized, _CRYPTO_KEYWORDS):
@@ -363,6 +365,12 @@ def _has_keyword_match(text: str, keywords: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
 
 
+def _has_esports_ticker_substring(text: str) -> bool:
+    """Match esports keywords inside concatenated tickers like KXVALORANTMAP."""
+    compact = re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+    return any(keyword.replace(" ", "") in compact for keyword in _ESPORTS_KEYWORDS)
+
+
 def _market_text(market: Market) -> str:
     category = (market.category or "").lower()
     question = (market.question or "").lower()
@@ -372,7 +380,9 @@ def _market_text(market: Market) -> str:
 
 def market_category_flags(market: Market) -> tuple[bool, bool]:
     text = _market_text(market)
-    is_esports = _has_keyword_match(text, _ESPORTS_KEYWORDS)
+    is_esports = _has_keyword_match(text, _ESPORTS_KEYWORDS) or _has_esports_ticker_substring(
+        text
+    )
     is_sports = _has_keyword_match(text, _SPORTS_KEYWORDS)
     return is_sports, is_esports
 

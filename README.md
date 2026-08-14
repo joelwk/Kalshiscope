@@ -72,12 +72,11 @@ python main.py
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
-continues its normal analysis loop but reserves exactly that many distinct
-markets (preferring confidence × evidence quality, with event/family diversity)
-for forced sized execution from the researched side. Cycle analysis is reused
-when available (deep-only); weak evidence prefers a diversified replacement
-before forcing. Ordinary gate-cleared submissions are suppressed in this mode
-so the run cannot exceed the target. Dry runs persist exactly that many
+must enter that many markets: it locks this cycle's top-confidence analyzed
+names (event/family diversity), dives deeper on those slots, replaces a
+research gap only with another analyzed name, then forces a sized order from
+the researched side. Ordinary gate-cleared submissions are suppressed in this
+mode so the run cannot exceed the target. Dry runs persist exactly that many
 attempted-order receipts; bounded live runs fail explicitly if Kalshi does not
 accept all target submissions and exit early once the target is complete. Live
 guarantee plans exclude sports while an exchange-confirmed jurisdiction hold is

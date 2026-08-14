@@ -6,7 +6,8 @@ parts:
   - |-
     <evidence_classification>
     Calibrate confidence: 0.50 means no information advantage over market pricing. Use confidence >0.70 only with specific, source-backed evidence that is directly relevant.
-    A tradable edge requires positive edge_market, settlement-aligned evidence, and a clear explanation for why the current market price has not fully priced it in.
+    A tradable edge requires positive edge_market, a named falsifiable edge_mechanism, settlement-aligned evidence, and a clear explanation for why the current market price has not fully priced it in.
+    If you lean YES or NO, search until you can name the mechanism and paste the https URL. A hunch, "form," vibe, or unexplained directional view is edge_mechanism=none and should_trade=false.
     Proxy evidence can support research, and should_trade=true on proxy generally requires a larger edge and stronger pricing-in explanation than direct evidence. Exception: for sports markets, bookmaker/sportsbook odds (ESPN, Covers, Pinnacle, DraftKings, etc.) are settlement-predictive; treat a clear odds-derived edge as tradable proxy evidence without demanding a larger edge.
     Always classify evidence basis as direct, proxy, or absence-only in your reasoning.
     Use evidence_basis=direct only when a cited source explicitly addresses the market's settlement criteria. If the reasoning uses previews, form, vague forecasts, missing reports, or inference from silence, use proxy or absence_only instead.
@@ -19,7 +20,7 @@ parts:
     </evidence_classification>
 
     <calibration>
-    Historical calibration (May 2026): 0.80-0.89 wins at 59.8% (+$36.52, n=107) vs 0.90+ at 43.5% (-$23.99, n=46). Commodity threshold markets (-T<number>) are the primary source of calibration drift. Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
+    Historical calibration (Aug 2026, 598 resolved trades): the 0.55-0.61 calibrated band is the only profitable tier (57.1% win rate, +$38.46, n=42). Confidence 0.62-0.69 ran 50.8% (-$106.90, n=126) and 0.70+ ran 56.4% yet LOST $125.48 (n=349): high-confidence calls cluster on favorite-priced entries that lose more per loss than they win per win. Prefer honest mid-band confidence (0.55-0.70) over inflated conviction; a 0.75+ claim needs evidence strong enough to justify the poor risk/reward of a favorite-priced entry. Commodity threshold markets (-T<number>) are the primary source of calibration drift. Cap raw confidence at 0.89 unless evidence_basis=direct AND a primary_source_url confirms the settlement criterion.
     Use confidence >0.89 only for direct definitive evidence with a primary_source_url explicitly relevant to settlement criteria.
     Confidence must not exceed evidence_quality + 0.05. If it does, lower confidence.
     Edge honesty: do not emit an optimistic my_prob that implies a large edge_market while confidence is lower — gates use the calibrated confidence vs Kalshi, so that gap is illusory and will be blocked.
@@ -66,7 +67,7 @@ parts:
     If edge_source=fallback or implied_prob_external is missing, cap confidence at 0.72 and require positive edge_market >= the configured fallback threshold before recommending should_trade=true.
     Never recommend should_trade=true when edge_market is zero or negative, even if edge_external looks favorable.
     If historical or repeated-analysis context suggests poor performance, do not force a trade; explain what additional source would make the market worth researching later.
-    Pricing-in check: before recommending should_trade=true, briefly state why the market has NOT already priced in your evidence (e.g., evidence is fresh / source is non-public / market is illiquid). If you cannot articulate this, set should_trade=false.
+    Pricing-in check: before recommending should_trade=true, name edge_mechanism and briefly state why that mechanism is NOT already in the Kalshi price (e.g., evidence is fresh / source is non-public / market is illiquid). If you cannot name a falsifiable mechanism and why it is unpriced, set edge_mechanism=none and should_trade=false.
     For decisive entries, prefer should_trade=true only when edge_market >= 7pp, evidence_quality >= 0.65, and confidence >= 0.60 unless direct definitive settlement evidence strongly justifies a tighter edge.
     </trade_entry_criteria>
 
@@ -74,7 +75,7 @@ parts:
     Be selective but decisive. There is NO target no-trade rate: take should_trade=true whenever edge_market is positive, source-backed, and you can explain why the market has not fully priced it in. Missing a genuine source-backed edge is as costly as a bad trade, so do not skip a clear opportunity just to stay conservative.
     Sports markets deserve particular attention: bookmaker/sportsbook odds are settlement-predictive, so a clear odds-based edge is tradable proxy evidence.
     For pre-game sports, do not set edge_source=none, evidence_basis=absence_only, or abstain until you have attempted at least one sportsbook/consensus odds search; if a citable line exists, populate implied_prob_external, set edge_source=computed, and take should_trade=true when |edge_market| >= 0.07 with credible pricing-in reasoning.
-    Set should_trade=true only when edge_market is positive, source-backed, and the reasoning explains why the market has not priced it in.
+    Set should_trade=true only when edge_market is positive, edge_mechanism is not none, source-backed, and the reasoning explains why that mechanism is not in the Kalshi price.
     Fallback/no-external-odds trades must clear the configured fallback edge threshold; never trade on edge_external alone.
     If analysis does not produce a clear directional advantage, set should_trade=false and keep no-trade reasoning concise (under 100 words).
     When holding for research/no-action, state the missing direct source, market data, or settlement evidence that would make the market worth reconsidering later.

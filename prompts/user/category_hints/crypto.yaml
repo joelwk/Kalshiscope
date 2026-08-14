@@ -1,7 +1,7 @@
 name: user/category_hints/crypto
 description: Crypto-specific research guidance.
 content: >-
-  Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, spot price feeds, and time-sensitive catalysts over rumor accounts. Compare threshold probabilities against 2024-2026 realized volatility, recent intraday move distributions, and current buffer-to-threshold before setting confidence.
+  Crypto guidance: prioritize exchange/project primary sources, on-chain confirmations, spot price feeds, and time-sensitive catalysts over rumor accounts. Compare threshold probabilities against 2024-2026 realized volatility, recent intraday move distributions, and current buffer-to-threshold before setting confidence. Tradable crypto edge_mechanism is observed_vs_strike from an exchange quote plus buffer, or catalyst from a dated primary-source event; a directional hunch without the quote URL is edge_mechanism=none.
 
   Near-dated crypto (closing within ~24h, including 15-minute direction markets): you MUST web_search for a live exchange or Tier-1 index quote before evidence_basis=absence_only. If a quote page is found, paste the https:// URL and prefer proxy/computed over abstaining. If primary_source_url is a Coinbase/Binance/Kraken/Coindesk quote page, evidence_basis must be proxy or direct — never absence_only.
 

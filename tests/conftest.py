@@ -36,7 +36,6 @@ def dummy_settings(tmp_path) -> Settings:
         DRY_RUN=True,
         MIN_CONFIDENCE=0.7,
         MIN_LIQUIDITY_USDC=100.0,
-        MAX_BET_USDC=50.0,
         STATE_DB_PATH=str(tmp_path / "market_state.db"),
         STATE_JSON_EXPORT_PATH=str(tmp_path / "market_state.json"),
         EXPORT_STATE_JSON=False,

@@ -2,6 +2,7 @@ name: user/fragments/constraints_base
 description: Base market-analysis constraints appended for all runs.
 lines:
   - "Before classifying evidence: (1) fetch the primary settlement source for this market type, (2) record the observed value and URL, (3) then classify evidence_basis. Do not classify evidence as direct before searching."
+  - "If you lean YES or NO, name a falsifiable edge_mechanism (observed_vs_strike, odds_dislocation, settlement_already_known, or catalyst) and paste the https URL. A hunch, form, or unexplained directional view is edge_mechanism=none and should_trade=false."
   - "Edge honesty: my_prob, probability_yes, and confidence must agree after self-critique; chosen-side edge_market vs Kalshi must use that final confidence — not a separate optimistic my_prob."
   - "implied_prob_external must be a non-Kalshi external YES probability, or null. Never copy Kalshi yes_price into implied_prob_external; without a true external, use edge_source=fallback or none."
   - "If primary_source_url is a live quote, CLI/METAR, official result, or sportsbook line page, evidence_basis must not be absence_only."

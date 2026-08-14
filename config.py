@@ -13,12 +13,21 @@ load_dotenv(override=True)
 XAI_WEB_SEARCH_ALLOWED_DOMAINS_LIMIT = 5
 XAI_X_SEARCH_ALLOWED_HANDLES_LIMIT = 10
 
+# Hard dollar floor applied to the bankroll-derived bet bounds so orders stay
+# above Kalshi's one-contract minimum and per-order fee rounding stays
+# efficient even at very small bankrolls.
+BET_ABSOLUTE_FLOOR_USDC = 1.0
+
 
 @dataclass(frozen=True)
 class Settings:
     # Risk controls - Conservative defaults for value betting
-    MIN_BET_USDC: float = 1.0
-    MAX_BET_USDC: float = 50.0
+    # Bet bounds are percentages of the live portfolio value (cash + positions)
+    # so per-trade sizing scales with the bankroll instead of requiring manual
+    # re-tuning of dollar limits. Effective dollars are derived once per cycle
+    # in main.py from the fetched balance (floored at BET_ABSOLUTE_FLOOR_USDC).
+    MIN_BET_PCT_OF_BANKROLL: float = 0.04
+    MAX_BET_PCT_OF_BANKROLL: float = 0.16
     MIN_CONFIDENCE: float = 0.62  # Raised to avoid low-confidence churn and improve calibration
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.08
@@ -166,6 +175,8 @@ class Settings:
     XAI_API_KEY: str = ""
     GROK_MODEL: str = "grok-4-1-fast-reasoning"
     GROK_MODEL_DEEP: str = "grok-4.20-beta-0309-reasoning"
+    GROK_REASONING_EFFORT: str = "high"
+    GROK_REASONING_EFFORT_DEEP: str = "high"
     SEARCH_LOOKBACK_HOURS: int = 24
     SEARCH_ALLOWED_DOMAINS: tuple[str, ...] = (
         "espn.com",
@@ -502,13 +513,13 @@ class Settings:
 
     # Execution
     DRY_RUN: bool = True
-    # Opt-in run-level forced-order target. When positive, ordinary submissions
-    # are suppressed until the plan completes: lock N distinct markets (prefer
-    # conf×EQ with event/family diversity; reuse cycle analysis when present),
-    # deep-research each slot, prefer replacing weak evidence, then force a
-    # sized order from the researched side. Ordinary score/edge/EQ gates are
-    # audit-only for these slots. Unexecutable markets (closed, price band,
-    # jurisdiction) and weak-evidence slots may be replaced up to
+    # Opt-in run-level forced-order target. When positive, the bot must enter
+    # N markets: lock this cycle's top-confidence analyzed names (event/family
+    # diversity), deep-research those slots, replace a research gap only with
+    # another analyzed name, then force a sized order from the researched
+    # side. Ordinary score/edge/EQ gates are audit-only for these slots.
+    # Unexecutable markets (closed, price band, jurisdiction) may still be
+    # replaced from the catalog up to
     # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. A bounded run that never
     # locks/completes the target fails loudly; a bounded run exits early once
     # the target is complete.
@@ -606,7 +617,10 @@ class Settings:
     MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
-    MAX_DAILY_DRAWDOWN_USDC: float = 30.0
+    # Daily drawdown cap as a fraction of the day's starting portfolio value,
+    # so the protective stop scales with the bankroll. The dollar cap is
+    # derived per cycle in main.py; 0 disables the guard.
+    MAX_DAILY_DRAWDOWN_PCT: float = 0.20
     # When the daily drawdown cap is already exceeded, skip Grok analysis for
     # the remainder of the day and route candidates to research_queue with
     # tier=MONITOR_ONLY so we capture the conviction signal without spending
@@ -1011,6 +1025,7 @@ class Settings:
     BORDERLINE_CRITIQUE_REFINEMENT_ENABLED: bool = True
     BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND: float = 0.10
     CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED: bool = True
+    CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED: bool = True
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -1120,8 +1135,12 @@ def load_settings() -> Settings:
     )
 
     settings = Settings(
-        MIN_BET_USDC=_read_env_float("MIN_BET_USDC", Settings.MIN_BET_USDC),
-        MAX_BET_USDC=_read_env_float("MAX_BET_USDC", Settings.MAX_BET_USDC),
+        MIN_BET_PCT_OF_BANKROLL=_read_env_float(
+            "MIN_BET_PCT_OF_BANKROLL", Settings.MIN_BET_PCT_OF_BANKROLL
+        ),
+        MAX_BET_PCT_OF_BANKROLL=_read_env_float(
+            "MAX_BET_PCT_OF_BANKROLL", Settings.MAX_BET_PCT_OF_BANKROLL
+        ),
         MIN_CONFIDENCE=_read_env_float("MIN_CONFIDENCE", Settings.MIN_CONFIDENCE),
         CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=_read_env_bool(
             "CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED",
@@ -1397,6 +1416,12 @@ def load_settings() -> Settings:
         XAI_API_KEY=_read_env_str("XAI_API_KEY", Settings.XAI_API_KEY),
         GROK_MODEL=normalized_model_initial,
         GROK_MODEL_DEEP=normalized_model_deep,
+        GROK_REASONING_EFFORT=_read_env_str(
+            "GROK_REASONING_EFFORT", Settings.GROK_REASONING_EFFORT
+        ),
+        GROK_REASONING_EFFORT_DEEP=_read_env_str(
+            "GROK_REASONING_EFFORT_DEEP", Settings.GROK_REASONING_EFFORT_DEEP
+        ),
         SEARCH_LOOKBACK_HOURS=_read_env_int(
             "SEARCH_LOOKBACK_HOURS", Settings.SEARCH_LOOKBACK_HOURS
         ),
@@ -1703,9 +1728,9 @@ def load_settings() -> Settings:
             "MAX_TRADES_PER_DAY",
             Settings.MAX_TRADES_PER_DAY,
         ),
-        MAX_DAILY_DRAWDOWN_USDC=_read_env_float(
-            "MAX_DAILY_DRAWDOWN_USDC",
-            Settings.MAX_DAILY_DRAWDOWN_USDC,
+        MAX_DAILY_DRAWDOWN_PCT=_read_env_float(
+            "MAX_DAILY_DRAWDOWN_PCT",
+            Settings.MAX_DAILY_DRAWDOWN_PCT,
         ),
         DAILY_DRAWDOWN_PREFLIGHT_ENABLED=_read_env_bool(
             "DAILY_DRAWDOWN_PREFLIGHT_ENABLED",
@@ -2681,6 +2706,10 @@ def load_settings() -> Settings:
         CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED=_read_env_bool(
             "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
             Settings.CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED,
+        ),
+        CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED=_read_env_bool(
+            "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED",
+            Settings.CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED,
         ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),

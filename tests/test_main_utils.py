@@ -62,6 +62,7 @@ from main import (
     _extract_order_fill_count,
     _fetch_markets_with_optional_server_filters,
     _filter_markets,
+    _is_tls_ca_bundle_error,
     _kelly_fraction_for_market_horizon,
     _load_execution_market_snapshot,
     _log_settings_summary,
@@ -1020,7 +1021,7 @@ class TestMainUtils(unittest.TestCase):
         """Hold overlay eases weather dominance and boosts crypto/generic."""
         self.assertAlmostEqual(
             _direct_evidence_family_affinity("weather"),
-            0.12,
+            0.04,
             places=4,
         )
         self.assertAlmostEqual(
@@ -1028,7 +1029,7 @@ class TestMainUtils(unittest.TestCase):
                 "weather",
                 sports_jurisdiction_hold_active=True,
             ),
-            0.06,
+            0.03,
             places=4,
         )
         self.assertAlmostEqual(
@@ -1047,9 +1048,19 @@ class TestMainUtils(unittest.TestCase):
             0.04,
             places=4,
         )
-        self.assertEqual(
+        # Hold overlay keeps weather below its base affinity and boosts crypto
+        # above it (base weather 0.04 / crypto 0.06 per the affinity tables).
+        self.assertLess(
+            _direct_evidence_family_affinity(
+                "weather", sports_jurisdiction_hold_active=True
+            ),
+            _direct_evidence_family_affinity("weather"),
+        )
+        self.assertGreater(
+            _direct_evidence_family_affinity(
+                "crypto", sports_jurisdiction_hold_active=True
+            ),
             _direct_evidence_family_affinity("crypto"),
-            0.0,
         )
 
         settings = Settings()
@@ -1100,7 +1111,7 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertAlmostEqual(
             weather_bd["pre_score_direct_evidence_family_affinity"],
-            0.06,
+            0.03,
             places=4,
         )
 
@@ -3071,6 +3082,55 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_calculate_bet(100, -1), 0)
         self.assertEqual(_calculate_bet(100, 2), 100)
 
+    def test_effective_bet_bounds_scale_with_bankroll(self) -> None:
+        from main import _effective_bet_bounds_usdc
+
+        settings = Settings(
+            MIN_BET_PCT_OF_BANKROLL=0.04,
+            MAX_BET_PCT_OF_BANKROLL=0.16,
+        )
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 75.0)
+        self.assertAlmostEqual(min_bet, 3.0)
+        self.assertAlmostEqual(max_bet, 12.0)
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 150.0)
+        self.assertAlmostEqual(min_bet, 6.0)
+        self.assertAlmostEqual(max_bet, 24.0)
+
+    def test_effective_bet_bounds_floor_at_one_dollar(self) -> None:
+        from main import _effective_bet_bounds_usdc
+
+        settings = Settings(
+            MIN_BET_PCT_OF_BANKROLL=0.04,
+            MAX_BET_PCT_OF_BANKROLL=0.16,
+        )
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 10.0)
+        # 4% of $10 = $0.40 floors to $1; 16% of $10 = $1.60 stays.
+        self.assertAlmostEqual(min_bet, 1.0)
+        self.assertAlmostEqual(max_bet, 1.6)
+        # Min never exceeds max even when both hit the floor.
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 3.0)
+        self.assertAlmostEqual(min_bet, 1.0)
+        self.assertAlmostEqual(max_bet, 1.0)
+
+    def test_effective_bet_bounds_zero_without_bankroll(self) -> None:
+        from main import _effective_bet_bounds_usdc
+
+        settings = Settings()
+        self.assertEqual(_effective_bet_bounds_usdc(settings, None), (0.0, 0.0))
+        self.assertEqual(_effective_bet_bounds_usdc(settings, 0.0), (0.0, 0.0))
+        self.assertEqual(_effective_bet_bounds_usdc(settings, -5.0), (0.0, 0.0))
+
+    def test_effective_daily_drawdown_cap_scales_and_disables(self) -> None:
+        from main import _effective_daily_drawdown_cap_usdc
+
+        settings = Settings(MAX_DAILY_DRAWDOWN_PCT=0.20)
+        self.assertAlmostEqual(
+            _effective_daily_drawdown_cap_usdc(settings, 75.0), 15.0
+        )
+        self.assertEqual(_effective_daily_drawdown_cap_usdc(settings, None), 0.0)
+        disabled = Settings(MAX_DAILY_DRAWDOWN_PCT=0.0)
+        self.assertEqual(_effective_daily_drawdown_cap_usdc(disabled, 75.0), 0.0)
+
     def test_filter_markets_captures_resolved_winners(self) -> None:
         now = datetime.now(timezone.utc)
         settled = Market(
@@ -3170,16 +3230,19 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(clamped_amount, 12.5)
 
     def test_satellite_cap_executable_above_min_bet_when_configured(self) -> None:
-        # Invariant: the recommended satellite cap (raised to 0.45) x MAX_BET
-        # must be >= MIN_BET so satellite trades are not structurally blocked.
+        # Invariant: the satellite cap x max-bet pct must be >= min-bet pct so
+        # satellite trades are not structurally blocked at any bankroll.
         settings = Settings(
-            MAX_BET_USDC=12.0,
-            MIN_BET_USDC=5.0,
+            MIN_BET_PCT_OF_BANKROLL=0.04,
+            MAX_BET_PCT_OF_BANKROLL=0.16,
             DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45,
         )
         _, cap = _daily_expectancy_role(settings=settings, daily_exposure_count=2)
         self.assertIsNotNone(cap)
-        self.assertGreaterEqual(cap * settings.MAX_BET_USDC, settings.MIN_BET_USDC)
+        self.assertGreaterEqual(
+            cap * settings.MAX_BET_PCT_OF_BANKROLL,
+            settings.MIN_BET_PCT_OF_BANKROLL,
+        )
 
     def test_daily_expectancy_ev_blocks_non_positive_primary_and_unfunded_satellite(self) -> None:
         self.assertEqual(
@@ -4255,6 +4318,35 @@ class TestMainUtils(unittest.TestCase):
         # last call should be unfiltered fallback
         self.assertEqual(client.calls[-1], (None, None, None))
 
+    def test_is_tls_ca_bundle_error_detects_requests_message(self) -> None:
+        self.assertTrue(
+            _is_tls_ca_bundle_error(
+                OSError(
+                    "Could not find a suitable TLS CA certificate bundle, "
+                    "invalid path: /venv/lib/python3.10/site-packages/certifi/cacert.pem"
+                )
+            )
+        )
+        self.assertFalse(_is_tls_ca_bundle_error(RuntimeError("first filtered failure")))
+
+    def test_fetch_markets_does_not_retry_tls_ca_bundle_errors(self) -> None:
+        now = datetime.now(timezone.utc)
+        tls_error = OSError(
+            "Could not find a suitable TLS CA certificate bundle, "
+            "invalid path: /venv/lib/python3.10/site-packages/certifi/cacert.pem"
+        )
+        client = self._DummyKalshiClient([tls_error, [Market(id="m", question="Q")]])
+        with self.assertRaises(OSError) as raised:
+            _fetch_markets_with_optional_server_filters(
+                client,
+                use_server_side_filters=True,
+                fetch_window_start=now,
+                fetch_window_end=now + timedelta(days=1),
+            )
+        self.assertIs(raised.exception, tls_error)
+        self.assertEqual(client.reset_calls, 0)
+        self.assertEqual(len(client.calls), 1)
+
     def test_cap_effective_confidence_for_market_respects_category_caps(self) -> None:
         settings = Settings(
             MAX_GLOBAL_CONFIDENCE=0.85,
@@ -4776,7 +4868,6 @@ class TestMainUtils(unittest.TestCase):
         settings = Settings(
             MAX_POSITION_PER_MARKET_USDC=200.0,
             MAX_POSITION_PCT_OF_BANKROLL=0.15,
-            MAX_BET_USDC=50.0,
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -4804,6 +4895,7 @@ class TestMainUtils(unittest.TestCase):
             state=None,
             settings=settings,
             cycle_bankroll=20.0,
+            max_bet_usdc=50.0,
         )
         self.assertTrue(allowed)
         self.assertEqual(reason, "confidence_increase_threshold_met")
@@ -5687,7 +5779,7 @@ class TestCounterfactualAuditFields(unittest.TestCase):
         self.assertEqual(fields["counterfactual_prefix_samples_short_by"], 13)
 
     def test_helper_emits_drawdown_counterfactual_for_drawdown_reason(self) -> None:
-        settings = Settings(MAX_DAILY_DRAWDOWN_USDC=25.0)
+        settings = Settings(MAX_DAILY_DRAWDOWN_PCT=0.25)
         fields = _build_counterfactual_audit_fields(
             reason="pre_analysis_daily_drawdown_blocked",
             settings=settings,
@@ -5696,7 +5788,7 @@ class TestCounterfactualAuditFields(unittest.TestCase):
             fields["counterfactual_required_for_drawdown_block"],
             "drawdown_reset_or_position_close",
         )
-        self.assertEqual(fields["counterfactual_max_daily_drawdown_usdc"], 25.0)
+        self.assertEqual(fields["counterfactual_max_daily_drawdown_pct"], 0.25)
 
 
 class TestSkipDueToForReason(unittest.TestCase):

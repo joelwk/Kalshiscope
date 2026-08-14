@@ -108,9 +108,10 @@ class KalshiClient:
         self.timeout_sec = timeout_sec
         self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
         self.default_time_in_force = _normalize_time_in_force(default_time_in_force)
-        # MIN_BET_USDC eligibility is decided by the execution pipeline before an
-        # OrderRequest reaches this client. Keep the values for compatibility and
-        # enforce MAX_BET_USDC again at the final integer-contract boundary.
+        # Min-bet eligibility is decided by the execution pipeline before an
+        # OrderRequest reaches this client. The bot refreshes these values each
+        # cycle from the bankroll-derived bet bounds and the max is re-enforced
+        # at the final integer-contract boundary.
         self.min_bet_usdc = max(0.0, float(min_bet_usdc))
         self.max_bet_usdc = max(0.0, float(max_bet_usdc))
         self.max_fetch_pages = (

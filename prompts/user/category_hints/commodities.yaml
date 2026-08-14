@@ -1,7 +1,7 @@
 name: user/category_hints/commodities
 description: Commodity-market guidance.
 content: >-
-  Commodities guidance: settlement prices come from CME Group (WTI/Natural Gas/Gold/Silver/Copper) and ICE Futures (Brent). Required sources: CME settlement feed or EIA weekly report for energy; COMEX official close for metals. Live quote pages (WSJ, Bloomberg, Reuters) are acceptable for real-time threshold checks but must include the observed value and timestamp.
+  Commodities guidance: settlement prices come from CME Group (WTI/Natural Gas/Gold/Silver/Copper) and ICE Futures (Brent). Required sources: CME settlement feed or EIA weekly report for energy; COMEX official close for metals. Live quote pages (WSJ, Bloomberg, Reuters) are acceptable for real-time threshold checks but must include the observed value and timestamp. Tradable commodity edge_mechanism is observed_vs_strike from a CME/ICE/EIA or Tier-1 quote versus the strike; a directional oil/metals hunch without that https quote is edge_mechanism=none.
 
   Prefer CME (cmegroup.com), ICE (theice.com), or COMEX quote/settlement pages that show the observed front-month price and timestamp for evidence_basis=direct. primary_source_url must be the exact https:// page (for example https://www.cmegroup.com/markets/energy/crude-oil/light-sweet-crude.html), never a prose label like "CME WTI quote Jul 28". Bare section landing pages without a quoted price (for example bloomberg.com/energy with no observed value) remain evidence_basis=proxy even when settlement-aligned — still set should_trade=true when buffer vs ATR supports a positive edge_market and primary_source_url is populated; do not abstain solely because the best citable URL is proxy.
 

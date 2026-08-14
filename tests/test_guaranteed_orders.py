@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import main
+from kalshi_client import PortfolioBalance
 from market_state import MarketStateManager
 from models import Market, MarketOutcome, OrderResponse, TradeDecision
 
@@ -32,10 +33,21 @@ class _GuaranteedKalshi:
         self.last_fetch_pages = 1
         self.last_fetch_cap_hit = False
         self.last_fetch_mve_filter = None
+        # Bankroll-derived bet bounds are refreshed on the client each cycle.
+        self.min_bet_usdc = 0.0
+        self.max_bet_usdc = 0.0
 
     def get_markets(self, **kwargs):
         self.last_fetch_mve_filter = kwargs.get("mve_filter")
         return self.markets
+
+    def get_portfolio_balance(self):
+        return PortfolioBalance(
+            available_balance=50.0,
+            position_value=25.0,
+            total_portfolio_value=75.0,
+            raw_payload={},
+        )
 
     def reset_session(self):
         return None
@@ -122,6 +134,7 @@ def _decision(
     confidence: float = 0.72,
     should_trade: bool = False,
     primary_source_url: str | None = "https://example.com/source",
+    edge_mechanism: str | None = None,
 ) -> TradeDecision:
     return TradeDecision(
         should_trade=should_trade,
@@ -134,6 +147,7 @@ def _decision(
         evidence_quality=evidence_quality,
         evidence_basis=evidence_basis,
         edge_source=edge_source,
+        edge_mechanism=edge_mechanism,
         primary_source_url=primary_source_url,
         abstain=not should_trade,
         prompt_tokens=10,
@@ -211,9 +225,9 @@ def test_guaranteed_dry_run_forces_deep_side_and_counts_one_attempt(tmp_path) ->
             settings=main.Settings(
                 DRY_RUN=True,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
         )
     finally:
         state.close()
@@ -260,9 +274,9 @@ def test_guaranteed_forces_absence_only_after_deep_research(tmp_path) -> None:
             settings=main.Settings(
                 DRY_RUN=True,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
         )
     finally:
         state.close()
@@ -298,12 +312,12 @@ def test_guaranteed_phase_forces_weak_evidence_without_replacement(tmp_path) -> 
             settings=main.Settings(
                 DRY_RUN=False,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
             grok_client=grok,
             kalshi_client=kalshi,
             state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
             log_decision=lambda **kwargs: decisions.append(kwargs),
             extended_research_market_ids=set(),
         )
@@ -355,12 +369,12 @@ def test_guaranteed_phase_replaces_weak_evidence_when_alternate_exists(tmp_path)
             settings=main.Settings(
                 DRY_RUN=False,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
             grok_client=grok,
             kalshi_client=kalshi,
             state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
             log_decision=lambda **kwargs: decisions.append(kwargs),
             extended_research_market_ids=set(),
         )
@@ -374,6 +388,71 @@ def test_guaranteed_phase_replaces_weak_evidence_when_alternate_exists(tmp_path)
     assert plan.research_gap_replacements == 1
     assert kalshi.submitted_market_ids == ["good-low"]
     assert grok.deep_calls == ["gap-high", "good-low"]
+
+
+def test_guaranteed_phase_forces_analyzed_gap_instead_of_unanalyzed_liquid(
+    tmp_path,
+) -> None:
+    gap_market = _market("analyzed-gap", liquidity=50.0)
+    liquid = _market("unanalyzed-liquid", liquidity=900.0)
+    gap_decision = _decision(
+        evidence_basis="absence_only",
+        edge_source="none",
+        evidence_quality=0.1,
+        confidence=0.80,
+    )
+    liquid_decision = _decision(evidence_basis="proxy", evidence_quality=0.85)
+
+    class _SelectiveGrok:
+        def __init__(self) -> None:
+            self.initial_calls: list[str] = []
+            self.deep_calls: list[str] = []
+
+        def analyze_market(self, market, **kwargs):
+            self.initial_calls.append(market.id)
+            return gap_decision if market.id == "analyzed-gap" else liquid_decision
+
+        def analyze_market_deep(self, market, **kwargs):
+            self.deep_calls.append(market.id)
+            return gap_decision if market.id == "analyzed-gap" else liquid_decision
+
+    grok = _SelectiveGrok()
+    kalshi = _LiveGuaranteedKalshi([gap_market, liquid])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="no-yeet")
+    decisions: list[dict] = []
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[gap_market, liquid],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(
+                DRY_RUN=False,
+                GUARANTEED_ORDERS_N=1,
+            ),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: decisions.append(kwargs),
+            extended_research_market_ids=set(),
+            priority_by_market_id={"analyzed-gap": 0.50},
+            seed_decisions_by_market_id={"analyzed-gap": gap_decision},
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert plan.is_complete
+    assert plan.slots[0].market_id == "analyzed-gap"
+    assert kalshi.submitted_market_ids == ["analyzed-gap"]
+    assert grok.initial_calls == []
+    assert grok.deep_calls == ["analyzed-gap"]
+    assert decisions[-1]["execution_audit"][
+        "guaranteed_order_research_gap_bypassed"
+    ] == "guaranteed_order_research_gap_absence_only"
 
 
 def test_lock_guaranteed_markets_prefers_analyzed_confidence() -> None:
@@ -392,6 +471,107 @@ def test_lock_guaranteed_markets_prefers_analyzed_confidence() -> None:
     )
 
     assert [slot.market_id for slot in locked] == ["confident"]
+
+
+def test_lock_analyzed_beats_unanalyzed_even_when_priority_negative() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    analyzed = _market("analyzed", liquidity=50.0)
+    liquid = _market("liquid", liquidity=900.0)
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [liquid, analyzed],
+        excluded_market_ids=set(),
+        priority_by_market_id={"analyzed": -0.20},
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["analyzed"]
+
+
+def test_lock_fills_remaining_slots_from_unanalyzed_catalog() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=2)
+    plan = main.GuaranteedOrderPlan(target=2)
+    analyzed = _market("analyzed", liquidity=50.0)
+    liquid = _market("liquid", liquidity=900.0)
+    thin = _market("thin", liquidity=80.0)
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [thin, liquid, analyzed],
+        excluded_market_ids=set(),
+        priority_by_market_id={"analyzed": 0.40},
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["analyzed", "liquid"]
+
+
+def test_research_gap_replacement_stays_inside_analyzed_set() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    plan.slots = [
+        main.GuaranteedOrderSlot(
+            slot_number=1,
+            market_id="gap",
+            market=_market("gap", liquidity=50.0),
+            locked_cycle=1,
+            client_order_id="BOT-GUAR-gap-001",
+            needs_replacement=True,
+            replacement_reason="guaranteed_order_research_gap_absence_only",
+        )
+    ]
+    plan.retired_market_ids.add("gap")
+    next_analyzed = _market("next-analyzed", liquidity=40.0)
+    unanalyzed_liquid = _market("unanalyzed-liquid", liquidity=900.0)
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [unanalyzed_liquid, next_analyzed, _market("gap", liquidity=50.0)],
+        excluded_market_ids=set(),
+        priority_by_market_id={"gap": 0.10, "next-analyzed": 0.05},
+        require_cycle_analysis=True,
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["next-analyzed"]
+    assert plan.slots[0].market_id == "next-analyzed"
+
+
+def test_research_gap_replacement_skips_unanalyzed_when_none_analyzed_remain() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    gap_market = _market("gap", liquidity=50.0)
+    plan.slots = [
+        main.GuaranteedOrderSlot(
+            slot_number=1,
+            market_id="gap",
+            market=gap_market,
+            locked_cycle=1,
+            client_order_id="BOT-GUAR-gap-001",
+            needs_replacement=True,
+            replacement_reason="guaranteed_order_research_gap_absence_only",
+        )
+    ]
+    plan.retired_market_ids.add("gap")
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [gap_market, _market("unanalyzed-liquid", liquidity=900.0)],
+        excluded_market_ids=set(),
+        priority_by_market_id={"gap": 0.10},
+        require_cycle_analysis=True,
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert locked == []
+    assert plan.slots[0].needs_replacement is True
+    assert plan.slots[0].market_id == "gap"
 
 
 def test_guaranteed_priority_prefers_high_eq_over_absence_only() -> None:
@@ -417,6 +597,44 @@ def test_guaranteed_priority_prefers_high_eq_over_absence_only() -> None:
         }
     )
     assert scores["strong"] > scores["absence"]
+
+
+def test_guaranteed_priority_prefers_named_edge_mechanism() -> None:
+    scores = main._guaranteed_order_priority_scores(
+        {
+            "hunch": {
+                "decision": _decision(
+                    evidence_basis="proxy",
+                    evidence_quality=0.7,
+                    confidence=0.60,
+                    edge_mechanism="none",
+                ),
+            },
+            "mechanism": {
+                "decision": _decision(
+                    evidence_basis="proxy",
+                    evidence_quality=0.7,
+                    confidence=0.60,
+                    edge_mechanism="observed_vs_strike",
+                ),
+            },
+        }
+    )
+    assert scores["mechanism"] > scores["hunch"]
+
+
+def test_research_gap_reason_flags_edge_mechanism_none() -> None:
+    settings = main.Settings()
+    decision = _decision(
+        evidence_basis="proxy",
+        edge_source="computed",
+        evidence_quality=0.8,
+        edge_mechanism="none",
+    )
+    assert (
+        main._guaranteed_order_research_gap_reason(decision, settings)
+        == "guaranteed_order_research_gap_edge_mechanism_none"
+    )
 
 
 def test_lock_guaranteed_markets_rejects_same_event_prefix() -> None:
@@ -464,9 +682,9 @@ def test_seeded_guaranteed_slot_skips_initial_analysis(tmp_path) -> None:
             settings=main.Settings(
                 DRY_RUN=True,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
         )
     finally:
         state.close()
@@ -497,9 +715,9 @@ def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> No
             settings=main.Settings(
                 DRY_RUN=False,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
         )
         pending = state.get_pending_orders()
     finally:
@@ -534,12 +752,12 @@ def test_guaranteed_phase_replaces_jurisdiction_blocked_sports_slot_same_cycle(
             settings=main.Settings(
                 DRY_RUN=False,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
             grok_client=grok,
             kalshi_client=kalshi,
             state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
             log_decision=lambda **kwargs: decisions.append(kwargs),
             extended_research_market_ids=set(),
         )
@@ -582,12 +800,12 @@ def test_guaranteed_phase_honors_existing_sports_jurisdiction_hold(tmp_path) -> 
             settings=main.Settings(
                 DRY_RUN=False,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
             grok_client=grok,
             kalshi_client=kalshi,
             state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
             log_decision=lambda **kwargs: None,
             extended_research_market_ids=set(),
         )
@@ -673,9 +891,9 @@ def test_guaranteed_allows_edge_source_none_with_proxy_url_and_eq(tmp_path) -> N
             settings=main.Settings(
                 DRY_RUN=True,
                 GUARANTEED_ORDERS_N=1,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
         )
     finally:
         state.close()
@@ -723,12 +941,12 @@ def test_guaranteed_phase_forces_fill_despite_weak_evidence_across_candidates(
                 DRY_RUN=False,
                 GUARANTEED_ORDERS_N=1,
                 GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=2,
-                MIN_BET_USDC=5.0,
-                MAX_BET_USDC=12.0,
             ),
             grok_client=grok,
             kalshi_client=kalshi,
             state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
             log_decision=lambda **kwargs: decisions.append(kwargs),
             extended_research_market_ids=set(),
         )

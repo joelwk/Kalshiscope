@@ -19,8 +19,8 @@ class TestConfig(unittest.TestCase):
             **self._required_env(),
             "MARKET_CATEGORIES_ALLOWLIST": "sports, politics",
             "MARKET_CATEGORIES_BLOCKLIST": "crypto",
-            "MIN_BET_USDC": "10",
-            "MAX_BET_USDC": "75",
+            "MIN_BET_PCT_OF_BANKROLL": "0.05",
+            "MAX_BET_PCT_OF_BANKROLL": "0.25",
             "DRY_RUN": "false",
         }
         with patch.dict(os.environ, env, clear=True):
@@ -34,8 +34,8 @@ class TestConfig(unittest.TestCase):
         )
         self.assertEqual(settings.MARKET_CATEGORIES_ALLOWLIST, ("sports", "politics"))
         self.assertEqual(settings.MARKET_CATEGORIES_BLOCKLIST, ("crypto",))
-        self.assertEqual(settings.MIN_BET_USDC, 10.0)
-        self.assertEqual(settings.MAX_BET_USDC, 75.0)
+        self.assertEqual(settings.MIN_BET_PCT_OF_BANKROLL, 0.05)
+        self.assertEqual(settings.MAX_BET_PCT_OF_BANKROLL, 0.25)
         self.assertFalse(settings.DRY_RUN)
 
     def test_close_days_filter_settings(self) -> None:
@@ -107,6 +107,27 @@ class TestConfig(unittest.TestCase):
             settings = config.load_settings()
         self.assertEqual(settings.GUARANTEED_ORDERS_N, 3)
         self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 2)
+
+    def test_grok_reasoning_and_numeric_code_execution_settings(self) -> None:
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.GROK_REASONING_EFFORT, "high")
+        self.assertEqual(defaults.GROK_REASONING_EFFORT_DEEP, "high")
+        self.assertTrue(defaults.CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED)
+        self.assertTrue(defaults.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
+        self.assertTrue(defaults.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
+
+        env = {
+            **self._required_env(),
+            "GROK_REASONING_EFFORT": "medium",
+            "GROK_REASONING_EFFORT_DEEP": "xhigh",
+            "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GROK_REASONING_EFFORT, "medium")
+        self.assertEqual(settings.GROK_REASONING_EFFORT_DEEP, "xhigh")
+        self.assertFalse(settings.CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED)
 
     def test_guaranteed_orders_rejects_negative_target(self) -> None:
         env = {**self._required_env(), "GUARANTEED_ORDERS_N": "-1"}
@@ -422,8 +443,8 @@ class TestConfig(unittest.TestCase):
             "SCORE_INEFFICIENCY_COMPONENT_WEIGHT=0.18",
             "SCORE_BAYESIAN_COMPONENT_WEIGHT=0.10",
             "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=0.05",
-            "MIN_BET_USDC=5.0",
-            "MAX_BET_USDC=12.0",
+            "MIN_BET_PCT_OF_BANKROLL=0.04",
+            "MAX_BET_PCT_OF_BANKROLL=0.16",
             "DRY_RUN=true",
             "GUARANTEED_ORDERS_N=0",
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=6",
@@ -441,7 +462,7 @@ class TestConfig(unittest.TestCase):
             "ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER=0.75",
             "MAX_TRADES_PER_CYCLE=4",
             "MAX_TRADES_PER_DAY=4",
-            "MAX_DAILY_DRAWDOWN_USDC=15.0",
+            "MAX_DAILY_DRAWDOWN_PCT=0.20",
             "KALSHI_MVE_FILTER=exclude",
             "KALSHI_ELIGIBLE_FLOOR=100",
             "KALSHI_FETCH_TOPUP_ENABLED=false",
@@ -479,6 +500,11 @@ class TestConfig(unittest.TestCase):
             "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
             "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
             "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45",
+            "GROK_REASONING_EFFORT=high",
+            "GROK_REASONING_EFFORT_DEEP=high",
+            "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED=true",
+            "NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=true",
+            "NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL=true",
             "BAYESIAN_MIN_UPDATES_FOR_TRADE=3",
             "BAYESIAN_MIN_POSTERIOR_DIVERGENCE=0.05",
             "HISTORICAL_FAMILY_SIGNAL_ENABLED=true",
@@ -650,7 +676,7 @@ class TestConfig(unittest.TestCase):
             "MAX_TRADES_PER_CYCLE": "6",
             "MAX_BETS_PER_EVENT": "3",
             "MAX_TRADES_PER_DAY": "18",
-            "MAX_DAILY_DRAWDOWN_USDC": "22",
+            "MAX_DAILY_DRAWDOWN_PCT": "0.22",
             "XAI_CIRCUIT_BREAKER_MAX_FAILURES": "4",
             "KALSHI_MAX_FETCH_PAGES": "12",
             "XAI_CLIENT_TIMEOUT_SECONDS": "75",
@@ -700,7 +726,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 6)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 3)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 18)
-        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 22.0)
+        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_PCT, 0.22)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 4)
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 12)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 75)
@@ -819,7 +845,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 4)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
-        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
+        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_PCT, 0.20)
         self.assertEqual(settings.GUARANTEED_ORDERS_N, 0)
         self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
         self.assertTrue(settings.POSITION_SYNC_ENABLED)

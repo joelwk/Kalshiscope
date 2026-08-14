@@ -107,6 +107,27 @@ _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL = re.compile(
     re.IGNORECASE,
 )
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
+_EDGE_MECHANISM_VALUES = frozenset(
+    {
+        "observed_vs_strike",
+        "odds_dislocation",
+        "settlement_already_known",
+        "catalyst",
+        "none",
+    }
+)
+_NUMERIC_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+", re.IGNORECASE)
+_NUMERIC_INITIAL_CODE_PROFILES = frozenset({"weather", "crypto", "commodity"})
+_ALLOWED_REASONING_EFFORT = frozenset({"low", "medium", "high", "xhigh"})
+_SLOW_REASONING_MODEL_MARKERS = ("grok-4.6", "grok-4-6")
+# grok-4.6 + high reasoning + tools routinely finishes at 110-170s and
+# DEADLINE_EXCEEDED at the 4.5-era 180s cap. Floor timeouts so a model
+# swap does not inherit that cap. xAI documents 3600s for reasoning models;
+# these floors are the practical bot-side minimum, not a ceiling.
+_SLOW_REASONING_MIN_STREAM_TIMEOUT_SECONDS = 300
+_SLOW_REASONING_MIN_CLIENT_TIMEOUT_SECONDS = 360
+_SLOW_REASONING_MIN_ANALYSIS_BUDGET_SECONDS = 780
+_TIMEOUT_RETRY_REASONING_EFFORT = "medium"
 _DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS = 120
 _DEFAULT_STREAM_TIMEOUT_SECONDS = 120
 _EDGE_CONSISTENCY_TOLERANCE = 0.03
@@ -284,6 +305,110 @@ def _extract_first_url_from_text(text: str) -> str | None:
         cleaned = _clean_extracted_url(match.group(0))
         if cleaned:
             return cleaned
+    return None
+
+
+def _normalize_edge_mechanism(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in _EDGE_MECHANISM_VALUES:
+        return normalized
+    return "none"
+
+
+def _normalize_reasoning_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "none", "off", "disable", "disabled"}:
+        return None
+    if normalized in _ALLOWED_REASONING_EFFORT:
+        return normalized
+    return None
+
+
+def _is_slow_reasoning_model(model: str | None) -> bool:
+    name = str(model or "").strip().lower()
+    return any(marker in name for marker in _SLOW_REASONING_MODEL_MARKERS)
+
+
+def _reasoning_effort_for_attempt(
+    setting: str | None,
+    *,
+    retry_attempt: int,
+) -> str | None:
+    """Keep configured depth on the first try; drop high/xhigh after a timeout."""
+    effort = _normalize_reasoning_effort(setting)
+    if retry_attempt > 1 and effort in {"high", "xhigh"}:
+        return _TIMEOUT_RETRY_REASONING_EFFORT
+    return effort
+
+
+def _should_enable_code_execution(
+    *,
+    deep: bool,
+    market: Market,
+    profile_name: str,
+    settings: Settings | None,
+) -> bool:
+    resolved = settings or Settings()
+    if deep:
+        return bool(getattr(resolved, "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED", True))
+    if not bool(getattr(resolved, "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED", True)):
+        return False
+    if (profile_name or "").strip().lower() in _NUMERIC_INITIAL_CODE_PROFILES:
+        return True
+    if is_commodity_market(market):
+        return True
+    ticker = str(getattr(market, "id", "") or "")
+    return bool(_NUMERIC_STRIKE_TICKER_PATTERN.search(ticker))
+
+
+def _extract_citation_urls(response: Any) -> list[str]:
+    if response is None:
+        return []
+    urls: list[str] = []
+    for attr in ("citations", "inline_citations"):
+        items = getattr(response, attr, None)
+        if items is None and isinstance(response, dict):
+            items = response.get(attr)
+        if not items:
+            continue
+        for item in items:
+            raw_url = ""
+            if isinstance(item, str):
+                raw_url = item
+            elif isinstance(item, dict):
+                raw_url = str(item.get("url") or "")
+            else:
+                raw_url = str(getattr(item, "url", "") or "")
+            cleaned = _clean_extracted_url(raw_url)
+            if cleaned and cleaned not in urls:
+                urls.append(cleaned)
+    return urls
+
+
+def _payload_from_stream_response(response: Any) -> dict[str, Any] | None:
+    if response is None:
+        return None
+    if isinstance(response, TradeDecision):
+        return response.model_dump()
+    parsed = getattr(response, "parsed", None)
+    if parsed is None and isinstance(response, dict):
+        parsed = response.get("parsed")
+    if isinstance(parsed, TradeDecision):
+        return parsed.model_dump()
+    if isinstance(parsed, dict) and "should_trade" in parsed:
+        return parsed
+    content = getattr(response, "content", None)
+    if content is None and isinstance(response, dict):
+        content = response.get("content")
+    if isinstance(content, str) and content.strip():
+        try:
+            data = json.loads(_normalize_model_response_text(content))
+        except json.JSONDecodeError:
+            return None
+        if isinstance(data, dict) and "should_trade" in data:
+            return data
     return None
 
 
@@ -509,6 +634,8 @@ class GrokClient:
     ) -> None:
         resolved_settings = settings or Settings()
         self.settings = resolved_settings
+        self.model = model
+        self.model_deep = model_deep or model
         self.xai_client_timeout_seconds = max(
             1,
             int(
@@ -539,12 +666,11 @@ class GrokClient:
                 )
             ),
         )
+        self._apply_slow_reasoning_timeout_floors()
         self.provider = provider or XAIProvider(
             api_key=api_key,
             timeout_seconds=self.xai_client_timeout_seconds,
         )
-        self.model = model
-        self.model_deep = model_deep or model
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
         self.default_search_config = search_config or _default_search_config(settings)
@@ -563,6 +689,61 @@ class GrokClient:
                 "stream_timeout_seconds": self.stream_timeout_seconds,
                 "analysis_budget_seconds": self.analysis_budget_seconds,
                 "xai_client_timeout_seconds": self.xai_client_timeout_seconds,
+                "slow_reasoning_timeout_floors_applied": _is_slow_reasoning_model(self.model)
+                or _is_slow_reasoning_model(self.model_deep),
+            },
+        )
+
+    def _apply_slow_reasoning_timeout_floors(self) -> None:
+        """Raise 4.5-era caps when grok-4.6 needs more than 180s of tool+reason time."""
+        if not (
+            _is_slow_reasoning_model(self.model)
+            or _is_slow_reasoning_model(self.model_deep)
+        ):
+            return
+        before = (
+            self.stream_timeout_seconds,
+            self.xai_client_timeout_seconds,
+            self.analysis_budget_seconds,
+        )
+        self.stream_timeout_seconds = max(
+            self.stream_timeout_seconds,
+            _SLOW_REASONING_MIN_STREAM_TIMEOUT_SECONDS,
+        )
+        self.xai_client_timeout_seconds = max(
+            self.xai_client_timeout_seconds,
+            self.stream_timeout_seconds,
+            _SLOW_REASONING_MIN_CLIENT_TIMEOUT_SECONDS,
+        )
+        self.analysis_budget_seconds = max(
+            self.analysis_budget_seconds,
+            _SLOW_REASONING_MIN_ANALYSIS_BUDGET_SECONDS,
+        )
+        after = (
+            self.stream_timeout_seconds,
+            self.xai_client_timeout_seconds,
+            self.analysis_budget_seconds,
+        )
+        if after == before:
+            return
+        logger.warning(
+            "Raised Grok timeouts for grok-4.6-class model: "
+            "stream %ds->%ds client %ds->%ds budget %ds->%ds",
+            before[0],
+            after[0],
+            before[1],
+            after[1],
+            before[2],
+            after[2],
+            data={
+                "model": self.model,
+                "model_deep": self.model_deep,
+                "stream_timeout_seconds_before": before[0],
+                "stream_timeout_seconds": after[0],
+                "xai_client_timeout_seconds_before": before[1],
+                "xai_client_timeout_seconds": after[1],
+                "analysis_budget_seconds_before": before[2],
+                "analysis_budget_seconds": after[2],
             },
         )
 
@@ -917,7 +1098,10 @@ class GrokClient:
         return any(host == domain or host.endswith("." + domain) for domain in allowlist)
 
     @staticmethod
-    def _extract_primary_source_url(decision: TradeDecision) -> str | None:
+    def _extract_primary_source_url(
+        decision: TradeDecision,
+        extra_urls: list[str] | None = None,
+    ) -> str | None:
         existing = _clean_extracted_url(str(decision.primary_source_url or ""))
         if existing:
             return existing
@@ -931,7 +1115,30 @@ class GrokClient:
             extracted = _extract_first_url_from_text(str(key_sources))
             if extracted:
                 return extracted
-        return _extract_first_url_from_text(decision.reasoning or "")
+        from_reasoning = _extract_first_url_from_text(decision.reasoning or "")
+        if from_reasoning:
+            return from_reasoning
+        for extra in extra_urls or []:
+            cleaned = _clean_extracted_url(str(extra or ""))
+            if cleaned:
+                return cleaned
+        return None
+
+    @staticmethod
+    def _decision_has_tradeable_source_url(
+        *,
+        profile_name: str,
+        primary_source_url: str | None,
+        key_sources: list[str] | None,
+    ) -> bool:
+        if primary_source_url:
+            return True
+        if (profile_name or "").strip().lower() != "sports":
+            return False
+        for source in key_sources or []:
+            if _extract_first_url_from_text(str(source or "")):
+                return True
+        return False
 
     def _validate_and_enrich_decision(
         self,
@@ -941,6 +1148,7 @@ class GrokClient:
         *,
         self_consistency_passed: bool = False,
         family_is_profitable: bool = False,
+        citation_urls: list[str] | None = None,
     ) -> TradeDecision:
         canonical_outcome = self._canonical_outcome_for_market(market, decision.outcome)
         if canonical_outcome is None:
@@ -1032,7 +1240,10 @@ class GrokClient:
             prob_consistency_ok = False
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
-        primary_source_url = self._extract_primary_source_url(decision)
+        primary_source_url = self._extract_primary_source_url(
+            decision, extra_urls=citation_urls
+        )
+        edge_mechanism = _normalize_edge_mechanism(decision.edge_mechanism)
         explicit_evidence_basis = str(decision.evidence_basis or "").strip().lower()
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
         low_information = bool(
@@ -1373,6 +1584,16 @@ class GrokClient:
             if evidence_basis_class == "absence_only":
                 should_trade = False
                 gate_reasons.append("absence_only_evidence")
+            if edge_mechanism == "none":
+                should_trade = False
+                gate_reasons.append("edge_mechanism_none")
+            if not self._decision_has_tradeable_source_url(
+                profile_name=profile_name,
+                primary_source_url=primary_source_url,
+                key_sources=list(decision.key_sources or []),
+            ):
+                should_trade = False
+                gate_reasons.append("missing_primary_source_url")
             if (
                 source_match_class == "preview_or_proxy"
                 and edge_source in {"fallback", "none"}
@@ -1467,6 +1688,7 @@ class GrokClient:
                 "my_prob": my_prob,
                 "edge_external": edge,
                 "edge_source": edge_source,
+                "edge_mechanism": edge_mechanism,
                 "evidence_basis": evidence_basis_class,
                 "evidence_quality": evidence_quality,
                 "raw_evidence_quality": raw_evidence_quality,
@@ -1698,6 +1920,7 @@ class GrokClient:
         timeout_seconds: float | None = None,
         temperature: float | None = None,
         enable_code_execution: bool = False,
+        reasoning_effort: str | None = None,
     ):
         return self.provider.create_chat(
             model=model or self.model,
@@ -1707,6 +1930,7 @@ class GrokClient:
             enable_code_execution=enable_code_execution,
             timeout_seconds=timeout_seconds,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
         )
 
     def _build_market_prompt(
@@ -2070,9 +2294,10 @@ class GrokClient:
         search_profile: str | None = None,
         deep: bool = False,
         deadline_seconds: float | None = None,
-    ) -> tuple[str, int, dict[str, int | None]]:
+    ) -> tuple[str, int, dict[str, int | None], Any]:
         content = ""
         chunk_count = 0
+        last_response: Any = None
         usage_metrics: dict[str, int | None] = {
             "prompt_tokens": None,
             "completion_tokens": None,
@@ -2088,6 +2313,7 @@ class GrokClient:
             )
         deadline = time.monotonic() + deadline_seconds
         for response, chunk in chat.stream():
+            last_response = response
             if time.monotonic() > deadline:
                 raise TimeoutError(
                     f"Grok stream exceeded {deadline_seconds:.1f}s for market {market_id}"
@@ -2098,10 +2324,8 @@ class GrokClient:
             if chunk.content:
                 content += chunk.content
                 chunk_count += 1
-        if not content:
-            raise ValueError("Empty response from Grok")
         usage_metrics["code_execution_used"] = int(code_execution_used)
-        return content, chunk_count, usage_metrics
+        return content, chunk_count, usage_metrics, last_response
 
     def _run_analysis(
         self,
@@ -2418,14 +2642,23 @@ class GrokClient:
                 decision=previous_analysis,
                 config=active_config,
             )
-            enable_code_execution = bool(
-                deep
-                and getattr(
-                    self.settings,
-                    "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
-                    True,
-                )
+            enable_code_execution = _should_enable_code_execution(
+                deep=deep,
+                market=market,
+                profile_name=getattr(active_config, "profile_name", "") or "",
+                settings=self.settings,
             )
+            reasoning_effort_setting = (
+                getattr(self.settings, "GROK_REASONING_EFFORT_DEEP", "high")
+                if deep
+                else getattr(self.settings, "GROK_REASONING_EFFORT", "high")
+            )
+            reasoning_effort = _reasoning_effort_for_attempt(
+                reasoning_effort_setting,
+                retry_attempt=retry_attempt,
+            )
+            if retry_attempt > 1:
+                enable_code_execution = False
             chat = self._build_chat(
                 active_config,
                 enable_multimedia,
@@ -2435,6 +2668,7 @@ class GrokClient:
                 ),
                 temperature=temperature,
                 enable_code_execution=enable_code_execution,
+                reasoning_effort=reasoning_effort,
             )
             chat.append(
                 self.provider.system_message(
@@ -2452,7 +2686,7 @@ class GrokClient:
                     )
                 )
             )
-            content, chunk_count, usage_metrics = self._stream_chat_content(
+            content, chunk_count, usage_metrics, last_response = self._stream_chat_content(
                 chat,
                 market.id,
                 budget_remaining_ms=budget_remaining_ms,
@@ -2460,7 +2694,14 @@ class GrokClient:
                 deep=deep,
                 deadline_seconds=stream_deadline_seconds,
             )
-            data = self._parse_response_payload(market.id, content, deep=deep)
+            citation_urls = _extract_citation_urls(last_response)
+            structured_payload = _payload_from_stream_response(last_response)
+            if not content and structured_payload is None:
+                raise ValueError("Empty response from Grok")
+            if structured_payload is not None:
+                data = structured_payload
+            else:
+                data = self._parse_response_payload(market.id, content, deep=deep)
             raw_payload = dict(data)
 
             deep_likelihood_ratio_provided = False
@@ -2477,6 +2718,7 @@ class GrokClient:
                 decision,
                 profile_name=active_config.profile_name,
                 family_is_profitable=getattr(self, "_current_family_is_profitable", False),
+                citation_urls=citation_urls,
             )
             code_execution_used = bool(usage_metrics.get("code_execution_used"))
             decision = decision.model_copy(
@@ -2559,6 +2801,8 @@ class GrokClient:
                     "lookback_hours": active_config.lookback_hours,
                     "model": model,
                     "temperature": temperature,
+                    "reasoning_effort": reasoning_effort,
+                    "code_execution_used": code_execution_used,
                     "self_consistency_variant": self_consistency_variant,
                     "chunks": chunk_count,
                     "prompt_tokens": usage_metrics["prompt_tokens"],

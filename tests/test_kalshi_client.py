@@ -645,7 +645,8 @@ class TestKalshiClient(unittest.TestCase):
 
         sent_payload = req_mock.call_args.kwargs["json"]
         # The execution pipeline approved $2.00, so 6 contracts ($2.22) are
-        # forbidden even though 5 contracts ($1.85) land below MIN_BET_USDC.
+        # forbidden even though 5 contracts ($1.85) land below the client's
+        # configured min bet.
         self.assertEqual(sent_payload["count"], "5")
         self.assertEqual(sent_payload["price"], "0.3700")
         self.assertEqual(response.raw["client_amount_usdc"], 2.0)
@@ -670,8 +671,9 @@ class TestKalshiClient(unittest.TestCase):
             client.submit_order(order, market=market)
 
         sent_payload = req_mock.call_args.kwargs["json"]
-        # The request exceeds MAX_BET_USDC, so the final integer count is based
-        # on the tighter $2.00 cap: floor($2.00 / $0.59) = 3 contracts.
+        # The request exceeds the client's configured max bet, so the final
+        # integer count is based on the tighter $2.00 cap:
+        # floor($2.00 / $0.59) = 3 contracts.
         self.assertEqual(sent_payload["count"], "3")
 
     def test_submit_order_rejects_budget_below_one_contract(self) -> None:

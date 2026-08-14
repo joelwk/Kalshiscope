@@ -115,6 +115,10 @@ class TradeDecision(BaseModel):
         default=None,
         description=_TRADE_DECISION_DESCRIPTIONS["edge_source"],
     )
+    edge_mechanism: str | None = Field(
+        default=None,
+        description=_TRADE_DECISION_DESCRIPTIONS["edge_mechanism"],
+    )
     evidence_basis: str | None = Field(
         default=None,
         description=_TRADE_DECISION_DESCRIPTIONS["evidence_basis"],

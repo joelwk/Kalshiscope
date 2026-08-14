@@ -183,8 +183,8 @@ def test_edge_based_sizing_scales_down_for_small_edge() -> None:
 
 def test_edge_based_sizing_caps_fallback_edge_to_min_bet() -> None:
     settings = Settings(
-        MIN_BET_USDC=2.0,
-        MAX_BET_USDC=8.0,
+        MIN_BET_PCT_OF_BANKROLL=0.05,
+        MAX_BET_PCT_OF_BANKROLL=0.20,
         MIN_EDGE=0.05,
         FALLBACK_EDGE_MIN_EDGE=0.15,
         EDGE_SCALING_RANGE=0.05,

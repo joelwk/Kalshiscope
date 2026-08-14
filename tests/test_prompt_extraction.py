@@ -6,31 +6,31 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Aug 4 2026: edge honesty, external-odds hygiene, aggregator/MapClick caps.
-    "analyze": "03d857e58c10a71f64b8da7c6ac49b84ee30fb1d7f0fd0577687960be1044c58",
-    "deep": "d04c2d3565b836fac6a8f42fb1bc2e992d1eac1aceba1e119857929910edfc9e",
+    # Re-pinned Aug 12 2026: anti-hunch edge_mechanism requirement.
+    "analyze": "897c6280f9f172449868b373c57ee415a68e936d83258ceebe508c3513ab4658",
+    "deep": "bb94bf528ff9a0d05e5b369d01d3a23e5b6ed23dc63796f362f9e36ac902eaeb",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    # Re-pinned Aug 4 2026: category/constraint field-hygiene updates.
-    "commodities:deep_false": "49ff9f19b3a207180d690fb26bfacbe9710de56992d33f07fc89eaae1582e5d4",
-    "commodities:deep_true": "f2d19e7c8290ba76a36a3ad778c8acd94421d402804984ac6eba2be01e66cef8",
-    "crypto:deep_false": "7e6c1956a717c9f845cc80f44f48bf8120a33c851a78e4917587c210f7bbfbca",
-    "crypto:deep_true": "85d821b8e4c4f06f1d4adb6fc583913d67e18bcb09389072053df9c10dbefa58",
-    "generic:deep_false": "6849bff3192109e4bdb5cc79e64b796db8bc0cf7333030a6807d9ae4e78e09ed",
-    "generic:deep_true": "a98ff2d218e0beb6fb5cfd81eb08139a60feb117367e7fec3fd0f36d2302a18c",
-    "music:deep_false": "7303d1797ea93804fe6eb871789970967ccbc36b8cafe6a6463321130efc340a",
-    "music:deep_true": "d1e933d58c00c77d63e08e7217617fc8044f3f091467b24192c9303204699339",
-    "politics:deep_false": "82721d5546da9a9a4443eb6f6afcbbcf739e75dcae3a25b8a8cb577c6c65d59f",
-    "politics:deep_true": "c50baf88c2b94ab274e5c06fdb8d6e138435542b3291bba2e5d035e40e17a74d",
-    "speech:deep_false": "a2b9ac7999318002b4b51b71c74b5c92416107cce77d6ac6b131322f14dd81d1",
-    "speech:deep_true": "e7e0fc1dff8c7e6c3ba9dfbf857dffbd474738ff430a37a7375d8111eac55ebf",
-    "speech_mention:deep_false": "d46ab7b93a8010202e09129168c99394bed3ec1914d23847a9c7a9b7418934b6",
-    "speech_mention:deep_true": "a3bd7e3ffcdc91a03ea0016cd999be6f58c649add310be5dbeeba99416ee8552",
-    "sports:deep_false": "66bf19af75717e70c6e9914848d155c2314e684220c024efe47a42faec910d91",
-    "sports:deep_true": "b5664f285b1390718ad1cd7d5b2ebb6e434bd87ec23922f155d0b5103961d54c",
-    "weather:deep_false": "cf722d0988eb77f560b3bac1a13cc39c4952584e0030519fe5bd37417b06a997",
-    "weather:deep_true": "770f9b1214b7ef8f0051181cfaf9ffa707763f098c731697814a5cacf163c4d1",
+    # Re-pinned Aug 12 2026: mechanism-or-abstain constraints and category hints.
+    "commodities:deep_false": "e88c352293f537572e6fa93884405b59bce4ceb5115bbe84f58bde5ce1747765",
+    "commodities:deep_true": "bbb6989d478adde7092ce30a8a04961ea4d15f1c9dd9c08c09e8fb6d4aad0a48",
+    "crypto:deep_false": "d0dc68ab06acb33fb6e1c98ac92a094fac8af83314948f420115b6b2a3931db0",
+    "crypto:deep_true": "ba0e7a492f5358ac4525ede5db3e28d626913bb2dd9d8f26cac8a2c7de46297a",
+    "generic:deep_false": "5c0e3518b2f7493da63a8f14a1be11dda02c95baaa3461fcbd7ce6aa9db8eadb",
+    "generic:deep_true": "febc8590bbe2b8fa0da65218d29d1653d7ed54a4a218895d1f9207404e908571",
+    "music:deep_false": "bb8f75e9b8f502862441105fb061d3032c2c6ae6d62d04bcd0acbcb021172151",
+    "music:deep_true": "f339f4dd6def06e4353750dd69d1f042e5520bbbe79e9a4438404ff93137c41d",
+    "politics:deep_false": "f12753300d7f3943b15947e551c1479745fec45bdd1586dbb1cb71c27f11edaf",
+    "politics:deep_true": "32073fdfa7e985523c91eae818e976aff413f70c2e4a8b498e84767cbd88f7eb",
+    "speech:deep_false": "243ebd8c59080e2a1bdc4604b96680541704be5a31d91f8a54d4438241ac35b8",
+    "speech:deep_true": "a8ef2663766b640b8d4574ff7d808fb35e72367b141b30c8a9823d174f8fb2f6",
+    "speech_mention:deep_false": "8d513a8ba0905b8df6211e36485a714137a5b00002c364b62e460b82abdd33ec",
+    "speech_mention:deep_true": "47b8bacff4ac722925d08861f0cb76e6e9206c0745334c4b455605b674bbb87b",
+    "sports:deep_false": "47eb8cd85ca3e940a622ab2c5482ee20a48102a9ded6ccfb8ac7e6270df56e93",
+    "sports:deep_true": "cdfdec0b0afc5536c0f87b49bcd436b517f648afb702f7e2fba14587d72dd97b",
+    "weather:deep_false": "ea82703262b4d9c780c0b93f3d1ea303828699512a510dfa235a958a159b9570",
+    "weather:deep_true": "96cb46693a1e62cebac0e8b1b0bc19d68e32604bd599953f9ba23969908348df",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
@@ -43,6 +43,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "confidence": "04b522eca80f69fed0bcb20dfee763f111f267ef6693886f4e9f91f80405271c",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
     "edge_external": "f282db8b1f7a551cd97b4d59c60a19c4b081c6dc016a6a302b347376897862b6",
+    "edge_mechanism": "3997dfef2a05ad911f4010fca0afd6fbf392172366e8fa91efe28db711b483a1",
     "edge_source": "b9776d71fbfe07f42694983863a13414ab896d3e57b689559af48d367499daee",
     "evidence_basis": "f95084f2b5778968536af2848391348a95eac3b52869a7b065975a69dcbe5d0b",
     "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
@@ -65,7 +66,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "reasoning": "247e17a3b1e2943c08f8ca99cfe0422652a66c814b0b29443d3d57dd21639b7f",
     "reasoning_tokens": "6b47f605e7844debc22ecbf3b199a6f581dd2a72a1ebdaaca8c06f282f7122b9",
     "self_critique": "ab2d939c15dcfe7ab68bd6af225432bdedfd4596e126f76a74ac6afde5bb7bbe",
-    "should_trade": "215fad0b1f319687dc14c538d174d5c12dccdfb0dac72b7af305004f73f8c82c",
+    "should_trade": "bf0c9e7de6bf47aa43bda0103abf9462462438e8ce3b89ae93e503f1011a108e",
     "source_match_class": "8bca00a6b3b1f3d3edc79c9a23303957f8c3971dc39208283368c5b6c1f07efc",
     "uncertainty_note": "0c8956f9b9c3e8e792696a9e4f2ab4c901795cd01e5d9b963b1ae33093f7539f",
 }
@@ -185,6 +186,7 @@ def test_trade_decision_schema_includes_primary_source_url() -> None:
     assert "primary_source_url" in properties
     assert "probability_yes" in properties
     assert "self_critique" in properties
+    assert "edge_mechanism" in properties
 
 
 def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> None:
@@ -196,6 +198,7 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "primary_source_url must be a real https:// link" in _SYSTEM_PROMPT_ANALYZE
     assert "Side consistency:" in _SYSTEM_PROMPT_ANALYZE
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE
+    assert "A hunch, \"form,\" vibe, or unexplained directional view is edge_mechanism=none" in _SYSTEM_PROMPT_ANALYZE
 
 
 def test_system_prompt_contains_edge_honesty_and_field_hygiene() -> None:

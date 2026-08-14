@@ -501,3 +501,23 @@ def test_market_category_flags_esports() -> None:
     is_sports, is_esports = market_category_flags(market)
     assert is_sports is False
     assert is_esports is True
+
+
+def test_market_family_valorant_map_ticker_is_sports() -> None:
+    market = Market(
+        id="KXVALORANTMAP-26AUG121100GMSGE-1-SGE",
+        question="Map 1 winner?",
+        category=None,
+    )
+    assert market_family(market) == "sports"
+    _, is_esports = market_category_flags(market)
+    assert is_esports is True
+
+
+def test_market_family_cs2_ticker_is_sports() -> None:
+    market = Market(
+        id="KXCS2-26AUG12-TEAM",
+        question="Match winner?",
+        category=None,
+    )
+    assert market_family(market) == "sports"

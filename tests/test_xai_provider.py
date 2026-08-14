@@ -166,3 +166,63 @@ def test_create_chat_passes_temperature_to_sdk() -> None:
         )
 
     assert response["kwargs"]["temperature"] == 0.7
+
+
+def test_create_chat_passes_include_and_reasoning_effort() -> None:
+    flaky_chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            reasoning_effort="high",
+        )
+
+    assert response["kwargs"]["include"] == ["inline_citations"]
+    assert response["kwargs"]["reasoning_effort"] == "high"
+
+
+def test_create_chat_retries_without_reasoning_effort_on_unimplemented() -> None:
+    class _UnimplementedThenOk:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "reasoning_effort" in kwargs:
+                raise RuntimeError("StatusCode.UNIMPLEMENTED: reasoning_effort")
+            return {"ok": True, "kwargs": kwargs}
+
+    chat = _UnimplementedThenOk()
+    with patch("xai_provider.Client", return_value=_FakeClient(chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            reasoning_effort="high",
+        )
+
+    assert response["ok"] is True
+    assert len(chat.calls) == 2
+    assert chat.calls[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in chat.calls[1]

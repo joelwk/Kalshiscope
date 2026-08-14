@@ -41,7 +41,7 @@ from calibration import (
     compute_adaptive_thresholds,
     historical_confidence_shrink,
 )
-from config import SearchConfig, Settings, load_settings
+from config import BET_ABSOLUTE_FLOOR_USDC, SearchConfig, Settings, load_settings
 from grok_client import GrokClient
 from kelly import kelly_bet_pct, kelly_fraction
 from lmsr import (
@@ -2459,8 +2459,13 @@ def _adjust_bet_size_for_edge(
         bet_pct *= settings.LOW_PRICE_BET_PENALTY
     normalized_edge_source = str(decision.edge_source or "").strip().lower()
     if normalized_edge_source in {"fallback", "none"}:
-        max_bet_safe = max(settings.MAX_BET_USDC, 1e-9)
-        fallback_max_pct = max(0.0, min(1.0, settings.MIN_BET_USDC / max_bet_safe))
+        # Cap fallback-evidence trades at the min-bet-equivalent fraction of
+        # the max bet. With pct-of-bankroll sizing this ratio is constant
+        # regardless of the live bankroll.
+        max_pct_safe = max(settings.MAX_BET_PCT_OF_BANKROLL, 1e-9)
+        fallback_max_pct = max(
+            0.0, min(1.0, settings.MIN_BET_PCT_OF_BANKROLL / max_pct_safe)
+        )
         bet_pct = min(bet_pct, fallback_max_pct)
     return max(0.0, min(1.0, bet_pct))
 
@@ -3921,6 +3926,7 @@ def _should_adjust_position(
     cycle_bankroll: float | None = None,
     current_entry_price: float | None = None,
     last_entry_price: float | None = None,
+    max_bet_usdc: float | None = None,
 ) -> tuple[bool, float, str]:
     """Determine if position should be added to and calculate amount."""
     if not existing_position:
@@ -3974,7 +3980,10 @@ def _should_adjust_position(
         if is_high_confidence
         else "confidence_increase_threshold_met"
     )
-    return True, min(decision.bet_size_pct, remaining / settings.MAX_BET_USDC), reason
+    if max_bet_usdc is None:
+        _, max_bet_usdc = _effective_bet_bounds_usdc(settings, cycle_bankroll)
+    max_bet_safe = max(float(max_bet_usdc), 1e-9)
+    return True, min(decision.bet_size_pct, remaining / max_bet_safe), reason
 
 
 def _effective_max_position_limit_usdc(
@@ -3989,25 +3998,61 @@ def _effective_max_position_limit_usdc(
     return effective_max_position
 
 
+def _effective_bet_bounds_usdc(
+    settings: Settings,
+    bankroll_usdc: float | None,
+) -> tuple[float, float]:
+    """Derive per-cycle dollar bet bounds from pct-of-bankroll sizing settings.
+
+    Returns (min_bet_usdc, max_bet_usdc). Both are floored at
+    BET_ABSOLUTE_FLOOR_USDC so orders stay above Kalshi's one-contract minimum.
+    When the bankroll has never been observed the bounds are (0, 0), which
+    degrades every sizing path to its existing zero-bet skip handling.
+    """
+    if bankroll_usdc is None or bankroll_usdc <= 0:
+        return 0.0, 0.0
+    max_bet = float(bankroll_usdc) * max(0.0, settings.MAX_BET_PCT_OF_BANKROLL)
+    min_bet = float(bankroll_usdc) * max(0.0, settings.MIN_BET_PCT_OF_BANKROLL)
+    if max_bet <= 0.0:
+        return 0.0, 0.0
+    max_bet = max(max_bet, BET_ABSOLUTE_FLOOR_USDC)
+    min_bet = min(max(min_bet, BET_ABSOLUTE_FLOOR_USDC), max_bet)
+    return min_bet, max_bet
+
+
+def _effective_daily_drawdown_cap_usdc(
+    settings: Settings,
+    reference_bankroll_usdc: float | None,
+) -> float:
+    """Derive the daily drawdown dollar stop from MAX_DAILY_DRAWDOWN_PCT.
+
+    Measured against the day's starting portfolio value. Returns 0 (guard
+    disabled) when no bankroll reference has been observed yet.
+    """
+    if reference_bankroll_usdc is None or reference_bankroll_usdc <= 0:
+        return 0.0
+    return float(reference_bankroll_usdc) * max(0.0, settings.MAX_DAILY_DRAWDOWN_PCT)
+
+
 def _log_settings_summary(settings) -> None:
     """Log a sanitized summary of current settings."""
     close_days_info = _format_close_days_info(
         settings.MARKET_MIN_CLOSE_DAYS, settings.MARKET_MAX_CLOSE_DAYS
     )
     logger.info(
-        "Configuration loaded: dry_run=%s, bet_range=$%.2f-$%.2f, min_confidence=%.2f, "
-        "poll_interval=%ds%s",
+        "Configuration loaded: dry_run=%s, bet_range=%.1f%%-%.1f%% of bankroll, "
+        "min_confidence=%.2f, poll_interval=%ds%s",
         settings.DRY_RUN,
-        settings.MIN_BET_USDC,
-        settings.MAX_BET_USDC,
+        settings.MIN_BET_PCT_OF_BANKROLL * 100.0,
+        settings.MAX_BET_PCT_OF_BANKROLL * 100.0,
         settings.MIN_CONFIDENCE,
         settings.POLL_INTERVAL_SEC,
         close_days_info,
         data={
             "dry_run": settings.DRY_RUN,
             "guaranteed_orders_n": settings.GUARANTEED_ORDERS_N,
-            "min_bet_usdc": settings.MIN_BET_USDC,
-            "max_bet_usdc": settings.MAX_BET_USDC,
+            "min_bet_pct_of_bankroll": settings.MIN_BET_PCT_OF_BANKROLL,
+            "max_bet_pct_of_bankroll": settings.MAX_BET_PCT_OF_BANKROLL,
             "min_confidence": settings.MIN_CONFIDENCE,
             "confidence_gate_edge_override_enabled": settings.CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED,
             "confidence_gate_min_edge": settings.CONFIDENCE_GATE_MIN_EDGE,
@@ -4114,8 +4159,10 @@ def _log_settings_summary(settings) -> None:
             "DRY_RUN is enabled. No live Kalshi orders will be submitted until DRY_RUN=false.",
             data={"dry_run": True},
         )
-    if settings.KELLY_SIZING_ENABLED and settings.MAX_BET_USDC > 0:
-        effective_min_bet_pct = settings.MIN_BET_USDC / settings.MAX_BET_USDC
+    if settings.KELLY_SIZING_ENABLED and settings.MAX_BET_PCT_OF_BANKROLL > 0:
+        effective_min_bet_pct = (
+            settings.MIN_BET_PCT_OF_BANKROLL / settings.MAX_BET_PCT_OF_BANKROLL
+        )
         logger.info(
             "Kelly min-bet policy active: policy=%s min_bet_pct=%.3f",
             settings.KELLY_MIN_BET_POLICY,
@@ -4123,8 +4170,8 @@ def _log_settings_summary(settings) -> None:
             data={
                 "kelly_sizing_enabled": settings.KELLY_SIZING_ENABLED,
                 "kelly_min_bet_policy": settings.KELLY_MIN_BET_POLICY,
-                "min_bet_usdc": settings.MIN_BET_USDC,
-                "max_bet_usdc": settings.MAX_BET_USDC,
+                "min_bet_pct_of_bankroll": settings.MIN_BET_PCT_OF_BANKROLL,
+                "max_bet_pct_of_bankroll": settings.MAX_BET_PCT_OF_BANKROLL,
                 "effective_min_bet_pct": round(effective_min_bet_pct, 6),
             },
         )
@@ -4152,6 +4199,11 @@ def _build_kalshi_market_fetch_window(
     return start, end
 
 
+def _is_tls_ca_bundle_error(exc: BaseException | str) -> bool:
+    """True when requests/certifi cannot locate a CA bundle (fatal env break)."""
+    return "could not find a suitable tls ca certificate bundle" in str(exc).lower()
+
+
 def _fetch_markets_with_optional_server_filters(
     kalshi_client: KalshiClient,
     *,
@@ -4169,6 +4221,8 @@ def _fetch_markets_with_optional_server_filters(
             mve_filter=mve_filter,
         )
     except Exception as exc:
+        if _is_tls_ca_bundle_error(exc):
+            raise
         logger.warning(
             "Kalshi server-side filters failed; attempting filtered retry before unfiltered fallback: %s",
             exc,
@@ -4191,6 +4245,8 @@ def _fetch_markets_with_optional_server_filters(
                 mve_filter=mve_filter,
             )
         except Exception as retry_exc:
+            if _is_tls_ca_bundle_error(retry_exc):
+                raise
             logger.warning(
                 "Kalshi filtered retry failed; falling back to unfiltered fetch: %s",
                 retry_exc,
@@ -4534,8 +4590,10 @@ def _guaranteed_order_priority_scores(
 ) -> dict[str, float]:
     """Map market_id -> lock priority from this cycle's analyzed decisions.
 
-    Prefers confidence scaled by evidence quality so coin-flip absence_only
-    weather does not outrank stronger evidence at similar confidence.
+    Ranks this cycle's research by confidence scaled by evidence quality so
+    guaranteed mode dives the most convicted names, not the most liquid
+    unanalyzed catalog rows. Named edge mechanisms outrank hunches;
+    absence_only is penalized among analyzed names only.
     """
     priorities: dict[str, float] = {}
     if not analysis_results:
@@ -4547,6 +4605,7 @@ def _guaranteed_order_priority_scores(
         confidence = 0.0
         evidence_quality = 0.0
         evidence_basis = ""
+        edge_mechanism = ""
         should_trade_signal = False
         if decision is not None:
             def _attr(name: str) -> Any:
@@ -4564,6 +4623,7 @@ def _guaranteed_order_priority_scores(
             except (TypeError, ValueError):
                 evidence_quality = 0.0
             evidence_basis = str(_attr("evidence_basis") or "").strip().lower()
+            edge_mechanism = str(_attr("edge_mechanism") or "").strip().lower()
             raw_should = _attr("raw_should_trade")
             should = _attr("should_trade")
             should_trade_signal = bool(raw_should) or bool(should)
@@ -4574,11 +4634,27 @@ def _guaranteed_order_priority_scores(
         priority = confidence * max(evidence_quality, 0.01)
         if should_trade_signal:
             priority += 0.15
+        if edge_mechanism and edge_mechanism != "none":
+            priority += 0.20
         if evidence_basis == "absence_only":
             priority -= 0.25
         priority += 0.05 * final_score
         priorities[str(market_id)] = priority
     return priorities
+
+
+def _guaranteed_order_analyzed_market_ids(
+    *,
+    priority_by_market_id: dict[str, float] | None,
+    seed_decisions_by_market_id: dict[str, TradeDecision] | None,
+) -> set[str]:
+    """Market IDs that already have this cycle's analysis."""
+    analyzed: set[str] = set()
+    if priority_by_market_id:
+        analyzed.update(str(market_id) for market_id in priority_by_market_id)
+    if seed_decisions_by_market_id:
+        analyzed.update(str(market_id) for market_id in seed_decisions_by_market_id)
+    return analyzed
 
 
 def _guaranteed_order_seed_decisions(
@@ -4632,10 +4708,16 @@ def _guaranteed_order_market_rank(
     market: Market,
     *,
     priority_by_market_id: dict[str, float] | None = None,
-) -> tuple[float, float, float, float, str]:
-    """Prefer high-confidence analyzed markets, then liquid/active ones."""
+    analyzed_market_ids: set[str] | None = None,
+) -> tuple[int, float, float, float, float, str]:
+    """Prefer this cycle's analyzed names, then confidence, then liquidity.
+
+    Unanalyzed catalog rows must not outrank analyzed absence_only: missing
+    from the priority map is not a 0.0 tie with researched names.
+    """
+    analyzed = 1 if analyzed_market_ids and market.id in analyzed_market_ids else 0
     priority = 0.0
-    if priority_by_market_id:
+    if priority_by_market_id and market.id in priority_by_market_id:
         try:
             priority = float(priority_by_market_id.get(market.id, 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -4643,6 +4725,7 @@ def _guaranteed_order_market_rank(
     yes_price = _get_outcome_entry_price(market, "YES")
     price_quality = 0.0 if yes_price is None else 1.0 - abs(yes_price - 0.5)
     return (
+        analyzed,
         priority,
         float(market.liquidity_usdc or 0.0),
         float(market.volume_24h or market.volume or 0.0),
@@ -4659,10 +4742,17 @@ def _lock_guaranteed_order_markets(
     excluded_market_families: set[str] | None = None,
     priority_by_market_id: dict[str, float] | None = None,
     seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
+    require_cycle_analysis: bool = False,
     settings: Settings,
     cycle_number: int,
 ) -> list[GuaranteedOrderSlot]:
-    """Lock distinct markets until the plan contains exactly its target count."""
+    """Lock distinct markets until the plan contains exactly its target count.
+
+    Initial locks prefer this cycle's top-confidence analyzed names, then
+    fill remaining slots from the catalog. Research-gap replacements stay
+    inside the analyzed set so a weak deep-dive is not swapped for an
+    unresearched liquid name.
+    """
     if plan.target <= 0:
         return []
 
@@ -4672,6 +4762,10 @@ def _lock_guaranteed_order_markets(
         if str(family or "").strip()
     }
     seed_decisions = seed_decisions_by_market_id or {}
+    analyzed_market_ids = _guaranteed_order_analyzed_market_ids(
+        priority_by_market_id=priority_by_market_id,
+        seed_decisions_by_market_id=seed_decisions,
+    )
     current_by_id = {market.id: market for market in markets if market.id}
     for slot in plan.slots:
         if slot.needs_replacement:
@@ -4705,10 +4799,15 @@ def _lock_guaranteed_order_markets(
         and market_family(market) not in normalized_excluded_families
         and _is_guaranteed_order_market_candidate(market, settings)
     ]
+    if require_cycle_analysis and analyzed_market_ids:
+        candidates = [
+            market for market in candidates if market.id in analyzed_market_ids
+        ]
     candidates.sort(
         key=lambda market: _guaranteed_order_market_rank(
             market,
             priority_by_market_id=priority_by_market_id,
+            analyzed_market_ids=analyzed_market_ids,
         ),
         reverse=True,
     )
@@ -4839,8 +4938,11 @@ def _guaranteed_order_research_gap_reason(
     except (TypeError, ValueError):
         evidence_quality = 0.0
     source_url = str(decision.primary_source_url or "").strip()
+    mechanism = str(decision.edge_mechanism or "").strip().lower()
     if basis == "absence_only":
         return "guaranteed_order_research_gap_absence_only"
+    if mechanism == "none":
+        return "guaranteed_order_research_gap_edge_mechanism_none"
     if evidence_quality < float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE):
         return "guaranteed_order_research_gap_low_evidence_quality"
     if edge_src == "none":
@@ -4855,10 +4957,12 @@ def _guaranteed_order_sized_amount_usdc(
     decision: TradeDecision,
     market: Market,
     settings: Settings,
+    min_bet_usdc: float,
+    max_bet_usdc: float,
 ) -> tuple[float, dict[str, Any]]:
     """Kelly-size a non-gap guaranteed order, floored at MIN_BET and capped at MAX_BET."""
-    min_bet = max(0.0, float(settings.MIN_BET_USDC))
-    max_bet = max(0.0, float(settings.MAX_BET_USDC))
+    min_bet = max(0.0, float(min_bet_usdc))
+    max_bet = max(0.0, float(max_bet_usdc))
     if max_bet > 0:
         min_bet = min(min_bet, max_bet)
     sizing_audit: dict[str, Any] = {
@@ -4981,6 +5085,8 @@ def _attempt_guaranteed_order_slot(
     kalshi_client: KalshiClient,
     state_manager: MarketStateManager,
     settings: Settings,
+    min_bet_usdc: float,
+    max_bet_usdc: float,
     replace_weak_evidence: bool = False,
 ) -> GuaranteedOrderAttemptResult:
     """Research a locked slot intensely and make its one forced order attempt.
@@ -5015,6 +5121,8 @@ def _attempt_guaranteed_order_slot(
             decision=researched,
             market=research_market,
             settings=settings,
+            min_bet_usdc=min_bet_usdc,
+            max_bet_usdc=max_bet_usdc,
         )
         if gap_reason is not None:
             sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
@@ -5022,15 +5130,18 @@ def _attempt_guaranteed_order_slot(
             researched,
             research_market,
             amount_usdc=amount_usdc,
-            max_bet_usdc=settings.MAX_BET_USDC,
+            max_bet_usdc=max_bet_usdc,
         )
 
     decision = slot.decision
-    amount_usdc = max(0.0, float(settings.MIN_BET_USDC))
-    if settings.MAX_BET_USDC > 0:
-        amount_usdc = min(amount_usdc, float(settings.MAX_BET_USDC))
+    amount_usdc = max(0.0, float(min_bet_usdc))
+    if max_bet_usdc > 0:
+        amount_usdc = min(amount_usdc, float(max_bet_usdc))
     if amount_usdc <= 0:
-        error = "Guaranteed orders require MIN_BET_USDC and MAX_BET_USDC to allow a positive order"
+        error = (
+            "Guaranteed orders require positive bankroll-derived bet bounds "
+            "(no portfolio balance observed yet this cycle)"
+        )
         slot.last_error = error
         return GuaranteedOrderAttemptResult(status="invalid_bet_size", error=error)
 
@@ -5229,6 +5340,8 @@ def _run_guaranteed_order_phase(
     state_manager: MarketStateManager,
     log_decision: Any,
     extended_research_market_ids: set[str],
+    min_bet_usdc: float,
+    max_bet_usdc: float,
     priority_by_market_id: dict[str, float] | None = None,
     seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
 ) -> GuaranteedOrderCycleResult:
@@ -5261,7 +5374,15 @@ def _run_guaranteed_order_phase(
             },
         )
 
-    def _lock_available_slots() -> list[GuaranteedOrderSlot]:
+    analyzed_market_ids = _guaranteed_order_analyzed_market_ids(
+        priority_by_market_id=priority_by_market_id,
+        seed_decisions_by_market_id=seed_decisions_by_market_id,
+    )
+
+    def _lock_available_slots(
+        *,
+        require_cycle_analysis: bool = False,
+    ) -> list[GuaranteedOrderSlot]:
         new_slots = _lock_guaranteed_order_markets(
             plan,
             markets,
@@ -5269,6 +5390,7 @@ def _run_guaranteed_order_phase(
             excluded_market_families=excluded_market_families,
             priority_by_market_id=priority_by_market_id,
             seed_decisions_by_market_id=seed_decisions_by_market_id,
+            require_cycle_analysis=require_cycle_analysis,
             settings=settings,
             cycle_number=cycle_number,
         )
@@ -5282,11 +5404,17 @@ def _run_guaranteed_order_phase(
                     "guaranteed_orders_n": plan.target,
                     "guaranteed_orders_locked": plan.locked_count,
                     "newly_locked_market_ids": [slot.market_id for slot in new_slots],
+                    "locked_from_cycle_analysis": [
+                        slot.market_id
+                        for slot in new_slots
+                        if slot.market_id in analyzed_market_ids
+                    ],
                     "replacement_slots": [
                         slot.slot_number
                         for slot in new_slots
                         if slot.replacement_count > 0
                     ],
+                    "require_cycle_analysis": require_cycle_analysis,
                     "excluded_market_families": sorted(excluded_market_families),
                     "priority_scores_applied": bool(priority_by_market_id),
                     "seeded_decision_count": sum(
@@ -5345,6 +5473,14 @@ def _run_guaranteed_order_phase(
         for slot in plan.slots
         if not slot.completed and not slot.abandoned and not slot.needs_replacement
     ]
+    pending_slots.sort(
+        key=lambda slot: _guaranteed_order_market_rank(
+            slot.market,
+            priority_by_market_id=priority_by_market_id,
+            analyzed_market_ids=analyzed_market_ids,
+        ),
+        reverse=True,
+    )
     while pending_slots:
         slot = pending_slots.pop(0)
         max_gap_replacements = int(
@@ -5360,6 +5496,8 @@ def _run_guaranteed_order_phase(
             kalshi_client=kalshi_client,
             state_manager=state_manager,
             settings=settings,
+            min_bet_usdc=min_bet_usdc,
+            max_bet_usdc=max_bet_usdc,
             replace_weak_evidence=replace_weak_evidence,
         )
         result.prompt_tokens += int(attempt.token_usage.get("prompt_tokens", 0))
@@ -5441,9 +5579,9 @@ def _run_guaranteed_order_phase(
                 slot,
                 reason=replacement_reason,
             )
-            replacement_slots = _lock_available_slots()
+            replacement_slots = _lock_available_slots(require_cycle_analysis=True)
             if slot.needs_replacement:
-                # No diversified replacement: force the researched side anyway.
+                # No analyzed replacement left: force the researched side anyway.
                 slot.needs_replacement = False
                 slot.replacement_reason = None
                 slot.abandoned = False
@@ -7627,8 +7765,8 @@ def _build_counterfactual_audit_fields(
         fields["counterfactual_required_for_drawdown_block"] = (
             "drawdown_reset_or_position_close"
         )
-        fields["counterfactual_max_daily_drawdown_usdc"] = (
-            settings.MAX_DAILY_DRAWDOWN_USDC
+        fields["counterfactual_max_daily_drawdown_pct"] = (
+            settings.MAX_DAILY_DRAWDOWN_PCT
         )
     if historical_metrics:
         prefix_n = historical_metrics.get("historical_gate_prefix_sample_size")
@@ -8577,13 +8715,15 @@ def _build_grok_client_for_worker(
     settings: Settings,
     provider: XAIProvider | None = None,
 ) -> GrokClient:
-    """Create a Grok client for threaded analysis workers."""
+    """Create a Grok client for threaded analysis workers.
+
+    The prompt bet range is bankroll-derived per cycle, so it is refreshed on
+    the client at analysis time rather than fixed at construction.
+    """
     return GrokClient(
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
         model_deep=settings.GROK_MODEL_DEEP,
-        min_bet_usdc=settings.MIN_BET_USDC,
-        max_bet_usdc=settings.MAX_BET_USDC,
         settings=settings,
         provider=provider,
     )
@@ -8662,9 +8802,15 @@ def _analyze_market_candidate_via_thread_local_client(
     research_queue_context: dict[str, Any] | None = None,
     family_context: dict[str, Any] | None = None,
     allow_self_consistency: bool = True,
+    min_bet_usdc: float = 0.0,
+    max_bet_usdc: float = 0.0,
 ) -> dict[str, Any]:
     """Worker entry point that reuses one GrokClient per worker thread."""
     grok_client = _get_or_create_worker_grok_client(settings, provider)
+    # Bet bounds are bankroll-derived per cycle while worker clients are cached
+    # per thread, so refresh the prompt bet range on every analysis.
+    grok_client.min_bet_usdc = float(min_bet_usdc)
+    grok_client.max_bet_usdc = float(max_bet_usdc)
     return _analyze_market_candidate_for_worker(
         market=market,
         state=state,
@@ -10463,8 +10609,6 @@ def main(max_cycles: int | None = None) -> None:
         api_key=settings.XAI_API_KEY,
         model=settings.GROK_MODEL,
         model_deep=settings.GROK_MODEL_DEEP,
-        min_bet_usdc=settings.MIN_BET_USDC,
-        max_bet_usdc=settings.MAX_BET_USDC,
         settings=settings,
         provider=shared_xai_provider,
     )
@@ -10474,6 +10618,8 @@ def main(max_cycles: int | None = None) -> None:
         settings.GROK_MODEL_DEEP,
     )
 
+    # Bet bounds are bankroll-derived per cycle; both clients receive the
+    # effective dollars right after each cycle's balance fetch.
     kalshi_client = KalshiClient(
         base_url=settings.KALSHI_API_BASE_URL,
         api_key_id=settings.KALSHI_API_KEY_ID,
@@ -10481,8 +10627,6 @@ def main(max_cycles: int | None = None) -> None:
         order_price_improvement_cents=settings.ORDER_PRICE_IMPROVEMENT_CENTS,
         default_time_in_force=settings.ORDER_DEFAULT_TIF,
         max_fetch_pages=settings.KALSHI_MAX_FETCH_PAGES,
-        min_bet_usdc=settings.MIN_BET_USDC,
-        max_bet_usdc=settings.MAX_BET_USDC,
     )
     logger.debug("Kalshi client initialized with base_url=%s", settings.KALSHI_API_BASE_URL)
 
@@ -10530,6 +10674,9 @@ def main(max_cycles: int | None = None) -> None:
     daily_expectancy_exposure_count = 0
     daily_projected_expected_value_usdc = 0.0
     daily_start_balance: float | None = None
+    # Most recent successfully-fetched portfolio value; lets bet sizing keep
+    # its bankroll reference on cycles where the balance refresh fails.
+    last_observed_bankroll_usdc: float | None = None
     # Per-market daily cap on conviction-repair deep passes (Grok cost bound).
     conviction_repair_attempt_days: dict[str, date] = {}
     cumulative_api_cost_estimate_usd = 0.0
@@ -10729,6 +10876,43 @@ def main(max_cycles: int | None = None) -> None:
                         "kelly_bankroll_guard_engaged": True,
                     },
                 )
+            if cycle_bankroll is not None:
+                last_observed_bankroll_usdc = cycle_bankroll
+            sizing_bankroll_usdc = (
+                cycle_bankroll
+                if cycle_bankroll is not None
+                else last_observed_bankroll_usdc
+            )
+            cycle_min_bet_usdc, cycle_max_bet_usdc = _effective_bet_bounds_usdc(
+                settings,
+                sizing_bankroll_usdc,
+            )
+            # Final-boundary clamp and prompt bet range both track the
+            # bankroll-derived bounds.
+            kalshi_client.min_bet_usdc = cycle_min_bet_usdc
+            kalshi_client.max_bet_usdc = cycle_max_bet_usdc
+            grok_client.min_bet_usdc = cycle_min_bet_usdc
+            grok_client.max_bet_usdc = cycle_max_bet_usdc
+            logger.info(
+                "Bet bounds for cycle: $%.2f-$%.2f (bankroll=$%s, min_pct=%.3f, max_pct=%.3f)",
+                cycle_min_bet_usdc,
+                cycle_max_bet_usdc,
+                (
+                    f"{sizing_bankroll_usdc:.2f}"
+                    if sizing_bankroll_usdc is not None
+                    else "unknown"
+                ),
+                settings.MIN_BET_PCT_OF_BANKROLL,
+                settings.MAX_BET_PCT_OF_BANKROLL,
+                data={
+                    "cycle_min_bet_usdc": round(cycle_min_bet_usdc, 4),
+                    "cycle_max_bet_usdc": round(cycle_max_bet_usdc, 4),
+                    "sizing_bankroll_usdc": sizing_bankroll_usdc,
+                    "sizing_bankroll_stale": cycle_bankroll is None,
+                    "min_bet_pct_of_bankroll": settings.MIN_BET_PCT_OF_BANKROLL,
+                    "max_bet_pct_of_bankroll": settings.MAX_BET_PCT_OF_BANKROLL,
+                },
+            )
             cycle_trade_day = datetime.now(timezone.utc).date()
             if cycle_trade_day != current_trade_day:
                 current_trade_day = cycle_trade_day
@@ -10739,6 +10923,12 @@ def main(max_cycles: int | None = None) -> None:
                 conviction_repair_attempt_days.clear()
             elif daily_start_balance is None and cycle_bankroll is not None:
                 daily_start_balance = cycle_bankroll
+            cycle_daily_drawdown_cap_usdc = _effective_daily_drawdown_cap_usdc(
+                settings,
+                daily_start_balance
+                if daily_start_balance is not None
+                else sizing_bankroll_usdc,
+            )
             try:
                 (
                     persisted_daily_trade_count,
@@ -13267,7 +13457,7 @@ def main(max_cycles: int | None = None) -> None:
             if (
                 settings.DAILY_DRAWDOWN_PREFLIGHT_ENABLED
                 and analysis_candidates
-                and settings.MAX_DAILY_DRAWDOWN_USDC > 0
+                and cycle_daily_drawdown_cap_usdc > 0
             ):
                 preflight_balance_delta, preflight_drawdown_basis = _daily_drawdown_basis_usdc(
                     state_manager=state_manager,
@@ -13281,7 +13471,7 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 if _daily_drawdown_cap_reached(
                     daily_balance_delta=preflight_balance_delta,
-                    max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                    max_daily_drawdown_usdc=cycle_daily_drawdown_cap_usdc,
                 ):
                     _drawdown_reason = "pre_analysis_daily_drawdown_blocked"
                     monitor_tier_str = str(ParticipationTier.MONITOR_ONLY)
@@ -13291,7 +13481,7 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     drawdown_why_not = (
                         f"Daily drawdown cap reached (drawdown=${preflight_drawdown:.2f}, "
-                        f"cap=${settings.MAX_DAILY_DRAWDOWN_USDC:.2f}); analysis skipped"
+                        f"cap=${cycle_daily_drawdown_cap_usdc:.2f}); analysis skipped"
                         " to avoid wasted Grok cost on trades that would be blocked."
                     )
                     for candidate in analysis_candidates:
@@ -13365,7 +13555,7 @@ def main(max_cycles: int | None = None) -> None:
                             skip_due_to=_skip_due_to_for_reason(_drawdown_reason),
                             daily_drawdown_usdc=round(preflight_drawdown, 2),
                             daily_drawdown_basis=preflight_drawdown_basis,
-                            max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                            max_daily_drawdown_usdc=cycle_daily_drawdown_cap_usdc,
                             **_SYNTHETIC_DECISION_AUDIT_FIELDS,
                             **drawdown_counterfactuals,
                         )
@@ -13396,14 +13586,14 @@ def main(max_cycles: int | None = None) -> None:
                         "Daily drawdown preflight engaged: drawdown=$%.2f cap=$%.2f basis=%s; "
                         "routed %d candidate(s) to research_queue (MONITOR_ONLY) and skipped Grok",
                         preflight_drawdown,
-                        settings.MAX_DAILY_DRAWDOWN_USDC,
+                        cycle_daily_drawdown_cap_usdc,
                         preflight_drawdown_basis,
                         daily_drawdown_preflight_blocked_count,
                         data={
                             "daily_drawdown_preflight_engaged": True,
                             "daily_drawdown_usdc": round(preflight_drawdown, 2),
                             "daily_drawdown_basis": preflight_drawdown_basis,
-                            "max_daily_drawdown_usdc": settings.MAX_DAILY_DRAWDOWN_USDC,
+                            "max_daily_drawdown_usdc": cycle_daily_drawdown_cap_usdc,
                             "daily_drawdown_preflight_blocked_count": (
                                 daily_drawdown_preflight_blocked_count
                             ),
@@ -13659,6 +13849,8 @@ def main(max_cycles: int | None = None) -> None:
                                     self_consistency_allowed_ids is None
                                     or candidate["market"].id in self_consistency_allowed_ids
                                 ),
+                                min_bet_usdc=cycle_min_bet_usdc,
+                                max_bet_usdc=cycle_max_bet_usdc,
                             )
                             future_to_market[future] = candidate["market"]
 
@@ -15261,7 +15453,7 @@ def main(max_cycles: int | None = None) -> None:
 
                 if _should_skip_for_balance(
                     available_balance=last_known_balance,
-                    min_bet_usdc=settings.MIN_BET_USDC,
+                    min_bet_usdc=cycle_min_bet_usdc,
                 ):
                     analysis_only_mode = True
                     trades_skipped_balance += 1
@@ -15279,7 +15471,7 @@ def main(max_cycles: int | None = None) -> None:
                             final_action="skip",
                             final_reason="balance_exhausted_skip",
                             available_balance=last_known_balance,
-                            min_bet_usdc=settings.MIN_BET_USDC,
+                            min_bet_usdc=cycle_min_bet_usdc,
                             **audit_context,
                         ),
                     )
@@ -15288,12 +15480,12 @@ def main(max_cycles: int | None = None) -> None:
                         "SKIP [%s] -> balance exhausted (available=$%.2f < min_bet=$%.2f)",
                         market.id,
                         last_known_balance,
-                        settings.MIN_BET_USDC,
+                        cycle_min_bet_usdc,
                         data={
                             "market_id": market.id,
                             "final_reason": "balance_exhausted_skip",
                             "available_balance": last_known_balance,
-                            "min_bet_usdc": settings.MIN_BET_USDC,
+                            "min_bet_usdc": cycle_min_bet_usdc,
                         },
                     )
                     continue
@@ -16482,7 +16674,7 @@ def main(max_cycles: int | None = None) -> None:
                     lmsr_execution_price = _compute_lmsr_execution_price_for_outcome(
                         market=active_market,
                         decision_outcome=decision_for_edge.outcome,
-                        amount_usdc=settings.MAX_BET_USDC,
+                        amount_usdc=cycle_max_bet_usdc,
                         settings=settings,
                     )
                     if lmsr_execution_price is not None:
@@ -16996,8 +17188,8 @@ def main(max_cycles: int | None = None) -> None:
                         recovered_policy,
                     ) = _resolve_min_bet_floor(
                         bet_amount=0.0,
-                        min_bet_usdc=settings.MIN_BET_USDC,
-                        max_bet_usdc=settings.MAX_BET_USDC,
+                        min_bet_usdc=cycle_min_bet_usdc,
+                        max_bet_usdc=cycle_max_bet_usdc,
                         kelly_path_active=True,
                         min_bet_policy=settings.KELLY_MIN_BET_POLICY,
                         edge_scaling_bet_pct=edge_scaling_bet_pct,
@@ -17006,7 +17198,7 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     recovered_via_fallback_edge = (
                         recovered_policy == _KELLY_MIN_BET_POLICY_FALLBACK_EDGE
-                        and recovered_bet_amount >= settings.MIN_BET_USDC
+                        and recovered_bet_amount >= cycle_min_bet_usdc
                         and recovered_bet_pct > 0.0
                     )
                     if recovered_via_fallback_edge:
@@ -17082,7 +17274,7 @@ def main(max_cycles: int | None = None) -> None:
                     _record_terminal_outcome(state_manager, market.id, "zero_bet_after_sizing")
                     continue
 
-                proposed_bet_amount = _calculate_bet(settings.MAX_BET_USDC, adjusted_bet_pct)
+                proposed_bet_amount = _calculate_bet(cycle_max_bet_usdc, adjusted_bet_pct)
                 # Use the same canonical LMSR signal for scoring and gating.
                 # Recomputing it after the score gate made the receipt describe a
                 # different signal than the one that actually passed scoring.
@@ -17219,6 +17411,7 @@ def main(max_cycles: int | None = None) -> None:
                     cycle_bankroll=cycle_bankroll,
                     current_entry_price=entry_price,
                     last_entry_price=last_entry_price,
+                    max_bet_usdc=cycle_max_bet_usdc,
                 )
                 if not should_add:
                     _record_should_trade_blocked("position_adjustment_blocked")
@@ -17293,7 +17486,7 @@ def main(max_cycles: int | None = None) -> None:
                     )
                     continue
 
-                bet_amount = _calculate_bet(settings.MAX_BET_USDC, bet_pct)
+                bet_amount = _calculate_bet(cycle_max_bet_usdc, bet_pct)
                 if bet_amount <= 0:
                     _record_should_trade_blocked("bet_amount_zero")
                     _record_rejection_reason(rejection_breakdown, "bet_amount_zero")
@@ -17332,8 +17525,8 @@ def main(max_cycles: int | None = None) -> None:
                     min_bet_policy_applied,
                 ) = _resolve_min_bet_floor(
                     bet_amount=bet_amount,
-                    min_bet_usdc=settings.MIN_BET_USDC,
-                    max_bet_usdc=settings.MAX_BET_USDC,
+                    min_bet_usdc=cycle_min_bet_usdc,
+                    max_bet_usdc=cycle_max_bet_usdc,
                     kelly_path_active=kelly_path_active,
                     min_bet_policy=settings.KELLY_MIN_BET_POLICY,
                     edge_scaling_bet_pct=edge_scaling_bet_pct,
@@ -17346,11 +17539,11 @@ def main(max_cycles: int | None = None) -> None:
                     _record_should_trade_blocked("kelly_sub_floor_skip")
                     _record_rejection_reason(rejection_breakdown, "kelly_sub_floor_skip")
                     kelly_sub_floor_gap = 0.0
-                    if settings.MIN_BET_USDC > 0:
+                    if cycle_min_bet_usdc > 0:
                         kelly_sub_floor_gap = max(
                             0.0,
-                            (float(settings.MIN_BET_USDC) - float(raw_bet_amount))
-                            / float(settings.MIN_BET_USDC),
+                            (float(cycle_min_bet_usdc) - float(raw_bet_amount))
+                            / float(cycle_min_bet_usdc),
                         )
                     queue_kelly_sub_floor = _should_queue_research_for_blocked_trade(
                         settings=settings,
@@ -17378,7 +17571,7 @@ def main(max_cycles: int | None = None) -> None:
                             participation_tier="execution_eligible",
                             why_not_execution_eligible=(
                                 f"Kelly raw bet ${raw_bet_amount:.2f} below "
-                                f"MIN_BET ${settings.MIN_BET_USDC:.2f}"
+                                f"MIN_BET ${cycle_min_bet_usdc:.2f}"
                             ),
                             what_to_learn_next=kelly_sub_floor_learning_target,
                         )
@@ -17392,14 +17585,14 @@ def main(max_cycles: int | None = None) -> None:
                         market.id,
                         question_short,
                         raw_bet_amount,
-                        settings.MIN_BET_USDC,
+                        cycle_min_bet_usdc,
                         data={
                             "market_id": market.id,
                             "final_action": kelly_final_action,
                             "final_reason": "kelly_sub_floor_skip",
                             "sizing_mode": sizing_mode,
                             "raw_bet_amount_usdc": raw_bet_amount,
-                            "min_bet_usdc": settings.MIN_BET_USDC,
+                            "min_bet_usdc": cycle_min_bet_usdc,
                             "kelly_sub_floor_skipped": True,
                             "min_bet_floor_applied": False,
                             "kelly_min_bet_policy": settings.KELLY_MIN_BET_POLICY,
@@ -17424,7 +17617,7 @@ def main(max_cycles: int | None = None) -> None:
                             post_position_bet_pct=bet_pct,
                             raw_bet_amount_usdc=raw_bet_amount,
                             bet_amount_usdc=0.0,
-                            min_bet_usdc=settings.MIN_BET_USDC,
+                            min_bet_usdc=cycle_min_bet_usdc,
                             min_bet_floor_applied=False,
                             kelly_sub_floor_skipped=True,
                             kelly_min_bet_policy=settings.KELLY_MIN_BET_POLICY,
@@ -17521,8 +17714,8 @@ def main(max_cycles: int | None = None) -> None:
                         bet_pct=bet_pct,
                         satellite_cap_pct=satellite_cap_pct,
                         min_bet_floor_applied=min_bet_floor_applied,
-                        max_bet_usdc=settings.MAX_BET_USDC,
-                        min_bet_usdc=settings.MIN_BET_USDC,
+                        max_bet_usdc=cycle_max_bet_usdc,
+                        min_bet_usdc=cycle_min_bet_usdc,
                     )
                     if satellite_recap is not None:
                         audit_context["satellite_recap_applied"] = True
@@ -18143,7 +18336,7 @@ def main(max_cycles: int | None = None) -> None:
                 )
                 if _daily_drawdown_cap_reached(
                     daily_balance_delta=daily_balance_delta,
-                    max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                    max_daily_drawdown_usdc=cycle_daily_drawdown_cap_usdc,
                 ):
                     trades_skipped_position += 1
                     _record_should_trade_blocked("daily_drawdown_limit")
@@ -18164,7 +18357,7 @@ def main(max_cycles: int | None = None) -> None:
                             final_reason="daily_drawdown_limit",
                             daily_drawdown_usdc=daily_drawdown,
                             daily_drawdown_basis=daily_drawdown_basis,
-                            max_daily_drawdown_usdc=settings.MAX_DAILY_DRAWDOWN_USDC,
+                            max_daily_drawdown_usdc=cycle_daily_drawdown_cap_usdc,
                             **audit_context,
                         ),
                     )
@@ -18697,6 +18890,8 @@ def main(max_cycles: int | None = None) -> None:
                     state_manager=state_manager,
                     log_decision=log_trade_decision,
                     extended_research_market_ids=extended_research_market_ids,
+                    min_bet_usdc=cycle_min_bet_usdc,
+                    max_bet_usdc=cycle_max_bet_usdc,
                     priority_by_market_id=_guaranteed_order_priority_scores(
                         analysis_results
                     ),
@@ -19720,15 +19915,16 @@ def main(max_cycles: int | None = None) -> None:
 
         except Exception as exc:
             error_text = str(exc)
-            if "Could not find a suitable TLS CA certificate bundle" in error_text:
+            if _is_tls_ca_bundle_error(exc):
                 certifi_path = None
                 if certifi is not None:
                     try:
                         certifi_path = certifi.where()
                     except Exception:
                         certifi_path = None
-                logger.error(
-                    "Bot cycle #%d TLS CA bundle error: %s",
+                logger.critical(
+                    "Bot cycle #%d TLS CA bundle error: %s — aborting "
+                    "(missing CA bundle cannot self-heal mid-run)",
                     cycle_count,
                     error_text,
                     data={
@@ -19739,8 +19935,11 @@ def main(max_cycles: int | None = None) -> None:
                         "certifi_where": certifi_path,
                     },
                 )
-                sleep_seconds = max(60, int(sleep_seconds))
-                continue
+                raise BootstrapError(
+                    "TLS CA certificate bundle missing mid-run: "
+                    f"{error_text}. certifi.where()={certifi_path!r}. "
+                    "Reinstall the venv (`poetry install`) and restart."
+                ) from exc
             logger.exception(
                 "Bot cycle #%d failed: %s",
                 cycle_count,
