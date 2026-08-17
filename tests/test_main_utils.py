@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import main as main_module
-from calibration_gates import PerformanceStats
+from calibration_gates import GateTier, PerformanceStats
 from config import Settings
 from participation import ParticipationTier
 from main import (
@@ -2453,6 +2453,108 @@ class TestMainUtils(unittest.TestCase):
             0.0,
         )
 
+    def test_pre_analysis_hard_deny_does_not_apply_score_penalty(self) -> None:
+        """HARD_DENY blocks execution, not Grok analysis. A leftover or
+        missing score-penalty key must not drop the market into the research
+        band via the soft-demote default.
+        """
+        market = Market(
+            id="KXHARDDENY-1234-T100",
+            question="Will the index settle above threshold?",
+            category="generic",
+            liquidity_usdc=400.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.0,
+        )
+        baseline, _ = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        leftover, leftover_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.HARD_DENY,
+                "historical_gate_score_penalty": 0.10,
+            },
+        )
+        missing, missing_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.HARD_DENY,
+            },
+        )
+        self.assertEqual(leftover_bd["pre_score_historical_gate_score_penalty"], 0.0)
+        self.assertEqual(missing_bd["pre_score_historical_gate_score_penalty"], 0.0)
+        self.assertAlmostEqual(leftover, baseline, places=6)
+        self.assertAlmostEqual(missing, baseline, places=6)
+
+    def test_pre_analysis_soft_demote_still_applies_score_penalty(self) -> None:
+        market = Market(
+            id="KXSOFTDEMOTE-1234-T100",
+            question="Will the index settle above threshold?",
+            category="generic",
+            liquidity_usdc=400.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.0,
+        )
+        baseline, _ = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        explicit, explicit_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.SOFT_DEMOTE,
+                "historical_gate_score_penalty": 0.08,
+            },
+        )
+        defaulted, defaulted_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.SOFT_DEMOTE,
+            },
+        )
+        self.assertAlmostEqual(
+            explicit_bd["pre_score_historical_gate_score_penalty"], 0.08, places=6
+        )
+        self.assertAlmostEqual(
+            defaulted_bd["pre_score_historical_gate_score_penalty"], 0.10, places=6
+        )
+        self.assertAlmostEqual(explicit, baseline - 0.08, places=6)
+        self.assertAlmostEqual(defaulted, baseline - 0.10, places=6)
+
     def test_pre_analysis_opportunity_score_does_not_credit_when_below_cap(
         self,
     ) -> None:
@@ -3991,6 +4093,51 @@ class TestMainUtils(unittest.TestCase):
         components = legacy["selection_rank_components"]
         assert components["historical_gate_penalty"] == 0.12
         assert components["risk_adjusted_score"] == 0.73  # 0.85 - 0.12
+
+    def test_cap_analysis_candidates_hard_deny_does_not_apply_score_penalty(self) -> None:
+        """HARD_DENY must not reuse a leftover soft-demote metric penalty
+        when ranking analysis candidates.
+        """
+        candidates = [
+            {
+                "market": Market(
+                    id="KXSPORTS-HARD-DENY",
+                    question="Will the NBA Lakers win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.65,
+                "historical_gate_allowed": False,
+                "historical_gate_metrics": {
+                    "historical_gate_tier": GateTier.HARD_DENY,
+                    "historical_gate_score_penalty": 0.08,
+                },
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN-HARD-DENY",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.50,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER-HARD-DENY",
+                    question="Will the NBA Heat win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        blocked = next(
+            item for item in capped if item["market"].id == "KXSPORTS-HARD-DENY"
+        )
+        components = blocked["selection_rank_components"]
+        assert components["historical_gate_penalty"] == 0.0
+        assert components["risk_adjusted_score"] == 0.65
 
     def test_cap_analysis_candidates_limits_sports_candidates(self) -> None:
         """Cycle 4 recovery: sports props were monopolizing all analysis

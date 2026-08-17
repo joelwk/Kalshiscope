@@ -89,6 +89,7 @@ def test_evaluate_market_flags_losing_family_and_blocks_execution() -> None:
     assert metrics["historical_family_samples"] == 30
     assert metrics["historical_family_pnl_total"] == -40.0
     assert metrics["historical_gate_tier"] == GateTier.HARD_DENY
+    assert metrics["historical_gate_score_penalty"] == 0.0
 
 
 def test_evaluate_market_does_not_block_zero_win_prefix_without_pnl_cutoff() -> None:
@@ -301,6 +302,7 @@ def test_tiered_n12_low_wilson_is_hard_deny_blocks_execution() -> None:
     assert result.tier == GateTier.HARD_DENY
     assert result.reason == "historical_prefix_pnl_block"
     assert result.allowed is False
+    assert result.metrics["historical_gate_score_penalty"] == 0.0
 
 
 def test_high_win_rate_negative_pnl_is_entry_price_caution_not_hard_deny() -> None:
@@ -558,7 +560,7 @@ def test_family_hard_deny_requires_wilson_lb_below_cutoff() -> None:
     # n=30, wins=10 (33.3%), WLB ~ 0.19 < 0.40, shrunk PnL ~ -1.0 < -0.5.
     assert result.tier == GateTier.HARD_DENY
     assert result.allowed is False
-    assert result.reason == "historical_family_pnl_block"
+    assert result.metrics["historical_gate_score_penalty"] == 0.0
     assert result.wilson_win_rate_lower_bound is not None
     assert result.wilson_win_rate_lower_bound < 0.40
 
@@ -753,3 +755,121 @@ def test_prefix_prior_win_rate_ignored_when_shrinkage_disabled() -> None:
     assert result.tier == GateTier.HARD_DENY
     assert result.allowed is False
     assert result.metrics["historical_gate_prefix_shrunk_win_rate"] == 0.30
+
+
+def test_prefix_soft_demote_does_not_skip_family_hard_deny() -> None:
+    """Prefix SOFT_DEMOTE must not return before the family gate.
+
+    Execution only checks ``allowed``. A small-sample losing prefix in a
+    family that would hard-deny must still be blocked.
+    """
+    prefix_stats = {
+        "KXSOFTFAM-12": PerformanceStats(
+            sample_size=4,
+            wins=0,
+            win_rate=0.0,
+            pnl_total=-16.0,
+        )
+    }
+    family_stats = {
+        "crypto": PerformanceStats(
+            sample_size=30,
+            wins=10,
+            win_rate=0.333,
+            pnl_total=-40.0,
+        )
+    }
+    blocked = evaluate_market_tiered(
+        market_id="KXSOFTFAM-123456-TEST",
+        family="crypto",
+        prefix_stats=prefix_stats,
+        family_stats=family_stats,
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+        family_shrunk_pnl_cutoff=-0.50,
+    )
+    assert blocked.tier == GateTier.HARD_DENY
+    assert blocked.allowed is False
+    assert blocked.reason == "historical_family_pnl_block"
+    assert blocked.metrics["historical_gate_score_penalty"] == 0.0
+    assert blocked.metrics["historical_gate_prefix_sample_size"] == 4
+    assert blocked.metrics["historical_family_samples"] == 30
+
+    prefix_only = evaluate_market_tiered(
+        market_id="KXSOFTFAM-123456-TEST",
+        family="crypto",
+        prefix_stats=prefix_stats,
+        family_stats=family_stats,
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=False,
+    )
+    assert prefix_only.tier == GateTier.SOFT_DEMOTE
+    assert prefix_only.allowed is True
+    assert prefix_only.reason == "historical_prefix_small_sample_negative"
+
+    healthy_family = evaluate_market_tiered(
+        market_id="KXSOFTFAM-123456-TEST",
+        family="crypto",
+        prefix_stats=prefix_stats,
+        family_stats={
+            "crypto": PerformanceStats(
+                sample_size=30,
+                wins=20,
+                win_rate=0.67,
+                pnl_total=25.0,
+            )
+        },
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+        family_shrunk_pnl_cutoff=-0.50,
+    )
+    assert healthy_family.tier == GateTier.SOFT_DEMOTE
+    assert healthy_family.allowed is True
+    assert healthy_family.reason == "historical_prefix_small_sample_negative"
+    assert healthy_family.metrics["historical_gate_score_penalty"] > 0.0
+
+    allowed, reason, metrics = evaluate_market(
+        market_id="KXSOFTFAM-123456-TEST",
+        family="crypto",
+        prefix_stats=prefix_stats,
+        family_stats=family_stats,
+        prefix_len=12,
+        prefix_gate_enabled=True,
+        prefix_min_samples=3,
+        prefix_hard_block_min_samples=20,
+        prefix_pnl_cutoff=-3.0,
+        prefix_win_rate_cutoff=0.40,
+        prefix_shrunk_pnl_cutoff=-0.50,
+        family_gate_enabled=True,
+        family_min_samples=12,
+        family_pnl_cutoff=-12.0,
+        family_win_rate_cutoff=0.40,
+        family_shrunk_pnl_cutoff=-0.50,
+    )
+    assert allowed is False
+    assert reason == "historical_family_pnl_block"
+    assert metrics["historical_gate_tier"] == GateTier.HARD_DENY

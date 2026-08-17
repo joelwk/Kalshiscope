@@ -235,11 +235,15 @@ def evaluate_market_tiered(
     When prefix shrinkage is enabled, hard-deny and soft-demote compare the
     win rate shrunk toward ``prefix_prior_win_rate`` rather than the raw
     observed rate. Wilson LB stays on the raw binomial counts.
+
+    Prefix ``SOFT_DEMOTE`` does not skip the family gate: a family hard-deny
+    still blocks execution.
     """
     normalized_market_id = str(market_id or "").strip().upper()
     normalized_family = str(family or "").strip().lower()
     normalized_prefix_len = max(1, int(prefix_len))
     market_prefix = normalized_market_id[:normalized_prefix_len]
+    pending_prefix_soft_demote: EvaluateMarketResult | None = None
     metrics: dict[str, Any] = {
         "historical_gate_market_prefix": market_prefix,
         "historical_gate_market_family": normalized_family,
@@ -304,7 +308,6 @@ def evaluate_market_tiered(
             metrics.update(
                 {
                     "historical_gate_sample_weight": round(sample_weight, 4),
-                    "historical_gate_score_penalty": round(score_penalty, 4),
                 }
             )
 
@@ -313,6 +316,8 @@ def evaluate_market_tiered(
             # both sit at or below cutoff. Wilson LB stays on raw counts so
             # a sufficient-sample prefix is not hard-blocked unless the
             # lower bound on its true win rate is also below cutoff.
+            # Score penalty stays 0: HARD_DENY blocks execution only and must
+            # not demote the market out of Grok analysis.
             if (
                 n >= hard_block_min
                 and gate_win_rate <= float(prefix_win_rate_cutoff)
@@ -320,6 +325,7 @@ def evaluate_market_tiered(
                 and shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
                 and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
             ):
+                metrics["historical_gate_score_penalty"] = 0.0
                 return EvaluateMarketResult(
                     tier=GateTier.HARD_DENY,
                     allowed=False,
@@ -347,7 +353,11 @@ def evaluate_market_tiered(
                     )
                 )
             ):
-                return EvaluateMarketResult(
+                # Hold the prefix demote so the family gate can still hard-deny.
+                # Execution only checks ``allowed``; returning here would let a
+                # losing family reach order submission.
+                metrics["historical_gate_score_penalty"] = round(score_penalty, 4)
+                pending_prefix_soft_demote = EvaluateMarketResult(
                     tier=GateTier.SOFT_DEMOTE,
                     allowed=True,
                     reason="historical_prefix_small_sample_negative",
@@ -409,6 +419,7 @@ def evaluate_market_tiered(
                 and wlb_fam <= float(family_win_rate_cutoff)
                 and shrunk_pnl_fam <= float(family_shrunk_pnl_cutoff)
             ):
+                metrics["historical_gate_score_penalty"] = 0.0
                 return EvaluateMarketResult(
                     tier=GateTier.HARD_DENY,
                     allowed=False,
@@ -424,6 +435,9 @@ def evaluate_market_tiered(
                         "for calibration and ranking context."
                     ),
                 )
+
+    if pending_prefix_soft_demote is not None:
+        return pending_prefix_soft_demote
 
     return EvaluateMarketResult(
         tier=GateTier.NEUTRAL,

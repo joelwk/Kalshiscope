@@ -9291,7 +9291,10 @@ def _pre_analysis_opportunity_score(
             )
         except (TypeError, ValueError):
             historical_gate_sample_weight = 0.0
-        if historical_gate_tier in {GateTier.SOFT_DEMOTE, GateTier.HARD_DENY}:
+        # HARD_DENY blocks execution only. Applying a score penalty here
+        # (or defaulting a missing key to the soft-demote bar) drops the
+        # market into the research band instead of keeping it in deep analysis.
+        if historical_gate_tier == GateTier.SOFT_DEMOTE:
             try:
                 historical_gate_score_penalty = float(
                     historical_gate_metrics.get(
@@ -9563,6 +9566,7 @@ def _cap_analysis_candidates(
         historical_gate_metrics = candidate.get("historical_gate_metrics")
         historical_gate_metric_penalty = 0.0
         historical_gate_metrics_present = isinstance(historical_gate_metrics, dict)
+        historical_gate_tier = ""
         pre_analysis_breakdown = candidate.get("pre_analysis_breakdown")
         historical_gate_penalty_already_applied = False
         if isinstance(pre_analysis_breakdown, dict):
@@ -9577,6 +9581,9 @@ def _cap_analysis_candidates(
             except (TypeError, ValueError):
                 historical_gate_penalty_already_applied = False
         if historical_gate_metrics_present:
+            historical_gate_tier = str(
+                historical_gate_metrics.get("historical_gate_tier") or ""
+            ).strip().lower()
             try:
                 historical_gate_metric_penalty = float(
                     historical_gate_metrics.get("historical_gate_score_penalty", 0.0) or 0.0
@@ -9590,9 +9597,12 @@ def _cap_analysis_candidates(
             if historical_win_rate and historical_win_rate < 0.50:
                 historical_loss_penalty += min(0.06, (0.50 - historical_win_rate) * 0.20)
         # The base pre-analysis score normally already includes the historical
-        # gate's soft penalty. Apply it here only for legacy/manual candidates
-        # whose score breakdown proves it was not absorbed upstream.
+        # gate's soft-demote penalty. Apply it here only for legacy/manual
+        # candidates whose score breakdown proves it was not absorbed upstream.
+        # HARD_DENY is an execution block, not a ranking demotion.
         if historical_gate_penalty_already_applied:
+            historical_gate_penalty = 0.0
+        elif historical_gate_tier == GateTier.HARD_DENY:
             historical_gate_penalty = 0.0
         elif historical_gate_metrics_present:
             historical_gate_penalty = max(0.0, historical_gate_metric_penalty)
