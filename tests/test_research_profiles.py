@@ -269,6 +269,24 @@ def test_market_family_entertainment_ticker_precedes_streaming_keyword() -> None
     assert market_family(market) == "entertainment"
 
 
+def test_market_family_youtube_views_ticker_is_entertainment() -> None:
+    market = Market(
+        id="KXYTVIEWSW-TAY26AUG16-14.5M",
+        question="Will Taylor Swift's video have over 14.5M YouTube views?",
+        category="entertainment",
+    )
+    assert market_family(market) == "entertainment"
+
+
+def test_market_family_rotten_tomatoes_ticker_is_entertainment() -> None:
+    market = Market(
+        id="KXRT-BRIN-70",
+        question="Will Bring Her Back have a Rotten Tomatoes score of 70 or higher?",
+        category="entertainment",
+    )
+    assert market_family(market) == "entertainment"
+
+
 def test_profile_for_market_returns_music_profile() -> None:
     settings = Settings()
     market = Market(

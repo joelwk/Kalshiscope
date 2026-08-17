@@ -48,6 +48,10 @@ from main import (
     _effective_research_queue_drain_quota,
     _effective_sports_candidate_cap,
     _clear_sports_jurisdiction_block,
+    _jurisdiction_blocked_families,
+    _jurisdiction_families_from_error,
+    _market_hits_jurisdiction_hold,
+    _record_jurisdiction_block,
     _record_sports_jurisdiction_block,
     _sports_jurisdiction_hold_active,
     _edge_threshold_for_market,
@@ -1047,6 +1051,13 @@ class TestMainUtils(unittest.TestCase):
             ),
             0.04,
             places=4,
+        )
+        self.assertEqual(
+            _direct_evidence_family_affinity(
+                "entertainment",
+                jurisdiction_blocked_families={"entertainment", "music", "sports"},
+            ),
+            0.0,
         )
         # Hold overlay keeps weather below its base affinity and boosts crypto
         # above it (base weather 0.04 / crypto 0.06 per the affinity tables).
@@ -2604,15 +2615,32 @@ class TestMainUtils(unittest.TestCase):
         self.assertIn("repair_action=", text)
         self.assertIn("should_trade=true", text)
 
-    def test_is_michigan_sports_jurisdiction_error(self) -> None:
-        from main import _is_michigan_sports_jurisdiction_error
+    def test_jurisdiction_families_from_error_parses_state_categories(self) -> None:
+        from main import _jurisdiction_rejection_reason
 
-        self.assertTrue(
-            _is_michigan_sports_jurisdiction_error(
+        self.assertEqual(
+            _jurisdiction_families_from_error(
                 "403 body=Michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports"
-            )
+            ),
+            frozenset({"sports"}),
         )
-        self.assertFalse(_is_michigan_sports_jurisdiction_error("insufficient balance"))
+        nevada = _jurisdiction_families_from_error(
+            "Nevada residents are not currently allowed to open positions in "
+            "Sports, Elections and Entertainment. Check your email for more details."
+        )
+        self.assertEqual(
+            nevada,
+            frozenset({"sports", "politics", "entertainment", "music"}),
+        )
+        self.assertEqual(_jurisdiction_rejection_reason(nevada), "jurisdiction_restricted")
+        self.assertEqual(
+            _jurisdiction_rejection_reason({"sports"}),
+            "jurisdiction_sports_blocked",
+        )
+        self.assertEqual(
+            _jurisdiction_families_from_error("insufficient balance"),
+            frozenset(),
+        )
 
     def test_edge_repair_skips_sports_computed_odds_near_binary(self) -> None:
         from main import _edge_repair_reason
@@ -2775,9 +2803,12 @@ class TestMainUtils(unittest.TestCase):
         text = _order_exception_error_text(exc)
         self.assertIn("403 Client Error", text)
         self.assertIn("michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports", text)
-        from main import _is_michigan_sports_jurisdiction_error
+        from main import _jurisdiction_families_from_error
 
-        self.assertTrue(_is_michigan_sports_jurisdiction_error(text))
+        self.assertEqual(
+            _jurisdiction_families_from_error(text),
+            frozenset({"sports"}),
+        )
 
     def test_kelly_fraction_shrinks_on_weather_calibration_gap(self) -> None:
         from kelly import kelly_bet_pct, kelly_fraction
@@ -4029,6 +4060,41 @@ class TestMainUtils(unittest.TestCase):
         self.assertIn("KXBTCD-T70K", capped_ids)
         self.assertIn("KXHIGHCHI-T50", capped_ids)
 
+    def test_cap_analysis_candidates_extra_family_caps_apply_under_global_cap(self) -> None:
+        """Jurisdiction probe caps must apply even when the global cycle cap
+        is larger than the candidate list (the early-return path)."""
+        candidates = [
+            {
+                "market": Market(
+                    id=f"KXYTVIEWSW-SHOW{idx}",
+                    question="Will this show clear 10M YouTube views?",
+                    category="entertainment",
+                ),
+                "pre_analysis_score": 0.90 - (idx * 0.01),
+            }
+            for idx in range(3)
+        ] + [
+            {
+                "market": Market(
+                    id="KXHIGHCHI-T50",
+                    question="Will Chicago high be below 50F?",
+                    category="weather",
+                ),
+                "pre_analysis_score": 0.40,
+            }
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=8,
+            extra_family_caps={"entertainment": 1},
+        )
+        capped_ids = [item["market"].id for item in capped]
+        self.assertEqual(
+            len([mid for mid in capped_ids if mid.startswith("KXYTVIEWSW-")]),
+            1,
+        )
+        self.assertIn("KXHIGHCHI-T50", capped_ids)
+
     def test_cap_analysis_candidates_sports_cap_none_keeps_legacy_behavior(self) -> None:
         """Backward-compat: with max_sports_candidates_per_cycle=None the
         previous behavior (no sports-specific cap) must remain so existing
@@ -4135,6 +4201,33 @@ class TestMainUtils(unittest.TestCase):
                 _clear_sports_jurisdiction_block(manager)
                 _clear_sports_jurisdiction_block(manager)
                 self.assertFalse(_sports_jurisdiction_hold_active(manager))
+                _record_jurisdiction_block(
+                    manager, {"sports", "entertainment", "politics", "music"}
+                )
+                self.assertEqual(
+                    _jurisdiction_blocked_families(manager),
+                    {"sports", "entertainment", "politics", "music"},
+                )
+                self.assertTrue(
+                    _market_hits_jurisdiction_hold(
+                        Market(
+                            id="KXYTVIEWSW-TAY26AUG16-14.5M",
+                            question="Will Taylor have over 14.5M YouTube views?",
+                            category="entertainment",
+                        ),
+                        _jurisdiction_blocked_families(manager),
+                    )
+                )
+                self.assertFalse(
+                    _market_hits_jurisdiction_hold(
+                        Market(
+                            id="KXHIGHNY-26AUG17-T88",
+                            question="Will the high temperature in NYC be above 88F?",
+                            category="weather",
+                        ),
+                        _jurisdiction_blocked_families(manager),
+                    )
+                )
             finally:
                 manager.close()
 
@@ -4393,6 +4486,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(_edge_threshold_for_market(0.20, settings, "computed"), 0.2125)
         self.assertAlmostEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.068)
         self.assertAlmostEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.072)
+        self.assertEqual(_edge_threshold_for_market(None, settings, "computed"), 0.05)
         weather_market = Market(
             id="w-edge",
             question="Will rainfall exceed 1 inch in Miami tomorrow?",

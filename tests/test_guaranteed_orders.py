@@ -102,6 +102,34 @@ class _JurisdictionThenSuccessKalshi(_LiveGuaranteedKalshi):
         )
 
 
+class _NevadaRestrictedThenSuccessKalshi(_LiveGuaranteedKalshi):
+    def submit_order(self, order, **kwargs):
+        self.submitted_market_ids.append(order.market_id)
+        self.client_order_ids.append(kwargs.get("client_order_id"))
+        market = next(item for item in self.markets if item.id == order.market_id)
+        family = main.market_family(market)
+        category = str(market.category or "").strip().lower()
+        if family in {"sports", "entertainment", "music", "politics"} or category in {
+            "entertainment",
+            "sports",
+            "elections",
+            "politics",
+        }:
+            raise RuntimeError(
+                "Nevada_residents_are_not_currently_allowed_to_open_positions_in_"
+                "Sports,_Elections_and_Entertainment. Check your email for more details."
+            )
+        return OrderResponse(
+            id=f"order-{order.market_id}",
+            status="open",
+            raw={
+                "client_qty_shares": 9,
+                "client_price": 0.56,
+                "fill_count": 0,
+            },
+        )
+
+
 def _market(
     market_id: str,
     *,
@@ -780,6 +808,60 @@ def test_guaranteed_phase_replaces_jurisdiction_blocked_sports_slot_same_cycle(
     assert decisions[0]["execution_audit"]["final_reason"] == (
         "jurisdiction_sports_blocked"
     )
+    assert decisions[-1]["execution_audit"]["final_reason"] == "order_submitted"
+
+
+def test_guaranteed_phase_replaces_nevada_restricted_entertainment_slot(
+    tmp_path,
+) -> None:
+    entertainment = _market(
+        "KXYTVIEWSW-TAY26AUG16-14.5M",
+        liquidity=900.0,
+        category="entertainment",
+    )
+    weather = _market(
+        "KXHIGHNY-26AUG17-T88",
+        liquidity=100.0,
+        category="weather",
+    )
+    grok = _GuaranteedGrok(_decision())
+    kalshi = _NevadaRestrictedThenSuccessKalshi([entertainment, weather])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="nevada-replacement")
+    decisions: list[dict] = []
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[entertainment, weather],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(
+                DRY_RUN=False,
+                GUARANTEED_ORDERS_N=1,
+            ),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: decisions.append(kwargs),
+            extended_research_market_ids=set(),
+        )
+        hold = main._jurisdiction_blocked_families(state)
+    finally:
+        state.close()
+
+    assert kalshi.submitted_market_ids == [
+        "KXYTVIEWSW-TAY26AUG16-14.5M",
+        "KXHIGHNY-26AUG17-T88",
+    ]
+    assert result.attempted == 2
+    assert result.completed == 1
+    assert plan.is_complete
+    assert plan.slots[0].market_id == "KXHIGHNY-26AUG17-T88"
+    assert "KXYTVIEWSW-TAY26AUG16-14.5M" in plan.retired_market_ids
+    assert hold == {"sports", "politics", "entertainment", "music"}
+    assert decisions[0]["execution_audit"]["final_reason"] == "jurisdiction_restricted"
     assert decisions[-1]["execution_audit"]["final_reason"] == "order_submitted"
 
 

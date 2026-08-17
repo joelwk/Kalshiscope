@@ -596,13 +596,13 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
-    # While the exchange-confirmed sports jurisdiction hold flag is set (order
-    # 403 with the Michigan sports message), throttle sports analysis slots to
-    # this probe cadence so freed slots flow to executable families. Jul 2026
-    # evidence: 657 sports analyses in 5 days produced 8 orders, all
-    # jurisdiction-rejected. Probes keep sports analysis-eligible and the flag
-    # auto-clears when the exchange accepts a sports order. 0 disables the
-    # throttle entirely (legacy behavior).
+    # While an exchange-confirmed jurisdiction hold is set (order 403 with a
+    # residents-are-not-allowed message covering Sports and/or Elections and
+    # Entertainment), throttle each held family's analysis slots to this probe
+    # cadence so freed slots flow to executable families. The hold is parsed
+    # from the Kalshi body (Michigan sports-only, Nevada sports+elections+
+    # entertainment, etc.) and auto-clears per family when the exchange accepts
+    # an order in that family. 0 disables the throttle entirely.
     SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE: int = 1
     # Generic is the catch-all family (speech/album/photo-count/macro/etc). A
     # 15-cycle review found it dominated analysis (~48% of slots) yet was

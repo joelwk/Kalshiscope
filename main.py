@@ -316,10 +316,10 @@ _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY = {
     "entertainment": 0.03,
     "crypto": 0.06,
 }
-# While Michigan sports jurisdiction hold blocks the only historically
-# profitable family, nudge analysis toward executable live-quote families
-# (crypto/generic) and ease weather dominance that mostly recirculates as
-# research_gap / EQ-floor misses. Soft affinity only — never a hard block.
+# While a jurisdiction hold blocks orderable families (sports in Michigan,
+# sports/elections/entertainment in Nevada), nudge analysis toward executable
+# live-quote families (crypto/generic) and ease weather dominance that mostly
+# recirculates as research_gap / EQ-floor misses. Soft affinity only.
 _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY_SPORTS_HOLD = {
     "weather": 0.03,
     "crypto": 0.08,
@@ -1825,7 +1825,7 @@ def _satellite_recap_bet(
 
 
 def _edge_threshold_for_market(
-    implied_prob: float,
+    implied_prob: float | None,
     settings: Settings,
     edge_source: str | None = None,
     market: Market | None = None,
@@ -1896,7 +1896,7 @@ def _edge_threshold_for_market(
                     commodity_floor * multiplier,
                 )
             min_edge = max(min_edge, commodity_floor)
-    if not definitive_outcome_eligible:
+    if not definitive_outcome_eligible and implied_prob is not None:
         low_price_multiplier = max(0.0, float(settings.LOW_PRICE_MIN_EDGE_MULTIPLIER))
         if implied_prob < settings.VERY_LOW_PRICE_THRESHOLD:
             min_edge = max(min_edge, settings.VERY_LOW_PRICE_MIN_EDGE * low_price_multiplier)
@@ -1916,9 +1916,20 @@ def _edge_threshold_for_market(
 
 
 _NWS_NOAA_HOST_MARKERS = ("weather.gov", "noaa.gov")
-_MICHIGAN_SPORTS_JURISDICTION_MARKER = (
-    "michigan_residents_are_not_currently_allowed_to_open_positions_in_sports"
+_JURISDICTION_RESTRICTION_MARKER = (
+    "residents_are_not_currently_allowed_to_open_positions_in_"
 )
+# Kalshi product categories in the 403 body -> Prediscope families to hold.
+# Entertainment includes music: Kalshi buckets charts/albums under Entertainment.
+_JURISDICTION_CATEGORY_TO_FAMILIES: dict[str, tuple[str, ...]] = {
+    "sports": ("sports",),
+    "elections": ("politics",),
+    "election": ("politics",),
+    "politics": ("politics",),
+    "entertainment": ("entertainment", "music"),
+}
+_JURISDICTION_BLOCKED_FAMILIES_FLAG_KEY = "jurisdiction_blocked_families"
+_SPORTS_JURISDICTION_FLAG_KEY = "sports_jurisdiction_blocked"
 _WEATHER_HIGH_EQ_REASONABLE_EDGE_MIN = 0.85
 
 
@@ -1936,58 +1947,163 @@ def _is_nws_noaa_primary_source_url(url: str) -> bool:
     )
 
 
-def _is_michigan_sports_jurisdiction_error(error_text: str) -> bool:
-    return _MICHIGAN_SPORTS_JURISDICTION_MARKER in str(error_text or "").lower()
+def _jurisdiction_families_from_error(error_text: str) -> frozenset[str]:
+    """Parse exchange 403 text into Prediscope families that cannot be opened.
+
+    Kalshi bodies look like ``Nevada_residents_are_not_currently_allowed_to_
+    open_positions_in_Sports,_Elections_and_Entertainment`` or the Michigan
+    sports-only variant. Unknown categories are ignored.
+    """
+    normalized = str(error_text or "").lower().replace(" ", "_")
+    marker_at = normalized.find(_JURISDICTION_RESTRICTION_MARKER)
+    if marker_at < 0:
+        return frozenset()
+    tail = normalized[marker_at + len(_JURISDICTION_RESTRICTION_MARKER) :]
+    families: set[str] = set()
+    for category, mapped_families in _JURISDICTION_CATEGORY_TO_FAMILIES.items():
+        if category in tail:
+            families.update(mapped_families)
+    return frozenset(families)
 
 
-_SPORTS_JURISDICTION_FLAG_KEY = "sports_jurisdiction_blocked"
+def _jurisdiction_rejection_reason(families: set[str] | frozenset[str]) -> str:
+    if families == {"sports"}:
+        return "jurisdiction_sports_blocked"
+    return "jurisdiction_restricted"
+
+
+def _parse_jurisdiction_family_flag(raw: str | None) -> set[str]:
+    return {
+        part.strip().lower()
+        for part in str(raw or "").split(",")
+        if part.strip()
+    }
+
+
+def _jurisdiction_blocked_families(state_manager: "MarketStateManager") -> set[str]:
+    """Exchange-confirmed families that currently reject new positions."""
+    families: set[str] = set()
+    try:
+        families.update(
+            _parse_jurisdiction_family_flag(
+                state_manager.get_runtime_flag(_JURISDICTION_BLOCKED_FAMILIES_FLAG_KEY)
+            )
+        )
+        if state_manager.get_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY) == "1":
+            families.add("sports")
+    except Exception as exc:
+        logger.debug(
+            "Jurisdiction hold flag read failed: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+    return families
+
+
+def _persist_jurisdiction_blocked_families(
+    state_manager: "MarketStateManager",
+    families: set[str],
+) -> None:
+    normalized = {str(family).strip().lower() for family in families if str(family).strip()}
+    if normalized:
+        state_manager.set_runtime_flag(
+            _JURISDICTION_BLOCKED_FAMILIES_FLAG_KEY,
+            ",".join(sorted(normalized)),
+        )
+    else:
+        state_manager.clear_runtime_flag(_JURISDICTION_BLOCKED_FAMILIES_FLAG_KEY)
+    if "sports" in normalized:
+        state_manager.set_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY, "1")
+    else:
+        state_manager.clear_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY)
 
 
 def _sports_jurisdiction_hold_active(state_manager: "MarketStateManager") -> bool:
-    """True while the exchange-confirmed sports jurisdiction hold flag is set.
+    """True while sports is in the exchange-confirmed jurisdiction hold set.
 
     The hold only throttles sports analysis-slot allocation (probe cadence);
     sports markets stay analysis-eligible and order-scoped 403 handling is
     unchanged, so this is not a family-level hard reject.
     """
+    return "sports" in _jurisdiction_blocked_families(state_manager)
+
+
+def _record_jurisdiction_block(
+    state_manager: "MarketStateManager",
+    families: set[str] | frozenset[str],
+) -> None:
+    incoming = {str(family).strip().lower() for family in families if str(family).strip()}
+    if not incoming:
+        return
     try:
-        return state_manager.get_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY) == "1"
+        updated = _jurisdiction_blocked_families(state_manager) | incoming
+        _persist_jurisdiction_blocked_families(state_manager, updated)
     except Exception as exc:
-        logger.debug(
-            "Sports jurisdiction flag read failed: %s",
+        logger.warning(
+            "Failed to persist jurisdiction hold flag: %s",
             exc,
-            data={"error": str(exc)},
+            data={"error": str(exc), "families": sorted(incoming)},
         )
-        return False
 
 
 def _record_sports_jurisdiction_block(state_manager: "MarketStateManager") -> None:
+    _record_jurisdiction_block(state_manager, {"sports"})
+
+
+def _clear_jurisdiction_family(
+    state_manager: "MarketStateManager",
+    family: str,
+) -> None:
+    """Drop one family from the hold once the exchange accepts an order in it."""
+    family_key = str(family or "").strip().lower()
+    if not family_key:
+        return
     try:
-        state_manager.set_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY, "1")
+        current = _jurisdiction_blocked_families(state_manager)
+        if family_key not in current:
+            return
+        current.discard(family_key)
+        _persist_jurisdiction_blocked_families(state_manager, current)
+        logger.info(
+            "Jurisdiction hold cleared for family=%s",
+            family_key,
+            data={
+                "cleared_family": family_key,
+                "remaining_families": sorted(current),
+            },
+        )
     except Exception as exc:
         logger.warning(
-            "Failed to persist sports jurisdiction hold flag: %s",
+            "Failed to clear jurisdiction hold family: %s",
             exc,
-            data={"error": str(exc)},
+            data={"error": str(exc), "family": family_key},
         )
 
 
 def _clear_sports_jurisdiction_block(state_manager: "MarketStateManager") -> None:
-    """Clear the hold once the exchange accepts a sports order again."""
-    try:
-        if state_manager.get_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY) is None:
-            return
-        state_manager.clear_runtime_flag(_SPORTS_JURISDICTION_FLAG_KEY)
-        logger.info(
-            "Sports jurisdiction hold cleared: exchange accepted a sports order",
-            data={"runtime_flag": _SPORTS_JURISDICTION_FLAG_KEY},
-        )
-    except Exception as exc:
-        logger.warning(
-            "Failed to clear sports jurisdiction hold flag: %s",
-            exc,
-            data={"error": str(exc)},
-        )
+    """Clear the sports hold once the exchange accepts a sports order again."""
+    _clear_jurisdiction_family(state_manager, "sports")
+
+
+def _market_hits_jurisdiction_hold(
+    market: Market | None,
+    blocked_families: set[str] | frozenset[str],
+) -> bool:
+    """True when inferred family or raw Kalshi category is in the hold set."""
+    if market is None or not blocked_families:
+        return False
+    normalized = {
+        str(family).strip().lower()
+        for family in blocked_families
+        if str(family).strip()
+    }
+    if market_family(market) in normalized:
+        return True
+    raw_category = str(getattr(market, "category", "") or "").strip().lower()
+    return any(
+        mapped in normalized
+        for mapped in _JURISDICTION_CATEGORY_TO_FAMILIES.get(raw_category, ())
+    )
 
 
 def _effective_sports_candidate_cap(
@@ -2012,26 +2128,36 @@ def _direct_evidence_family_affinity(
     family: str,
     *,
     sports_jurisdiction_hold_active: bool = False,
+    jurisdiction_blocked_families: set[str] | frozenset[str] | tuple[str, ...] = (),
 ) -> float:
     """Soft pre-analysis affinity for families with findable settlement evidence.
 
-    When sports orders are jurisdiction-blocked, use the hold overlay so
-    analysis spend shifts toward executable live-quote families.
+    When jurisdiction holds block orderable families, use the hold overlay so
+    analysis spend shifts toward executable live-quote families. Blocked
+    families themselves get zero affinity.
     """
+    family_key = str(family or "").strip().lower()
+    blocked = {
+        str(item).strip().lower()
+        for item in jurisdiction_blocked_families
+        if str(item).strip()
+    }
+    if family_key in blocked:
+        return 0.0
     table = (
         _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY_SPORTS_HOLD
-        if sports_jurisdiction_hold_active
+        if sports_jurisdiction_hold_active or blocked
         else _PRE_ANALYSIS_DIRECT_EVIDENCE_FAMILY_AFFINITY
     )
-    return float(table.get(str(family or "").strip().lower(), 0.0))
+    return float(table.get(family_key, 0.0))
 
 
 def _order_exception_error_text(exc: BaseException) -> str:
     """Compose order-failure text including Kalshi response body when present.
 
     ``requests.HTTPError`` only stringifies as ``403 Client Error: Forbidden for
-    url: ...``; the Michigan sports jurisdiction message lives on
-    ``exc.response.text``. Soft-hold detection must see that body.
+    url: ...``; the jurisdiction restriction message lives on
+    ``exc.response.text``. Hold detection must see that body.
     """
     parts = [str(exc)]
     body = getattr(exc, "_kalshi_response_body", None)
@@ -4796,7 +4922,7 @@ def _lock_guaranteed_order_markets(
         if market.id not in locked_ids
         and market.id not in excluded_market_ids
         and market.id not in plan.retired_market_ids
-        and market_family(market) not in normalized_excluded_families
+        and not _market_hits_jurisdiction_hold(market, normalized_excluded_families)
         and _is_guaranteed_order_market_candidate(market, settings)
     ]
     if require_cycle_analysis and analyzed_market_ids:
@@ -5346,30 +5472,29 @@ def _run_guaranteed_order_phase(
     seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
 ) -> GuaranteedOrderCycleResult:
     result = GuaranteedOrderCycleResult()
-    sports_jurisdiction_hold = (
-        not settings.DRY_RUN and _sports_jurisdiction_hold_active(state_manager)
-    )
-    excluded_market_families = {"sports"} if sports_jurisdiction_hold else set()
-    if sports_jurisdiction_hold:
+    excluded_market_families: set[str] = set()
+    if not settings.DRY_RUN:
+        excluded_market_families.update(_jurisdiction_blocked_families(state_manager))
+    if excluded_market_families:
         slots_retired_for_hold = []
+        hold_reason = _jurisdiction_rejection_reason(excluded_market_families)
         for slot in plan.slots:
             if (
                 not slot.completed
                 and not slot.needs_replacement
-                and market_family(slot.market) == "sports"
+                and _market_hits_jurisdiction_hold(slot.market, excluded_market_families)
             ):
                 slots_retired_for_hold.append(slot.slot_number)
                 _mark_guaranteed_order_slot_for_replacement(
                     plan,
                     slot,
-                    reason="jurisdiction_sports_blocked",
+                    reason=hold_reason,
                 )
         logger.warning(
-            "Guaranteed-order selection excludes sports while the exchange-confirmed "
-            "jurisdiction hold is active",
+            "Guaranteed-order selection excludes families under the exchange-confirmed "
+            "jurisdiction hold",
             data={
-                "sports_jurisdiction_hold": True,
-                "excluded_market_family": "sports",
+                "jurisdiction_blocked_families": sorted(excluded_market_families),
                 "retired_guaranteed_order_slots": slots_retired_for_hold,
             },
         )
@@ -5751,12 +5876,12 @@ def _run_guaranteed_order_phase(
         if attempt.status == "dry_run" or attempt.submission_attempted:
             result.attempted += 1
         if attempt.status == "submission_failed":
-            jurisdiction_sports_blocked = _is_michigan_sports_jurisdiction_error(
-                attempt.error or ""
+            jurisdiction_families = set(
+                _jurisdiction_families_from_error(attempt.error or "")
             )
             submission_failure_reason = (
-                "jurisdiction_sports_blocked"
-                if jurisdiction_sports_blocked
+                _jurisdiction_rejection_reason(jurisdiction_families)
+                if jurisdiction_families
                 else "guaranteed_order_submission_failed"
             )
             result.failures.append(
@@ -5781,27 +5906,30 @@ def _run_guaranteed_order_phase(
                     **audit,
                 ),
             )
-            if jurisdiction_sports_blocked:
-                _record_sports_jurisdiction_block(state_manager)
-                excluded_market_families.add("sports")
+            if jurisdiction_families:
+                _record_jurisdiction_block(state_manager, jurisdiction_families)
+                excluded_market_families.update(jurisdiction_families)
                 retired_slot_numbers: set[int] = {slot.slot_number}
+                hold_reason = _jurisdiction_rejection_reason(jurisdiction_families)
                 _mark_guaranteed_order_slot_for_replacement(
                     plan,
                     slot,
-                    reason="jurisdiction_sports_blocked",
+                    reason=hold_reason,
                 )
                 for pending_slot in plan.slots:
                     if (
                         pending_slot is not slot
                         and not pending_slot.completed
                         and not pending_slot.needs_replacement
-                        and market_family(pending_slot.market) == "sports"
+                        and _market_hits_jurisdiction_hold(
+                            pending_slot.market, excluded_market_families
+                        )
                     ):
                         retired_slot_numbers.add(pending_slot.slot_number)
                         _mark_guaranteed_order_slot_for_replacement(
                             plan,
                             pending_slot,
-                            reason="jurisdiction_sports_blocked",
+                            reason=hold_reason,
                         )
                 pending_slots = [
                     pending_slot
@@ -5809,12 +5937,12 @@ def _run_guaranteed_order_phase(
                     if pending_slot.slot_number not in retired_slot_numbers
                 ]
                 logger.warning(
-                    "Guaranteed-order sports market rejected by jurisdiction; "
-                    "retiring pending sports slots and selecting executable families",
+                    "Guaranteed-order market rejected by jurisdiction; "
+                    "retiring pending restricted slots and selecting executable families",
                     data={
                         "market_id": slot.market_id,
                         "retired_slot_numbers": sorted(retired_slot_numbers),
-                        "excluded_market_family": "sports",
+                        "jurisdiction_blocked_families": sorted(excluded_market_families),
                         "jurisdiction_rejection_scope": "guaranteed_order_plan",
                     },
                 )
@@ -8901,6 +9029,7 @@ def _pre_analysis_opportunity_score(
     historical_prefix_stats: dict[str, Any] | None = None,
     historical_gate_metrics: dict[str, Any] | None = None,
     sports_jurisdiction_hold_active: bool = False,
+    jurisdiction_blocked_families: set[str] | frozenset[str] | tuple[str, ...] = (),
 ) -> tuple[float, dict[str, Any]]:
     """Estimate opportunity quality before expensive enrichment/analysis."""
     now_utc = datetime.now(timezone.utc)
@@ -9104,6 +9233,7 @@ def _pre_analysis_opportunity_score(
     direct_evidence_family_affinity = _direct_evidence_family_affinity(
         family,
         sports_jurisdiction_hold_active=sports_jurisdiction_hold_active,
+        jurisdiction_blocked_families=jurisdiction_blocked_families,
     )
     ambiguous_resolution_penalty = 0.0
     if not (market.resolution_criteria or "").strip():
@@ -9226,7 +9356,7 @@ def _pre_analysis_opportunity_score(
         "pre_score_tradeable_price": tradeable_price_score,
         "pre_score_direct_evidence_family_affinity": direct_evidence_family_affinity,
         "pre_score_sports_jurisdiction_hold_affinity": bool(
-            sports_jurisdiction_hold_active
+            sports_jurisdiction_hold_active or jurisdiction_blocked_families
         ),
         "pre_score_liquidity": liquidity_score,
         "pre_score_horizon": horizon_score,
@@ -9396,12 +9526,18 @@ def _cap_analysis_candidates(
     max_music_candidates_per_cycle: int | None = None,
     max_sports_candidates_per_cycle: int | None = None,
     max_generic_candidates_per_cycle: int | None = None,
+    extra_family_caps: dict[str, int] | None = None,
     pre_scores: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply a hard cap using global risk-adjusted rank, then family caps."""
     if max_markets_per_cycle <= 0:
         return []
-    if len(analysis_candidates) <= max_markets_per_cycle:
+    extra_caps = {
+        str(family).strip().lower(): int(cap)
+        for family, cap in (extra_family_caps or {}).items()
+        if str(family).strip()
+    }
+    if len(analysis_candidates) <= max_markets_per_cycle and not extra_caps:
         return analysis_candidates
 
     ranked_candidates: list[tuple[tuple[float, int, int, str], dict[str, Any]]] = []
@@ -9522,6 +9658,7 @@ def _cap_analysis_candidates(
     selected_music_count = 0
     selected_sports_count = 0
     selected_generic_count = 0
+    selected_extra_family_counts: dict[str, int] = {}
     for _, candidate in sorted(ranked_candidates, key=lambda item: item[0]):
         if len(selected) >= max_markets_per_cycle:
             break
@@ -9565,6 +9702,9 @@ def _cap_analysis_candidates(
             and selected_generic_count >= max_generic_candidates_per_cycle
         ):
             continue
+        extra_cap = extra_caps.get(family)
+        if extra_cap is not None and selected_extra_family_counts.get(family, 0) >= extra_cap:
+            continue
         selected.append(candidate)
         if family == "weather":
             selected_weather_count += 1
@@ -9578,6 +9718,10 @@ def _cap_analysis_candidates(
             selected_sports_count += 1
         elif family == "generic":
             selected_generic_count += 1
+        if family in extra_caps:
+            selected_extra_family_counts[family] = (
+                selected_extra_family_counts.get(family, 0) + 1
+            )
     if len(selected) < max_markets_per_cycle and invalid_candidates:
         selected.extend(invalid_candidates[: max_markets_per_cycle - len(selected)])
     return selected
@@ -12368,11 +12512,14 @@ def main(max_cycles: int | None = None) -> None:
                 )
 
             # Compute once before pre-analysis scoring so affinity overlay can
-            # rebalance toward executable live-quote families while sports
-            # orders are jurisdiction-blocked.
+            # rebalance toward executable live-quote families while restricted
+            # families are jurisdiction-blocked.
+            jurisdiction_blocked_families = _jurisdiction_blocked_families(
+                state_manager
+            )
             sports_jurisdiction_hold = (
                 max(0, settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE) > 0
-                and _sports_jurisdiction_hold_active(state_manager)
+                and "sports" in jurisdiction_blocked_families
             )
 
             for market in markets:
@@ -12937,6 +13084,7 @@ def main(max_cycles: int | None = None) -> None:
                         historical_prefix_stats=historical_prefix_stats,
                         historical_gate_metrics=historical_gate_metrics,
                         sports_jurisdiction_hold_active=sports_jurisdiction_hold,
+                        jurisdiction_blocked_families=jurisdiction_blocked_families,
                     )
                     research_entry = recent_research_entries.get(market.id)
                     is_research_queue_score_promotion = False
@@ -13384,14 +13532,28 @@ def main(max_cycles: int | None = None) -> None:
                 jurisdiction_hold_active=sports_jurisdiction_hold,
                 probe_cap=sports_jurisdiction_probe_cap,
             )
-            if sports_jurisdiction_hold:
+            jurisdiction_extra_family_caps: dict[str, int] = {}
+            if sports_jurisdiction_probe_cap > 0:
+                for family in jurisdiction_blocked_families:
+                    if family == "sports":
+                        continue
+                    jurisdiction_extra_family_caps[family] = (
+                        sports_jurisdiction_probe_cap
+                    )
+            if jurisdiction_blocked_families:
                 logger.info(
-                    "Sports jurisdiction hold active: sports analysis slots "
-                    "throttled to %d probe candidate(s) this cycle",
+                    "Jurisdiction hold active: blocked families=%s; "
+                    "sports slots=%s; extra family probe caps=%s",
+                    sorted(jurisdiction_blocked_families),
                     sports_candidate_cap,
+                    jurisdiction_extra_family_caps,
                     data={
-                        "sports_jurisdiction_hold": True,
+                        "jurisdiction_blocked_families": sorted(
+                            jurisdiction_blocked_families
+                        ),
+                        "sports_jurisdiction_hold": sports_jurisdiction_hold,
                         "sports_candidate_cap": sports_candidate_cap,
+                        "jurisdiction_extra_family_caps": jurisdiction_extra_family_caps,
                         "max_sports_candidates_per_cycle": (
                             settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
                         ),
@@ -13411,6 +13573,7 @@ def main(max_cycles: int | None = None) -> None:
                 max_music_candidates_per_cycle=settings.MAX_MUSIC_CANDIDATES_PER_CYCLE,
                 max_sports_candidates_per_cycle=sports_candidate_cap,
                 max_generic_candidates_per_cycle=generic_candidate_cap,
+                extra_family_caps=jurisdiction_extra_family_caps or None,
                 pre_scores=pre_analysis_scores,
             )
             selected_family_distribution = _analysis_candidate_family_counts(
@@ -18525,24 +18688,32 @@ def main(max_cycles: int | None = None) -> None:
                     error_msg = _order_exception_error_text(order_exc)
                     normalized_order_error = error_msg.lower()
                     order_failure_reason = "order_submission_failed"
+                    jurisdiction_families = set(
+                        _jurisdiction_families_from_error(error_msg)
+                    )
                     if "invalid parameters" in normalized_order_error:
                         order_failure_reason = "order_submission_invalid_parameters"
                     elif "timeinforce" in normalized_order_error or "time_in_force" in normalized_order_error:
                         order_failure_reason = "order_submission_invalid_time_in_force"
-                    elif _is_michigan_sports_jurisdiction_error(error_msg):
-                        order_failure_reason = "jurisdiction_sports_blocked"
-                        _record_sports_jurisdiction_block(state_manager)
+                    elif jurisdiction_families:
+                        order_failure_reason = _jurisdiction_rejection_reason(
+                            jurisdiction_families
+                        )
+                        _record_jurisdiction_block(state_manager, jurisdiction_families)
                         logger.warning(
-                            "Order-scoped sports jurisdiction rejection: market=%s; "
-                            "sports analysis slots throttle to probe cadence until "
-                            "an order is accepted",
+                            "Order-scoped jurisdiction rejection: market=%s families=%s; "
+                            "held families throttle to probe cadence until "
+                            "an order in that family is accepted",
                             market.id,
+                            sorted(jurisdiction_families),
                             data={
                                 "market_id": market.id,
                                 "market_family": market_family_name,
+                                "jurisdiction_blocked_families": sorted(
+                                    jurisdiction_families
+                                ),
                                 "jurisdiction_rejection_scope": "order_only",
-                                "sports_analysis_remains_eligible": True,
-                                "sports_jurisdiction_probe_candidates_per_cycle": (
+                                "jurisdiction_probe_candidates_per_cycle": (
                                     settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE
                                 ),
                             },
@@ -18633,10 +18804,10 @@ def main(max_cycles: int | None = None) -> None:
                         "market_id": market.id,
                     },
                 )
-                if market_family_name == "sports":
-                    # A sports order the exchange accepted (no jurisdiction 403)
-                    # means the hold has lifted; restore full slot allocation.
-                    _clear_sports_jurisdiction_block(state_manager)
+                if market_family_name:
+                    # An accepted order in a held family means that family's
+                    # restriction has lifted; other held families stay blocked.
+                    _clear_jurisdiction_family(state_manager, market_family_name)
                 normalized_order_status = (order_response.status or "").strip().lower()
                 order_cancel_reason = None
                 order_fill_count = None
