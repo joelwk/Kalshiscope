@@ -836,6 +836,9 @@ class Settings:
     HISTORICAL_SHORT_PREFIX_SCORE_PENALTY: float = 0.10
     HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES: int = 20
     HISTORICAL_TICKER_PREFIX_SHRINKAGE_ENABLED: bool = True
+    # Win-rate prior for prefix Bayesian shrinkage. When shrinkage is on,
+    # hard-deny / soft-demote compare the shrunk win rate (not the raw rate)
+    # against HISTORICAL_TICKER_PREFIX_WIN_RATE_CUTOFF.
     HISTORICAL_TICKER_PREFIX_PRIOR_WIN_RATE: float = 0.50
     HISTORICAL_TICKER_PREFIX_PRIOR_STRENGTH: float = 10.0
     HISTORICAL_TICKER_PREFIX_SHRUNK_PNL_CUTOFF: float = -0.50

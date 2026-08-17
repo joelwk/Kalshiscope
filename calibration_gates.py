@@ -5,7 +5,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from market_state import MarketStateManager
-from participation import wilson_lower_bound, bayesian_shrunk_pnl
+from participation import (
+    bayesian_shrunk_pnl,
+    bayesian_shrunk_win_rate,
+    wilson_lower_bound,
+)
 
 
 @dataclass(frozen=True)
@@ -226,7 +230,12 @@ def evaluate_market_tiered(
     family_prior_strength: float = 10.0,
     family_shrunk_pnl_cutoff: float = -0.50,
 ) -> EvaluateMarketResult:
-    """Tiered market evaluation using Wilson lower-bound and Bayesian PnL shrinkage."""
+    """Tiered market evaluation using Wilson lower-bound and Bayesian shrinkage.
+
+    When prefix shrinkage is enabled, hard-deny and soft-demote compare the
+    win rate shrunk toward ``prefix_prior_win_rate`` rather than the raw
+    observed rate. Wilson LB stays on the raw binomial counts.
+    """
     normalized_market_id = str(market_id or "").strip().upper()
     normalized_family = str(family or "").strip().lower()
     normalized_prefix_len = max(1, int(prefix_len))
@@ -246,14 +255,22 @@ def evaluate_market_tiered(
         if prefix_snapshot is not None:
             n = prefix_snapshot.sample_size
             wlb = wilson_lower_bound(prefix_snapshot.wins, n)
-            shrunk_pnl = bayesian_shrunk_pnl(
-                prefix_snapshot.pnl_total,
-                n,
-                prior_pnl_per_trade=0.0,
-                prior_strength=prefix_prior_strength,
-            ) if prefix_shrinkage_enabled else (
-                prefix_snapshot.pnl_total / n if n > 0 else 0.0
-            )
+            if prefix_shrinkage_enabled:
+                shrunk_pnl = bayesian_shrunk_pnl(
+                    prefix_snapshot.pnl_total,
+                    n,
+                    prior_pnl_per_trade=0.0,
+                    prior_strength=prefix_prior_strength,
+                )
+                gate_win_rate = bayesian_shrunk_win_rate(
+                    prefix_snapshot.wins,
+                    n,
+                    prior_win_rate=prefix_prior_win_rate,
+                    prior_strength=prefix_prior_strength,
+                )
+            else:
+                shrunk_pnl = prefix_snapshot.pnl_total / n if n > 0 else 0.0
+                gate_win_rate = prefix_snapshot.win_rate
             soft_min = max(1, int(prefix_min_samples))
             hard_block_min = max(soft_min, int(prefix_hard_block_min_samples))
             prefix_loss_mode = _loss_mode(
@@ -267,6 +284,8 @@ def evaluate_market_tiered(
                 {
                     "historical_gate_prefix_sample_size": n,
                     "historical_gate_prefix_win_rate": prefix_snapshot.win_rate,
+                    "historical_gate_prefix_shrunk_win_rate": round(gate_win_rate, 4),
+                    "historical_gate_prefix_prior_win_rate": float(prefix_prior_win_rate),
                     "historical_gate_prefix_pnl_total": prefix_snapshot.pnl_total,
                     "historical_gate_prefix_wilson_lb": round(wlb, 4),
                     "historical_gate_prefix_shrunk_pnl_per_trade": round(shrunk_pnl, 4),
@@ -289,14 +308,14 @@ def evaluate_market_tiered(
                 }
             )
 
-            # Hard-deny requires both observed and Wilson-LB win rates to be
-            # below the cutoff. Adding the Wilson-LB requirement enforces
-            # statistical confidence on top of observed win-rate / PnL signals
-            # so even a sufficient-sample prefix is not hard-blocked unless
-            # the lower bound on its true win rate is below cutoff.
+            # Hard-deny requires the gate win rate (shrunk toward
+            # prefix_prior_win_rate when shrinkage is on) and Wilson-LB to
+            # both sit at or below cutoff. Wilson LB stays on raw counts so
+            # a sufficient-sample prefix is not hard-blocked unless the
+            # lower bound on its true win rate is also below cutoff.
             if (
                 n >= hard_block_min
-                and prefix_snapshot.win_rate <= float(prefix_win_rate_cutoff)
+                and gate_win_rate <= float(prefix_win_rate_cutoff)
                 and wlb <= float(prefix_win_rate_cutoff)
                 and shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
                 and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
@@ -323,7 +342,7 @@ def evaluate_market_tiered(
                 and (
                     shrunk_pnl <= float(prefix_shrunk_pnl_cutoff)
                     or (
-                        prefix_snapshot.win_rate <= float(prefix_win_rate_cutoff)
+                        gate_win_rate <= float(prefix_win_rate_cutoff)
                         and prefix_snapshot.pnl_total <= float(prefix_pnl_cutoff)
                     )
                 )

@@ -6,6 +6,7 @@ from participation import (
     ParticipationTier,
     TimeoutState,
     bayesian_shrunk_pnl,
+    bayesian_shrunk_win_rate,
     classify_participation,
     wilson_lower_bound,
 )
@@ -42,6 +43,20 @@ def test_bayesian_shrunk_pnl_large_sample_dominates() -> None:
 def test_bayesian_shrunk_pnl_small_sample_shrinks_toward_prior() -> None:
     result = bayesian_shrunk_pnl(-9.0, 3, prior_pnl_per_trade=0.0, prior_strength=10.0)
     assert -3.0 < result < 0.0
+
+
+def test_bayesian_shrunk_win_rate_no_samples() -> None:
+    assert bayesian_shrunk_win_rate(0, 0, prior_win_rate=0.50) == 0.50
+
+
+def test_bayesian_shrunk_win_rate_large_sample_dominates() -> None:
+    result = bayesian_shrunk_win_rate(20, 100, prior_win_rate=0.50, prior_strength=10.0)
+    assert 0.20 < result < 0.30
+
+
+def test_bayesian_shrunk_win_rate_small_sample_shrinks_toward_prior() -> None:
+    result = bayesian_shrunk_win_rate(0, 3, prior_win_rate=0.50, prior_strength=10.0)
+    assert 0.30 < result < 0.50
 
 
 def test_classify_small_sample_neg_pnl_returns_research_only() -> None:
