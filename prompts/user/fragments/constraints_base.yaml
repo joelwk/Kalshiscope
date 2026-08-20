@@ -4,7 +4,7 @@ lines:
   - "Before classifying evidence: (1) fetch the primary settlement source for this market type, (2) record the observed value and URL, (3) then classify evidence_basis. Do not classify evidence as direct before searching."
   - "If you lean YES or NO, name a falsifiable edge_mechanism (observed_vs_strike, odds_dislocation, settlement_already_known, or catalyst) and paste the https URL. A hunch, form, or unexplained directional view is edge_mechanism=none and should_trade=false."
   - "Edge honesty: my_prob, probability_yes, and confidence must agree after self-critique; chosen-side edge_market vs Kalshi must use that final confidence — not a separate optimistic my_prob."
-  - "implied_prob_external must be a non-Kalshi external YES probability, or null. Never copy Kalshi yes_price into implied_prob_external; without a true external, use edge_source=fallback or none."
+  - "implied_prob_external must be a non-Kalshi external YES probability (including NWS PoP), or null. Never copy Kalshi yes_price into implied_prob_external; without a true external, use edge_source=fallback (not none) when primary_source_url is populated."
   - "If primary_source_url is a live quote, CLI/METAR, official result, or sportsbook line page, evidence_basis must not be absence_only."
   - "likelihood_ratio must be null (not 0) when no comparative evidence is available; prefer null over a reflexive 1.0; use 1.0 only when evidence is genuinely equally consistent with both outcomes."
   - "If your source is settlement-aligned (directly resolves the market's settlement criterion), classify it as direct and populate primary_source_url. Proxy is for sources that are adjacent, predictive, or indirectly relevant — not settlement-aligned."
@@ -18,7 +18,7 @@ lines:
   - "Ordinary weak proxy evidence defaults to should_trade=false. Exceptional proxy may still trade when system rules allow it: sportsbook/consensus odds with positive edge_market and pricing-in reasoning, or other settlement-predictive proxy called out in category hints."
   - "Do not set should_trade=false solely because a prior cycle abstained when this pass has a settlement-aligned primary_source_url and positive edge_market."
   - Do not use absence of mentions alone as a high-confidence trading signal.
-  - If external odds are unavailable, keep evidence_quality < 0.50, set edge_source=none or fallback as appropriate, and default should_trade=false unless a primary settlement-aligned source already supports a positive edge_market.
+  - "Missing bookmaker odds is normal for weather/crypto/commodity. If primary_source_url is already a settlement-aligned NWS, exchange, or Tier-1 quote page, set edge_source=fallback (not none) and populate edge_external; reserve edge_source=none for truly missing sources. Default should_trade=false unless that primary source already supports a positive edge_market."
   - If evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only, name what direct source or price signal is missing in reasoning.
   - Never treat evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only as an executable market judgment; classify it as a research failure or monitoring case.
   - For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.

@@ -1,4 +1,4 @@
 name: user/category_hints/politics
 description: Politics-specific research guidance.
 content: >-
-  Politics guidance: prioritize reputable polling, official filings/statements, and base-rate priors; discount unverified viral claims. Use 2024-2026 polling error, turnout, filing, or event-frequency base rates where relevant before adjusting for today's source-backed news.
+  Politics guidance: prioritize reputable polling, official filings/statements, and base-rate priors; discount unverified viral claims. Use 2024-2026 polling error, turnout, filing, or event-frequency base rates where relevant before adjusting for today's source-backed news. Exact RCP/poll bin markets (for example "exactly 39.2") default should_trade=false unless the live RCP print at the settlement timestamp is the primary_source_url. Secondary poll stories are not that print.
