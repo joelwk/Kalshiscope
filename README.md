@@ -72,17 +72,26 @@ python main.py
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
-must enter that many markets: it locks this cycle's top-confidence analyzed
-names (event/family diversity), dives deeper on those slots, replaces a
-research gap only with another analyzed name, then forces a sized order from
-the researched side. Ordinary gate-cleared submissions are suppressed in this
-mode so the run cannot exceed the target. Dry runs persist exactly that many
-attempted-order receipts; bounded live runs fail explicitly if Kalshi does not
-accept all target submissions and exit early once the target is complete. Live
-guarantee plans exclude families the exchange has rejected for this account
-(Sports, and when present Elections and Entertainment). If that restriction is
-first discovered during forced submission, the rejected slot is retired and
-replaced with an executable family using a new idempotency key.
+locks this cycle's highest positive-EV analyzed names (chosen-side edge after
+calibration × evidence quality × confidence, with event/family diversity among
++EV names only), dives deeper on those slots, and forces a Kelly-sized order
+from the researched side only when that side still has clear positive edge and
+strong evidence. Weak, zero, or negative-EV slots are replaced with another
+analyzed +EV name or abandoned — never forced to fill the quota.
+`GUARANTEED_MIN_EDGE` (default `0.12`) is the hard chosen-side floor; ordinary
+proxy must also clear `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`); sports
+computed-odds proxy uses the lower floor. Ordinary gate-cleared submissions are
+suppressed in this mode so the run cannot exceed the target. Forced (and
+normal) stakes scale with live portfolio value:
+`clip(kelly_bet_pct × MAX_BET_PCT_OF_BANKROLL × portfolio, MIN_BET_PCT_OF_BANKROLL × portfolio, position/drawdown caps)`.
+Dry runs persist up to that many attempted-order receipts when enough +EV
+markets exist; bounded live runs fail explicitly if Kalshi does not accept all
+target submissions and exit early once the target is complete. Live guarantee
+plans exclude families the exchange has rejected for this account (Sports, and
+when present Elections and Entertainment). If that restriction is first
+discovered during forced submission, the rejected slot is retired and replaced
+with an executable family using a new idempotency key. Set
+`GUARANTEED_ORDERS_N=5` for a five-cycle `poetry run kalshi --cycles 5` run.
 
 Start in dry run and switch to live only after reviewing behavior in logs.
 
@@ -108,8 +117,9 @@ See `.env.example` for the full set of runtime controls.
 
 - `MIN_EDGE`, `LOW_PRICE_MIN_EDGE`, `FALLBACK_EDGE_MIN_EDGE` for edge thresholds.
 - `SCORE_GATE_MODE` (`off`, `shadow`, `active`) for decision scoring rollout.
-- `BAYESIAN_ENABLED`, `LMSR_ENABLED`, `KELLY_SIZING_ENABLED` for optional advanced layers.
+- `BAYESIAN_ENABLED`, `LMSR_ENABLED`, `KELLY_SIZING_ENABLED` for optional advanced layers. Keep `KELLY_SIZING_ENABLED=true` for normal orders; guaranteed slots always Kelly-size against the cycle's bankroll-derived max bet.
 - `KELLY_MIN_BET_POLICY` controls handling when Kelly sizing is below minimum bet.
+- `MIN_BET_PCT_OF_BANKROLL`, `MAX_BET_PCT_OF_BANKROLL` scale dollar bets with portfolio value (cash + positions).
 - `MAX_POSITION_PCT_OF_BANKROLL`, `MAX_POSITION_PER_MARKET_USDC` cap exposure.
 - `OPPOSITE_OUTCOME_STRATEGY` and flip-guard settings reduce churn from side flips.
 - `MARKET_TICKER_BLOCKLIST_PREFIXES`, ladder collapse controls, and extreme-price filters reduce noisy candidates.

@@ -4177,6 +4177,8 @@ def _log_settings_summary(settings) -> None:
         data={
             "dry_run": settings.DRY_RUN,
             "guaranteed_orders_n": settings.GUARANTEED_ORDERS_N,
+            "guaranteed_min_edge": settings.GUARANTEED_MIN_EDGE,
+            "guaranteed_proxy_min_edge": settings.GUARANTEED_PROXY_MIN_EDGE,
             "min_bet_pct_of_bankroll": settings.MIN_BET_PCT_OF_BANKROLL,
             "max_bet_pct_of_bankroll": settings.MAX_BET_PCT_OF_BANKROLL,
             "min_confidence": settings.MIN_CONFIDENCE,
@@ -4711,19 +4713,88 @@ def _load_execution_market_snapshot(
     )
 
 
+def _guaranteed_chosen_side_edge(
+    decision: TradeDecision,
+    market: Market,
+) -> float | None:
+    """Chosen-side edge the gates use: calibrated confidence − Kalshi implied."""
+    outcome = str(decision.outcome or "").strip().upper()
+    implied_prob = _get_implied_probability(market, outcome)
+    if implied_prob is None:
+        probability_yes = decision.probability_yes
+        if probability_yes is None:
+            probability_yes = getattr(decision, "my_prob", None)
+        if probability_yes is not None:
+            try:
+                outcome = "YES" if float(probability_yes) >= 0.5 else "NO"
+            except (TypeError, ValueError):
+                outcome = outcome
+            implied_prob = _get_implied_probability(market, outcome)
+    if implied_prob is None:
+        return None
+    try:
+        posterior = float(decision.confidence)
+    except (TypeError, ValueError):
+        return None
+    return posterior - float(implied_prob)
+
+
+def _guaranteed_order_min_edge(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> float:
+    """Direct / settled / sports computed-odds use MIN; ordinary proxy is higher."""
+    floor = max(0.0, float(settings.GUARANTEED_MIN_EDGE))
+    proxy_floor = max(floor, float(settings.GUARANTEED_PROXY_MIN_EDGE))
+    basis = _decision_evidence_basis(decision)
+    edge_source = str(decision.edge_source or "").strip().lower()
+    if basis == "direct":
+        return floor
+    if _is_high_quality_settled_evidence(decision, settings, market=market):
+        return floor
+    if _is_settlement_aligned_high_eq_computed(decision, settings):
+        return floor
+    if market_family(market) == "sports" and edge_source == "computed":
+        return floor
+    return proxy_floor
+
+
+def _guaranteed_order_reject_reason(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> str | None:
+    """Audit label when a slot must not be forced (gap, non-positive, or thin edge)."""
+    gap_reason = _guaranteed_order_research_gap_reason(decision, settings)
+    if gap_reason is not None:
+        return gap_reason
+    edge = _guaranteed_chosen_side_edge(decision, market)
+    if edge is None:
+        return "guaranteed_order_missing_implied_probability"
+    if edge <= 0.0:
+        return "guaranteed_order_non_positive_edge"
+    min_edge = _guaranteed_order_min_edge(decision, market, settings)
+    if edge < min_edge - 1e-9:
+        return "guaranteed_order_edge_below_min"
+    return None
+
+
 def _guaranteed_order_priority_scores(
     analysis_results: dict[str, Any] | None,
+    markets_by_id: dict[str, Market] | None = None,
 ) -> dict[str, float]:
     """Map market_id -> lock priority from this cycle's analyzed decisions.
 
-    Ranks this cycle's research by confidence scaled by evidence quality so
-    guaranteed mode dives the most convicted names, not the most liquid
-    unanalyzed catalog rows. Named edge mechanisms outrank hunches;
+    Ranks by chosen-side edge_market (after calibration) × evidence quality ×
+    confidence so guaranteed mode dives positive-EV names, not high-conf
+    zero-edge catalog rows. Named edge mechanisms outrank hunches;
     absence_only is penalized among analyzed names only.
     """
     priorities: dict[str, float] = {}
     if not analysis_results:
         return priorities
+    resolved_markets = markets_by_id or {}
     for market_id, result in analysis_results.items():
         if not market_id or not isinstance(result, dict):
             continue
@@ -4733,6 +4804,7 @@ def _guaranteed_order_priority_scores(
         evidence_basis = ""
         edge_mechanism = ""
         should_trade_signal = False
+        edge_value = 0.0
         if decision is not None:
             def _attr(name: str) -> Any:
                 value = getattr(decision, name, None)
@@ -4753,11 +4825,20 @@ def _guaranteed_order_priority_scores(
             raw_should = _attr("raw_should_trade")
             should = _attr("should_trade")
             should_trade_signal = bool(raw_should) or bool(should)
+            market = resolved_markets.get(str(market_id))
+            if market is not None and isinstance(decision, TradeDecision):
+                computed_edge = _guaranteed_chosen_side_edge(decision, market)
+                if computed_edge is not None:
+                    edge_value = computed_edge
         try:
             final_score = float(result.get("pre_execution_final_score", 0.0) or 0.0)
         except (TypeError, ValueError):
             final_score = 0.0
-        priority = confidence * max(evidence_quality, 0.01)
+        priority = (
+            max(0.0, edge_value)
+            * max(evidence_quality, 0.01)
+            * max(0.0, confidence)
+        )
         if should_trade_signal:
             priority += 0.15
         if edge_mechanism and edge_mechanism != "none":
@@ -4874,10 +4955,10 @@ def _lock_guaranteed_order_markets(
 ) -> list[GuaranteedOrderSlot]:
     """Lock distinct markets until the plan contains exactly its target count.
 
-    Initial locks prefer this cycle's top-confidence analyzed names, then
-    fill remaining slots from the catalog. Research-gap replacements stay
-    inside the analyzed set so a weak deep-dive is not swapped for an
-    unresearched liquid name.
+    Initial locks prefer this cycle's positive-EV analyzed names, then fill
+    remaining slots from the catalog. Research-gap replacements stay inside
+    the analyzed +EV set so a weak deep-dive is not swapped for an
+    unresearched liquid name or a known non-positive-EV row.
     """
     if plan.target <= 0:
         return []
@@ -4929,6 +5010,15 @@ def _lock_guaranteed_order_markets(
         candidates = [
             market for market in candidates if market.id in analyzed_market_ids
         ]
+        filtered_candidates: list[Market] = []
+        for market in candidates:
+            seeded = seed_decisions.get(market.id)
+            if seeded is not None and _guaranteed_order_reject_reason(
+                seeded, market, settings
+            ) is not None:
+                continue
+            filtered_candidates.append(market)
+        candidates = filtered_candidates
     candidates.sort(
         key=lambda market: _guaranteed_order_market_rank(
             market,
@@ -4937,20 +5027,53 @@ def _lock_guaranteed_order_markets(
         ),
         reverse=True,
     )
+    plus_ev_analyzed = [
+        market for market in candidates if market.id in analyzed_market_ids
+    ]
+    catalog_rest = [
+        market for market in candidates if market.id not in analyzed_market_ids
+    ]
+
+    def _passes_diversity(
+        market: Market, *, unique_family: bool, unique_event: bool
+    ) -> bool:
+        event_prefix = _event_ticker_prefix(market)
+        if unique_event and event_prefix and event_prefix in locked_event_prefixes:
+            return False
+        if unique_family and market_family(market) in locked_families:
+            return False
+        return True
+
+    def _pop_from(
+        pool: list[Market], *, unique_family: bool, unique_event: bool
+    ) -> Market | None:
+        for index, market in enumerate(pool):
+            if not _passes_diversity(
+                market, unique_family=unique_family, unique_event=unique_event
+            ):
+                continue
+            return pool.pop(index)
+        return None
 
     def _pick_next_candidate() -> Market | None:
-        nonlocal candidates
-        # Prefer unique event + unique family, then unique event only, then any.
-        for require_unique_family in (True, False):
-            for index, market in enumerate(candidates):
-                event_prefix = _event_ticker_prefix(market)
-                if event_prefix and event_prefix in locked_event_prefixes:
-                    continue
-                family = market_family(market)
-                if require_unique_family and family in locked_families:
-                    continue
-                candidates.pop(index)
-                return market
+        # +EV analyzed first: unique event+family, unique event, then any +EV.
+        for unique_family, unique_event in ((True, True), (False, True), (False, False)):
+            picked = _pop_from(
+                plus_ev_analyzed,
+                unique_family=unique_family,
+                unique_event=unique_event,
+            )
+            if picked is not None:
+                return picked
+        # Unanalyzed catalog fills leftovers; keep unique-event diversity.
+        for unique_family, unique_event in ((True, True), (False, True)):
+            picked = _pop_from(
+                catalog_rest,
+                unique_family=unique_family,
+                unique_event=unique_event,
+            )
+            if picked is not None:
+                return picked
         return None
 
     def _apply_seed(slot: GuaranteedOrderSlot, market: Market) -> None:
@@ -5054,8 +5177,8 @@ def _guaranteed_order_research_gap_reason(
 ) -> str | None:
     """Return an audit label when deep research would fail ordinary evidence gates.
 
-    Guaranteed mode still forces a fill after research; this label is stamped
-    into sizing/audit metadata so operators can see weak-evidence forced slots.
+    Guaranteed mode does not force a fill on a research gap; this label is
+    stamped so the phase can replace or abandon the slot.
     """
     basis = str(decision.evidence_basis or "").strip().lower()
     edge_src = str(decision.edge_source or "").strip().lower()
@@ -5086,78 +5209,82 @@ def _guaranteed_order_sized_amount_usdc(
     min_bet_usdc: float,
     max_bet_usdc: float,
 ) -> tuple[float, dict[str, Any]]:
-    """Kelly-size a non-gap guaranteed order, floored at MIN_BET and capped at MAX_BET."""
+    """Kelly-size a guaranteed slot against bankroll-derived bet bounds.
+
+    Stake = clip(max_bet * kelly_bet_pct, min_bet, max_bet) when Kelly > 0.
+    min_bet / max_bet are already portfolio * MIN/MAX_BET_PCT_OF_BANKROLL for
+    the cycle (floored at BET_ABSOLUTE_FLOOR_USDC). Always uses fractional
+    Kelly on this path; zero Kelly is not replaced with min_bet to fill a quota.
+    """
     min_bet = max(0.0, float(min_bet_usdc))
     max_bet = max(0.0, float(max_bet_usdc))
     if max_bet > 0:
         min_bet = min(min_bet, max_bet)
     sizing_audit: dict[str, Any] = {
-        "guaranteed_order_sizing_mode": "min_bet_floor",
+        "guaranteed_order_sizing_mode": "kelly",
         "kelly_raw": None,
         "kelly_fraction_value": None,
         "extreme_edge_size_dampener": 1.0,
+        "guaranteed_min_edge": float(settings.GUARANTEED_MIN_EDGE),
     }
-    amount_usdc = min_bet
     outcome = str(decision.outcome or "").strip().upper()
     implied_prob = _get_implied_probability(market, outcome)
     posterior: float | None = None
-    for candidate in (decision.my_prob, decision.confidence):
-        if candidate is None:
-            continue
-        try:
-            posterior = float(candidate)
+    try:
+        posterior = float(decision.confidence)
+    except (TypeError, ValueError):
+        posterior = None
+    if posterior is None:
+        for candidate in (decision.my_prob, decision.probability_yes):
+            if candidate is None:
+                continue
+            try:
+                yes_prob = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            posterior = yes_prob if outcome != "NO" else (1.0 - yes_prob)
             break
-        except (TypeError, ValueError):
-            continue
-    if (
-        settings.KELLY_SIZING_ENABLED
-        and implied_prob is not None
-        and posterior is not None
-        and max_bet > 0
-    ):
-        edge_value = float(posterior) - float(implied_prob)
-        kelly_fraction_value = _kelly_fraction_for_decision(
-            market,
-            settings,
-            decision,
-            float(posterior),
-        )
-        min_edge = _edge_threshold_for_market(
-            float(implied_prob),
-            settings,
-            market=market,
-            decision=decision,
-        )
-        kelly_raw_value = kelly_fraction(
-            posterior=float(posterior),
-            market_price=float(implied_prob),
-        )
-        bet_pct = kelly_bet_pct(
-            posterior=float(posterior),
-            market_price=float(implied_prob),
-            fraction=kelly_fraction_value,
-            min_edge=min_edge,
-            edge=edge_value,
-            dynamic_enabled=True,
-        )
-        dampener = _extreme_edge_size_dampener(edge_value, settings)
-        if dampener < 1.0 and bet_pct > 0.0:
-            bet_pct = max(0.0, min(1.0, bet_pct * dampener))
-        kelly_amount = max_bet * float(bet_pct)
-        amount_usdc = max(min_bet, kelly_amount) if kelly_amount > 0.0 else min_bet
-        amount_usdc = min(amount_usdc, max_bet)
-        sizing_audit.update(
-            {
-                "guaranteed_order_sizing_mode": "kelly",
-                "kelly_raw": kelly_raw_value,
-                "kelly_fraction_value": kelly_fraction_value,
-                "extreme_edge_size_dampener": dampener,
-                "kelly_bet_pct": bet_pct,
-                "posterior_for_kelly": posterior,
-                "implied_prob_for_kelly": implied_prob,
-                "min_edge_for_kelly": min_edge,
-            }
-        )
+    if implied_prob is None or posterior is None or max_bet <= 0:
+        sizing_audit["guaranteed_order_sizing_mode"] = "kelly_zero"
+        return 0.0, sizing_audit
+    edge_value = float(posterior) - float(implied_prob)
+    kelly_fraction_value = _kelly_fraction_for_decision(
+        market,
+        settings,
+        decision,
+        float(posterior),
+    )
+    min_edge = float(settings.GUARANTEED_MIN_EDGE)
+    kelly_raw_value = kelly_fraction(
+        posterior=float(posterior),
+        market_price=float(implied_prob),
+    )
+    bet_pct = kelly_bet_pct(
+        posterior=float(posterior),
+        market_price=float(implied_prob),
+        fraction=kelly_fraction_value,
+        min_edge=min_edge,
+        edge=edge_value,
+        dynamic_enabled=True,
+    )
+    dampener = _extreme_edge_size_dampener(edge_value, settings)
+    if dampener < 1.0 and bet_pct > 0.0:
+        bet_pct = max(0.0, min(1.0, bet_pct * dampener))
+    sizing_audit.update(
+        {
+            "kelly_raw": kelly_raw_value,
+            "kelly_fraction_value": kelly_fraction_value,
+            "extreme_edge_size_dampener": dampener,
+            "kelly_bet_pct": bet_pct,
+            "posterior_for_kelly": posterior,
+            "implied_prob_for_kelly": implied_prob,
+            "min_edge_for_kelly": min_edge,
+        }
+    )
+    if bet_pct <= 0.0:
+        sizing_audit["guaranteed_order_sizing_mode"] = "kelly_zero"
+        return 0.0, sizing_audit
+    amount_usdc = min(max(max_bet * float(bet_pct), min_bet), max_bet)
     return amount_usdc, sizing_audit
 
 
@@ -5193,8 +5320,9 @@ def _forced_execution_decision(
         "outcome": outcome,
         "bet_size_pct": bet_size_pct,
         "reasoning": (
-            "[GuaranteedOrder forced after initial+deep research; "
-            "ordinary execution gates are audit-only for this slot] "
+            "[GuaranteedOrder forced after initial+deep research on a "
+            "positive-EV researched side; ordinary execution gates are "
+            "audit-only for this slot] "
             f"{decision.reasoning}"
         ),
     }
@@ -5213,13 +5341,12 @@ def _attempt_guaranteed_order_slot(
     settings: Settings,
     min_bet_usdc: float,
     max_bet_usdc: float,
-    replace_weak_evidence: bool = False,
 ) -> GuaranteedOrderAttemptResult:
-    """Research a locked slot intensely and make its one forced order attempt.
+    """Research a locked slot intensely and force only a positive-EV researched side.
 
-    When replace_weak_evidence is True and deep research is still a research gap,
-    return status=research_gap_replaceable so the phase can swap markets before
-    forcing. When False (or no replacement available), force the researched side.
+    When deep research is a research gap or fails the chosen-side edge bar,
+    return status=research_gap_replaceable so the phase can swap or abandon.
+    Never force a non-positive-EV slot to fill the quota.
     """
     intense_research_performed = False
     sizing_audit: dict[str, Any] = {}
@@ -5236,13 +5363,39 @@ def _attempt_guaranteed_order_slot(
                 getattr(analyzed_decision, usage_key, 0) or 0
             )
 
+    def _replaceable_result(
+        researched: TradeDecision,
+        reason: str,
+        *,
+        research_done: bool,
+    ) -> GuaranteedOrderAttemptResult:
+        slot.decision = researched
+        slot.research_completed = True
+        slot.last_error = reason
+        return GuaranteedOrderAttemptResult(
+            status="research_gap_replaceable",
+            decision=researched,
+            amount_usdc=0.0,
+            intense_research_performed=research_done,
+            token_usage=token_usage,
+            error=reason,
+            sizing_audit={"guaranteed_order_research_gap_bypassed": reason},
+        )
+
     def _force_from_research(
         researched: TradeDecision,
         research_market: Market,
-        *,
-        gap_reason: str | None,
-    ) -> TradeDecision:
+    ) -> TradeDecision | GuaranteedOrderAttemptResult:
         nonlocal amount_usdc, sizing_audit
+        reject_reason = _guaranteed_order_reject_reason(
+            researched, research_market, settings
+        )
+        if reject_reason is not None:
+            return _replaceable_result(
+                researched,
+                reject_reason,
+                research_done=intense_research_performed,
+            )
         amount_usdc, sizing_audit = _guaranteed_order_sized_amount_usdc(
             decision=researched,
             market=research_market,
@@ -5250,8 +5403,12 @@ def _attempt_guaranteed_order_slot(
             min_bet_usdc=min_bet_usdc,
             max_bet_usdc=max_bet_usdc,
         )
-        if gap_reason is not None:
-            sizing_audit["guaranteed_order_research_gap_bypassed"] = gap_reason
+        if amount_usdc <= 0:
+            return _replaceable_result(
+                researched,
+                "guaranteed_order_kelly_zero",
+                research_done=intense_research_performed,
+            )
         return _forced_execution_decision(
             researched,
             research_market,
@@ -5295,26 +5452,11 @@ def _attempt_guaranteed_order_slot(
                 search_config=search_config,
             )
             _capture_usage(deep_decision)
-            gap_reason = _guaranteed_order_research_gap_reason(deep_decision, settings)
             intense_research_performed = True
-            if gap_reason is not None and replace_weak_evidence:
-                slot.decision = deep_decision
-                slot.research_completed = True
-                slot.last_error = gap_reason
-                return GuaranteedOrderAttemptResult(
-                    status="research_gap_replaceable",
-                    decision=deep_decision,
-                    amount_usdc=0.0,
-                    intense_research_performed=True,
-                    token_usage=token_usage,
-                    error=gap_reason,
-                    sizing_audit={"guaranteed_order_research_gap_bypassed": gap_reason},
-                )
-            decision = _force_from_research(
-                deep_decision,
-                research_market,
-                gap_reason=gap_reason,
-            )
+            forced = _force_from_research(deep_decision, research_market)
+            if isinstance(forced, GuaranteedOrderAttemptResult):
+                return forced
+            decision = forced
             slot.decision = decision
             slot.research_completed = True
             slot.last_error = None
@@ -5328,23 +5470,10 @@ def _attempt_guaranteed_order_slot(
                 error=error,
             )
     else:
-        gap_reason = _guaranteed_order_research_gap_reason(decision, settings)
-        if gap_reason is not None and replace_weak_evidence:
-            slot.last_error = gap_reason
-            return GuaranteedOrderAttemptResult(
-                status="research_gap_replaceable",
-                decision=decision,
-                amount_usdc=0.0,
-                intense_research_performed=intense_research_performed,
-                token_usage=token_usage,
-                error=gap_reason,
-                sizing_audit={"guaranteed_order_research_gap_bypassed": gap_reason},
-            )
-        decision = _force_from_research(
-            decision,
-            slot.market,
-            gap_reason=gap_reason,
-        )
+        forced = _force_from_research(decision, slot.market)
+        if isinstance(forced, GuaranteedOrderAttemptResult):
+            return forced
+        decision = forced
         slot.decision = decision
 
     try:
@@ -5583,21 +5712,29 @@ def _run_guaranteed_order_phase(
             bucket["orders_canceled_unfilled"] += 1.0
 
     _lock_available_slots()
-    if not plan.is_fully_locked:
-        logger.error(
-            "Guaranteed-order plan is waiting for enough eligible markets: "
-            "locked=%d target=%d; no forced orders will run until all slots are locked",
-            plan.locked_count,
-            plan.target,
-            data=plan.summary(),
-        )
-        return result
-
     pending_slots = [
         slot
         for slot in plan.slots
         if not slot.completed and not slot.abandoned and not slot.needs_replacement
     ]
+    if not pending_slots:
+        if not plan.is_fully_locked:
+            logger.error(
+                "Guaranteed-order plan is waiting for enough eligible markets: "
+                "locked=%d target=%d",
+                plan.locked_count,
+                plan.target,
+                data=plan.summary(),
+            )
+        return result
+    if not plan.is_fully_locked:
+        logger.warning(
+            "Guaranteed-order plan partially locked (%d/%d); submitting "
+            "forceable +EV slots this cycle without padding the remainder",
+            plan.locked_count,
+            plan.target,
+            data=plan.summary(),
+        )
     pending_slots.sort(
         key=lambda slot: _guaranteed_order_market_rank(
             slot.market,
@@ -5611,10 +5748,6 @@ def _run_guaranteed_order_phase(
         max_gap_replacements = int(
             settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
         )
-        replace_weak_evidence = (
-            plan.research_gap_replacements < max_gap_replacements
-            and not slot.force_despite_research_gap
-        )
         attempt = _attempt_guaranteed_order_slot(
             slot,
             grok_client=grok_client,
@@ -5623,7 +5756,6 @@ def _run_guaranteed_order_phase(
             settings=settings,
             min_bet_usdc=min_bet_usdc,
             max_bet_usdc=max_bet_usdc,
-            replace_weak_evidence=replace_weak_evidence,
         )
         result.prompt_tokens += int(attempt.token_usage.get("prompt_tokens", 0))
         result.completion_tokens += int(
@@ -5696,6 +5828,42 @@ def _run_guaranteed_order_phase(
             replacement_reason = (
                 str(attempt.error or "").strip() or "guaranteed_order_research_gap"
             )
+            if plan.research_gap_replacements >= max_gap_replacements:
+                _abandon_guaranteed_order_slot(
+                    plan,
+                    slot,
+                    reason=f"{replacement_reason}_replace_cap",
+                )
+                logger.warning(
+                    "Guaranteed-order +EV/research-gap replace cap reached "
+                    "(%d); abandoning slot %d market=%s",
+                    max_gap_replacements,
+                    slot.slot_number,
+                    slot.market_id,
+                    data={
+                        **audit,
+                        "market_id": slot.market_id,
+                        "research_gap_replacements": plan.research_gap_replacements,
+                        "guaranteed_order_abandoned": True,
+                        "abandon_reason": slot.last_error,
+                    },
+                )
+                if decision is not None:
+                    log_decision(
+                        market_id=slot.market_id,
+                        question=slot.market.question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase="guaranteed_order_research_gap",
+                            decision_terminal=True,
+                            final_action="skip",
+                            final_reason=f"{replacement_reason}_replace_cap",
+                            guaranteed_order_abandoned=True,
+                            order_error=attempt.error,
+                            **audit,
+                        ),
+                    )
+                continue
             plan.research_gap_replacements += 1
             retired_market_id = slot.market_id
             retired_question = slot.market.question
@@ -5706,22 +5874,21 @@ def _run_guaranteed_order_phase(
             )
             replacement_slots = _lock_available_slots(require_cycle_analysis=True)
             if slot.needs_replacement:
-                # No analyzed replacement left: force the researched side anyway.
-                slot.needs_replacement = False
-                slot.replacement_reason = None
-                slot.abandoned = False
-                slot.last_error = None
-                slot.force_despite_research_gap = True
+                _abandon_guaranteed_order_slot(
+                    plan,
+                    slot,
+                    reason=f"{replacement_reason}_no_replacement",
+                )
                 logger.warning(
-                    "Guaranteed-order research gap with no replacement; "
-                    "forcing researched side for slot %d market=%s",
+                    "Guaranteed-order research gap with no +EV replacement; "
+                    "abandoning slot %d market=%s",
                     slot.slot_number,
                     retired_market_id,
                     data={
                         **audit,
                         "market_id": retired_market_id,
-                        "force_after_research_gap": True,
-                        "gap_reason": replacement_reason,
+                        "guaranteed_order_abandoned": True,
+                        "abandon_reason": slot.last_error,
                     },
                 )
                 if decision is not None:
@@ -5731,15 +5898,14 @@ def _run_guaranteed_order_phase(
                         decision=decision.model_dump(),
                         execution_audit=_build_execution_audit(
                             decision_phase="guaranteed_order_research_gap",
-                            decision_terminal=False,
+                            decision_terminal=True,
                             final_action="skip",
-                            final_reason=f"{replacement_reason}_force_no_replacement",
-                            guaranteed_order_retry_pending=True,
+                            final_reason=f"{replacement_reason}_no_replacement",
+                            guaranteed_order_abandoned=True,
                             order_error=attempt.error,
                             **audit,
                         ),
                     )
-                pending_slots.insert(0, slot)
                 continue
             if decision is not None:
                 log_decision(
@@ -10808,16 +10974,21 @@ def main(max_cycles: int | None = None) -> None:
     )
     if guaranteed_order_plan.target > 0:
         logger.warning(
-            "Guaranteed-order mode enabled: %d forced order(s) after "
-            "initial+deep research on highest-confidence locks; ordinary executions "
-            "suppressed until the plan completes (unexecutable replace cap=%d)",
+            "Guaranteed-order mode enabled: %d positive-EV forced order(s) after "
+            "initial+deep research; ordinary executions suppressed until the "
+            "plan completes (unexecutable replace cap=%d, min_edge=%.2f, "
+            "proxy_min_edge=%.2f)",
             guaranteed_order_plan.target,
             settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS,
+            settings.GUARANTEED_MIN_EDGE,
+            settings.GUARANTEED_PROXY_MIN_EDGE,
             data={
                 "guaranteed_orders_n": guaranteed_order_plan.target,
                 "guaranteed_order_max_research_gap_replacements": (
                     settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
                 ),
+                "guaranteed_min_edge": settings.GUARANTEED_MIN_EDGE,
+                "guaranteed_proxy_min_edge": settings.GUARANTEED_PROXY_MIN_EDGE,
                 "dry_run": settings.DRY_RUN,
                 "normal_execution_suppressed": True,
             },
@@ -19074,7 +19245,10 @@ def main(max_cycles: int | None = None) -> None:
                     min_bet_usdc=cycle_min_bet_usdc,
                     max_bet_usdc=cycle_max_bet_usdc,
                     priority_by_market_id=_guaranteed_order_priority_scores(
-                        analysis_results
+                        analysis_results,
+                        markets_by_id={
+                            market.id: market for market in markets if market.id
+                        },
                     ),
                     seed_decisions_by_market_id=_guaranteed_order_seed_decisions(
                         analysis_results

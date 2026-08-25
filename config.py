@@ -513,13 +513,15 @@ class Settings:
 
     # Execution
     DRY_RUN: bool = True
-    # Opt-in run-level forced-order target. When positive, the bot must enter
-    # N markets: lock this cycle's top-confidence analyzed names (event/family
-    # diversity), deep-research those slots, replace a research gap only with
-    # another analyzed name, then force a sized order from the researched
-    # side. Ordinary score/edge/EQ gates are audit-only for these slots.
-    # Unexecutable markets (closed, price band, jurisdiction) may still be
-    # replaced from the catalog up to
+    # Opt-in run-level forced-order target. When positive, lock this cycle's
+    # highest positive-EV analyzed names (chosen-side edge × EQ × confidence,
+    # event/family diversity among +EV only), deep-research those slots, and
+    # Kelly-size a forced order from the researched side only when that side
+    # still clears GUARANTEED_MIN_EDGE (or GUARANTEED_PROXY_MIN_EDGE). Weak or
+    # non-+EV slots are replaced from the analyzed +EV set or abandoned —
+    # never forced to fill the quota. Ordinary score/edge/EQ gates are
+    # audit-only for forceable slots. Unexecutable markets (closed, price
+    # band, jurisdiction) may still be replaced from the catalog up to
     # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. A bounded run that never
     # locks/completes the target fails loudly; a bounded run exits early once
     # the target is complete.
@@ -527,6 +529,11 @@ class Settings:
     # Cap on slot replacements per run (weak evidence + unexecutable markets).
     # Prevents infinite thrash when GUARANTEED_ORDERS_N > 0.
     GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS: int = 6
+    # Hard chosen-side edge floor (confidence − Kalshi implied) for a forced
+    # slot after calibration. Direct / settlement-aligned / sports computed-odds
+    # proxy use this floor; ordinary proxy uses GUARANTEED_PROXY_MIN_EDGE.
+    GUARANTEED_MIN_EDGE: float = 0.12
+    GUARANTEED_PROXY_MIN_EDGE: float = 0.15
     ORDER_RECONCILIATION_ENABLED: bool = True
     POSITION_SYNC_ENABLED: bool = True
     POSITION_SYNC_INTERVAL_CYCLES: int = 3
@@ -1571,6 +1578,12 @@ def load_settings() -> Settings:
         GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=_read_env_int(
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS",
             Settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS,
+        ),
+        GUARANTEED_MIN_EDGE=_read_env_float(
+            "GUARANTEED_MIN_EDGE", Settings.GUARANTEED_MIN_EDGE
+        ),
+        GUARANTEED_PROXY_MIN_EDGE=_read_env_float(
+            "GUARANTEED_PROXY_MIN_EDGE", Settings.GUARANTEED_PROXY_MIN_EDGE
         ),
         ORDER_RECONCILIATION_ENABLED=_read_env_bool(
             "ORDER_RECONCILIATION_ENABLED",
@@ -2766,6 +2779,17 @@ def load_settings() -> Settings:
         raise ValueError(
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS must be greater "
             "than or equal to zero"
+        )
+    if settings.GUARANTEED_MIN_EDGE < 0:
+        raise ValueError("GUARANTEED_MIN_EDGE must be greater than or equal to zero")
+    if settings.GUARANTEED_PROXY_MIN_EDGE < 0:
+        raise ValueError(
+            "GUARANTEED_PROXY_MIN_EDGE must be greater than or equal to zero"
+        )
+    if settings.GUARANTEED_PROXY_MIN_EDGE < settings.GUARANTEED_MIN_EDGE:
+        raise ValueError(
+            "GUARANTEED_PROXY_MIN_EDGE must be greater than or equal to "
+            "GUARANTEED_MIN_EDGE"
         )
     if settings.POSITION_SYNC_INTERVAL_CYCLES < 0:
         raise ValueError(

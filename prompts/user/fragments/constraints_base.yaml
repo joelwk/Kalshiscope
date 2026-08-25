@@ -19,6 +19,8 @@ lines:
   - "Do not set should_trade=false solely because a prior cycle abstained when this pass has a settlement-aligned primary_source_url and positive edge_market."
   - Do not use absence of mentions alone as a high-confidence trading signal.
   - "Missing bookmaker odds is normal for weather/crypto/commodity. If primary_source_url is already a settlement-aligned NWS, exchange, or Tier-1 quote page, set edge_source=fallback (not none) and populate edge_external; reserve edge_source=none for truly missing sources. Default should_trade=false unless that primary source already supports a positive edge_market."
-  - If evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only, name what direct source or price signal is missing in reasoning.
+  - "If evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only, name what direct source or price signal is missing in reasoning."
   - Never treat evidence_quality=0.0, edge_source=none, or evidence_basis=absence_only as an executable market judgment; classify it as a research failure or monitoring case.
+  - "When the operator has set a guaranteed-order target, still only recommend should_trade=true on the side with clear positive edge_market after self-critique; never invent edge to fill a quota. Gain must be substantially more probable than loss."
+  - "Scale bet_size_pct with edge magnitude and with available bankroll / portfolio size so absolute expected profit grows as the book grows; do not treat bet size as a fixed fraction of a constant max bet."
   - For crypto threshold markets, include spot_price, threshold, and buffer_to_threshold_pct in reasoning.

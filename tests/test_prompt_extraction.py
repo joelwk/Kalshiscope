@@ -6,37 +6,37 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Aug 19 2026: weather/numeric field repair and favorite-price cap.
-    "analyze": "a00aa8f24f5569c54f41d3ac39e0b91e905c2f5cf20975c156521b1346e4238f",
+    # Re-pinned Aug 25 2026: guaranteed-quota honesty + bankroll-scaled bet_size_pct.
+    "analyze": "d580da339eae5743791453a9c700064e99680e70c840290ba5b672545920955f",
     "deep": "447595d7487c060bd07539fc0327c185a955ce8c8dd4102ea12dcd4938c0bd14",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    # Re-pinned Aug 19 2026: NWS PoP implied, fallback-not-none, family hint repairs.
-    "commodities:deep_false": "b1baaaa661424945224d271f2fb44bed899c3fe00308545ef00b75a466c2ba46",
-    "commodities:deep_true": "9313bbf962c43e38684d908823fdd4c8ee1b4b2d5b66a598a077cbcecfe04f14",
-    "crypto:deep_false": "9fc9744dc0c6afa67d38903a49e27673bf0c2802018c6ea0bbcb9df9394035c2",
-    "crypto:deep_true": "b2ab083c4fdf277dc264767d7aa946bd71ee0dafb118e0fdd762ea9b989df9e2",
-    "generic:deep_false": "9aa0ba4496ade868d5252a038c09756ad637d6ff21c91366da112a99e84d5cd9",
-    "generic:deep_true": "cb39d6611ba96c75550b0ac2daca43b083e6abab6dd1707ccc3262c6a8fe81ac",
-    "music:deep_false": "fb11f93439a3cc643d0081f4bc46824bd4490d63eb2b9cb5613a9f0fa29c171d",
-    "music:deep_true": "f816441dbee48166f01d02323c7a395ca96125effb3b48757f10d86689278ded",
-    "politics:deep_false": "8c2f5fee9a0cffbdbecc492c4e0575e5c74630166f9283b13d089d9621f2c135",
-    "politics:deep_true": "1e6b0ee975c552397c952fbb4ec9c6c2a0f1d7538023275e37071c390baf09f1",
-    "speech:deep_false": "ffaccf37a2e1684934c1325571a155d8d2344d0864889be6dc8c8627b8a17fad",
-    "speech:deep_true": "849f8072f798804baee46c7bd4c8113e7e06e07b3447a1bfea46eec07157ad98",
-    "speech_mention:deep_false": "abe982c2939059f1a8ff2632a890d2dabd321ca84bdc0a83c472163b082827ae",
-    "speech_mention:deep_true": "4be155b5ffa5557acfdb5ce9e7c422a1470028ab34d830ed26fd7f931cf8c8aa",
-    "sports:deep_false": "9135576cb7f4ebafa9ea6ab74ca51cb2614089dc974377a18ad6db4810a1ca03",
-    "sports:deep_true": "38b3d70329442ee4479b48c1273b959b85d9a93f365eb6cc15018e77e1612c6b",
-    "weather:deep_false": "3b190401a6c7187a2d50ab6d3e68b25778852e6b40df37d24b722ad83520f01d",
-    "weather:deep_true": "d4d3a1ccad3245a3c2d7c702526fcd96d7d6a4ffe99f018b6cf93c8fe50be1df",
+    # Re-pinned Aug 25 2026: constraints_base quota honesty + bankroll-scaled size.
+    "commodities:deep_false": "2a6671249c51a1017d0accae443ae75f42415b03fbf1807e7abc1dee375b4334",
+    "commodities:deep_true": "ffd8c0ade9b36fad8a836974e6198ef7762265987ec0a4a2e465c08ebb63c4d1",
+    "crypto:deep_false": "b581c7914f3aa3d2523e6810e165785931679e8e880ef7d6b6f89d7d1b2f51e3",
+    "crypto:deep_true": "4b5379e2fc7b1fce960af70b795fffdc3d07054703038b0ec3019b4bc7b33f15",
+    "generic:deep_false": "cb12632c72b55ffda32bce93a17c5fad936d12728d6d0ee44597223a42ccaede",
+    "generic:deep_true": "4fc48a94146057488badeebd5ddd702584f86f411108f14250b4ecf0ce8f29b6",
+    "music:deep_false": "89133cd3004e6e1c342f792370d56f7cbd372d2392dc52653f32919b2d4ae9ff",
+    "music:deep_true": "7ebc882290785a720d0fc016bb937c7ad4baef924adcc9b9dd80b748b4c0515e",
+    "politics:deep_false": "51acb2f73c32c9a579430d785df943f4e66635ee5174e8382903a3ac2d770329",
+    "politics:deep_true": "27a56ea208a54b3b7330a6e72211a3954b81e1d34306071d343597379afa0200",
+    "speech:deep_false": "dea50ec2e4dddd89c7e7926f1c6d567d6075f2f10aa06ff8aa851ad39491e35b",
+    "speech:deep_true": "d35755400a3c96bcc835f27e5e04e4d34d0b9ec45a11c74932cbf36727c70314",
+    "speech_mention:deep_false": "4a4d6db8e88e623068fa3c38ec7ebe75a709232f5c718d42cd7623e69f200d76",
+    "speech_mention:deep_true": "06d8a2e4518371a7e0c6eee8a1ba493d8037cadbcd1253e64d02fec0fc8636a9",
+    "sports:deep_false": "4fd086a2e374bc136b44589525a889706b8b3d732949b16a63a5f9dfee056b20",
+    "sports:deep_true": "c12ff1783020c7f23336d2096b449fe7750275400bdb97a748f4cc54880cbdb7",
+    "weather:deep_false": "df865f49c2069bb3006b9c8481d09a331d08c40e10704cf80983dc52a49ec0a5",
+    "weather:deep_true": "e9f2bbac993322e383fa51a730e825e539da52f154e5ab6e7e94eb6cbcb3bac1",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "abstain": "139411c8d6a39816135c7602c019ef257a8bc4cbe6de148d6accbf5ac05de84b",
     "base_rate_used": "37af25f50be73dbfece673e830b4583f4c3efeaca815fd0fffeeae0b1f68ac5a",
-    "bet_size_pct": "641a0cd6d5347f4b1e64447cfe665638765238c6505b67697d4b2e2750d80dc4",
+    "bet_size_pct": "877a104afcbf5c06877e2aaec867289d3c7f0b5ce65dab11f5efda2da8f12705",
     "cached_tokens": "17c3feb94f70c94185ca5932f3717f8808124cb104f6a59ca433d72b6970a180",
     "code_execution_used": "01fa8db002c20f439e072fdc6edbb98dd81754b999e3cd1ae3e763ddb84956a0",
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
@@ -198,6 +198,8 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "primary_source_url must be a real https:// link" in _SYSTEM_PROMPT_ANALYZE
     assert "Side consistency:" in _SYSTEM_PROMPT_ANALYZE
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE
+    assert "never invent edge to fill a quota" in _SYSTEM_PROMPT_ANALYZE
+    assert "Scale bet_size_pct with edge magnitude" in _SYSTEM_PROMPT_ANALYZE
     assert "A hunch, \"form,\" vibe, or unexplained directional view is edge_mechanism=none" in _SYSTEM_PROMPT_ANALYZE
 
 
