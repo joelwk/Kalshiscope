@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import market_state as market_state_module
 from market_state import MarketStateManager
 from models import OrderResponse, TradeDecision
 
@@ -271,6 +273,25 @@ def test_export_to_json(tmp_path) -> None:
         assert payload["historical_counts"]["trade_outcomes"] == 1
         assert "analyses" not in payload
         assert "trade_log" not in payload
+    finally:
+        manager.close()
+
+
+def test_export_to_json_falls_back_on_cross_device_replace(tmp_path, monkeypatch) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_analysis("m-exdev", _decision(0.7), is_refined=False)
+        export_path = tmp_path / "state.json"
+
+        def _exdev(src, dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(market_state_module.os, "replace", _exdev)
+        manager.export_to_json(str(export_path))
+
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == 2
+        assert payload["historical_counts"]["trade_log"] == 0
     finally:
         manager.close()
 

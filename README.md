@@ -75,12 +75,17 @@ python main.py
 locks this cycle's highest positive-EV analyzed names (chosen-side edge after
 calibration × evidence quality × confidence, with event/family diversity among
 +EV names only), dives deeper on those slots, and forces a Kelly-sized order
-from the researched side only when that side still has clear positive edge and
-strong evidence. Weak, zero, or negative-EV slots are replaced with another
-analyzed +EV name or abandoned — never forced to fill the quota.
-`GUARANTEED_MIN_EDGE` (default `0.12`) is the hard chosen-side floor; ordinary
-proxy must also clear `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`); sports
-computed-odds proxy uses the lower floor. Ordinary gate-cleared submissions are
+from the researched side only when that side still has clear positive
+chosen-side edge. Absence-only, zero, or negative-EV slots are replaced with
+another analyzed +EV name the same cycle, or deferred to the next cycle —
+never forced to fill the quota. A slot is abandoned only after the
+replacement cap. Unlabeled `edge_mechanism` or proxy evidence quality below
+the ordinary trade floor is not a hard skip when chosen-side edge still
+clears the floor.
+`GUARANTEED_MIN_EDGE` (default `0.12`) is the hard chosen-side floor for
+direct, computed-odds, named-mechanism, or weather sides; unlabeled
+non-weather proxy must also clear `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`).
+Ordinary gate-cleared submissions are
 suppressed in this mode so the run cannot exceed the target. Forced (and
 normal) stakes scale with live portfolio value:
 `clip(kelly_bet_pct × MAX_BET_PCT_OF_BANKROLL × portfolio, MIN_BET_PCT_OF_BANKROLL × portfolio, position/drawdown caps)`.

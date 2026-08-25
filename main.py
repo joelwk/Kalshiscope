@@ -4483,7 +4483,11 @@ class GuaranteedOrderPlan:
 
     @property
     def locked_count(self) -> int:
-        return sum(1 for slot in self.slots if not slot.needs_replacement)
+        return sum(
+            1
+            for slot in self.slots
+            if not slot.needs_replacement and not slot.abandoned
+        )
 
     @property
     def completed_count(self) -> int:
@@ -4507,7 +4511,12 @@ class GuaranteedOrderPlan:
 
     @property
     def is_resolved(self) -> bool:
-        """True when every target slot is filled or abandoned (no more GO work)."""
+        """True when every target slot is filled or cap-abandoned (no more GO work).
+
+        A research-gap defer (`needs_replacement`) is not resolved: later
+        cycles still hunt +EV names. Cap-abandon still counts so a bounded
+        run can finish under target instead of looping forever.
+        """
         if self.target <= 0:
             return True
         return (self.completed_count + self.abandoned_count) >= self.target
@@ -4744,18 +4753,27 @@ def _guaranteed_order_min_edge(
     market: Market,
     settings: Settings,
 ) -> float:
-    """Direct / settled / sports computed-odds use MIN; ordinary proxy is higher."""
+    """Direct / computed / named-mechanism / weather use MIN; unlabeled proxy is higher."""
     floor = max(0.0, float(settings.GUARANTEED_MIN_EDGE))
     proxy_floor = max(floor, float(settings.GUARANTEED_PROXY_MIN_EDGE))
     basis = _decision_evidence_basis(decision)
     edge_source = str(decision.edge_source or "").strip().lower()
+    mechanism = str(decision.edge_mechanism or "").strip().lower()
+    named_mechanism = bool(mechanism) and mechanism != "none"
+    family = market_family(market)
     if basis == "direct":
+        return floor
+    if family == "weather":
+        # NWS/NOAA is the settlement source; Grok often leaves mechanism/source
+        # unlabeled on otherwise +EV hourly/highs (LAX +14pp / Miami +14pp misses).
         return floor
     if _is_high_quality_settled_evidence(decision, settings, market=market):
         return floor
     if _is_settlement_aligned_high_eq_computed(decision, settings):
         return floor
-    if market_family(market) == "sports" and edge_source == "computed":
+    if edge_source == "computed" or named_mechanism:
+        return floor
+    if family == "sports" and edge_source == "computed":
         return floor
     return proxy_floor
 
@@ -4955,10 +4973,14 @@ def _lock_guaranteed_order_markets(
 ) -> list[GuaranteedOrderSlot]:
     """Lock distinct markets until the plan contains exactly its target count.
 
-    Initial locks prefer this cycle's positive-EV analyzed names, then fill
-    remaining slots from the catalog. Research-gap replacements stay inside
-    the analyzed +EV set so a weak deep-dive is not swapped for an
-    unresearched liquid name or a known non-positive-EV row.
+    Initial locks prefer this cycle's forceable analyzed names (seeded
+    decisions that already clear the guaranteed edge bar), then fill
+    remaining slots from the unanalyzed catalog. Known non-positive / thin
+    first-pass seeds are not preferred over fresh catalog names; they are
+    only re-locked as a last resort so a sparse catalog can still deep-dive.
+    Research-gap replacements stay inside the analyzed +EV set so a weak
+    deep-dive is not swapped for an unresearched liquid name or a known
+    non-positive-EV row.
     """
     if plan.target <= 0:
         return []
@@ -5006,19 +5028,22 @@ def _lock_guaranteed_order_markets(
         and not _market_hits_jurisdiction_hold(market, normalized_excluded_families)
         and _is_guaranteed_order_market_candidate(market, settings)
     ]
+
+    def _seed_is_unforceable(market: Market) -> bool:
+        seeded = seed_decisions.get(market.id)
+        if seeded is None:
+            return False
+        return (
+            _guaranteed_order_reject_reason(seeded, market, settings) is not None
+        )
+
     if require_cycle_analysis and analyzed_market_ids:
         candidates = [
             market for market in candidates if market.id in analyzed_market_ids
         ]
-        filtered_candidates: list[Market] = []
-        for market in candidates:
-            seeded = seed_decisions.get(market.id)
-            if seeded is not None and _guaranteed_order_reject_reason(
-                seeded, market, settings
-            ) is not None:
-                continue
-            filtered_candidates.append(market)
-        candidates = filtered_candidates
+        candidates = [
+            market for market in candidates if not _seed_is_unforceable(market)
+        ]
     candidates.sort(
         key=lambda market: _guaranteed_order_market_rank(
             market,
@@ -5028,10 +5053,19 @@ def _lock_guaranteed_order_markets(
         reverse=True,
     )
     plus_ev_analyzed = [
-        market for market in candidates if market.id in analyzed_market_ids
+        market
+        for market in candidates
+        if market.id in analyzed_market_ids and not _seed_is_unforceable(market)
     ]
     catalog_rest = [
         market for market in candidates if market.id not in analyzed_market_ids
+    ]
+    # First-pass thin/negative seeds still need a deep dive when no forceable
+    # analyzed name or fresh catalog row is available (dummy/sparse catalogs).
+    thin_analyzed = [
+        market
+        for market in candidates
+        if market.id in analyzed_market_ids and _seed_is_unforceable(market)
     ]
 
     def _passes_diversity(
@@ -5056,7 +5090,7 @@ def _lock_guaranteed_order_markets(
         return None
 
     def _pick_next_candidate() -> Market | None:
-        # +EV analyzed first: unique event+family, unique event, then any +EV.
+        # Forceable analyzed first: unique event+family, unique event, then any.
         for unique_family, unique_event in ((True, True), (False, True), (False, False)):
             picked = _pop_from(
                 plus_ev_analyzed,
@@ -5069,6 +5103,16 @@ def _lock_guaranteed_order_markets(
         for unique_family, unique_event in ((True, True), (False, True)):
             picked = _pop_from(
                 catalog_rest,
+                unique_family=unique_family,
+                unique_event=unique_event,
+            )
+            if picked is not None:
+                return picked
+        # Last resort: re-dive a thin first-pass so a sparse catalog can still
+        # lock a slot for deep research instead of locking nothing.
+        for unique_family, unique_event in ((True, True), (False, True), (False, False)):
+            picked = _pop_from(
+                thin_analyzed,
                 unique_family=unique_family,
                 unique_event=unique_event,
             )
@@ -5161,7 +5205,7 @@ def _abandon_guaranteed_order_slot(
     *,
     reason: str,
 ) -> None:
-    """Close a slot after research without a forced fill (conditional-fill mode)."""
+    """Close a slot after the replace cap; does not fill the remaining target."""
     if slot.completed or slot.abandoned:
         return
     plan.retired_market_ids.add(slot.market_id)
@@ -5175,29 +5219,15 @@ def _guaranteed_order_research_gap_reason(
     decision: TradeDecision,
     settings: Settings,
 ) -> str | None:
-    """Return an audit label when deep research would fail ordinary evidence gates.
+    """Hard skip only when research produced no side at all.
 
-    Guaranteed mode does not force a fill on a research gap; this label is
-    stamped so the phase can replace or abandon the slot.
+    Grok often leaves edge_mechanism unlabeled, caps proxy evidence_quality at
+    0.45, and omits a URL on settlement-aligned commodities. Those are not
+    absence_only; chosen-side edge vs Kalshi is the guaranteed EV filter.
     """
     basis = str(decision.evidence_basis or "").strip().lower()
-    edge_src = str(decision.edge_source or "").strip().lower()
-    try:
-        evidence_quality = float(decision.evidence_quality or 0.0)
-    except (TypeError, ValueError):
-        evidence_quality = 0.0
-    source_url = str(decision.primary_source_url or "").strip()
-    mechanism = str(decision.edge_mechanism or "").strip().lower()
     if basis == "absence_only":
         return "guaranteed_order_research_gap_absence_only"
-    if mechanism == "none":
-        return "guaranteed_order_research_gap_edge_mechanism_none"
-    if evidence_quality < float(settings.MIN_EVIDENCE_QUALITY_FOR_TRADE):
-        return "guaranteed_order_research_gap_low_evidence_quality"
-    if edge_src == "none":
-        if basis in {"proxy", "direct"} and source_url:
-            return None
-        return "guaranteed_order_research_gap_edge_source_none"
     return None
 
 
@@ -5345,8 +5375,9 @@ def _attempt_guaranteed_order_slot(
     """Research a locked slot intensely and force only a positive-EV researched side.
 
     When deep research is a research gap or fails the chosen-side edge bar,
-    return status=research_gap_replaceable so the phase can swap or abandon.
-    Never force a non-positive-EV slot to fill the quota.
+    return status=research_gap_replaceable so the phase can swap, defer to
+    the next cycle, or abandon on replace cap. Never force a non-positive-EV
+    slot to fill the quota.
     """
     intense_research_performed = False
     sizing_audit: dict[str, Any] = {}
@@ -5743,11 +5774,118 @@ def _run_guaranteed_order_phase(
         ),
         reverse=True,
     )
+    max_gap_replacements = int(
+        settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
+    )
+
+    def _replace_or_defer_slot(
+        slot: GuaranteedOrderSlot,
+        *,
+        replacement_reason: str,
+        require_cycle_analysis: bool,
+        decision_phase: str,
+        decision: TradeDecision | None,
+        audit: dict[str, Any],
+        cap_log: str,
+        cap_final_reason: str,
+        defer_log: str,
+        error: str | None,
+    ) -> None:
+        """Same-cycle +EV replace, else keep the slot open for the next cycle."""
+        if plan.research_gap_replacements >= max_gap_replacements:
+            _abandon_guaranteed_order_slot(
+                plan,
+                slot,
+                reason=f"{replacement_reason}_replace_cap",
+            )
+            logger.warning(
+                cap_log,
+                max_gap_replacements,
+                slot.slot_number,
+                slot.market_id,
+                data={
+                    **audit,
+                    "market_id": slot.market_id,
+                    "research_gap_replacements": plan.research_gap_replacements,
+                    "guaranteed_order_abandoned": True,
+                    "abandon_reason": slot.last_error,
+                },
+            )
+            if decision is not None:
+                log_decision(
+                    market_id=slot.market_id,
+                    question=slot.market.question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase=decision_phase,
+                        decision_terminal=True,
+                        final_action="skip",
+                        final_reason=cap_final_reason,
+                        guaranteed_order_abandoned=True,
+                        order_error=error,
+                        **audit,
+                    ),
+                )
+            return
+        retired_market_id = slot.market_id
+        retired_question = slot.market.question
+        _mark_guaranteed_order_slot_for_replacement(
+            plan,
+            slot,
+            reason=replacement_reason,
+        )
+        replacement_slots = _lock_available_slots(
+            require_cycle_analysis=require_cycle_analysis,
+        )
+        if slot.needs_replacement:
+            logger.warning(
+                defer_log,
+                slot.slot_number,
+                retired_market_id,
+                data={
+                    **audit,
+                    "market_id": retired_market_id,
+                    "guaranteed_order_deferred": True,
+                    "defer_reason": replacement_reason,
+                    "needs_replacement": True,
+                },
+            )
+            if decision is not None:
+                log_decision(
+                    market_id=retired_market_id,
+                    question=retired_question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase=decision_phase,
+                        decision_terminal=False,
+                        final_action="skip",
+                        final_reason=f"{replacement_reason}_deferred",
+                        guaranteed_order_retry_pending=True,
+                        order_error=error,
+                        **audit,
+                    ),
+                )
+            return
+        plan.research_gap_replacements += 1
+        if decision is not None:
+            log_decision(
+                market_id=retired_market_id,
+                question=retired_question,
+                decision=decision.model_dump(),
+                execution_audit=_build_execution_audit(
+                    decision_phase=decision_phase,
+                    decision_terminal=False,
+                    final_action="skip",
+                    final_reason=replacement_reason,
+                    guaranteed_order_retry_pending=True,
+                    order_error=error,
+                    **audit,
+                ),
+            )
+        pending_slots.extend(replacement_slots)
+
     while pending_slots:
         slot = pending_slots.pop(0)
-        max_gap_replacements = int(
-            settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
-        )
         attempt = _attempt_guaranteed_order_slot(
             slot,
             grok_client=grok_client,
@@ -5828,101 +5966,24 @@ def _run_guaranteed_order_phase(
             replacement_reason = (
                 str(attempt.error or "").strip() or "guaranteed_order_research_gap"
             )
-            if plan.research_gap_replacements >= max_gap_replacements:
-                _abandon_guaranteed_order_slot(
-                    plan,
-                    slot,
-                    reason=f"{replacement_reason}_replace_cap",
-                )
-                logger.warning(
-                    "Guaranteed-order +EV/research-gap replace cap reached "
-                    "(%d); abandoning slot %d market=%s",
-                    max_gap_replacements,
-                    slot.slot_number,
-                    slot.market_id,
-                    data={
-                        **audit,
-                        "market_id": slot.market_id,
-                        "research_gap_replacements": plan.research_gap_replacements,
-                        "guaranteed_order_abandoned": True,
-                        "abandon_reason": slot.last_error,
-                    },
-                )
-                if decision is not None:
-                    log_decision(
-                        market_id=slot.market_id,
-                        question=slot.market.question,
-                        decision=decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="guaranteed_order_research_gap",
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason=f"{replacement_reason}_replace_cap",
-                            guaranteed_order_abandoned=True,
-                            order_error=attempt.error,
-                            **audit,
-                        ),
-                    )
-                continue
-            plan.research_gap_replacements += 1
-            retired_market_id = slot.market_id
-            retired_question = slot.market.question
-            _mark_guaranteed_order_slot_for_replacement(
-                plan,
+            _replace_or_defer_slot(
                 slot,
-                reason=replacement_reason,
+                replacement_reason=replacement_reason,
+                require_cycle_analysis=True,
+                decision_phase="guaranteed_order_research_gap",
+                decision=decision,
+                audit=audit,
+                cap_log=(
+                    "Guaranteed-order +EV/research-gap replace cap reached "
+                    "(%d); abandoning slot %d market=%s"
+                ),
+                cap_final_reason=f"{replacement_reason}_replace_cap",
+                defer_log=(
+                    "Guaranteed-order research gap with no +EV replacement this "
+                    "cycle; deferring slot %d market=%s to the next cycle"
+                ),
+                error=attempt.error,
             )
-            replacement_slots = _lock_available_slots(require_cycle_analysis=True)
-            if slot.needs_replacement:
-                _abandon_guaranteed_order_slot(
-                    plan,
-                    slot,
-                    reason=f"{replacement_reason}_no_replacement",
-                )
-                logger.warning(
-                    "Guaranteed-order research gap with no +EV replacement; "
-                    "abandoning slot %d market=%s",
-                    slot.slot_number,
-                    retired_market_id,
-                    data={
-                        **audit,
-                        "market_id": retired_market_id,
-                        "guaranteed_order_abandoned": True,
-                        "abandon_reason": slot.last_error,
-                    },
-                )
-                if decision is not None:
-                    log_decision(
-                        market_id=retired_market_id,
-                        question=retired_question,
-                        decision=decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="guaranteed_order_research_gap",
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason=f"{replacement_reason}_no_replacement",
-                            guaranteed_order_abandoned=True,
-                            order_error=attempt.error,
-                            **audit,
-                        ),
-                    )
-                continue
-            if decision is not None:
-                log_decision(
-                    market_id=retired_market_id,
-                    question=retired_question,
-                    decision=decision.model_dump(),
-                    execution_audit=_build_execution_audit(
-                        decision_phase="guaranteed_order_research_gap",
-                        decision_terminal=False,
-                        final_action="skip",
-                        final_reason=replacement_reason,
-                        guaranteed_order_retry_pending=True,
-                        order_error=attempt.error,
-                        **audit,
-                    ),
-                )
-            pending_slots.extend(replacement_slots)
             continue
         if attempt.status == "market_validation_failed":
             result.failures.append(
@@ -5937,101 +5998,24 @@ def _run_guaranteed_order_phase(
                 str(attempt.error or "").strip()
                 or "guaranteed_order_market_validation_failed"
             )
-            if plan.research_gap_replacements >= max_gap_replacements:
-                _abandon_guaranteed_order_slot(
-                    plan,
-                    slot,
-                    reason=f"{replacement_reason}_replace_cap",
-                )
-                logger.warning(
-                    "Guaranteed-order unexecutable replace cap reached "
-                    "(%d); abandoning slot %d market=%s",
-                    max_gap_replacements,
-                    slot.slot_number,
-                    slot.market_id,
-                    data={
-                        **audit,
-                        "market_id": slot.market_id,
-                        "research_gap_replacements": plan.research_gap_replacements,
-                        "guaranteed_order_abandoned": True,
-                        "abandon_reason": slot.last_error,
-                    },
-                )
-                if decision is not None:
-                    log_decision(
-                        market_id=slot.market_id,
-                        question=slot.market.question,
-                        decision=decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="guaranteed_order_market_validation",
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="guaranteed_order_market_validation_replace_cap",
-                            guaranteed_order_abandoned=True,
-                            order_error=attempt.error,
-                            **audit,
-                        ),
-                    )
-                continue
-            plan.research_gap_replacements += 1
-            retired_market_id = slot.market_id
-            retired_question = slot.market.question
-            _mark_guaranteed_order_slot_for_replacement(
-                plan,
+            _replace_or_defer_slot(
                 slot,
-                reason=replacement_reason,
+                replacement_reason=replacement_reason,
+                require_cycle_analysis=False,
+                decision_phase="guaranteed_order_market_validation",
+                decision=decision,
+                audit=audit,
+                cap_log=(
+                    "Guaranteed-order unexecutable replace cap reached "
+                    "(%d); abandoning slot %d market=%s"
+                ),
+                cap_final_reason="guaranteed_order_market_validation_replace_cap",
+                defer_log=(
+                    "Guaranteed-order market validation failed with no replacement "
+                    "this cycle; deferring slot %d market=%s to the next cycle"
+                ),
+                error=attempt.error,
             )
-            replacement_slots = _lock_available_slots()
-            if slot.needs_replacement:
-                _abandon_guaranteed_order_slot(
-                    plan,
-                    slot,
-                    reason=f"{replacement_reason}_no_replacement",
-                )
-                logger.warning(
-                    "Guaranteed-order market validation failed with no replacement; "
-                    "abandoning slot %d market=%s",
-                    slot.slot_number,
-                    retired_market_id,
-                    data={
-                        **audit,
-                        "market_id": retired_market_id,
-                        "guaranteed_order_abandoned": True,
-                        "abandon_reason": slot.last_error,
-                    },
-                )
-                if decision is not None:
-                    log_decision(
-                        market_id=retired_market_id,
-                        question=retired_question,
-                        decision=decision.model_dump(),
-                        execution_audit=_build_execution_audit(
-                            decision_phase="guaranteed_order_market_validation",
-                            decision_terminal=True,
-                            final_action="skip",
-                            final_reason="guaranteed_order_market_validation_no_replacement",
-                            guaranteed_order_abandoned=True,
-                            order_error=attempt.error,
-                            **audit,
-                        ),
-                    )
-                continue
-            if decision is not None:
-                log_decision(
-                    market_id=retired_market_id,
-                    question=retired_question,
-                    decision=decision.model_dump(),
-                    execution_audit=_build_execution_audit(
-                        decision_phase="guaranteed_order_market_validation",
-                        decision_terminal=False,
-                        final_action="skip",
-                        final_reason=replacement_reason,
-                        guaranteed_order_retry_pending=True,
-                        order_error=attempt.error,
-                        **audit,
-                    ),
-                )
-            pending_slots.extend(replacement_slots)
             continue
         if decision is None:
             continue
@@ -7431,14 +7415,30 @@ def _analysis_result_rank(
     )
 
 
+_STRIKE_TICKER_SUFFIX = re.compile(r"-[BT]\d+(?:\.\d+)?$", re.IGNORECASE)
+
+
+def _canonical_event_prefix(ticker: str) -> str:
+    """Strip weather/numeric strike suffixes so bins of one event share a key.
+
+    Kalshi often stamps event_ticker as the full market id (`...-B103.5`).
+    Using that raw value lets two OKC high bins occupy two guaranteed slots.
+    """
+    normalized = str(ticker or "").strip().upper()
+    if not normalized:
+        return ""
+    stripped = _STRIKE_TICKER_SUFFIX.sub("", normalized)
+    return stripped or normalized
+
+
 def _event_ticker_prefix(market: Market) -> str:
-    event_ticker = str(market.event_ticker or "").strip().upper()
+    event_ticker = _canonical_event_prefix(market.event_ticker or "")
     if event_ticker:
         return event_ticker
     market_id = str(market.id or "").strip().upper()
     if "-" in market_id:
-        return market_id.rsplit("-", maxsplit=1)[0]
-    return market_id
+        return _canonical_event_prefix(market_id.rsplit("-", maxsplit=1)[0])
+    return _canonical_event_prefix(market_id)
 
 
 def _daily_balance_delta_usdc(
@@ -20322,12 +20322,6 @@ def main(max_cycles: int | None = None) -> None:
             )
             break
 
-        logger.debug(
-            "Sleeping for %d seconds before next cycle",
-            sleep_seconds,
-            data={"sleep_seconds": sleep_seconds, "cycle_id": cycle_id},
-        )
-        time.sleep(sleep_seconds)
         if max_cycles is not None and cycle_count >= max_cycles:
             logger.info(
                 "Reached max cycles (%d/%d) - shutting down",
@@ -20336,6 +20330,30 @@ def main(max_cycles: int | None = None) -> None:
                 data={"cycle_count": cycle_count, "max_cycles": max_cycles},
             )
             break
+        if (
+            guaranteed_order_plan.target > 0
+            and not guaranteed_order_plan.is_resolved
+        ):
+            logger.info(
+                "Guaranteed-order plan incomplete (%d/%d); "
+                "skipping poll sleep before the next hunt cycle",
+                guaranteed_order_plan.completed_count,
+                guaranteed_order_plan.target,
+                data={
+                    "cycle_count": cycle_count,
+                    "sleep_seconds_skipped": sleep_seconds,
+                    "guaranteed_orders_n": guaranteed_order_plan.target,
+                    "remaining_count": guaranteed_order_plan.remaining_count,
+                },
+            )
+            continue
+
+        logger.debug(
+            "Sleeping for %d seconds before next cycle",
+            sleep_seconds,
+            data={"sleep_seconds": sleep_seconds, "cycle_id": cycle_id},
+        )
+        time.sleep(sleep_seconds)
 
     if guaranteed_order_plan.target > 0:
         guarantee_summary = guaranteed_order_plan.summary()

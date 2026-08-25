@@ -530,8 +530,9 @@ class Settings:
     # Prevents infinite thrash when GUARANTEED_ORDERS_N > 0.
     GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS: int = 6
     # Hard chosen-side edge floor (confidence − Kalshi implied) for a forced
-    # slot after calibration. Direct / settlement-aligned / sports computed-odds
-    # proxy use this floor; ordinary proxy uses GUARANTEED_PROXY_MIN_EDGE.
+    # slot after calibration. Direct / settlement-aligned / weather / sports
+    # computed-odds / named-mechanism use this floor; unlabeled non-weather
+    # proxy uses GUARANTEED_PROXY_MIN_EDGE.
     GUARANTEED_MIN_EDGE: float = 0.12
     GUARANTEED_PROXY_MIN_EDGE: float = 0.15
     ORDER_RECONCILIATION_ENABLED: bool = True

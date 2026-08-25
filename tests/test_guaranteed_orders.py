@@ -325,7 +325,7 @@ def test_guaranteed_absence_only_is_replaceable_not_forced(tmp_path) -> None:
     assert kalshi.submitted_market_ids == []
 
 
-def test_guaranteed_phase_abandons_weak_evidence_without_replacement(tmp_path) -> None:
+def test_guaranteed_phase_defers_weak_evidence_without_replacement(tmp_path) -> None:
     gap_market = _market("gap-only", liquidity=900.0)
     gap_decision = _decision(
         evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
@@ -359,10 +359,90 @@ def test_guaranteed_phase_abandons_weak_evidence_without_replacement(tmp_path) -
 
     assert result.completed == 0
     assert plan.is_complete is False
-    assert plan.abandoned_count == 1
-    assert plan.is_resolved is True
+    assert plan.abandoned_count == 0
+    assert plan.is_resolved is False
+    assert plan.slots[0].needs_replacement is True
+    assert plan.research_gap_replacements == 0
     assert kalshi.submitted_market_ids == []
-    assert decisions[-1]["execution_audit"]["guaranteed_order_abandoned"] is True
+    assert decisions[-1]["execution_audit"]["guaranteed_order_retry_pending"] is True
+    assert plan.suppresses_normal_execution is True
+
+
+def test_guaranteed_phase_fills_deferred_slot_from_next_cycle_plus_ev(
+    tmp_path,
+) -> None:
+    gap_market = _market("gap-high", liquidity=900.0)
+    good_market = _market("good-low", liquidity=100.0)
+    gap_decision = _decision(
+        evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
+    )
+    good_decision = _decision(evidence_basis="proxy", evidence_quality=0.85)
+
+    class _SelectiveGrok:
+        def __init__(self) -> None:
+            self.deep_calls: list[str] = []
+
+        def analyze_market(self, market, **kwargs):
+            return gap_decision if market.id == "gap-high" else good_decision
+
+        def analyze_market_deep(self, market, **kwargs):
+            self.deep_calls.append(market.id)
+            return gap_decision if market.id == "gap-high" else good_decision
+
+    grok = _SelectiveGrok()
+    kalshi = _LiveGuaranteedKalshi([gap_market, good_market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="gap-defer-next")
+    settings = main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1)
+    try:
+        cycle_one = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[gap_market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=settings,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+            priority_by_market_id={"gap-high": 0.40},
+            seed_decisions_by_market_id={"gap-high": gap_decision},
+        )
+        assert cycle_one.completed == 0
+        assert plan.slots[0].needs_replacement is True
+        assert plan.is_resolved is False
+
+        cycle_two = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[gap_market, good_market],
+            excluded_market_ids=set(),
+            cycle_number=2,
+            settings=settings,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+            priority_by_market_id={"good-low": 0.80, "gap-high": 0.10},
+            seed_decisions_by_market_id={
+                "good-low": good_decision,
+                "gap-high": gap_decision,
+            },
+        )
+    finally:
+        state.close()
+
+    assert cycle_two.completed == 1
+    assert plan.is_complete
+    assert plan.slots[0].market_id == "good-low"
+    assert "gap-high" in plan.retired_market_ids
+    assert kalshi.submitted_market_ids == ["good-low"]
+    assert grok.deep_calls[-1] == "good-low"
 
 
 def test_guaranteed_phase_replaces_weak_evidence_when_alternate_exists(tmp_path) -> None:
@@ -421,7 +501,7 @@ def test_guaranteed_phase_replaces_weak_evidence_when_alternate_exists(tmp_path)
     assert grok.deep_calls == ["gap-high", "good-low"]
 
 
-def test_guaranteed_phase_abandons_analyzed_gap_instead_of_unanalyzed_liquid(
+def test_guaranteed_phase_defers_analyzed_gap_instead_of_unanalyzed_liquid(
     tmp_path,
 ) -> None:
     gap_market = _market("analyzed-gap", liquidity=50.0)
@@ -475,8 +555,10 @@ def test_guaranteed_phase_abandons_analyzed_gap_instead_of_unanalyzed_liquid(
         state.close()
 
     assert result.completed == 0
-    assert plan.abandoned_count == 1
+    assert plan.abandoned_count == 0
+    assert plan.slots[0].needs_replacement is True
     assert plan.slots[0].market_id == "analyzed-gap"
+    assert plan.is_resolved is False
     assert kalshi.submitted_market_ids == []
     assert grok.deep_calls == ["analyzed-gap"]
     assert "analyzed-gap" in plan.retired_market_ids
@@ -651,7 +733,7 @@ def test_guaranteed_priority_prefers_named_edge_mechanism() -> None:
     assert scores["mechanism"] > scores["hunch"]
 
 
-def test_research_gap_reason_flags_edge_mechanism_none() -> None:
+def test_research_gap_reason_ignores_unlabeled_mechanism() -> None:
     settings = main.Settings()
     decision = _decision(
         evidence_basis="proxy",
@@ -659,10 +741,166 @@ def test_research_gap_reason_flags_edge_mechanism_none() -> None:
         evidence_quality=0.8,
         edge_mechanism="none",
     )
-    assert (
-        main._guaranteed_order_research_gap_reason(decision, settings)
-        == "guaranteed_order_research_gap_edge_mechanism_none"
+    assert main._guaranteed_order_research_gap_reason(decision, settings) is None
+
+
+def test_guaranteed_forces_computed_plus_ev_with_unlabeled_mechanism(tmp_path) -> None:
+    """Live miss: TEMPMIAH-style computed +EV with edge_mechanism=none."""
+    market = _market("temp-mia", yes_price=0.67)
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-temp-001",
     )
+    grok = _GuaranteedGrok(
+        _decision(
+            outcome="NO",
+            confidence=0.52,
+            evidence_basis="proxy",
+            edge_source="computed",
+            evidence_quality=0.60,
+            edge_mechanism="none",
+        )
+    )
+    kalshi = _GuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.amount_usdc > 0
+    assert result.error is None
+
+
+def test_guaranteed_forces_low_eq_proxy_when_chosen_side_edge_clears(
+    tmp_path,
+) -> None:
+    """Live miss: diesel-style eq=0.45 unlabeled proxy with large NO edge."""
+    market = _market("diesel", yes_price=0.65)
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-diesel-001",
+    )
+    grok = _GuaranteedGrok(
+        _decision(
+            outcome="NO",
+            confidence=0.62,
+            evidence_basis="proxy",
+            edge_source="none",
+            evidence_quality=0.45,
+            edge_mechanism="none",
+            primary_source_url=None,
+        )
+    )
+    kalshi = _GuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.amount_usdc > 0
+
+
+def test_named_mechanism_uses_guaranteed_min_edge_not_proxy_floor(tmp_path) -> None:
+    """Live miss: Brent 12pp observed_vs_strike failed the 15pp proxy floor."""
+    market = _market("brent", yes_price=0.60)
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-brent-001",
+    )
+    grok = _GuaranteedGrok(
+        _decision(
+            outcome="YES",
+            confidence=0.72,
+            evidence_basis="proxy",
+            edge_source="none",
+            evidence_quality=0.60,
+            edge_mechanism="observed_vs_strike",
+        )
+    )
+    kalshi = _GuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.amount_usdc > 0
+
+
+def test_unlabeled_proxy_still_requires_proxy_min_edge() -> None:
+    settings = main.Settings()
+    market = _market("thin-proxy", yes_price=0.60)
+    decision = _decision(
+        outcome="YES",
+        confidence=0.72,
+        evidence_basis="proxy",
+        edge_source="none",
+        evidence_quality=0.60,
+        edge_mechanism="none",
+    )
+    assert (
+        main._guaranteed_order_reject_reason(decision, market, settings)
+        == "guaranteed_order_edge_below_min"
+    )
+
+
+def test_unlabeled_weather_proxy_uses_min_edge_not_proxy_floor() -> None:
+    """Live miss: TEMPLAXH/TEMPMIAH +14pp unlabeled proxy deferred at 0.15."""
+    settings = main.Settings()
+    market = _market(
+        "KXTEMPLAXH-26AUG2513-T81.99",
+        yes_price=0.59,
+        category="weather",
+        event_ticker="KXTEMPLAXH-26AUG2513-T81.99",
+    )
+    decision = _decision(
+        outcome="NO",
+        confidence=0.55,
+        evidence_basis="proxy",
+        edge_source="none",
+        evidence_quality=0.45,
+        edge_mechanism="none",
+    )
+    assert main._guaranteed_order_min_edge(decision, market, settings) == 0.12
+    assert main._guaranteed_order_reject_reason(decision, market, settings) is None
 
 
 def test_lock_guaranteed_markets_rejects_same_event_prefix() -> None:
@@ -684,6 +922,70 @@ def test_lock_guaranteed_markets_rejects_same_event_prefix() -> None:
 
     assert [slot.market_id for slot in locked] == ["HIGHMIA-B88.5", "OTHER-A"]
     assert plan.is_fully_locked
+
+
+def test_lock_collapses_weather_bins_with_full_event_tickers() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=2)
+    plan = main.GuaranteedOrderPlan(target=2)
+    markets = [
+        _market(
+            "KXHIGHTOKC-26AUG25-B103.5",
+            liquidity=500.0,
+            event_ticker="KXHIGHTOKC-26AUG25-B103.5",
+            category="weather",
+        ),
+        _market(
+            "KXHIGHTOKC-26AUG25-B101.5",
+            liquidity=400.0,
+            event_ticker="KXHIGHTOKC-26AUG25-B101.5",
+            category="weather",
+        ),
+        _market(
+            "KXHIGHPHIL-26AUG25-B82.5",
+            liquidity=100.0,
+            event_ticker="KXHIGHPHIL-26AUG25-B82.5",
+            category="weather",
+        ),
+    ]
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        markets,
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == [
+        "KXHIGHTOKC-26AUG25-B103.5",
+        "KXHIGHPHIL-26AUG25-B82.5",
+    ]
+
+
+def test_lock_skips_negative_edge_analyzed_seeds_for_catalog_fill() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    analyzed_dog = _market("analyzed-neg", liquidity=900.0, yes_price=0.55)
+    catalog = _market("catalog-fresh", liquidity=80.0)
+    seeds = {
+        "analyzed-neg": _decision(confidence=0.50, evidence_quality=0.8),
+    }
+    priority = main._guaranteed_order_priority_scores(
+        {market_id: {"decision": decision} for market_id, decision in seeds.items()},
+        markets_by_id={"analyzed-neg": analyzed_dog},
+    )
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [analyzed_dog, catalog],
+        excluded_market_ids=set(),
+        priority_by_market_id=priority,
+        seed_decisions_by_market_id=seeds,
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["catalog-fresh"]
 
 
 def test_seeded_guaranteed_slot_skips_initial_analysis(tmp_path) -> None:
@@ -1104,7 +1406,8 @@ def test_bounded_main_does_not_complete_guaranteed_target_with_weak_evidence(
     monkeypatch.setattr(main, "KalshiClient", lambda *args, **kwargs: kalshi)
     monkeypatch.setattr(main.time, "sleep", lambda _: None)
 
-    main.main(max_cycles=1)
+    with pytest.raises(main.GuaranteedOrdersIncompleteError, match="completed=0/1"):
+        main.main(max_cycles=1)
 
     verifier = MarketStateManager(settings.STATE_DB_PATH)
     try:
@@ -1123,7 +1426,6 @@ def test_bounded_main_does_not_complete_guaranteed_target_with_weak_evidence(
         verifier.close()
 
     assert cycle_receipt is not None
-    assert '"guaranteed_orders_resolved": true' in cycle_receipt["payload_json"]
     assert '"guaranteed_orders_complete": true' not in cycle_receipt["payload_json"]
     assert len(attempts) == 0
 

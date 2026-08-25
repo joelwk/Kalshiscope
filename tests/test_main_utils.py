@@ -387,6 +387,26 @@ class TestMainUtils(unittest.TestCase):
             "KXSAMPLEGAME-26APR121610TEAMA",
         )
 
+    def test_event_ticker_prefix_strips_weather_bin_from_event_ticker(self) -> None:
+        high_a = Market(
+            id="KXHIGHTOKC-26AUG25-B103.5",
+            event_ticker="KXHIGHTOKC-26AUG25-B103.5",
+            question="OKC high",
+        )
+        high_b = Market(
+            id="KXHIGHTOKC-26AUG25-B101.5",
+            event_ticker="KXHIGHTOKC-26AUG25-B101.5",
+            question="OKC high",
+        )
+        self.assertEqual(
+            _event_ticker_prefix(high_a),
+            "KXHIGHTOKC-26AUG25",
+        )
+        self.assertEqual(
+            _event_ticker_prefix(high_a),
+            _event_ticker_prefix(high_b),
+        )
+
     def test_event_ticker_prefix_falls_back_to_market_id_prefix(self) -> None:
         market = Market(
             id="KXINXU-26APR13H1600-T6774.9999",

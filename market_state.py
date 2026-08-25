@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 from collections import defaultdict
@@ -3845,7 +3847,10 @@ class MarketStateManager:
         recent_decisions_limit: int = 500,
     ) -> None:
         """Atomically export a bounded current-state snapshot (schema version 2)."""
-        export_path = Path(path)
+        export_path = Path(path).expanduser()
+        if not export_path.is_absolute():
+            export_path = Path.cwd() / export_path
+        export_path = export_path.resolve()
         export_path.parent.mkdir(parents=True, exist_ok=True)
 
         latest_cycle_row = self._conn.execute(
@@ -4025,7 +4030,15 @@ class MarketStateManager:
                 json.dump(payload, handle, indent=2, default=str)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, export_path)
+            try:
+                os.replace(temp_path, export_path)
+            except OSError as exc:
+                # WSL /mnt/c (drvfs) often raises EXDEV even for same-dir rename.
+                if getattr(exc, "errno", None) != errno.EXDEV:
+                    raise
+                shutil.copyfile(temp_path, export_path)
+                temp_path.unlink(missing_ok=True)
+                temp_path = None
         except Exception:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
