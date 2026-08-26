@@ -112,6 +112,15 @@ _ADAPTIVE_SLEEP_CAP_SECONDS = 1800
 _ORDERBOOK_SPREAD_CUTOFF_DEFAULT = 0.08
 _STALE_REFRESH_RETRY_DELAY_SECONDS = 1.0
 _STALE_REFRESH_LENIENT_AGE_MULTIPLIER = 2.5
+# Guaranteed catalog locks must outlive a multi-cycle research pass. 15-minute
+# crypto and soon-to-settle hourlies 404 mid-run if locked with minutes left.
+_GUARANTEED_LOCK_MIN_HOURS_TO_CLOSE = 2.0
+_UNEXECUTABLE_MARKET_ERROR_MARKERS = (
+    "market_not_found",
+    "market not found",
+    "market_closed",
+    "market closed",
+)
 _MAX_CONFIDENCE = 1.0
 _AGGRESSIVE_CONFIDENCE_SHRINKAGE_FACTOR = 0.30
 # Minimum resolved-trade samples before a family's windowed PnL is trusted to
@@ -2171,6 +2180,22 @@ def _order_exception_error_text(exc: BaseException) -> str:
     if body:
         parts.append(str(body))
     return "\n".join(parts)
+
+
+def _is_unexecutable_market_error(error_text: str | None) -> bool:
+    """True when Kalshi rejected because the ticker is gone or already closed."""
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _UNEXECUTABLE_MARKET_ERROR_MARKERS)
+
+
+def _guaranteed_lock_has_enough_time(market: Market) -> bool:
+    """Skip names that will expire before a remaining guaranteed cycle can submit."""
+    hours = _hours_to_market_close(market)
+    if hours is None:
+        return True
+    return hours >= _GUARANTEED_LOCK_MIN_HOURS_TO_CLOSE
 
 
 def _is_observed_direct_weather_evidence(
@@ -4997,11 +5022,18 @@ def _lock_guaranteed_order_markets(
     )
     current_by_id = {market.id: market for market in markets if market.id}
     for slot in plan.slots:
-        if slot.needs_replacement:
+        if slot.completed or slot.abandoned or slot.needs_replacement:
             continue
         refreshed = current_by_id.get(slot.market_id)
-        if refreshed is not None:
-            slot.market = refreshed
+        if refreshed is None:
+            continue
+        slot.market = refreshed
+        if not _is_guaranteed_order_market_candidate(refreshed, settings):
+            _mark_guaranteed_order_slot_for_replacement(
+                plan,
+                slot,
+                reason="guaranteed_order_market_no_longer_executable",
+            )
 
     if plan.is_fully_locked:
         return []
@@ -5027,6 +5059,7 @@ def _lock_guaranteed_order_markets(
         and market.id not in plan.retired_market_ids
         and not _market_hits_jurisdiction_hold(market, normalized_excluded_families)
         and _is_guaranteed_order_market_candidate(market, settings)
+        and _guaranteed_lock_has_enough_time(market)
     ]
 
     def _seed_is_unforceable(market: Market) -> bool:
@@ -5377,7 +5410,9 @@ def _attempt_guaranteed_order_slot(
     When deep research is a research gap or fails the chosen-side edge bar,
     return status=research_gap_replaceable so the phase can swap, defer to
     the next cycle, or abandon on replace cap. Never force a non-positive-EV
-    slot to fill the quota.
+    slot to fill the quota. Seeded first-pass decisions that already clear
+    the +EV bar skip a redundant deep call. Catalog fills still do initial
+    (no self-consistency) plus deep.
     """
     intense_research_performed = False
     sizing_audit: dict[str, Any] = {}
@@ -5471,20 +5506,31 @@ def _attempt_guaranteed_order_slot(
                     research_market,
                     search_config=search_config,
                     previous_analysis=None,
-                    allow_self_consistency=True,
+                    allow_self_consistency=False,
                 )
                 _capture_usage(initial_decision)
             else:
-                # Seeded from this cycle's analysis: skip re-initial, deep only.
+                # Seeded from this cycle's analysis: skip re-initial.
                 initial_decision = decision
-            deep_decision = grok_client.analyze_market_deep(
-                research_market,
-                previous_analysis=initial_decision,
-                search_config=search_config,
+            seed_clears_bar = (
+                decision is not None
+                and _guaranteed_order_reject_reason(
+                    initial_decision, research_market, settings
+                )
+                is None
             )
-            _capture_usage(deep_decision)
-            intense_research_performed = True
-            forced = _force_from_research(deep_decision, research_market)
+            if seed_clears_bar:
+                researched = initial_decision
+            else:
+                deep_decision = grok_client.analyze_market_deep(
+                    research_market,
+                    previous_analysis=initial_decision,
+                    search_config=search_config,
+                )
+                _capture_usage(deep_decision)
+                intense_research_performed = True
+                researched = deep_decision
+            forced = _force_from_research(researched, research_market)
             if isinstance(forced, GuaranteedOrderAttemptResult):
                 return forced
             decision = forced
@@ -5516,6 +5562,10 @@ def _attempt_guaranteed_order_slot(
             market_snapshot_monotonic=time.monotonic(),
         )
         active_market = execution_snapshot.market
+        if execution_snapshot.refresh_error is not None and _is_unexecutable_market_error(
+            _order_exception_error_text(execution_snapshot.refresh_error)
+        ):
+            raise execution_snapshot.refresh_error
         if _is_market_resolved_or_closed(active_market):
             raise MarketClosedError(f"Guaranteed market {active_market.id} is closed")
         entry_price = _get_outcome_entry_price(active_market, decision.outcome)
@@ -6042,21 +6092,21 @@ def _run_guaranteed_order_phase(
                     "error": attempt.error,
                 }
             )
-            log_decision(
-                market_id=slot.market_id,
-                question=slot.market.question,
-                decision=decision.model_dump(),
-                execution_audit=_build_execution_audit(
-                    decision_phase="guaranteed_order_submission",
-                    decision_terminal=False,
-                    final_action="order_attempt",
-                    final_reason=submission_failure_reason,
-                    guaranteed_order_retry_pending=True,
-                    order_error=attempt.error,
-                    **audit,
-                ),
-            )
             if jurisdiction_families:
+                log_decision(
+                    market_id=slot.market_id,
+                    question=slot.market.question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase="guaranteed_order_submission",
+                        decision_terminal=False,
+                        final_action="order_attempt",
+                        final_reason=submission_failure_reason,
+                        guaranteed_order_retry_pending=True,
+                        order_error=attempt.error,
+                        **audit,
+                    ),
+                )
                 _record_jurisdiction_block(state_manager, jurisdiction_families)
                 excluded_market_families.update(jurisdiction_families)
                 retired_slot_numbers: set[int] = {slot.slot_number}
@@ -6098,6 +6148,46 @@ def _run_guaranteed_order_phase(
                 )
                 replacement_slots = _lock_available_slots()
                 pending_slots.extend(replacement_slots)
+            elif _is_unexecutable_market_error(attempt.error):
+                error_text = str(attempt.error or "").lower()
+                replacement_reason = (
+                    "guaranteed_order_market_not_found"
+                    if "not found" in error_text
+                    else "guaranteed_order_market_closed"
+                )
+                _replace_or_defer_slot(
+                    slot,
+                    replacement_reason=replacement_reason,
+                    require_cycle_analysis=False,
+                    decision_phase="guaranteed_order_submission",
+                    decision=decision,
+                    audit=audit,
+                    cap_log=(
+                        "Guaranteed-order unexecutable replace cap reached "
+                        "(%d); abandoning slot %d market=%s"
+                    ),
+                    cap_final_reason=f"{replacement_reason}_replace_cap",
+                    defer_log=(
+                        "Guaranteed-order market missing/closed with no replacement "
+                        "this cycle; deferring slot %d market=%s to the next cycle"
+                    ),
+                    error=attempt.error,
+                )
+            else:
+                log_decision(
+                    market_id=slot.market_id,
+                    question=slot.market.question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase="guaranteed_order_submission",
+                        decision_terminal=False,
+                        final_action="order_attempt",
+                        final_reason=submission_failure_reason,
+                        guaranteed_order_retry_pending=True,
+                        order_error=attempt.error,
+                        **audit,
+                    ),
+                )
             continue
 
         slot.completed = True

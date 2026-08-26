@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import requests
 
 import main
 from kalshi_client import PortfolioBalance
@@ -130,6 +131,15 @@ class _NevadaRestrictedThenSuccessKalshi(_LiveGuaranteedKalshi):
         )
 
 
+class _MarketNotFoundThenSuccessKalshi(_LiveGuaranteedKalshi):
+    def submit_order(self, order, **kwargs):
+        if order.market_id.startswith("dead-"):
+            self.submitted_market_ids.append(order.market_id)
+            self.client_order_ids.append(kwargs.get("client_order_id"))
+            raise _http_market_not_found()
+        return super().submit_order(order, **kwargs)
+
+
 def _market(
     market_id: str,
     *,
@@ -137,6 +147,8 @@ def _market(
     category: str = "politics",
     event_ticker: str | None = None,
     yes_price: float = 0.55,
+    status: str = "open",
+    close_in: timedelta | None = None,
 ) -> Market:
     no_price = round(max(0.01, min(0.99, 1.0 - yes_price)), 2)
     return Market(
@@ -151,9 +163,24 @@ def _market(
         volume_24h=100.0,
         open_interest=100.0,
         category=category,
-        status="open",
-        close_time=datetime.now(timezone.utc) + timedelta(days=2),
+        status=status,
+        close_time=datetime.now(timezone.utc) + (close_in or timedelta(days=2)),
     )
+
+
+def _http_market_not_found() -> requests.exceptions.HTTPError:
+    response = requests.models.Response()
+    response.status_code = 404
+    response._content = (
+        b'{"error":{"code":"market_not_found","message":"market not found"}}'
+    )
+    exc = requests.exceptions.HTTPError(
+        "404 Client Error: Not Found for url: "
+        "https://api.elections.kalshi.com/trade-api/v2/portfolio/events/orders",
+        response=response,
+    )
+    setattr(exc, "_kalshi_response_body", response.text)
+    return exc
 
 
 def _decision(
@@ -239,6 +266,64 @@ def test_lock_guaranteed_markets_excludes_known_unexecutable_family() -> None:
 
     assert [slot.market_id for slot in locked] == ["politics-low"]
     assert plan.is_fully_locked
+
+
+def test_lock_guaranteed_markets_skips_soon_to_close() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    soon = _market("soon-high", liquidity=900.0, close_in=timedelta(minutes=15))
+    later = _market("later-low", liquidity=100.0, close_in=timedelta(days=2))
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [soon, later],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["later-low"]
+
+
+def test_lock_retires_closed_locked_market_and_fills_from_catalog() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    live = _market("was-live", liquidity=900.0)
+    replacement = _market("still-open", liquidity=100.0)
+    main._lock_guaranteed_order_markets(
+        plan,
+        [live],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+    )
+    assert plan.slots[0].market_id == "was-live"
+
+    closed = _market("was-live", liquidity=900.0, status="closed")
+    newly = main._lock_guaranteed_order_markets(
+        plan,
+        [closed, replacement],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=2,
+    )
+
+    assert [slot.market_id for slot in newly] == ["still-open"]
+    assert plan.slots[0].market_id == "still-open"
+    assert "was-live" in plan.retired_market_ids
+
+
+def test_unexecutable_market_error_detects_kalshi_gone_tickers() -> None:
+    assert main._is_unexecutable_market_error(
+        'HTTPError: 404 Client Error: Not Found\n{"error":{"code":"market_not_found"}}'
+    )
+    assert main._is_unexecutable_market_error(
+        "MarketClosedError: Market closed before order submission"
+    )
+    assert not main._is_unexecutable_market_error(
+        "Insufficient balance on Kalshi account"
+    )
+    assert not main._is_unexecutable_market_error("429 Too Many Requests")
 
 
 def test_guaranteed_dry_run_forces_deep_side_and_counts_one_attempt(tmp_path) -> None:
@@ -442,7 +527,7 @@ def test_guaranteed_phase_fills_deferred_slot_from_next_cycle_plus_ev(
     assert plan.slots[0].market_id == "good-low"
     assert "gap-high" in plan.retired_market_ids
     assert kalshi.submitted_market_ids == ["good-low"]
-    assert grok.deep_calls[-1] == "good-low"
+    assert grok.deep_calls == ["gap-high"]
 
 
 def test_guaranteed_phase_replaces_weak_evidence_when_alternate_exists(tmp_path) -> None:
@@ -1021,7 +1106,7 @@ def test_seeded_guaranteed_slot_skips_initial_analysis(tmp_path) -> None:
 
     assert result.status == "dry_run"
     assert grok.initial_calls == []
-    assert grok.deep_calls == ["seeded"]
+    assert grok.deep_calls == []
 
 
 def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> None:
@@ -1061,6 +1146,41 @@ def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> No
     assert kalshi.client_order_ids == ["BOT-GUAR-test-001"]
     assert slot.submission_attempts == 1
     assert [row["order_id"] for row in pending] == ["order-live-forced"]
+
+
+def test_guaranteed_phase_replaces_market_not_found_same_cycle(tmp_path) -> None:
+    dead = _market("dead-high", liquidity=900.0)
+    good = _market("good-low", liquidity=100.0)
+    grok = _GuaranteedGrok(_decision())
+    kalshi = _MarketNotFoundThenSuccessKalshi([dead, good])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="not-found")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[dead, good],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(
+                DRY_RUN=False,
+                GUARANTEED_ORDERS_N=1,
+            ),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert plan.is_complete
+    assert plan.slots[0].market_id == "good-low"
+    assert "dead-high" in plan.retired_market_ids
+    assert kalshi.submitted_market_ids == ["dead-high", "good-low"]
 
 
 def test_guaranteed_phase_replaces_jurisdiction_blocked_sports_slot_same_cycle(
