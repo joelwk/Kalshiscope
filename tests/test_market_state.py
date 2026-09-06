@@ -687,6 +687,73 @@ def test_runtime_flags_persist_across_manager_instances(tmp_path) -> None:
         restored.close()
 
 
+def test_guaranteed_series_outcomes_persist_across_manager_instances(tmp_path) -> None:
+    db_path = str(tmp_path / "series.db")
+    manager = MarketStateManager(db_path)
+    try:
+        assert manager.get_guaranteed_series_outcomes() == {}
+        manager.record_guaranteed_series_attempt(
+            "KXBTCD",
+            filled=False,
+            reject_reason="guaranteed_order_non_positive_edge",
+        )
+        # Case is normalized so a lowercase ticker hits the same row.
+        manager.record_guaranteed_series_attempt(
+            "kxbtcd",
+            filled=False,
+            reject_reason="guaranteed_order_edge_below_min",
+        )
+    finally:
+        manager.close()
+
+    restored = MarketStateManager(db_path)
+    try:
+        outcomes = restored.get_guaranteed_series_outcomes()
+        assert outcomes["KXBTCD"]["attempts"] == 2
+        assert outcomes["KXBTCD"]["fills"] == 0
+        assert outcomes["KXBTCD"]["consecutive_misses"] == 2
+        assert outcomes["KXBTCD"]["fill_rate"] == 0.0
+        assert (
+            outcomes["KXBTCD"]["last_reject_reason"]
+            == "guaranteed_order_edge_below_min"
+        )
+    finally:
+        restored.close()
+
+
+def test_guaranteed_series_fill_resets_the_miss_streak(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "series_fill.db"))
+    try:
+        for _ in range(3):
+            manager.record_guaranteed_series_attempt(
+                "KXHIGHNY",
+                filled=False,
+                reject_reason="guaranteed_order_non_positive_edge",
+            )
+        assert manager.get_guaranteed_series_outcomes()["KXHIGHNY"][
+            "consecutive_misses"
+        ] == 3
+
+        manager.record_guaranteed_series_attempt("KXHIGHNY", filled=True)
+        outcome = manager.get_guaranteed_series_outcomes()["KXHIGHNY"]
+        assert outcome["attempts"] == 4
+        assert outcome["fills"] == 1
+        assert outcome["consecutive_misses"] == 0
+        assert outcome["fill_rate"] == 0.25
+        assert outcome["last_reject_reason"] is None
+    finally:
+        manager.close()
+
+
+def test_guaranteed_series_attempt_ignores_a_blank_ticker(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "series_blank.db"))
+    try:
+        manager.record_guaranteed_series_attempt("   ", filled=False)
+        assert manager.get_guaranteed_series_outcomes() == {}
+    finally:
+        manager.close()
+
+
 def test_neutralize_pathological_online_calibration(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "calib.db"))
     try:

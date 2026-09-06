@@ -99,6 +99,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(defaults.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
         self.assertEqual(defaults.GUARANTEED_MIN_EDGE, 0.12)
         self.assertEqual(defaults.GUARANTEED_PROXY_MIN_EDGE, 0.15)
+        self.assertEqual(defaults.GUARANTEED_SERIES_MISS_LIMIT, 3)
+        self.assertEqual(defaults.GUARANTEED_FAMILY_MIN_EDGE, (("crypto", 0.06),))
 
         env = {
             **self._required_env(),
@@ -106,6 +108,8 @@ class TestConfig(unittest.TestCase):
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS": "2",
             "GUARANTEED_MIN_EDGE": "0.10",
             "GUARANTEED_PROXY_MIN_EDGE": "0.14",
+            "GUARANTEED_SERIES_MISS_LIMIT": "5",
+            "GUARANTEED_FAMILY_MIN_EDGE": "Generic:0.08, crypto:0.05",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
@@ -113,6 +117,29 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 2)
         self.assertEqual(settings.GUARANTEED_MIN_EDGE, 0.10)
         self.assertEqual(settings.GUARANTEED_PROXY_MIN_EDGE, 0.14)
+        self.assertEqual(settings.GUARANTEED_SERIES_MISS_LIMIT, 5)
+        self.assertEqual(
+            settings.GUARANTEED_FAMILY_MIN_EDGE,
+            (("crypto", 0.05), ("generic", 0.08)),
+        )
+
+    def test_guaranteed_family_min_edge_drops_unparsable_entries(self) -> None:
+        env = {
+            **self._required_env(),
+            "GUARANTEED_FAMILY_MIN_EDGE": "crypto:0.06,generic,speech:abc,:0.1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GUARANTEED_FAMILY_MIN_EDGE, (("crypto", 0.06),))
+
+    def test_guaranteed_family_min_edge_rejects_non_positive(self) -> None:
+        for value in ("crypto:0", "crypto:-0.02"):
+            env = {**self._required_env(), "GUARANTEED_FAMILY_MIN_EDGE": value}
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(
+                    ValueError, "GUARANTEED_FAMILY_MIN_EDGE"
+                ):
+                    config.load_settings()
 
     def test_grok_reasoning_and_numeric_code_execution_settings(self) -> None:
         with patch.dict(os.environ, self._required_env(), clear=True):
@@ -157,6 +184,15 @@ class TestConfig(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaisesRegex(ValueError, "GUARANTEED_MIN_EDGE"):
                 config.load_settings()
+
+    def test_guaranteed_series_miss_limit_rejects_non_positive(self) -> None:
+        for value in ("0", "-1"):
+            env = {**self._required_env(), "GUARANTEED_SERIES_MISS_LIMIT": value}
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(
+                    ValueError, "GUARANTEED_SERIES_MISS_LIMIT"
+                ):
+                    config.load_settings()
 
     def test_guaranteed_proxy_min_edge_must_meet_min_edge(self) -> None:
         env = {
@@ -472,6 +508,8 @@ class TestConfig(unittest.TestCase):
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=6",
             "GUARANTEED_MIN_EDGE=0.12",
             "GUARANTEED_PROXY_MIN_EDGE=0.15",
+            "GUARANTEED_SERIES_MISS_LIMIT=3",
+            "GUARANTEED_FAMILY_MIN_EDGE=crypto:0.06",
             "MAX_POSITION_PER_MARKET_USDC=200.0",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
@@ -875,6 +913,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
         self.assertEqual(settings.GUARANTEED_MIN_EDGE, 0.12)
         self.assertEqual(settings.GUARANTEED_PROXY_MIN_EDGE, 0.15)
+        self.assertEqual(settings.GUARANTEED_SERIES_MISS_LIMIT, 3)
+        self.assertEqual(settings.GUARANTEED_FAMILY_MIN_EDGE, (("crypto", 0.06),))
         self.assertTrue(settings.POSITION_SYNC_ENABLED)
         self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
         self.assertEqual(settings.ORDER_PRICE_IMPROVEMENT_CENTS, 1)

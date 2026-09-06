@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 import requests
@@ -146,6 +147,7 @@ def _market(
     liquidity: float = 200.0,
     category: str = "politics",
     event_ticker: str | None = None,
+    series_ticker: str | None = None,
     yes_price: float = 0.55,
     status: str = "open",
     close_in: timedelta | None = None,
@@ -154,6 +156,7 @@ def _market(
     return Market(
         id=market_id,
         event_ticker=event_ticker or f"EVENT-{market_id}",
+        series_ticker=series_ticker,
         question=f"Will {market_id} happen?",
         outcomes=[
             MarketOutcome(name="YES", price=yes_price),
@@ -168,12 +171,10 @@ def _market(
     )
 
 
-def _http_market_not_found() -> requests.exceptions.HTTPError:
+def _http_order_error(body: bytes) -> requests.exceptions.HTTPError:
     response = requests.models.Response()
     response.status_code = 404
-    response._content = (
-        b'{"error":{"code":"market_not_found","message":"market not found"}}'
-    )
+    response._content = body
     exc = requests.exceptions.HTTPError(
         "404 Client Error: Not Found for url: "
         "https://api.elections.kalshi.com/trade-api/v2/portfolio/events/orders",
@@ -181,6 +182,19 @@ def _http_market_not_found() -> requests.exceptions.HTTPError:
     )
     setattr(exc, "_kalshi_response_body", response.text)
     return exc
+
+
+def _http_market_not_found() -> requests.exceptions.HTTPError:
+    return _http_order_error(
+        b'{"error":{"code":"market_not_found","message":"market not found"}}'
+    )
+
+
+def _http_user_not_found() -> requests.exceptions.HTTPError:
+    """Kalshi answers an account-scoped rejection with 404 as well."""
+    return _http_order_error(
+        b'{"error":{"code":"user_not_found","message":"user not found"}}'
+    )
 
 
 def _decision(
@@ -447,7 +461,8 @@ def test_guaranteed_phase_defers_weak_evidence_without_replacement(tmp_path) -> 
     assert plan.abandoned_count == 0
     assert plan.is_resolved is False
     assert plan.slots[0].needs_replacement is True
-    assert plan.research_gap_replacements == 0
+    # A defer spends the wasted-research budget just as a same-cycle swap does.
+    assert plan.research_gap_replacements == 1
     assert kalshi.submitted_market_ids == []
     assert decisions[-1]["execution_audit"]["guaranteed_order_retry_pending"] is True
     assert plan.suppresses_normal_execution is True
@@ -1369,6 +1384,106 @@ def test_bounded_main_dry_run_records_exact_guaranteed_target(
     assert all('"guaranteed_order_forced_execution": true' in row["audit_json"] for row in attempts)
     assert cycle_receipt is not None
     assert '"guaranteed_orders_complete": true' in cycle_receipt["payload_json"]
+
+
+def test_live_guaranteed_preflight_block_avoids_all_grok_calls(
+    monkeypatch,
+    dummy_settings,
+) -> None:
+    market = _market("missing-live-order", liquidity=500.0)
+    grok = _GuaranteedGrok(_decision())
+
+    class _BlockedKalshi(_GuaranteedKalshi):
+        order_sync_calls = 0
+
+        def get_orders(self, **kwargs):
+            self.order_sync_calls += 1
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_order(order_id: str, **kwargs) -> dict:
+            raise LookupError("not found")
+
+        @staticmethod
+        def get_historical_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_fills(**kwargs) -> dict:
+            return {"fills": [], "cursor": ""}
+
+        @staticmethod
+        def get_positions(**kwargs) -> dict:
+            return {"market_positions": [], "cursor": ""}
+
+    kalshi = _BlockedKalshi([market])
+    settings = replace(
+        dummy_settings,
+        GUARANTEED_ORDERS_N=1,
+        DRY_RUN=False,
+        MIN_VOLUME_24H=0.0,
+        MIN_OPEN_INTEREST=0.0,
+        MARKET_MIN_CLOSE_DAYS=None,
+        MARKET_MAX_CLOSE_DAYS=None,
+        POLL_INTERVAL_SEC=0,
+    )
+    seed = MarketStateManager(settings.STATE_DB_PATH)
+    try:
+        seed.record_pending_order(
+            order_id="missing-order",
+            market_id=market.id,
+            outcome="YES",
+            submitted_amount_usdc=2.0,
+            requested_shares=5.0,
+            limit_price=0.40,
+            confidence=0.75,
+            implied_prob=0.40,
+            status="resting",
+            raw={"status": "resting"},
+        )
+    finally:
+        seed.close()
+
+    monkeypatch.setattr(main, "load_settings", lambda: settings)
+    monkeypatch.setattr(main, "GrokClient", lambda *args, **kwargs: grok)
+    monkeypatch.setattr(main, "KalshiClient", lambda *args, **kwargs: kalshi)
+    monkeypatch.setattr(main, "run_bootstrap_checks", lambda **kwargs: None)
+    critical_messages: list[str] = []
+    monkeypatch.setattr(
+        main.logger,
+        "critical",
+        lambda message, *args, **kwargs: critical_messages.append(message % args),
+    )
+
+    with pytest.raises(
+        main.GuaranteedOrdersIncompleteError,
+        match="preflight blocked before analysis",
+    ):
+        main.main(max_cycles=5)
+
+    verifier = MarketStateManager(settings.STATE_DB_PATH)
+    try:
+        rows = verifier._conn.execute(
+            "SELECT payload_json FROM cycle_receipts ORDER BY id"
+        ).fetchall()
+    finally:
+        verifier.close()
+
+    assert grok.initial_calls == []
+    assert grok.deep_calls == []
+    assert kalshi.order_sync_calls == 1
+    assert len(rows) == 1
+    receipt = json.loads(rows[0]["payload_json"])
+    assert receipt["guaranteed_run_outcome"] == "preflight_blocked"
+    assert receipt["guaranteed_preflight_blocked"] is True
+    assert receipt["analyzed_markets"] == 0
+    assert receipt["order_attempts"] == 0
+    assert receipt["total_run_api_cost_estimate_usd"] == 0.0
+    assert receipt["unresolved_local_order_ids"] == ["missing-order"]
+    assert critical_messages == [
+        "Guaranteed-order preflight blocked before analysis: "
+        "completed=0/1 reasons=orders_incomplete"
+    ]
     assert kalshi.submitted_market_ids == []
 
 
@@ -1409,9 +1524,14 @@ def test_guaranteed_allows_edge_source_none_with_proxy_url_and_eq(tmp_path) -> N
     assert slot.submission_attempts == 1
 
 
-def test_guaranteed_phase_abandons_after_weak_evidence_replace_cap(
+def test_spent_replacement_budget_holds_the_slot_instead_of_abandoning_it(
     tmp_path,
 ) -> None:
+    """A tradeable market keeps its slot so later cycles can re-price it.
+
+    Abandoning here resolved the plan under target and idled every remaining
+    cycle, which is how a five-order run finished with zero orders.
+    """
     markets = [
         _market(f"gap-{idx}", liquidity=1000.0 - idx) for idx in range(4)
     ]
@@ -1459,11 +1579,60 @@ def test_guaranteed_phase_abandons_after_weak_evidence_replace_cap(
 
     assert result.completed == 0
     assert plan.is_complete is False
-    assert plan.abandoned_count == 1
+    assert plan.abandoned_count == 0
     assert plan.research_gap_replacements == 2
     assert len(grok.deep_calls) == 3
     assert kalshi.submitted_market_ids == []
-    assert plan.suppresses_normal_execution is False
+
+    held = plan.slots[0]
+    assert held.abandoned is False
+    assert held.needs_replacement is False
+    assert held.research_completed is False
+    assert held.decision is None
+    assert plan.is_resolved is False
+    assert plan.suppresses_normal_execution is True
+
+
+def test_spent_budget_still_abandons_a_market_that_cannot_be_traded(
+    tmp_path,
+) -> None:
+    """Holding is only for markets a later cycle could still fill."""
+    dead = _market("dead-only", liquidity=900.0)
+    grok = _GuaranteedGrok(
+        _decision(
+            evidence_basis="direct",
+            evidence_quality=0.85,
+            edge_mechanism="observed_vs_strike",
+        )
+    )
+    kalshi = _MarketNotFoundThenSuccessKalshi([dead])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="dead-budget")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[dead],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(
+                DRY_RUN=False,
+                GUARANTEED_ORDERS_N=1,
+                GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=0,
+            ),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 0
+    assert plan.abandoned_count == 1
+    assert plan.is_resolved is True
 
 
 def test_bounded_main_exits_early_when_guaranteed_target_complete(
@@ -1547,6 +1716,9 @@ def test_bounded_main_does_not_complete_guaranteed_target_with_weak_evidence(
 
     assert cycle_receipt is not None
     assert '"guaranteed_orders_complete": true' not in cycle_receipt["payload_json"]
+    assert json.loads(cycle_receipt["payload_json"])["guaranteed_run_outcome"] == (
+        "insufficient_positive_ev"
+    )
     assert len(attempts) == 0
 
 
@@ -1700,6 +1872,24 @@ def test_guaranteed_reject_reason_flags_non_positive_edge() -> None:
     )
 
 
+def test_guaranteed_run_outcome_distinguishes_terminal_failure_modes() -> None:
+    market = _market("outcome")
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="outcome-slot",
+    )
+    plan = main.GuaranteedOrderPlan(target=1, slots=[slot])
+
+    assert main._guaranteed_run_outcome(plan) == "insufficient_positive_ev"
+    slot.submission_attempts = 1
+    assert main._guaranteed_run_outcome(plan) == "submission_failed"
+    slot.completed = True
+    assert main._guaranteed_run_outcome(plan) == "completed"
+
+
 def test_guaranteed_sizing_scales_with_bankroll() -> None:
     market = _market("sized")
     decision = _decision(
@@ -1754,8 +1944,14 @@ def test_bounded_main_records_five_positive_ev_guaranteed_orders(
     monkeypatch,
     dummy_settings,
 ) -> None:
+    # Two families: no family may hold more than three of the five slots.
     markets = [
-        _market(f"g{idx}", liquidity=500.0 - idx, event_ticker=f"EVT{idx}")
+        _market(
+            f"g{idx}",
+            liquidity=500.0 - idx,
+            event_ticker=f"EVT{idx}",
+            category="politics" if idx < 3 else "weather",
+        )
         for idx in range(5)
     ]
     grok = _GuaranteedGrok(
@@ -1803,3 +1999,504 @@ def test_bounded_main_records_five_positive_ev_guaranteed_orders(
     assert [row["market_id"] for row in attempts] == [f"g{idx}" for idx in range(5)]
     assert cycle_receipt is not None
     assert '"guaranteed_orders_complete": true' in cycle_receipt["payload_json"]
+
+
+def _burned_series_outcomes(series_ticker: str, *, misses: int, fills: int = 0) -> dict:
+    return {
+        series_ticker: {
+            "attempts": misses + fills,
+            "fills": fills,
+            "consecutive_misses": misses,
+            "fill_rate": fills / (misses + fills) if (misses + fills) else 0.0,
+            "last_reject_reason": "guaranteed_order_non_positive_edge",
+        }
+    }
+
+
+def test_lock_skips_series_past_the_miss_limit() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1, GUARANTEED_SERIES_MISS_LIMIT=3)
+    plan = main.GuaranteedOrderPlan(target=1)
+    burned = _market("KXBTCD-T79", liquidity=900.0, series_ticker="KXBTCD")
+    healthy = _market("KXHIGHNY-T80", liquidity=100.0, series_ticker="KXHIGHNY")
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [burned, healthy],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+        series_outcomes=_burned_series_outcomes("KXBTCD", misses=3),
+    )
+
+    assert [slot.market_id for slot in locked] == ["KXHIGHNY-T80"]
+
+
+def test_lock_keeps_series_that_has_ever_filled() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1, GUARANTEED_SERIES_MISS_LIMIT=3)
+    plan = main.GuaranteedOrderPlan(target=1)
+    market = _market("KXHIGHNY-T80", liquidity=900.0, series_ticker="KXHIGHNY")
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [market],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+        series_outcomes=_burned_series_outcomes("KXHIGHNY", misses=5, fills=1),
+    )
+
+    assert [slot.market_id for slot in locked] == ["KXHIGHNY-T80"]
+
+
+def test_lock_below_miss_limit_still_allows_the_series() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=1, GUARANTEED_SERIES_MISS_LIMIT=3)
+    plan = main.GuaranteedOrderPlan(target=1)
+    market = _market("KXBTCD-T79", liquidity=900.0, series_ticker="KXBTCD")
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [market],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+        series_outcomes=_burned_series_outcomes("KXBTCD", misses=2),
+    )
+
+    assert [slot.market_id for slot in locked] == ["KXBTCD-T79"]
+
+
+def test_proven_series_outranks_a_more_liquid_unproven_one() -> None:
+    proven = _market("KXHIGHNY-T80", liquidity=50.0, series_ticker="KXHIGHNY")
+    liquid = _market("KXNASDAQ-T29", liquidity=9000.0, series_ticker="KXNASDAQ")
+    series_outcomes = {
+        "KXHIGHNY": {"attempts": 4, "fills": 3, "consecutive_misses": 0, "fill_rate": 0.75},
+    }
+
+    ranked = sorted(
+        [liquid, proven],
+        key=lambda market: main._guaranteed_order_market_rank(
+            market, series_outcomes=series_outcomes
+        ),
+        reverse=True,
+    )
+
+    assert [market.id for market in ranked] == ["KXHIGHNY-T80", "KXNASDAQ-T29"]
+
+
+def test_series_outcomes_absent_falls_back_to_liquidity_order() -> None:
+    small = _market("small", liquidity=50.0)
+    large = _market("large", liquidity=9000.0)
+
+    ranked = sorted(
+        [small, large],
+        key=lambda market: main._guaranteed_order_market_rank(market),
+        reverse=True,
+    )
+
+    assert [market.id for market in ranked] == ["large", "small"]
+
+
+def test_family_floor_override_replaces_both_default_floors() -> None:
+    crypto = _market("KXBTCD-T79", category="crypto")
+    settings = main.Settings(
+        GUARANTEED_MIN_EDGE=0.12,
+        GUARANTEED_PROXY_MIN_EDGE=0.15,
+        GUARANTEED_FAMILY_MIN_EDGE=(("crypto", 0.06),),
+    )
+
+    # Unlabeled proxy would otherwise owe the higher 0.15 proxy floor.
+    proxy = _decision(evidence_basis="proxy", edge_source="none")
+    direct = _decision(evidence_basis="direct")
+
+    assert main._guaranteed_order_min_edge(proxy, crypto, settings) == 0.06
+    assert main._guaranteed_order_min_edge(direct, crypto, settings) == 0.06
+
+
+def test_families_without_an_override_keep_the_default_floors() -> None:
+    weather = _market("KXHIGHNY-T80", category="weather")
+    generic = _market("gen-1", category="generic")
+    settings = main.Settings(
+        GUARANTEED_MIN_EDGE=0.12,
+        GUARANTEED_PROXY_MIN_EDGE=0.15,
+        GUARANTEED_FAMILY_MIN_EDGE=(("crypto", 0.06),),
+    )
+    proxy = _decision(evidence_basis="proxy", edge_source="none")
+
+    assert main._guaranteed_order_min_edge(proxy, weather, settings) == 0.12
+    assert main._guaranteed_order_min_edge(proxy, generic, settings) == 0.15
+
+
+def test_crypto_edge_between_the_two_floors_is_no_longer_rejected() -> None:
+    crypto = _market("KXBTCD-T79", category="crypto", yes_price=0.55)
+    # Chosen-side edge of 0.63 - 0.55 = 0.08: under the 0.12 default, over 0.06.
+    decision = _decision(
+        confidence=0.63,
+        evidence_basis="direct",
+        edge_mechanism="observed_vs_strike",
+    )
+    default_floor = main.Settings(
+        GUARANTEED_ORDERS_N=1, GUARANTEED_FAMILY_MIN_EDGE=()
+    )
+    with_override = main.Settings(
+        GUARANTEED_ORDERS_N=1,
+        GUARANTEED_FAMILY_MIN_EDGE=(("crypto", 0.06),),
+    )
+
+    assert (
+        main._guaranteed_order_reject_reason(decision, crypto, default_floor)
+        == "guaranteed_order_edge_below_min"
+    )
+    assert (
+        main._guaranteed_order_reject_reason(decision, crypto, with_override)
+        is None
+    )
+
+
+def _family_of_locked(locked) -> list[str]:
+    return [main.market_family(slot.market) for slot in locked]
+
+
+def test_a_proven_family_may_take_three_of_five_slots() -> None:
+    """Requiring a distinct family per slot is what starved the run.
+
+    Weather was the only family that ever filled, so capping it at one slot
+    spent the other four on families with no fills on record.
+    """
+    settings = main.Settings(GUARANTEED_ORDERS_N=5)
+    plan = main.GuaranteedOrderPlan(target=5)
+    weather = [
+        _market(
+            f"KXHIGH{city}-T80",
+            liquidity=100.0,
+            category="weather",
+            series_ticker="KXHIGHTEMP",
+            event_ticker=f"EVT-{city}",
+        )
+        for city in ("NY", "LA", "MIA", "CHI")
+    ]
+    others = [
+        _market(f"other-{idx}", liquidity=9000.0, category="politics")
+        for idx in range(4)
+    ]
+    series_outcomes = {
+        "KXHIGHTEMP": {
+            "attempts": 9,
+            "fills": 6,
+            "consecutive_misses": 0,
+            "fill_rate": 6 / 9,
+        }
+    }
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        weather + others,
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+        series_outcomes=series_outcomes,
+    )
+
+    assert len(locked) == 5
+    assert _family_of_locked(locked).count("weather") == 3
+
+
+def test_no_family_exceeds_the_slot_cap_even_when_it_is_the_only_choice() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=5)
+    plan = main.GuaranteedOrderPlan(target=5)
+    markets = [
+        _market(
+            f"KXHIGH{idx}-T80",
+            liquidity=100.0 + idx,
+            category="weather",
+            event_ticker=f"EVT-{idx}",
+        )
+        for idx in range(5)
+    ]
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        markets,
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert len(locked) == main._GUARANTEED_MAX_SLOTS_PER_FAMILY
+
+
+def test_family_cap_counts_slots_locked_in_earlier_cycles() -> None:
+    settings = main.Settings(GUARANTEED_ORDERS_N=5)
+    plan = main.GuaranteedOrderPlan(target=5)
+    weather = [
+        _market(
+            f"KXHIGH{idx}-T80",
+            liquidity=500.0,
+            category="weather",
+            event_ticker=f"EVT-W{idx}",
+        )
+        for idx in range(4)
+    ]
+    politics = [
+        _market(f"pol-{idx}", liquidity=10.0, category="politics")
+        for idx in range(2)
+    ]
+
+    first = main._lock_guaranteed_order_markets(
+        plan,
+        weather[:2],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+    )
+    second = main._lock_guaranteed_order_markets(
+        plan,
+        weather + politics,
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=2,
+    )
+
+    assert len(first) == 2
+    assert _family_of_locked(first + second).count("weather") == (
+        main._GUARANTEED_MAX_SLOTS_PER_FAMILY
+    )
+
+
+def test_hopeless_initial_edge_skips_the_deep_call(tmp_path) -> None:
+    market = _market("KXBTCD-T79", series_ticker="KXBTCD", yes_price=0.55)
+    # Edge is 0.30 - 0.55 = -0.25 against a 0.12 floor: a 0.37 gap that no
+    # observed initial->deep revision has ever closed.
+    grok = _GuaranteedGrok(_decision(confidence=0.30))
+    kalshi = _LiveGuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="hopeless")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 0
+    assert grok.initial_calls == ["KXBTCD-T79"]
+    assert grok.deep_calls == []
+    assert plan.skipped_deep_research_calls == 1
+    assert plan.deep_research_calls == 0
+    assert plan.reject_reason_counts == {"guaranteed_order_initial_edge_hopeless": 1}
+    assert kalshi.submitted_market_ids == []
+
+
+def test_recoverable_initial_edge_still_runs_the_deep_call(tmp_path) -> None:
+    market = _market("near-miss", yes_price=0.55)
+    # Edge is 0.60 - 0.55 = 0.05 against a 0.12 floor: a 0.07 gap that deep
+    # research closes often enough to be worth paying for.
+    grok = _GuaranteedGrok(_decision(confidence=0.60))
+    kalshi = _LiveGuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="near-miss")
+    try:
+        main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert grok.deep_calls == ["near-miss"]
+    assert plan.deep_research_calls == 1
+    assert plan.skipped_deep_research_calls == 0
+
+
+class _UserNotFoundThenSuccessKalshi(_LiveGuaranteedKalshi):
+    def __init__(self, markets: list[Market]) -> None:
+        super().__init__(markets)
+        self.attempts = 0
+
+    def submit_order(self, order, **kwargs):
+        self.attempts += 1
+        if self.attempts == 1:
+            self.submitted_market_ids.append(order.market_id)
+            self.client_order_ids.append(kwargs.get("client_order_id"))
+            raise _http_user_not_found()
+        return super().submit_order(order, **kwargs)
+
+
+def test_account_error_retries_the_same_slot_without_retiring_the_market(
+    tmp_path,
+) -> None:
+    market = _market("KXBTCD-T79", series_ticker="KXBTCD")
+    grok = _GuaranteedGrok(
+        _decision(confidence=0.85, evidence_basis="direct", edge_mechanism="observed")
+    )
+    kalshi = _UserNotFoundThenSuccessKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="account-error")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert kalshi.attempts == 2
+    assert result.completed == 1
+    assert plan.is_complete is True
+    # The ticker was never at fault, so it must not be retired or replaced.
+    assert plan.retired_market_ids == set()
+    assert plan.slots[0].market_id == "KXBTCD-T79"
+    assert plan.slots[0].replacement_count == 0
+    # The re-attempt reuses the researched decision rather than paying again.
+    assert grok.deep_calls == ["KXBTCD-T79"]
+
+
+def test_account_error_retries_at_most_once_per_slot(tmp_path) -> None:
+    market = _market("KXBTCD-T79", series_ticker="KXBTCD")
+
+    class _AlwaysUserNotFound(_LiveGuaranteedKalshi):
+        def __init__(self, markets: list[Market]) -> None:
+            super().__init__(markets)
+            self.attempts = 0
+
+        def submit_order(self, order, **kwargs):
+            self.attempts += 1
+            raise _http_user_not_found()
+
+    grok = _GuaranteedGrok(
+        _decision(confidence=0.85, evidence_basis="direct", edge_mechanism="observed")
+    )
+    kalshi = _AlwaysUserNotFound([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="account-error-loop")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert kalshi.attempts == 2
+    assert result.completed == 0
+    assert plan.retired_market_ids == set()
+
+
+def test_account_error_is_not_classified_as_a_market_error() -> None:
+    account_text = main._order_exception_error_text(_http_user_not_found())
+    market_text = main._order_exception_error_text(_http_market_not_found())
+
+    assert main._is_account_submission_error(account_text) is True
+    assert main._is_unexecutable_market_error(account_text) is False
+    assert main._is_account_submission_error(market_text) is False
+    assert main._is_unexecutable_market_error(market_text) is True
+
+
+def test_guaranteed_phase_records_series_outcomes_for_the_next_run(tmp_path) -> None:
+    market = _market("KXBTCD-T79", series_ticker="KXBTCD", yes_price=0.55)
+    grok = _GuaranteedGrok(_decision(confidence=0.30))
+    kalshi = _LiveGuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="series-record")
+    try:
+        main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+        recorded = state.get_guaranteed_series_outcomes()
+    finally:
+        state.close()
+
+    assert recorded["KXBTCD"]["attempts"] == 1
+    assert recorded["KXBTCD"]["fills"] == 0
+    assert recorded["KXBTCD"]["consecutive_misses"] == 1
+    assert (
+        recorded["KXBTCD"]["last_reject_reason"]
+        == "guaranteed_order_initial_edge_hopeless"
+    )
+    assert plan.series_attempt_counts == {"KXBTCD": 1}
+
+
+def test_run_summary_reports_why_the_target_was_missed(tmp_path) -> None:
+    market = _market("KXBTCD-T79", series_ticker="KXBTCD", yes_price=0.55)
+    grok = _GuaranteedGrok(_decision(confidence=0.30))
+    kalshi = _LiveGuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="summary")
+    try:
+        main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    summary = plan.summary()
+    assert summary["reject_reason_counts"] == {
+        "guaranteed_order_initial_edge_hopeless": 1
+    }
+    assert summary["series_attempt_counts"] == {"KXBTCD": 1}
+    assert summary["deep_research_calls"] == 0
+    assert summary["skipped_deep_research_calls"] == 1
+    assert summary["research_cost_usd"] >= 0.0
+    assert summary["research_cost_per_completed_order_usd"] is None

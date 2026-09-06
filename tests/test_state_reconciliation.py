@@ -288,6 +288,203 @@ def test_order_reconciliation_uses_historical_fallback(tmp_path) -> None:
         manager.close()
 
 
+def test_missing_closed_order_without_fills_is_inferred_expired(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    market_id = "MKT-CLOSED"
+    _pending(manager, "missing-order", market_id=market_id)
+    manager.upsert_market_snapshots(
+        [
+            Market(
+                id=market_id,
+                question="Closed market",
+                close_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+        ],
+        cycle_id="closed-cycle",
+    )
+
+    class Client:
+        @staticmethod
+        def get_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_order(order_id: str, **kwargs) -> dict:
+            raise LookupError("not found")
+
+        @staticmethod
+        def get_historical_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_fills(**kwargs) -> dict:
+            assert kwargs["order_id"] == "missing-order"
+            return {"fills": [], "cursor": ""}
+
+    try:
+        metrics = _sync_orders_from_exchange(
+            state_manager=manager,
+            kalshi_client=Client(),
+        )
+        order = manager.get_pending_order("missing-order")
+        assert metrics.complete is True
+        assert metrics.unresolved_local_order_ids == ()
+        assert order["status"] == "expired"
+        assert order["remaining_shares"] == 0.0
+        assert order["raw"]["reconciliation_inference"]["reason"] == (
+            "absent_from_complete_live_and_historical_orders"
+        )
+        assert order["raw"]["reconciliation_inference"][
+            "previous_exchange_payload"
+        ] == {"status": "resting"}
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    ("fill_count", "expected_status"),
+    [(5.0, "filled"), (2.0, "canceled_partially_filled")],
+)
+def test_missing_order_recovers_targeted_fills(
+    tmp_path,
+    fill_count: float,
+    expected_status: str,
+) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    market_id = "MKT-FILL-RECOVERY"
+    _pending(manager, "missing-filled", market_id=market_id)
+
+    class Client:
+        @staticmethod
+        def get_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_order(order_id: str, **kwargs) -> dict:
+            raise LookupError("not found")
+
+        @staticmethod
+        def get_historical_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_fills(**kwargs) -> dict:
+            return {
+                "fills": [
+                    {
+                        "fill_id": "targeted-fill",
+                        "order_id": "missing-filled",
+                        "ticker": market_id,
+                        "count_fp": str(fill_count),
+                        "yes_price_dollars": "0.40",
+                    }
+                ],
+                "cursor": "",
+            }
+
+    try:
+        metrics = _sync_orders_from_exchange(
+            state_manager=manager,
+            kalshi_client=Client(),
+        )
+        order = manager.get_pending_order("missing-filled")
+        assert metrics.complete is True
+        assert order["status"] == expected_status
+        assert order["filled_shares"] == fill_count
+        assert manager.get_position(market_id).contracts == fill_count
+    finally:
+        manager.close()
+
+
+def test_missing_open_order_remains_fail_closed(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    market_id = "MKT-STILL-OPEN"
+    _pending(manager, "missing-open", market_id=market_id)
+    manager.upsert_market_snapshots(
+        [
+            Market(
+                id=market_id,
+                question="Open market",
+                close_time=datetime(2099, 1, 1, tzinfo=timezone.utc),
+            )
+        ],
+        cycle_id="open-cycle",
+    )
+
+    class Client:
+        @staticmethod
+        def get_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_order(order_id: str, **kwargs) -> dict:
+            raise LookupError("not found")
+
+        @staticmethod
+        def get_historical_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_fills(**kwargs) -> dict:
+            return {"fills": [], "cursor": ""}
+
+    try:
+        metrics = _sync_orders_from_exchange(
+            state_manager=manager,
+            kalshi_client=Client(),
+        )
+        assert metrics.complete is False
+        assert metrics.unresolved_local_order_ids == ("missing-open",)
+        assert manager.get_pending_order("missing-open")["status"] == "resting"
+    finally:
+        manager.close()
+
+
+def test_missing_order_with_incomplete_fill_lookup_remains_fail_closed(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    market_id = "MKT-CLOSED-INCOMPLETE"
+    _pending(manager, "missing-incomplete", market_id=market_id)
+    manager.upsert_market_snapshots(
+        [
+            Market(
+                id=market_id,
+                question="Closed market",
+                close_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+        ],
+        cycle_id="closed-cycle",
+    )
+
+    class Client:
+        @staticmethod
+        def get_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_order(order_id: str, **kwargs) -> dict:
+            raise LookupError("not found")
+
+        @staticmethod
+        def get_historical_orders(**kwargs) -> dict:
+            return {"orders": [], "cursor": ""}
+
+        @staticmethod
+        def get_fills(**kwargs) -> dict:
+            return {"fills": [], "cursor": "more"}
+
+    try:
+        metrics = _sync_orders_from_exchange(
+            state_manager=manager,
+            kalshi_client=Client(),
+            max_pages=1,
+        )
+        assert metrics.complete is False
+        assert metrics.unresolved_local_order_ids == ("missing-incomplete",)
+        assert manager.get_pending_order("missing-incomplete")["status"] == "resting"
+    finally:
+        manager.close()
+
+
 def test_terminal_order_status_never_regresses_to_active(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "state.db"))
     _pending(manager, "terminal", status="filled")

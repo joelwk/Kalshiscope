@@ -535,6 +535,18 @@ class Settings:
     # proxy uses GUARANTEED_PROXY_MIN_EDGE.
     GUARANTEED_MIN_EDGE: float = 0.12
     GUARANTEED_PROXY_MIN_EDGE: float = 0.15
+    # Per-family chosen-side edge floors, which replace both floors above for
+    # the families listed. Calibrated on 857 resolved trades: crypto returned
+    # +7% below a 0.12 edge and -13% above it, because a large claimed edge on
+    # a continuously repriced ladder is overconfidence rather than mispricing.
+    # Weather is the family the 0.12 default actually fits (+3% above, -16%
+    # below), so it stays on the default.
+    GUARANTEED_FAMILY_MIN_EDGE: tuple[tuple[str, float], ...] = (("crypto", 0.06),)
+    # Consecutive guaranteed-slot misses before a Kalshi series stops being
+    # locked at all. Continuously repriced ladders (crypto strikes, index
+    # levels) never clear the edge floor, so every strike in the series burns
+    # a deep dive for nothing. A series that has ever filled is never excluded.
+    GUARANTEED_SERIES_MISS_LIMIT: int = 3
     ORDER_RECONCILIATION_ENABLED: bool = True
     POSITION_SYNC_ENABLED: bool = True
     POSITION_SYNC_INTERVAL_CYCLES: int = 3
@@ -1118,6 +1130,29 @@ def _read_env_float_pair(
         return default
 
 
+def _read_env_family_float_map(
+    name: str,
+    default: tuple[tuple[str, float], ...],
+) -> tuple[tuple[str, float], ...]:
+    """Parse `family:value,family:value` into sorted, lower-cased pairs."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    parsed: dict[str, float] = {}
+    for entry in _split_csv(raw):
+        family, separator, value = entry.partition(":")
+        if not separator:
+            continue
+        family = family.strip().lower()
+        if not family:
+            continue
+        try:
+            parsed[family] = float(value.strip())
+        except ValueError:
+            continue
+    return tuple(sorted(parsed.items()))
+
+
 def _read_env_int_optional(name: str, default: int | None) -> int | None:
     raw = os.getenv(name)
     if not raw or raw.strip().lower() in {"", "none", "null"}:
@@ -1585,6 +1620,12 @@ def load_settings() -> Settings:
         ),
         GUARANTEED_PROXY_MIN_EDGE=_read_env_float(
             "GUARANTEED_PROXY_MIN_EDGE", Settings.GUARANTEED_PROXY_MIN_EDGE
+        ),
+        GUARANTEED_FAMILY_MIN_EDGE=_read_env_family_float_map(
+            "GUARANTEED_FAMILY_MIN_EDGE", Settings.GUARANTEED_FAMILY_MIN_EDGE
+        ),
+        GUARANTEED_SERIES_MISS_LIMIT=_read_env_int(
+            "GUARANTEED_SERIES_MISS_LIMIT", Settings.GUARANTEED_SERIES_MISS_LIMIT
         ),
         ORDER_RECONCILIATION_ENABLED=_read_env_bool(
             "ORDER_RECONCILIATION_ENABLED",
@@ -2792,6 +2833,14 @@ def load_settings() -> Settings:
             "GUARANTEED_PROXY_MIN_EDGE must be greater than or equal to "
             "GUARANTEED_MIN_EDGE"
         )
+    for family, min_edge in settings.GUARANTEED_FAMILY_MIN_EDGE:
+        if min_edge <= 0:
+            raise ValueError(
+                "GUARANTEED_FAMILY_MIN_EDGE floors must be greater than zero "
+                f"(got {min_edge} for {family!r})"
+            )
+    if settings.GUARANTEED_SERIES_MISS_LIMIT <= 0:
+        raise ValueError("GUARANTEED_SERIES_MISS_LIMIT must be greater than zero")
     if settings.POSITION_SYNC_INTERVAL_CYCLES < 0:
         raise ValueError(
             "POSITION_SYNC_INTERVAL_CYCLES must be greater than or equal to zero"

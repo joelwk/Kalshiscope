@@ -385,6 +385,18 @@ class MarketStateManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS guaranteed_series_outcomes (
+                    series_ticker TEXT PRIMARY KEY,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    fills INTEGER NOT NULL DEFAULT 0,
+                    consecutive_misses INTEGER NOT NULL DEFAULT 0,
+                    last_reject_reason TEXT,
+                    last_attempt_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS exchange_sync_state (
                     stream TEXT PRIMARY KEY,
                     last_attempt_at TEXT NOT NULL,
@@ -480,6 +492,14 @@ class MarketStateManager:
             fill_failure_count=fill_failure_count,
             next_eligible_cycle=next_eligible_cycle,
         )
+
+    def get_market_close_time(self, market_id: str) -> datetime | None:
+        """Return the last persisted close time for an exchange market."""
+        row = self._conn.execute(
+            "SELECT close_time FROM markets WHERE id = ?",
+            (str(market_id or "").strip(),),
+        ).fetchone()
+        return _parse_timestamp(row["close_time"] if row else None)
 
     def get_position(
         self,
@@ -2429,6 +2449,86 @@ class MarketStateManager:
                 (normalized_key,),
             )
         return int(cursor.rowcount or 0) > 0
+
+    def record_guaranteed_series_attempt(
+        self,
+        series_ticker: str,
+        *,
+        filled: bool,
+        reject_reason: str | None = None,
+    ) -> None:
+        """Track how a Kalshi series performs as a guaranteed-order candidate.
+
+        Series (``KXBTCD``, ``KXHIGHNY``) is the granularity that matches
+        observed behavior: every strike in a continuously repriced ladder
+        clears or misses the guaranteed edge bar for the same reason, while
+        ``market_family()`` lumps unrelated ladders into ``generic``.
+        """
+        normalized_series = str(series_ticker or "").strip().upper()
+        if not normalized_series:
+            return
+        normalized_reason = None if filled else (
+            str(reject_reason or "").strip() or None
+        )
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO guaranteed_series_outcomes (
+                    series_ticker,
+                    attempts,
+                    fills,
+                    consecutive_misses,
+                    last_reject_reason,
+                    last_attempt_at
+                )
+                VALUES (?, 1, ?, ?, ?, ?)
+                ON CONFLICT(series_ticker) DO UPDATE SET
+                    attempts = attempts + 1,
+                    fills = fills + excluded.fills,
+                    consecutive_misses = CASE
+                        WHEN excluded.fills > 0 THEN 0
+                        ELSE consecutive_misses + 1
+                    END,
+                    last_reject_reason = excluded.last_reject_reason,
+                    last_attempt_at = excluded.last_attempt_at
+                """,
+                (
+                    normalized_series,
+                    1 if filled else 0,
+                    0 if filled else 1,
+                    normalized_reason,
+                    timestamp,
+                ),
+            )
+
+    def get_guaranteed_series_outcomes(self) -> dict[str, dict[str, Any]]:
+        """Map series ticker -> guaranteed-order attempt history."""
+        rows = self._conn.execute(
+            """
+            SELECT
+                series_ticker,
+                attempts,
+                fills,
+                consecutive_misses,
+                last_reject_reason,
+                last_attempt_at
+            FROM guaranteed_series_outcomes
+            """
+        ).fetchall()
+        outcomes: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            attempts = int(row["attempts"] or 0)
+            fills = int(row["fills"] or 0)
+            outcomes[str(row["series_ticker"])] = {
+                "attempts": attempts,
+                "fills": fills,
+                "consecutive_misses": int(row["consecutive_misses"] or 0),
+                "fill_rate": (fills / attempts) if attempts > 0 else 0.0,
+                "last_reject_reason": row["last_reject_reason"],
+                "last_attempt_at": row["last_attempt_at"],
+            }
+        return outcomes
 
     def neutralize_pathological_online_calibration(
         self,

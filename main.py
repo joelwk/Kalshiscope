@@ -121,6 +121,22 @@ _UNEXECUTABLE_MARKET_ERROR_MARKERS = (
     "market_closed",
     "market closed",
 )
+# Account-scoped submission rejections. Kalshi answers these with 404 too, so
+# they must be kept apart from the market markers above: the ticker is fine and
+# retiring it would burn a researched slot for an account-side fault.
+_ACCOUNT_SUBMISSION_ERROR_MARKERS = (
+    "user_not_found",
+    "user not found",
+)
+# Deep research moves confidence by more than 0.19 in only 5% of the 2054
+# initial->deep revisions on record, so a first pass further than this below
+# the guaranteed edge floor cannot realistically be rescued by a second call.
+_GUARANTEED_DEEP_DIVE_MAX_EDGE_GAP = 0.20
+# One market family may hold at most this many guaranteed slots. Requiring a
+# distinct family per slot spent four of every five slots on families that have
+# never cleared the edge floor, because the only family that fills was capped at
+# one. Distinct events inside a family are uncorrelated enough to share a run.
+_GUARANTEED_MAX_SLOTS_PER_FAMILY = 3
 _MAX_CONFIDENCE = 1.0
 _AGGRESSIVE_CONFIDENCE_SHRINKAGE_FACTOR = 0.30
 # Minimum resolved-trade samples before a family's windowed PnL is trusted to
@@ -2188,6 +2204,14 @@ def _is_unexecutable_market_error(error_text: str | None) -> bool:
     if not text:
         return False
     return any(marker in text for marker in _UNEXECUTABLE_MARKET_ERROR_MARKERS)
+
+
+def _is_account_submission_error(error_text: str | None) -> bool:
+    """True when Kalshi rejected the account rather than the market."""
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _ACCOUNT_SUBMISSION_ERROR_MARKERS)
 
 
 def _guaranteed_lock_has_enough_time(market: Market) -> bool:
@@ -4505,6 +4529,13 @@ class GuaranteedOrderPlan:
     normal_execution_suppressed: int = 0
     retired_market_ids: set[str] = field(default_factory=set)
     research_gap_replacements: int = 0
+    # Run-level rollup so the end-of-run log explains "why 3/5" on its own,
+    # instead of requiring a replay of every cycle's warnings.
+    reject_reason_counts: dict[str, int] = field(default_factory=dict)
+    series_attempt_counts: dict[str, int] = field(default_factory=dict)
+    deep_research_calls: int = 0
+    skipped_deep_research_calls: int = 0
+    research_cost_usd: float = 0.0
 
     @property
     def locked_count(self) -> int:
@@ -4562,6 +4593,26 @@ class GuaranteedOrderPlan:
             "is_resolved": self.is_resolved,
             "research_gap_replacements": self.research_gap_replacements,
             "normal_execution_suppressed": self.normal_execution_suppressed,
+            "reject_reason_counts": dict(
+                sorted(
+                    self.reject_reason_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ),
+            "series_attempt_counts": dict(
+                sorted(
+                    self.series_attempt_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ),
+            "deep_research_calls": self.deep_research_calls,
+            "skipped_deep_research_calls": self.skipped_deep_research_calls,
+            "research_cost_usd": round(self.research_cost_usd, 6),
+            "research_cost_per_completed_order_usd": (
+                round(self.research_cost_usd / self.completed_count, 6)
+                if self.completed_count > 0
+                else None
+            ),
             "slots": [
                 {
                     "slot_number": slot.slot_number,
@@ -4582,6 +4633,84 @@ class GuaranteedOrderPlan:
             ],
             "retired_market_ids": sorted(self.retired_market_ids),
         }
+
+
+def _guaranteed_run_outcome(plan: GuaranteedOrderPlan) -> str:
+    if plan.is_complete:
+        return "completed"
+    if any(
+        slot.submission_attempts > 0 and not slot.completed
+        for slot in plan.slots
+    ):
+        return "submission_failed"
+    return "insufficient_positive_ev"
+
+
+def _abort_guaranteed_preflight(
+    *,
+    state_manager: MarketStateManager,
+    plan: GuaranteedOrderPlan,
+    cycle_id: str,
+    cycle_number: int,
+    fetched_markets: int,
+    eligible_markets: int,
+    reconciliation_block_reasons: list[str],
+    order_sync_metrics: OrderSyncMetrics,
+    cumulative_api_cost_estimate_usd: float,
+) -> None:
+    """Persist one zero-research receipt and abort a blocked live guarantee."""
+    unresolved_order_ids = list(order_sync_metrics.unresolved_local_order_ids)
+    receipt = {
+        "cycle": cycle_number,
+        "cycle_id": cycle_id,
+        "fetched_markets": fetched_markets,
+        "eligible_markets": eligible_markets,
+        "analyzed_markets": 0,
+        "decisions_made": 0,
+        "order_attempts": 0,
+        "guaranteed_order_mode": True,
+        "guaranteed_orders_target": plan.target,
+        "guaranteed_orders_completed": plan.completed_count,
+        "guaranteed_orders_remaining": plan.remaining_count,
+        "guaranteed_run_outcome": "preflight_blocked",
+        "guaranteed_preflight_blocked": True,
+        "guaranteed_order_research_cost_usd": round(plan.research_cost_usd, 6),
+        "total_run_api_cost_estimate_usd": round(
+            cumulative_api_cost_estimate_usd,
+            6,
+        ),
+        "reconciliation_live_blocked": True,
+        "reconciliation_block_reasons": list(reconciliation_block_reasons),
+        "unresolved_local_order_ids": unresolved_order_ids,
+        "unknown_exchange_order_ids": list(
+            order_sync_metrics.unknown_exchange_orders
+        ),
+    }
+    logger.critical(
+        "Guaranteed-order preflight blocked before analysis: completed=%d/%d reasons=%s",
+        plan.completed_count,
+        plan.target,
+        ", ".join(reconciliation_block_reasons),
+        data=receipt,
+    )
+    try:
+        state_manager.record_cycle_receipt(
+            cycle_id=cycle_id,
+            cycle_number=cycle_number,
+            payload=receipt,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Guaranteed preflight receipt persistence failed: cycle=%s error=%s",
+            cycle_id,
+            exc,
+            data={"cycle_id": cycle_id, "error": str(exc)},
+        )
+    raise GuaranteedOrdersIncompleteError(
+        "Guaranteed-order preflight blocked before analysis: "
+        f"completed={plan.completed_count}/{plan.target}, "
+        f"reasons={','.join(reconciliation_block_reasons)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -4778,7 +4907,12 @@ def _guaranteed_order_min_edge(
     market: Market,
     settings: Settings,
 ) -> float:
-    """Direct / computed / named-mechanism / weather use MIN; unlabeled proxy is higher."""
+    """Direct / computed / named-mechanism / weather use MIN; unlabeled proxy is higher.
+
+    A `GUARANTEED_FAMILY_MIN_EDGE` entry replaces both floors for its family.
+    Evidence strength is still gated separately by the research-gap check, so
+    the override only moves the edge magnitude a family has to clear.
+    """
     floor = max(0.0, float(settings.GUARANTEED_MIN_EDGE))
     proxy_floor = max(floor, float(settings.GUARANTEED_PROXY_MIN_EDGE))
     basis = _decision_evidence_basis(decision)
@@ -4786,6 +4920,9 @@ def _guaranteed_order_min_edge(
     mechanism = str(decision.edge_mechanism or "").strip().lower()
     named_mechanism = bool(mechanism) and mechanism != "none"
     family = market_family(market)
+    for override_family, override_edge in settings.GUARANTEED_FAMILY_MIN_EDGE:
+        if override_family == family:
+            return max(0.0, float(override_edge))
     if basis == "direct":
         return floor
     if family == "weather":
@@ -4801,6 +4938,27 @@ def _guaranteed_order_min_edge(
     if family == "sports" and edge_source == "computed":
         return floor
     return proxy_floor
+
+
+def _guaranteed_deep_dive_is_hopeless(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> bool:
+    """True when no realistic deep-research revision can reach the edge floor.
+
+    Measured over 2054 initial->deep revisions in the decision history, deep
+    research moves confidence by more than 0.19 only 5% of the time. A first
+    pass sitting further than that below the floor is not worth a second
+    (search-backed, and by far the most expensive) call.
+    """
+    if _guaranteed_order_research_gap_reason(decision, settings) is not None:
+        return False
+    edge = _guaranteed_chosen_side_edge(decision, market)
+    if edge is None:
+        return False
+    min_edge = _guaranteed_order_min_edge(decision, market, settings)
+    return (min_edge - edge) > _GUARANTEED_DEEP_DIVE_MAX_EDGE_GAP
 
 
 def _guaranteed_order_reject_reason(
@@ -4821,6 +4979,50 @@ def _guaranteed_order_reject_reason(
     if edge < min_edge - 1e-9:
         return "guaranteed_order_edge_below_min"
     return None
+
+
+def _guaranteed_series_fill_rate(
+    market: Market,
+    series_outcomes: dict[str, dict[str, Any]] | None,
+) -> float:
+    """Historical guaranteed-order fill rate for this market's series.
+
+    Unseen series rank above burned ones but below proven ones, so a fresh
+    name still gets a chance before a series that keeps missing.
+    """
+    if not series_outcomes:
+        return 0.0
+    record = series_outcomes.get(_market_series_ticker(market))
+    if not record:
+        return 0.0
+    try:
+        return float(record.get("fill_rate", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _guaranteed_series_is_burned(
+    market: Market,
+    series_outcomes: dict[str, dict[str, Any]] | None,
+    settings: Settings,
+) -> bool:
+    """True when a series has missed the edge floor enough times to stop trying.
+
+    A series that has ever filled is never burned: the misses are name-level
+    noise, not a structurally efficient ladder.
+    """
+    if not series_outcomes:
+        return False
+    record = series_outcomes.get(_market_series_ticker(market))
+    if not record:
+        return False
+    try:
+        if int(record.get("fills", 0) or 0) > 0:
+            return False
+        consecutive_misses = int(record.get("consecutive_misses", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return consecutive_misses >= int(settings.GUARANTEED_SERIES_MISS_LIMIT)
 
 
 def _guaranteed_order_priority_scores(
@@ -4959,11 +5161,15 @@ def _guaranteed_order_market_rank(
     *,
     priority_by_market_id: dict[str, float] | None = None,
     analyzed_market_ids: set[str] | None = None,
-) -> tuple[int, float, float, float, float, str]:
-    """Prefer this cycle's analyzed names, then confidence, then liquidity.
+    series_outcomes: dict[str, dict[str, Any]] | None = None,
+) -> tuple[int, float, float, float, float, float, str]:
+    """Prefer analyzed names, then proven series, then confidence, then liquidity.
 
     Unanalyzed catalog rows must not outrank analyzed absence_only: missing
-    from the priority map is not a 0.0 tie with researched names.
+    from the priority map is not a 0.0 tie with researched names. Among
+    unanalyzed rows every earlier term ties at zero, so without the series
+    term raw liquidity decides — and the most liquid Kalshi markets are the
+    continuously repriced ladders that never clear the guaranteed edge floor.
     """
     analyzed = 1 if analyzed_market_ids and market.id in analyzed_market_ids else 0
     priority = 0.0
@@ -4972,11 +5178,13 @@ def _guaranteed_order_market_rank(
             priority = float(priority_by_market_id.get(market.id, 0.0) or 0.0)
         except (TypeError, ValueError):
             priority = 0.0
+    series_fill_rate = _guaranteed_series_fill_rate(market, series_outcomes)
     yes_price = _get_outcome_entry_price(market, "YES")
     price_quality = 0.0 if yes_price is None else 1.0 - abs(yes_price - 0.5)
     return (
         analyzed,
         priority,
+        series_fill_rate,
         float(market.liquidity_usdc or 0.0),
         float(market.volume_24h or market.volume or 0.0),
         price_quality,
@@ -4995,6 +5203,7 @@ def _lock_guaranteed_order_markets(
     require_cycle_analysis: bool = False,
     settings: Settings,
     cycle_number: int,
+    series_outcomes: dict[str, dict[str, Any]] | None = None,
 ) -> list[GuaranteedOrderSlot]:
     """Lock distinct markets until the plan contains exactly its target count.
 
@@ -5005,7 +5214,9 @@ def _lock_guaranteed_order_markets(
     only re-locked as a last resort so a sparse catalog can still deep-dive.
     Research-gap replacements stay inside the analyzed +EV set so a weak
     deep-dive is not swapped for an unresearched liquid name or a known
-    non-positive-EV row.
+    non-positive-EV row. Series that repeatedly miss the edge floor are
+    dropped entirely so their remaining strikes stop burning deep dives, and
+    no family may hold more than `_GUARANTEED_MAX_SLOTS_PER_FAMILY` slots.
     """
     if plan.target <= 0:
         return []
@@ -5046,11 +5257,11 @@ def _lock_guaranteed_order_markets(
         for slot in plan.slots
         if not slot.needs_replacement and slot.market is not None
     }
-    locked_families = {
+    locked_family_counts: Counter[str] = Counter(
         market_family(slot.market)
         for slot in plan.slots
         if not slot.needs_replacement and slot.market is not None
-    }
+    )
     candidates = [
         market
         for market in markets
@@ -5058,6 +5269,7 @@ def _lock_guaranteed_order_markets(
         and market.id not in excluded_market_ids
         and market.id not in plan.retired_market_ids
         and not _market_hits_jurisdiction_hold(market, normalized_excluded_families)
+        and not _guaranteed_series_is_burned(market, series_outcomes, settings)
         and _is_guaranteed_order_market_candidate(market, settings)
         and _guaranteed_lock_has_enough_time(market)
     ]
@@ -5082,6 +5294,7 @@ def _lock_guaranteed_order_markets(
             market,
             priority_by_market_id=priority_by_market_id,
             analyzed_market_ids=analyzed_market_ids,
+            series_outcomes=series_outcomes,
         ),
         reverse=True,
     )
@@ -5101,54 +5314,38 @@ def _lock_guaranteed_order_markets(
         if market.id in analyzed_market_ids and _seed_is_unforceable(market)
     ]
 
-    def _passes_diversity(
-        market: Market, *, unique_family: bool, unique_event: bool
-    ) -> bool:
+    def _passes_diversity(market: Market, *, unique_event: bool) -> bool:
         event_prefix = _event_ticker_prefix(market)
         if unique_event and event_prefix and event_prefix in locked_event_prefixes:
             return False
-        if unique_family and market_family(market) in locked_families:
-            return False
-        return True
+        return (
+            locked_family_counts[market_family(market)]
+            < _GUARANTEED_MAX_SLOTS_PER_FAMILY
+        )
 
-    def _pop_from(
-        pool: list[Market], *, unique_family: bool, unique_event: bool
-    ) -> Market | None:
+    def _pop_from(pool: list[Market], *, unique_event: bool) -> Market | None:
         for index, market in enumerate(pool):
-            if not _passes_diversity(
-                market, unique_family=unique_family, unique_event=unique_event
-            ):
+            if not _passes_diversity(market, unique_event=unique_event):
                 continue
             return pool.pop(index)
         return None
 
     def _pick_next_candidate() -> Market | None:
-        # Forceable analyzed first: unique event+family, unique event, then any.
-        for unique_family, unique_event in ((True, True), (False, True), (False, False)):
-            picked = _pop_from(
-                plus_ev_analyzed,
-                unique_family=unique_family,
-                unique_event=unique_event,
-            )
-            if picked is not None:
-                return picked
-        # Unanalyzed catalog fills leftovers; keep unique-event diversity.
-        for unique_family, unique_event in ((True, True), (False, True)):
-            picked = _pop_from(
-                catalog_rest,
-                unique_family=unique_family,
-                unique_event=unique_event,
-            )
-            if picked is not None:
-                return picked
-        # Last resort: re-dive a thin first-pass so a sparse catalog can still
-        # lock a slot for deep research instead of locking nothing.
-        for unique_family, unique_event in ((True, True), (False, True), (False, False)):
-            picked = _pop_from(
-                thin_analyzed,
-                unique_family=unique_family,
-                unique_event=unique_event,
-            )
+        """Take the best-ranked candidate the family cap and event set allow.
+
+        The pools are already ordered by analysed-first, then proven series,
+        then liquidity, so the cap alone decides how far a filling family may
+        spread. Duplicate events are a last resort for sparse catalogs, where
+        locking a second strike beats locking nothing.
+        """
+        for pool, unique_event in (
+            (plus_ev_analyzed, True),
+            (plus_ev_analyzed, False),
+            (catalog_rest, True),
+            (thin_analyzed, True),
+            (thin_analyzed, False),
+        ):
+            picked = _pop_from(pool, unique_event=unique_event)
             if picked is not None:
                 return picked
         return None
@@ -5188,7 +5385,7 @@ def _lock_guaranteed_order_markets(
         event_prefix = _event_ticker_prefix(market)
         if event_prefix:
             locked_event_prefixes.add(event_prefix)
-        locked_families.add(market_family(market))
+        locked_family_counts[market_family(market)] += 1
         newly_locked.append(slot)
 
     slots_needed = max(0, plan.target - len(plan.slots))
@@ -5211,7 +5408,7 @@ def _lock_guaranteed_order_markets(
         event_prefix = _event_ticker_prefix(market)
         if event_prefix:
             locked_event_prefixes.add(event_prefix)
-        locked_families.add(market_family(market))
+        locked_family_counts[market_family(market)] += 1
         newly_locked.append(slot)
     return newly_locked
 
@@ -5411,8 +5608,9 @@ def _attempt_guaranteed_order_slot(
     return status=research_gap_replaceable so the phase can swap, defer to
     the next cycle, or abandon on replace cap. Never force a non-positive-EV
     slot to fill the quota. Seeded first-pass decisions that already clear
-    the +EV bar skip a redundant deep call. Catalog fills still do initial
-    (no self-consistency) plus deep.
+    the +EV bar skip a redundant deep call, and a first pass sitting further
+    than a plausible revision below the bar skips it too. Catalog fills
+    otherwise do initial (no self-consistency) plus deep.
     """
     intense_research_performed = False
     sizing_audit: dict[str, Any] = {}
@@ -5521,6 +5719,14 @@ def _attempt_guaranteed_order_slot(
             )
             if seed_clears_bar:
                 researched = initial_decision
+            elif _guaranteed_deep_dive_is_hopeless(
+                initial_decision, research_market, settings
+            ):
+                return _replaceable_result(
+                    initial_decision,
+                    "guaranteed_order_initial_edge_hopeless",
+                    research_done=False,
+                )
             else:
                 deep_decision = grok_client.analyze_market_deep(
                     research_market,
@@ -5713,6 +5919,33 @@ def _run_guaranteed_order_phase(
         priority_by_market_id=priority_by_market_id,
         seed_decisions_by_market_id=seed_decisions_by_market_id,
     )
+    try:
+        series_outcomes = state_manager.get_guaranteed_series_outcomes()
+    except Exception as exc:
+        series_outcomes = {}
+        logger.warning(
+            "Failed to load guaranteed-order series history; locking without it: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+    burned_series = sorted(
+        series
+        for series, record in series_outcomes.items()
+        if int(record.get("fills", 0) or 0) == 0
+        and int(record.get("consecutive_misses", 0) or 0)
+        >= int(settings.GUARANTEED_SERIES_MISS_LIMIT)
+    )
+    if burned_series:
+        logger.warning(
+            "Guaranteed-order selection excludes %d series that keep missing the "
+            "edge floor: %s",
+            len(burned_series),
+            ", ".join(burned_series),
+            data={
+                "burned_series": burned_series,
+                "guaranteed_series_miss_limit": settings.GUARANTEED_SERIES_MISS_LIMIT,
+            },
+        )
 
     def _lock_available_slots(
         *,
@@ -5728,6 +5961,7 @@ def _run_guaranteed_order_phase(
             require_cycle_analysis=require_cycle_analysis,
             settings=settings,
             cycle_number=cycle_number,
+            series_outcomes=series_outcomes,
         )
         result.locked += len(new_slots)
         if new_slots:
@@ -5821,12 +6055,55 @@ def _run_guaranteed_order_phase(
             slot.market,
             priority_by_market_id=priority_by_market_id,
             analyzed_market_ids=analyzed_market_ids,
+            series_outcomes=series_outcomes,
         ),
         reverse=True,
     )
     max_gap_replacements = int(
         settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
     )
+
+    def _record_series_outcome(
+        slot: GuaranteedOrderSlot,
+        *,
+        filled: bool,
+        reject_reason: str | None = None,
+    ) -> None:
+        """Persist the series verdict and reflect it in this cycle's ranking."""
+        series_ticker = _market_series_ticker(slot.market)
+        if not series_ticker:
+            return
+        plan.series_attempt_counts[series_ticker] = (
+            plan.series_attempt_counts.get(series_ticker, 0) + 1
+        )
+        try:
+            state_manager.record_guaranteed_series_attempt(
+                series_ticker,
+                filled=filled,
+                reject_reason=reject_reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist guaranteed-order series outcome: series=%s error=%s",
+                series_ticker,
+                exc,
+                data={"series_ticker": series_ticker, "error": str(exc)},
+            )
+            return
+        record = series_outcomes.setdefault(
+            series_ticker,
+            {"attempts": 0, "fills": 0, "consecutive_misses": 0, "fill_rate": 0.0},
+        )
+        record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+        if filled:
+            record["fills"] = int(record.get("fills", 0) or 0) + 1
+            record["consecutive_misses"] = 0
+        else:
+            record["consecutive_misses"] = (
+                int(record.get("consecutive_misses", 0) or 0) + 1
+            )
+            record["last_reject_reason"] = reject_reason
+        record["fill_rate"] = record["fills"] / record["attempts"]
 
     def _replace_or_defer_slot(
         slot: GuaranteedOrderSlot,
@@ -5840,9 +6117,51 @@ def _run_guaranteed_order_phase(
         cap_final_reason: str,
         defer_log: str,
         error: str | None,
+        can_retry_same_market: bool,
     ) -> None:
-        """Same-cycle +EV replace, else keep the slot open for the next cycle."""
+        """Same-cycle +EV replace, else keep the slot open for the next cycle.
+
+        The replacement budget bounds churn across markets, not the run. Once
+        it is spent, a slot whose market is still tradeable holds its lock and
+        re-prices next cycle; only a market that can never fill is abandoned.
+        Abandoning on budget exhaustion resolved whole runs at zero orders and
+        idled every remaining cycle.
+        """
         if plan.research_gap_replacements >= max_gap_replacements:
+            if can_retry_same_market:
+                slot.decision = None
+                slot.research_completed = False
+                slot.last_error = replacement_reason
+                logger.warning(
+                    "Guaranteed-order replacement budget spent (%d); holding "
+                    "slot %d market=%s for a re-price next cycle",
+                    max_gap_replacements,
+                    slot.slot_number,
+                    slot.market_id,
+                    data={
+                        **audit,
+                        "market_id": slot.market_id,
+                        "research_gap_replacements": plan.research_gap_replacements,
+                        "guaranteed_order_held": True,
+                        "hold_reason": replacement_reason,
+                    },
+                )
+                if decision is not None:
+                    log_decision(
+                        market_id=slot.market_id,
+                        question=slot.market.question,
+                        decision=decision.model_dump(),
+                        execution_audit=_build_execution_audit(
+                            decision_phase=decision_phase,
+                            decision_terminal=False,
+                            final_action="skip",
+                            final_reason=f"{replacement_reason}_budget_hold",
+                            guaranteed_order_retry_pending=True,
+                            order_error=error,
+                            **audit,
+                        ),
+                    )
+                return
             _abandon_guaranteed_order_slot(
                 plan,
                 slot,
@@ -5887,6 +6206,10 @@ def _run_guaranteed_order_phase(
         replacement_slots = _lock_available_slots(
             require_cycle_analysis=require_cycle_analysis,
         )
+        # The budget counts wasted research, so a defer spends it just as a
+        # same-cycle swap does. Only crediting swaps left the cap unreachable
+        # and let a slot re-lock a fresh name every cycle forever.
+        plan.research_gap_replacements += 1
         if slot.needs_replacement:
             logger.warning(
                 defer_log,
@@ -5897,6 +6220,7 @@ def _run_guaranteed_order_phase(
                     "market_id": retired_market_id,
                     "guaranteed_order_deferred": True,
                     "defer_reason": replacement_reason,
+                    "research_gap_replacements": plan.research_gap_replacements,
                     "needs_replacement": True,
                 },
             )
@@ -5916,7 +6240,6 @@ def _run_guaranteed_order_phase(
                     ),
                 )
             return
-        plan.research_gap_replacements += 1
         if decision is not None:
             log_decision(
                 market_id=retired_market_id,
@@ -5933,6 +6256,8 @@ def _run_guaranteed_order_phase(
                 ),
             )
         pending_slots.extend(replacement_slots)
+
+    account_error_retried_slots: set[int] = set()
 
     while pending_slots:
         slot = pending_slots.pop(0)
@@ -5953,6 +6278,28 @@ def _run_guaranteed_order_phase(
             attempt.token_usage.get("reasoning_tokens", 0)
         )
         result.cached_tokens += int(attempt.token_usage.get("cached_tokens", 0))
+        plan.research_cost_usd += _estimate_api_cost_usd(
+            prompt_tokens=int(attempt.token_usage.get("prompt_tokens", 0)),
+            completion_tokens=int(attempt.token_usage.get("completion_tokens", 0)),
+            cached_tokens=int(attempt.token_usage.get("cached_tokens", 0)),
+            settings=settings,
+        )
+        if attempt.intense_research_performed:
+            plan.deep_research_calls += 1
+        elif attempt.error == "guaranteed_order_initial_edge_hopeless":
+            plan.skipped_deep_research_calls += 1
+        # research_gap_replaceable already carries a short guaranteed_order_*
+        # label; every other status carries a raw exception string that would
+        # make the rollup unaggregatable.
+        reject_label = (
+            attempt.error
+            if attempt.status == "research_gap_replaceable"
+            else attempt.status
+        )
+        if reject_label and attempt.status not in {"submitted", "dry_run"}:
+            plan.reject_reason_counts[reject_label] = (
+                plan.reject_reason_counts.get(reject_label, 0) + 1
+            )
         decision = attempt.decision
         if decision is not None and attempt.intense_research_performed:
             extended_research_market_ids.add(slot.market_id)
@@ -6016,6 +6363,11 @@ def _run_guaranteed_order_phase(
             replacement_reason = (
                 str(attempt.error or "").strip() or "guaranteed_order_research_gap"
             )
+            _record_series_outcome(
+                slot,
+                filled=False,
+                reject_reason=replacement_reason,
+            )
             _replace_or_defer_slot(
                 slot,
                 replacement_reason=replacement_reason,
@@ -6033,6 +6385,7 @@ def _run_guaranteed_order_phase(
                     "cycle; deferring slot %d market=%s to the next cycle"
                 ),
                 error=attempt.error,
+                can_retry_same_market=True,
             )
             continue
         if attempt.status == "market_validation_failed":
@@ -6065,6 +6418,7 @@ def _run_guaranteed_order_phase(
                     "this cycle; deferring slot %d market=%s to the next cycle"
                 ),
                 error=attempt.error,
+                can_retry_same_market=False,
             )
             continue
         if decision is None:
@@ -6148,6 +6502,44 @@ def _run_guaranteed_order_phase(
                 )
                 replacement_slots = _lock_available_slots()
                 pending_slots.extend(replacement_slots)
+            elif _is_account_submission_error(attempt.error):
+                # The ticker is fine, so the researched slot keeps its market
+                # and gets one more shot before the cycle ends.
+                retry_pending = slot.slot_number not in account_error_retried_slots
+                logger.error(
+                    "Guaranteed-order submission rejected at the account level: "
+                    "slot=%d market=%s retrying=%s error=%s",
+                    slot.slot_number,
+                    slot.market_id,
+                    retry_pending,
+                    attempt.error,
+                    data={
+                        **audit,
+                        "market_id": slot.market_id,
+                        "client_order_id": slot.client_order_id,
+                        "submission_attempts": slot.submission_attempts,
+                        "guaranteed_order_account_error": True,
+                        "guaranteed_order_account_error_retrying": retry_pending,
+                        "error": attempt.error,
+                    },
+                )
+                log_decision(
+                    market_id=slot.market_id,
+                    question=slot.market.question,
+                    decision=decision.model_dump(),
+                    execution_audit=_build_execution_audit(
+                        decision_phase="guaranteed_order_submission",
+                        decision_terminal=False,
+                        final_action="order_attempt",
+                        final_reason="guaranteed_order_account_submission_failed",
+                        guaranteed_order_retry_pending=True,
+                        order_error=attempt.error,
+                        **audit,
+                    ),
+                )
+                if retry_pending:
+                    account_error_retried_slots.add(slot.slot_number)
+                    pending_slots.append(slot)
             elif _is_unexecutable_market_error(attempt.error):
                 error_text = str(attempt.error or "").lower()
                 replacement_reason = (
@@ -6172,6 +6564,7 @@ def _run_guaranteed_order_phase(
                         "this cycle; deferring slot %d market=%s to the next cycle"
                     ),
                     error=attempt.error,
+                    can_retry_same_market=False,
                 )
             else:
                 log_decision(
@@ -6193,6 +6586,7 @@ def _run_guaranteed_order_phase(
         slot.completed = True
         slot.last_error = None
         result.completed += 1
+        _record_series_outcome(slot, filled=True)
         if attempt.status == "dry_run":
             result.usd_submitted += attempt.amount_usdc
             _record_family_attempt(
@@ -6667,6 +7061,7 @@ class OrderSyncMetrics:
     active_local_count: int = 0
     exchange_resting_count: int = 0
     unknown_exchange_orders: tuple[str, ...] = ()
+    unresolved_local_order_ids: tuple[str, ...] = ()
     pages_fetched: int = 0
     complete: bool = False
 
@@ -6776,6 +7171,84 @@ def _find_historical_order(
         if not cursor:
             return None
     raise RuntimeError(f"historical order page cap reached for order {order_id}")
+
+
+def _find_current_order_fills(
+    *,
+    kalshi_client: KalshiClient,
+    order_id: str,
+    max_pages: int,
+) -> list[dict[str, Any]]:
+    """Fetch every current-tier fill for one otherwise missing order."""
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(max(1, int(max_pages))):
+        payload = kalshi_client.get_fills(
+            order_id=order_id,
+            limit=1000,
+            cursor=cursor,
+            subaccount=0,
+        )
+        rows.extend(
+            row
+            for row in _exchange_fill_rows(payload)
+            if _exchange_fill_order_id(row) == order_id
+        )
+        cursor = _exchange_next_cursor(payload)
+        if not cursor:
+            return rows
+    raise RuntimeError(f"fill page cap reached for order {order_id}")
+
+
+def _inferred_missing_order_snapshot(
+    *,
+    pending: dict[str, Any],
+    fill_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build an auditable terminal snapshot from complete absence evidence."""
+    order_id = str(pending.get("order_id") or "").strip()
+    requested_shares = _coerce_float(pending.get("requested_shares"))
+    outcome = str(pending.get("outcome") or "").strip()
+    filled_shares = sum(_exchange_fill_quantity(row) for row in fill_rows)
+    fill_cost = 0.0
+    priced_fill_shares = 0.0
+    for row in fill_rows:
+        quantity = _exchange_fill_quantity(row)
+        price = _exchange_fill_price(row, outcome=outcome)
+        if price is None:
+            continue
+        fill_cost += quantity * price
+        priced_fill_shares += quantity
+    fill_price = (
+        fill_cost / priced_fill_shares
+        if priced_fill_shares > 0.0
+        else _coerce_float(pending.get("limit_price"))
+    )
+    fully_filled = (
+        requested_shares is not None
+        and requested_shares > 0.0
+        and filled_shares >= requested_shares - 1e-9
+    )
+    status = "filled" if fully_filled else "canceled"
+    snapshot: dict[str, Any] = {
+        "order_id": order_id,
+        "status": "executed" if fully_filled else status,
+        "initial_count_fp": requested_shares,
+        "fill_count_fp": filled_shares,
+        "remaining_count_fp": 0.0,
+        "last_update_time": datetime.now(timezone.utc).isoformat(),
+        "reconciliation_inference": {
+            "reason": "absent_from_complete_live_and_historical_orders",
+            "targeted_fill_count": len(fill_rows),
+            "targeted_fills": fill_rows,
+            "previous_exchange_payload": pending.get("raw") or {},
+        },
+    }
+    if fill_price is not None:
+        snapshot[f"{outcome.lower()}_price_dollars"] = fill_price
+    if priced_fill_shares > 0.0:
+        snapshot["maker_fill_cost_dollars"] = fill_cost
+    return snapshot
 
 
 def _apply_exchange_order_snapshot(
@@ -6906,6 +7379,7 @@ def _sync_orders_from_exchange(
     )
     reconciled = 0
     lookup_errors: list[str] = []
+    unresolved_local_order_ids: set[str] = set()
 
     # Apply all locally-known resting rows, including invalid terminal-to-active
     # regressions. The state manager rejects regressions monotonically.
@@ -6920,6 +7394,7 @@ def _sync_orders_from_exchange(
                 )
             except Exception as exc:
                 lookup_errors.append(f"{order_id}: {exc}")
+                unresolved_local_order_ids.add(order_id)
             else:
                 if applied:
                     reconciled += 1
@@ -6946,8 +7421,51 @@ def _sync_orders_from_exchange(
                 )
                 continue
         if order_row is None:
-            lookup_errors.append(f"{order_id}: absent from live and historical orders")
-            continue
+            try:
+                fill_rows = _find_current_order_fills(
+                    kalshi_client=kalshi_client,
+                    order_id=order_id,
+                    max_pages=max_pages,
+                )
+                close_time = state_manager.get_market_close_time(
+                    str(pending.get("market_id") or "")
+                )
+            except Exception as exc:
+                lookup_errors.append(f"{order_id}: missing-order verification failed: {exc}")
+                unresolved_local_order_ids.add(order_id)
+                continue
+            if fill_rows or (
+                close_time is not None
+                and close_time <= datetime.now(timezone.utc)
+            ):
+                order_row = _inferred_missing_order_snapshot(
+                    pending=pending,
+                    fill_rows=fill_rows,
+                )
+                if not fill_rows:
+                    order_row["status"] = "expired"
+                logger.warning(
+                    "Inferred terminal order lifecycle: order=%s market=%s status=%s fills=%d",
+                    order_id,
+                    pending.get("market_id"),
+                    order_row["status"],
+                    len(fill_rows),
+                    data={
+                        "order_id": order_id,
+                        "market_id": pending.get("market_id"),
+                        "inferred_status": order_row["status"],
+                        "targeted_fill_count": len(fill_rows),
+                        "market_close_time": (
+                            close_time.isoformat() if close_time is not None else None
+                        ),
+                    },
+                )
+            else:
+                lookup_errors.append(
+                    f"{order_id}: absent from live and historical orders while market remains open"
+                )
+                unresolved_local_order_ids.add(order_id)
+                continue
         try:
             applied = _apply_exchange_order_snapshot(
                 state_manager=state_manager,
@@ -6956,6 +7474,7 @@ def _sync_orders_from_exchange(
             )
         except Exception as exc:
             lookup_errors.append(f"{order_id}: {exc}")
+            unresolved_local_order_ids.add(order_id)
         else:
             if applied:
                 reconciled += 1
@@ -6986,6 +7505,7 @@ def _sync_orders_from_exchange(
         active_local_count=len(active_by_id),
         exchange_resting_count=len(resting_by_id),
         unknown_exchange_orders=unknown_exchange,
+        unresolved_local_order_ids=tuple(sorted(unresolved_local_order_ids)),
         pages_fetched=pages_fetched,
         complete=complete,
     )
@@ -7519,6 +8039,15 @@ def _canonical_event_prefix(ticker: str) -> str:
         return ""
     stripped = _STRIKE_TICKER_SUFFIX.sub("", normalized)
     return stripped or normalized
+
+
+def _market_series_ticker(market: Market) -> str:
+    """Series key (`KXBTCD`, `KXHIGHNY`) shared by every strike of one ladder."""
+    series_ticker = str(market.series_ticker or "").strip().upper()
+    if series_ticker:
+        return series_ticker
+    market_id = str(market.id or "").strip().upper()
+    return market_id.split("-", maxsplit=1)[0]
 
 
 def _event_ticker_prefix(market: Market) -> str:
@@ -11462,6 +11991,20 @@ def main(max_cycles: int | None = None) -> None:
                         "unknown_exchange_order_ids": list(unknown_exchange_order_ids),
                     },
                 )
+                if guaranteed_order_plan.target > 0:
+                    _abort_guaranteed_preflight(
+                        state_manager=state_manager,
+                        plan=guaranteed_order_plan,
+                        cycle_id=cycle_id,
+                        cycle_number=cycle_count,
+                        fetched_markets=fetched_count,
+                        eligible_markets=len(markets),
+                        reconciliation_block_reasons=reconciliation_block_reasons,
+                        order_sync_metrics=order_sync_metrics,
+                        cumulative_api_cost_estimate_usd=(
+                            cumulative_api_cost_estimate_usd
+                        ),
+                    )
 
             if settings.RESOLUTION_SYNC_INTERVAL_CYCLES > 0:
                 if cycle_count % settings.RESOLUTION_SYNC_INTERVAL_CYCLES == 0:
@@ -19711,6 +20254,21 @@ def main(max_cycles: int | None = None) -> None:
                 "order_attempts": trades_attempted,
                 "guaranteed_order_mode": guaranteed_order_plan.target > 0,
                 "guaranteed_orders_target": guaranteed_order_plan.target,
+                "guaranteed_run_outcome": (
+                    _guaranteed_run_outcome(guaranteed_order_plan)
+                    if (
+                        guaranteed_order_plan.is_resolved
+                        or (
+                            max_cycles is not None
+                            and cycle_count >= max_cycles
+                        )
+                    )
+                    else "in_progress"
+                ),
+                "guaranteed_order_research_cost_usd": round(
+                    guaranteed_order_plan.research_cost_usd,
+                    6,
+                ),
                 "guaranteed_orders_locked": guaranteed_order_plan.locked_count,
                 "guaranteed_orders_completed": guaranteed_order_plan.completed_count,
                 "guaranteed_orders_abandoned": guaranteed_order_plan.abandoned_count,
@@ -20358,6 +20916,8 @@ def main(max_cycles: int | None = None) -> None:
                         },
                     )
 
+        except GuaranteedOrdersIncompleteError:
+            raise
         except Exception as exc:
             error_text = str(exc)
             if _is_tls_ca_bundle_error(exc):
@@ -20447,32 +21007,56 @@ def main(max_cycles: int | None = None) -> None:
 
     if guaranteed_order_plan.target > 0:
         guarantee_summary = guaranteed_order_plan.summary()
+        guarantee_summary["guaranteed_run_outcome"] = _guaranteed_run_outcome(
+            guaranteed_order_plan
+        )
+        guarantee_summary["total_run_api_cost_estimate_usd"] = round(
+            cumulative_api_cost_estimate_usd,
+            6,
+        )
+        top_reject_reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(
+                guaranteed_order_plan.reject_reason_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:3]
+        )
         if not guaranteed_order_plan.is_resolved:
             message = (
                 "Guaranteed-order run incomplete: "
+                f"outcome={guarantee_summary['guaranteed_run_outcome']}, "
                 f"completed={guaranteed_order_plan.completed_count}/"
                 f"{guaranteed_order_plan.target}, "
                 f"abandoned={guaranteed_order_plan.abandoned_count}, "
-                f"locked={guaranteed_order_plan.locked_count}. "
+                f"locked={guaranteed_order_plan.locked_count}, "
+                f"deep_research_calls={guaranteed_order_plan.deep_research_calls}, "
+                f"guarantee_research_cost=${guaranteed_order_plan.research_cost_usd:.2f}, "
+                f"total_run_api_cost=${cumulative_api_cost_estimate_usd:.2f}. "
+                f"Top reject reasons: {top_reject_reasons or 'none'}. "
                 "The run is not considered completed."
             )
             logger.critical(message, data=guarantee_summary)
             raise GuaranteedOrdersIncompleteError(message)
         if not guaranteed_order_plan.is_complete:
             logger.warning(
-                "Guaranteed-order run resolved under target: "
-                "completed=%d/%d abandoned=%d unexecutable_replacements=%d",
+                "Guaranteed-order run resolved under target: outcome=%s "
+                "completed=%d/%d abandoned=%d unexecutable_replacements=%d "
+                "total_run_api_cost=$%.2f",
+                guarantee_summary["guaranteed_run_outcome"],
                 guaranteed_order_plan.completed_count,
                 guaranteed_order_plan.target,
                 guaranteed_order_plan.abandoned_count,
                 guaranteed_order_plan.research_gap_replacements,
+                cumulative_api_cost_estimate_usd,
                 data=guarantee_summary,
             )
         else:
             logger.warning(
-                "Guaranteed-order run completed exactly at target: %d/%d",
+                "Guaranteed-order run completed exactly at target: outcome=completed "
+                "%d/%d total_run_api_cost=$%.2f",
                 guaranteed_order_plan.completed_count,
                 guaranteed_order_plan.target,
+                cumulative_api_cost_estimate_usd,
                 data=guarantee_summary,
             )
 

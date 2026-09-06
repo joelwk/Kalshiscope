@@ -73,19 +73,39 @@ python main.py
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
 locks this cycle's highest positive-EV analyzed names (chosen-side edge after
-calibration × evidence quality × confidence, with event/family diversity among
-+EV names only), dives deeper on those slots, and forces a Kelly-sized order
-from the researched side only when that side still has clear positive
-chosen-side edge. Absence-only, zero, or negative-EV slots are replaced with
-another analyzed +EV name the same cycle, or deferred to the next cycle —
-never forced to fill the quota. A slot is abandoned only after the
-replacement cap. Unlabeled `edge_mechanism` or proxy evidence quality below
-the ordinary trade floor is not a hard skip when chosen-side edge still
-clears the floor.
+calibration × evidence quality × confidence), dives deeper on those slots, and
+forces a Kelly-sized order from the researched side only when that side still
+has clear positive chosen-side edge. Slots never share an event, and no market
+family may hold more than three of them: demanding a distinct family per slot
+handed four of every five slots to families with no fills on record, because
+the one family that does fill was capped at a single slot. Absence-only, zero,
+or negative-EV slots are replaced with another analyzed +EV name the same
+cycle, or deferred to the next cycle — never forced to fill the quota.
+Unlabeled `edge_mechanism` or proxy evidence quality below the ordinary trade
+floor is not a hard skip when chosen-side edge still clears the floor.
 `GUARANTEED_MIN_EDGE` (default `0.12`) is the hard chosen-side floor for
 direct, computed-odds, named-mechanism, or weather sides; unlabeled
 non-weather proxy must also clear `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`).
-Ordinary gate-cleared submissions are
+`GUARANTEED_FAMILY_MIN_EDGE` (default `crypto:0.06`) replaces both of those
+floors for the families it names. The default is calibrated on 857 resolved
+trades: crypto returned +7% below a 0.12 edge and −13% above it, because a
+large claimed edge on a continuously repriced ladder is overconfidence rather
+than mispricing. Weather is the family `0.12` actually fits (+3% above it,
+−16% below), so it stays on the default. Evidence strength is gated separately,
+so an override only moves the edge magnitude a family has to clear.
+Two guards keep the hunt from spending deep research where it cannot pay off.
+A first pass sitting more than 20 points below the floor skips the deep call
+outright, since deep research has historically moved confidence that far only
+5% of the time. And a Kalshi series that misses the floor
+`GUARANTEED_SERIES_MISS_LIMIT` times in a row (default `3`) without ever
+filling stops being locked at all; the tally persists across runs, and any fill
+resets it. This is what stops continuously repriced ladders such as crypto
+strikes and index levels — the most liquid names on the exchange, and the ones
+least likely to be mispriced — from consuming every slot.
+`GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS` bounds churn across markets,
+not the run itself: once it is spent, a slot whose market is still tradeable
+holds its lock and re-prices on later cycles, and only a market that can never
+fill is abandoned. Ordinary gate-cleared submissions are
 suppressed in this mode so the run cannot exceed the target. Forced (and
 normal) stakes scale with live portfolio value:
 `clip(kelly_bet_pct × MAX_BET_PCT_OF_BANKROLL × portfolio, MIN_BET_PCT_OF_BANKROLL × portfolio, position/drawdown caps)`.
