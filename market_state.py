@@ -270,6 +270,28 @@ class MarketStateManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS xai_usage_ledger (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    cycle_number INTEGER NOT NULL,
+                    market_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    server_tool_calls INTEGER NOT NULL DEFAULT 0,
+                    server_side_tool_usage_json TEXT NOT NULL,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    pricing_version TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS exchange_settlements (
                     settlement_id TEXT PRIMARY KEY,
                     market_id TEXT NOT NULL,
@@ -341,6 +363,9 @@ class MarketStateManager:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cycle_receipts_cycle_id ON cycle_receipts (cycle_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_xai_usage_run_cycle ON xai_usage_ledger (run_id, cycle_id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_decision_receipts_market_id ON decision_receipts (market_id)"
@@ -2419,6 +2444,85 @@ class MarketStateManager:
         if row is None:
             return None
         return str(row["value"])
+
+    def record_xai_usage(self, event: dict[str, Any]) -> None:
+        """Append one completed provider response using a dedicated connection.
+
+        Analysis workers call this concurrently. A short-lived connection keeps
+        the main state connection thread-confined while making each completed
+        response durable before parsing or later decision replacement.
+        """
+        payload = dict(event)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute(
+                """
+                INSERT INTO xai_usage_ledger (
+                    event_id, run_id, cycle_id, cycle_number, market_id, phase,
+                    model, prompt_tokens, cached_tokens, completion_tokens,
+                    reasoning_tokens, server_tool_calls,
+                    server_side_tool_usage_json, cost_usd, pricing_version,
+                    recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload["event_id"]),
+                    str(payload["run_id"]),
+                    str(payload["cycle_id"]),
+                    int(payload["cycle_number"]),
+                    str(payload["market_id"]),
+                    str(payload["phase"]),
+                    str(payload["model"]),
+                    int(payload.get("prompt_tokens") or 0),
+                    int(payload.get("cached_tokens") or 0),
+                    int(payload.get("completion_tokens") or 0),
+                    int(payload.get("reasoning_tokens") or 0),
+                    int(payload.get("server_tool_calls") or 0),
+                    json.dumps(
+                        payload.get("server_side_tool_usage") or {},
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    float(payload.get("cost_usd") or 0.0),
+                    str(payload["pricing_version"]),
+                    str(payload["recorded_at"]),
+                ),
+            )
+
+    def get_xai_usage_totals(
+        self,
+        *,
+        run_id: str,
+        cycle_id: str | None = None,
+    ) -> dict[str, int | float]:
+        where = "run_id = ?"
+        params: list[Any] = [run_id]
+        if cycle_id is not None:
+            where += " AND cycle_id = ?"
+            params.append(cycle_id)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                       COALESCE(SUM(server_tool_calls), 0) AS server_tool_calls,
+                       COALESCE(SUM(cost_usd), 0.0) AS cost_usd
+                FROM xai_usage_ledger WHERE {where}
+                """,
+                params,
+            ).fetchone()
+        return {
+            "calls": int(row["calls"] or 0),
+            "prompt_tokens": int(row["prompt_tokens"] or 0),
+            "cached_tokens": int(row["cached_tokens"] or 0),
+            "completion_tokens": int(row["completion_tokens"] or 0),
+            "reasoning_tokens": int(row["reasoning_tokens"] or 0),
+            "server_tool_calls": int(row["server_tool_calls"] or 0),
+            "cost_usd": float(row["cost_usd"] or 0.0),
+        }
 
     def set_runtime_flag(self, key: str, value: str) -> None:
         """Persist a runtime flag across bot restarts."""

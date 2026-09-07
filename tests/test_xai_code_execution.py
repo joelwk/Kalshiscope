@@ -44,5 +44,5 @@ def test_create_chat_appends_code_execution_when_enabled() -> None:
             enable_code_execution=True,
         )
     tools = capture_chat.last_kwargs.get("tools") or []
-    assert len(tools) == 3
+    assert tools == [{"tool": "web"}, {"tool": "code"}]
     assert tools[-1] == {"tool": "code"}

@@ -92,6 +92,20 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
         self.assertEqual(settings.MAX_MARKET_DATA_AGE_SECONDS, 120)
 
+    def test_current_api_origins_pricing_and_cost_caps(self) -> None:
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.KALSHI_API_BASE_URL,
+            "https://external-api.kalshi.com/trade-api/v2",
+        )
+        self.assertEqual(settings.API_COST_INPUT_PER_1K_TOKENS_USD, 0.00125)
+        self.assertEqual(settings.API_COST_CACHED_INPUT_PER_1K_TOKENS_USD, 0.00020)
+        self.assertEqual(settings.API_COST_OUTPUT_PER_1K_TOKENS_USD, 0.00250)
+        self.assertEqual(settings.API_COST_SERVER_TOOL_PER_CALL_USD, 0.005)
+        self.assertEqual(settings.MAX_XAI_COST_PER_RUN_USD, 10.0)
+        self.assertEqual(settings.MAX_XAI_COST_PER_CYCLE_USD, 3.0)
+
     def test_guaranteed_orders_defaults_disabled_and_parses_override(self) -> None:
         with patch.dict(os.environ, self._required_env(), clear=True):
             defaults = config.load_settings()

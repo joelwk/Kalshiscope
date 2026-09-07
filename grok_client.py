@@ -6,7 +6,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from config import (
@@ -559,6 +559,35 @@ def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
     }
 
 
+def _extract_server_side_tool_usage(response: Any) -> tuple[dict[str, Any], int]:
+    usage = getattr(response, "server_side_tool_usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("server_side_tool_usage")
+    if usage is None:
+        return {}, 0
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump()
+    elif hasattr(usage, "to_dict"):
+        usage = usage.to_dict()
+    elif not isinstance(usage, dict) and hasattr(usage, "__dict__"):
+        usage = vars(usage)
+    if not isinstance(usage, dict):
+        return {"raw": str(usage)}, 0
+
+    def _count(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        if isinstance(value, dict):
+            return sum(_count(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(_count(item) for item in value)
+        return 0
+
+    return usage, _count(usage)
+
+
 def _format_previous_analysis(previous: TradeDecision | None) -> str:
     if not previous:
         return "None"
@@ -631,6 +660,8 @@ class GrokClient:
         search_config: SearchConfig | None = None,
         settings: Settings | None = None,
         provider: XAIProvider | None = None,
+        usage_recorder: Callable[[dict[str, Any]], None] | None = None,
+        usage_admission: Callable[[], None] | None = None,
     ) -> None:
         resolved_settings = settings or Settings()
         self.settings = resolved_settings
@@ -671,6 +702,8 @@ class GrokClient:
             api_key=api_key,
             timeout_seconds=self.xai_client_timeout_seconds,
         )
+        self.usage_recorder = usage_recorder
+        self.usage_admission = usage_admission
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
         self.default_search_config = search_config or _default_search_config(settings)
@@ -800,20 +833,8 @@ class GrokClient:
         decision: TradeDecision | None,
         config: SearchConfig,
     ) -> bool:
-        """Enable multimedia for borderline confidence or urgent markets."""
-        if config.profile_name == "speech":
-            return True
-        if decision:
-            lower, upper = config.multimedia_confidence_range
-            if lower <= decision.confidence <= upper:
-                return True
-        if market.close_time:
-            close_time = market.close_time
-            if close_time.tzinfo is None:
-                close_time = close_time.replace(tzinfo=timezone.utc)
-            if (close_time - datetime.now(timezone.utc)).total_seconds() <= 86400:
-                return True
-        return config.enable_multimedia
+        """Enable media inspection only for profiles whose evidence is media."""
+        return config.profile_name in {"speech", "social"}
 
     @staticmethod
     def _market_implied_probability(market: Market, outcome: str) -> float | None:
@@ -2038,17 +2059,17 @@ class GrokClient:
             return False
         if not allow_self_consistency:
             return False
-        liquidity = float(market.liquidity_usdc or 0.0)
-        liquidity_threshold = max(
-            0.0,
-            float(getattr(self.settings, "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD", 300.0)),
-        )
         edge_threshold = max(
             0.0,
             float(getattr(self.settings, "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD", 0.15)),
         )
         edge = self._decision_market_edge(market, decision)
-        return liquidity > liquidity_threshold or (edge is not None and edge >= edge_threshold)
+        return bool(
+            decision.should_trade
+            and edge is not None
+            and edge > 0.0
+            and edge >= edge_threshold
+        )
 
     def _merge_self_consistency_decisions(
         self,
@@ -2336,6 +2357,7 @@ class GrokClient:
         deep: bool,
         family_is_profitable: bool = False,
         allow_self_consistency: bool = True,
+        usage_phase: str = "initial",
     ) -> TradeDecision:
         self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
@@ -2398,6 +2420,7 @@ class GrokClient:
                     budget_remaining_ms=budget_remaining_ms,
                     max_attempts=max_attempts,
                     temperature=primary_temperature,
+                    usage_phase=usage_phase,
                 )
                 active_config_for_merge = self._active_search_config(search_config)
                 break
@@ -2492,6 +2515,7 @@ class GrokClient:
                         temperature=None,
                         model_override=_FAST_REASONING_FALLBACK_MODEL,
                         allow_model_fallback=False,
+                        usage_phase=usage_phase,
                     )
                     return fallback_decision.model_copy(
                         update={
@@ -2530,6 +2554,7 @@ class GrokClient:
                             )
                         ),
                         self_consistency_variant=True,
+                        usage_phase="self_consistency",
                     )
                     profile_name = (
                         active_config_for_merge.profile_name
@@ -2606,8 +2631,11 @@ class GrokClient:
         self_consistency_variant: bool = False,
         model_override: str | None = None,
         allow_model_fallback: bool = True,
+        usage_phase: str = "initial",
     ) -> TradeDecision:
         start_time = time.monotonic()
+        if self.usage_admission is not None:
+            self.usage_admission()
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
         model = model_override or (self.model_deep if deep else self.model)
@@ -2694,6 +2722,23 @@ class GrokClient:
                 deep=deep,
                 deadline_seconds=stream_deadline_seconds,
             )
+            server_side_tool_usage, server_tool_calls = (
+                _extract_server_side_tool_usage(last_response)
+            )
+            if self.usage_recorder is not None:
+                self.usage_recorder(
+                    {
+                        "market_id": market.id,
+                        "phase": usage_phase,
+                        "model": model,
+                        "prompt_tokens": usage_metrics.get("prompt_tokens") or 0,
+                        "cached_tokens": usage_metrics.get("cached_tokens") or 0,
+                        "completion_tokens": usage_metrics.get("completion_tokens") or 0,
+                        "reasoning_tokens": usage_metrics.get("reasoning_tokens") or 0,
+                        "server_tool_calls": server_tool_calls,
+                        "server_side_tool_usage": server_side_tool_usage,
+                    }
+                )
             citation_urls = _extract_citation_urls(last_response)
             structured_payload = _payload_from_stream_response(last_response)
             if not content and structured_payload is None:
@@ -2758,6 +2803,8 @@ class GrokClient:
                     "completion_tokens": usage_metrics["completion_tokens"],
                     "reasoning_tokens": usage_metrics["reasoning_tokens"],
                     "cached_tokens": usage_metrics["cached_tokens"],
+                    "server_tool_calls": server_tool_calls,
+                    "server_side_tool_usage": server_side_tool_usage,
                 }
             )
 
@@ -2851,6 +2898,7 @@ class GrokClient:
                     self_consistency_variant=self_consistency_variant,
                     model_override=_FAST_REASONING_FALLBACK_MODEL,
                     allow_model_fallback=False,
+                    usage_phase=usage_phase,
                 )
             will_retry = (
                 retriable
@@ -2903,6 +2951,7 @@ class GrokClient:
         *,
         family_is_profitable: bool = False,
         allow_self_consistency: bool = True,
+        usage_phase: str = "initial",
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
@@ -2911,6 +2960,7 @@ class GrokClient:
             deep=False,
             family_is_profitable=family_is_profitable,
             allow_self_consistency=allow_self_consistency,
+            usage_phase=usage_phase,
         )
 
     def analyze_market_deep(
@@ -2920,6 +2970,7 @@ class GrokClient:
         search_config: SearchConfig | None = None,
         *,
         family_is_profitable: bool = False,
+        usage_phase: str = "refinement",
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
@@ -2927,4 +2978,5 @@ class GrokClient:
             previous_analysis=previous_analysis,
             deep=True,
             family_is_profitable=family_is_profitable,
+            usage_phase=usage_phase,
         )

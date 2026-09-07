@@ -567,7 +567,9 @@ def test_fill_pagination_and_restart_replay_are_idempotent(tmp_path) -> None:
         assert first.complete is True
         assert first.pages_fetched == 2
         assert first.new_fill_events == 2
+        assert first.orders_with_new_fills == 1
         assert replay.new_fill_events == 0
+        assert replay.orders_with_new_fills == 0
         assert manager.get_pending_order("fill-order")["status"] == "filled"
         count = manager._conn.execute(
             "SELECT COUNT(*) FROM order_fill_events"

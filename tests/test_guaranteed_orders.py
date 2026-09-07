@@ -387,6 +387,41 @@ def test_guaranteed_dry_run_forces_deep_side_and_counts_one_attempt(tmp_path) ->
     }
 
 
+def test_guaranteed_budget_exhaustion_is_not_a_research_failure(tmp_path) -> None:
+    market = _market("budget-stop")
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-budget-001",
+    )
+
+    class _BudgetStoppedGrok:
+        def analyze_market(self, *args, **kwargs):
+            raise main.XAIBudgetExhaustedError(
+                "api_budget_exhausted:cycle_cost_cap"
+            )
+
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=_BudgetStoppedGrok(),
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "api_budget_exhausted"
+    assert "cycle_cost_cap" in str(result.error)
+    assert slot.submission_attempts == 0
+
+
 def test_guaranteed_absence_only_is_replaceable_not_forced(tmp_path) -> None:
     market = _market("gap-forced")
     slot = main.GuaranteedOrderSlot(
@@ -2375,6 +2410,8 @@ def test_account_error_retries_the_same_slot_without_retiring_the_market(
     assert plan.is_complete is True
     # The ticker was never at fault, so it must not be retired or replaced.
     assert plan.retired_market_ids == set()
+    assert plan.account_error_series == {"KXBTCD"}
+    assert plan.slots[0].needs_replacement is False
     assert plan.slots[0].market_id == "KXBTCD-T79"
     assert plan.slots[0].replacement_count == 0
     # The re-attempt reuses the researched decision rather than paying again.
@@ -2419,7 +2456,9 @@ def test_account_error_retries_at_most_once_per_slot(tmp_path) -> None:
 
     assert kalshi.attempts == 2
     assert result.completed == 0
-    assert plan.retired_market_ids == set()
+    assert plan.retired_market_ids == {"KXBTCD-T79"}
+    assert plan.account_error_series == {"KXBTCD"}
+    assert plan.slots[0].needs_replacement is True
 
 
 def test_account_error_is_not_classified_as_a_market_error() -> None:
@@ -2430,6 +2469,77 @@ def test_account_error_is_not_classified_as_a_market_error() -> None:
     assert main._is_unexecutable_market_error(account_text) is False
     assert main._is_account_submission_error(market_text) is False
     assert main._is_unexecutable_market_error(market_text) is True
+
+
+def test_two_account_error_series_open_write_circuit(tmp_path) -> None:
+    markets = [
+        _market("SERIES-A-MKT", series_ticker="SERIES-A"),
+        _market("SERIES-B-MKT", series_ticker="SERIES-B"),
+    ]
+
+    class _AlwaysUserNotFound(_LiveGuaranteedKalshi):
+        def __init__(self, available: list[Market]) -> None:
+            super().__init__(available)
+            self.attempts = 0
+
+        def submit_order(self, order, **kwargs):
+            self.attempts += 1
+            raise _http_user_not_found()
+
+    grok = _GuaranteedGrok(
+        _decision(confidence=0.85, evidence_basis="direct", edge_mechanism="observed")
+    )
+    kalshi = _AlwaysUserNotFound(markets)
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="two-series")
+    kwargs = {
+        "plan": plan,
+        "markets": markets,
+        "excluded_market_ids": set(),
+        "settings": main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+        "grok_client": grok,
+        "kalshi_client": kalshi,
+        "state_manager": state,
+        "min_bet_usdc": 5.0,
+        "max_bet_usdc": 12.0,
+        "log_decision": lambda **kwargs: None,
+        "extended_research_market_ids": set(),
+    }
+    try:
+        main._run_guaranteed_order_phase(cycle_number=1, **kwargs)
+        attempts_after_open = kalshi.attempts
+        deep_calls_after_open = len(grok.deep_calls)
+        main._run_guaranteed_order_phase(cycle_number=2, **kwargs)
+    finally:
+        state.close()
+
+    assert plan.write_circuit_open is True
+    assert plan.account_error_series == {"SERIES-A", "SERIES-B"}
+    assert attempts_after_open == 3
+    assert kalshi.attempts == attempts_after_open
+    assert len(grok.deep_calls) == deep_calls_after_open
+
+
+def test_forced_reason_marker_is_idempotent() -> None:
+    market = _market("MKT")
+    decision = _decision(
+        confidence=0.85,
+        evidence_basis="direct",
+        edge_mechanism="observed",
+    )
+    once = main._forced_execution_decision(
+        decision,
+        market,
+        amount_usdc=5.0,
+        max_bet_usdc=10.0,
+    )
+    twice = main._forced_execution_decision(
+        once,
+        market,
+        amount_usdc=5.0,
+        max_bet_usdc=10.0,
+    )
+    assert twice.reasoning.count("[GuaranteedOrder forced") == 1
 
 
 def test_guaranteed_phase_records_series_outcomes_for_the_next_run(tmp_path) -> None:

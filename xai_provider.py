@@ -74,15 +74,18 @@ class XAIProvider:
             web_search(
                 allowed_domains=config.allowed_domains,
                 enable_image_understanding=enable_multimedia,
-            ),
-            x_search(
-                from_date=config.from_date,
-                to_date=config.to_date,
-                allowed_x_handles=config.allowed_x_handles,
-                enable_image_understanding=enable_multimedia,
-                enable_video_understanding=enable_multimedia,
-            ),
+            )
         ]
+        if config.profile_name in {"speech", "social", "live_news", "politics"}:
+            tools.append(
+                x_search(
+                    from_date=config.from_date,
+                    to_date=config.to_date,
+                    allowed_x_handles=config.allowed_x_handles,
+                    enable_image_understanding=enable_multimedia,
+                    enable_video_understanding=enable_multimedia,
+                )
+            )
         if enable_code_execution:
             tools.append(code_execution())
         create_kwargs: dict[str, Any] = {

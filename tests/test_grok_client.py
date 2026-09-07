@@ -342,7 +342,7 @@ class TestGrokClient(unittest.TestCase):
         first_tools = sequenced.chat.create_kwargs[0].get("tools") or []
         second_tools = sequenced.chat.create_kwargs[1].get("tools") or []
         self.assertGreater(len(first_tools), len(second_tools))
-        self.assertEqual(len(second_tools), 2)
+        self.assertEqual(len(second_tools), 1)
 
     def test_recovered_retriable_analysis_attempt_does_not_log_error(self) -> None:
         market = Market(
@@ -607,7 +607,7 @@ class TestGrokClient(unittest.TestCase):
 
         last_kwargs = client.client.chat.create_kwargs
         self.assertEqual(last_kwargs["model"], client.model)
-        self.assertEqual(len(last_kwargs["tools"]), 2)
+        self.assertEqual(len(last_kwargs["tools"]), 1)
         self.assertIs(last_kwargs["response_format"], TradeDecision)
         self.assertEqual(last_kwargs["temperature"], 0.7)
         self.assertEqual(last_kwargs["include"], ["inline_citations"])
@@ -628,14 +628,20 @@ class TestGrokClient(unittest.TestCase):
             '"probability_yes": 0.75, "bet_size_pct": 0.5, '
             '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
             '"evidence_quality": 0.8, "key_sources": ["source A"], '
-            '"base_rate_used": true}'
+            '"base_rate_used": true, "evidence_basis": "direct", '
+            '"edge_source": "computed", "edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": '
+            '"https://example.com/source"}'
         )
         second = (
             '{"should_trade": true, "outcome": "YES", "confidence": 0.65, '
             '"probability_yes": 0.65, "bet_size_pct": 0.5, '
             '"reasoning": "Implied prob: 55%, My prob: 65%, Edge: 10%. Counter-evidence lowers this.", '
             '"evidence_quality": 0.8, "key_sources": ["source B"], '
-            '"self_critique": "Recent base rate lowers probability."}'
+            '"self_critique": "Recent base rate lowers probability.", '
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": "https://example.com/source-b"}'
         )
         client = GrokClient(api_key="x")
         sequenced = SequencedClient([first, second])
@@ -666,7 +672,10 @@ class TestGrokClient(unittest.TestCase):
         first = (
             '{"should_trade": true, "outcome": "YES", "confidence": 0.78, '
             '"probability_yes": 0.78, "bet_size_pct": 0.5, '
-            '"reasoning": "YES edge", "evidence_quality": 0.8}'
+            '"reasoning": "YES edge", "evidence_quality": 0.8, '
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": "https://example.com/source"}'
         )
         second = (
             '{"should_trade": false, "outcome": "NO", "confidence": 0.62, '
@@ -706,7 +715,8 @@ class TestGrokClient(unittest.TestCase):
             '"reasoning": "NWS favors below bin. Implied YES 47%, my YES 22%.", '
             '"evidence_quality": 0.9, "primary_source_url": '
             '"https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43", '
-            '"evidence_basis": "direct", "edge_source": "computed"}'
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"edge_mechanism": "observed_vs_strike"}'
         )
         second = (
             '{"should_trade": true, "outcome": "NO", "confidence": 0.82, '
@@ -871,11 +881,7 @@ class TestGrokClient(unittest.TestCase):
             client.analyze_market(market)
 
         self.assertEqual(captured["web"]["allowed_domains"], ["example.com"])
-        self.assertEqual(captured["x"]["from_date"], datetime(2026, 1, 13, 0, 0, tzinfo=timezone.utc))
-        self.assertEqual(captured["x"]["to_date"], datetime(2026, 1, 13, 12, 0, tzinfo=timezone.utc))
-        self.assertEqual(captured["x"]["allowed_x_handles"], ["Foo"])
-        self.assertFalse(captured["x"]["enable_image_understanding"])
-        self.assertFalse(captured["x"]["enable_video_understanding"])
+        self.assertNotIn("x", captured)
 
     def test_tools_respect_search_config_source_caps(self) -> None:
         market = Market(
@@ -917,7 +923,7 @@ class TestGrokClient(unittest.TestCase):
             captured["web"]["allowed_domains"],
             ["a.com", "b.com", "c.com"],
         )
-        self.assertEqual(captured["x"]["allowed_x_handles"], ["A", "B", "C", "D"])
+        self.assertNotIn("x", captured)
 
     def test_tools_clamp_search_sources_to_xai_caps(self) -> None:
         market = Market(
@@ -971,10 +977,7 @@ class TestGrokClient(unittest.TestCase):
             captured["web"]["allowed_domains"],
             ["a.com", "b.com", "c.com", "d.com", "e.com"],
         )
-        self.assertEqual(
-            captured["x"]["allowed_x_handles"],
-            ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
-        )
+        self.assertNotIn("x", captured)
 
     def test_analyze_market_deep_enables_multimedia_for_borderline(self) -> None:
         market = Market(
@@ -1018,8 +1021,8 @@ class TestGrokClient(unittest.TestCase):
         ):
             client.analyze_market_deep(market, previous_analysis=previous)
 
-        self.assertTrue(captured["x"]["enable_image_understanding"])
-        self.assertTrue(captured["x"]["enable_video_understanding"])
+        self.assertFalse(captured["web"]["enable_image_understanding"])
+        self.assertNotIn("x", captured)
 
     def test_analyze_market_deep_merges_partial_payload(self) -> None:
         market = Market(
@@ -1188,7 +1191,7 @@ class TestGrokClient(unittest.TestCase):
             close_time=datetime.now(timezone.utc) + timedelta(hours=12),
         )
         client = GrokClient(api_key="x")
-        self.assertTrue(
+        self.assertFalse(
             client._should_enable_multimedia(
                 market,
                 decision=None,
@@ -2646,7 +2649,7 @@ class SelfConsistencyShouldRunTest(unittest.TestCase):
         return TradeDecision(
             should_trade=True,
             outcome="YES",
-            confidence=0.70,
+            confidence=0.71,
             bet_size_pct=0.3,
             reasoning="x",
             implied_prob_external=0.45,
@@ -2658,7 +2661,7 @@ class SelfConsistencyShouldRunTest(unittest.TestCase):
         client = GrokClient(api_key="x")
         market = self._market()
         decision = self._decision()
-        # High liquidity clears the threshold, so it runs when allowed.
+        # Positive execution-relevant edge clears the threshold when allowed.
         self.assertTrue(
             client._should_run_self_consistency(
                 market, decision, deep=False, allow_self_consistency=True
@@ -2866,7 +2869,7 @@ class TestEdgeMechanismAndSdkWiring(unittest.TestCase):
         client.client = dummy
         client.analyze_market(market)
         tools = dummy.chat.create_kwargs.get("tools") or []
-        self.assertEqual(len(tools), 3)
+        self.assertEqual(len(tools), 2)
 
 
 if __name__ == "__main__":

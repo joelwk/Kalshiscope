@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Iterable
 
 from dotenv import load_dotenv
@@ -480,7 +481,7 @@ class Settings:
     )
 
     # Kalshi
-    KALSHI_API_BASE_URL: str = "https://api.elections.kalshi.com/trade-api/v2"
+    KALSHI_API_BASE_URL: str = "https://external-api.kalshi.com/trade-api/v2"
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
     KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
@@ -1057,8 +1058,13 @@ class Settings:
     ENABLE_FILE_LOGGING: bool = True
     ENABLE_JSON_LOGGING: bool = True
     ENABLE_COLORED_LOGGING: bool = True
-    API_COST_INPUT_PER_1K_TOKENS_USD: float = 0.0
-    API_COST_OUTPUT_PER_1K_TOKENS_USD: float = 0.0
+    API_COST_INPUT_PER_1K_TOKENS_USD: float = 0.00125
+    API_COST_CACHED_INPUT_PER_1K_TOKENS_USD: float = 0.00020
+    API_COST_OUTPUT_PER_1K_TOKENS_USD: float = 0.00250
+    API_COST_SERVER_TOOL_PER_CALL_USD: float = 0.005
+    API_COST_PRICING_VERSION: str = "xai-grok-4.3-2026-09"
+    MAX_XAI_COST_PER_RUN_USD: float = 10.0
+    MAX_XAI_COST_PER_CYCLE_USD: float = 3.0
 
 
 BASE_REQUIRED_ENV_VARS = (
@@ -2785,9 +2791,29 @@ def load_settings() -> Settings:
             "API_COST_INPUT_PER_1K_TOKENS_USD",
             Settings.API_COST_INPUT_PER_1K_TOKENS_USD,
         ),
+        API_COST_CACHED_INPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_CACHED_INPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_CACHED_INPUT_PER_1K_TOKENS_USD,
+        ),
         API_COST_OUTPUT_PER_1K_TOKENS_USD=_read_env_float(
             "API_COST_OUTPUT_PER_1K_TOKENS_USD",
             Settings.API_COST_OUTPUT_PER_1K_TOKENS_USD,
+        ),
+        API_COST_SERVER_TOOL_PER_CALL_USD=_read_env_float(
+            "API_COST_SERVER_TOOL_PER_CALL_USD",
+            Settings.API_COST_SERVER_TOOL_PER_CALL_USD,
+        ),
+        API_COST_PRICING_VERSION=_read_env_str(
+            "API_COST_PRICING_VERSION",
+            Settings.API_COST_PRICING_VERSION,
+        ),
+        MAX_XAI_COST_PER_RUN_USD=_read_env_float(
+            "MAX_XAI_COST_PER_RUN_USD",
+            Settings.MAX_XAI_COST_PER_RUN_USD,
+        ),
+        MAX_XAI_COST_PER_CYCLE_USD=_read_env_float(
+            "MAX_XAI_COST_PER_CYCLE_USD",
+            Settings.MAX_XAI_COST_PER_CYCLE_USD,
         ),
     )
     strategy = settings.OPPOSITE_OUTCOME_STRATEGY.strip().lower()
@@ -2822,6 +2848,16 @@ def load_settings() -> Settings:
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS must be greater "
             "than or equal to zero"
         )
+    for cost_field in (
+        "API_COST_INPUT_PER_1K_TOKENS_USD",
+        "API_COST_CACHED_INPUT_PER_1K_TOKENS_USD",
+        "API_COST_OUTPUT_PER_1K_TOKENS_USD",
+        "API_COST_SERVER_TOOL_PER_CALL_USD",
+        "MAX_XAI_COST_PER_RUN_USD",
+        "MAX_XAI_COST_PER_CYCLE_USD",
+    ):
+        if float(getattr(settings, cost_field)) < 0:
+            raise ValueError(f"{cost_field} must be greater than or equal to zero")
     if settings.GUARANTEED_MIN_EDGE < 0:
         raise ValueError("GUARANTEED_MIN_EDGE must be greater than or equal to zero")
     if settings.GUARANTEED_PROXY_MIN_EDGE < 0:

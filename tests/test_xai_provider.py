@@ -142,7 +142,28 @@ def test_create_chat_passes_image_understanding_to_web_search() -> None:
         )
 
     assert captured["web"]["enable_image_understanding"] is True
-    assert captured["x"]["enable_image_understanding"] is True
+    assert "x" not in captured
+
+
+@pytest.mark.parametrize("profile_name", ["speech", "social", "live_news", "politics"])
+def test_create_chat_exposes_x_search_for_live_news_profiles(
+    profile_name: str,
+) -> None:
+    flaky_chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):
+        provider = XAIProvider(api_key="xai-key", timeout_seconds=5)
+    config = _search_config()
+    config.profile_name = profile_name
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ) as x_tool:
+        provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=config,
+            enable_multimedia=True,
+        )
+    x_tool.assert_called_once()
 
 
 def test_create_chat_passes_temperature_to_sdk() -> None:

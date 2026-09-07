@@ -85,6 +85,11 @@ from score_engine import (
     score_breakdown_explanation,
 )
 from xai_provider import XAIProvider
+from xai_usage import (
+    XAIBudgetExhaustedError,
+    XAIUsageTracker,
+    estimate_xai_cost_usd,
+)
 
 try:
     import certifi
@@ -4536,6 +4541,9 @@ class GuaranteedOrderPlan:
     deep_research_calls: int = 0
     skipped_deep_research_calls: int = 0
     research_cost_usd: float = 0.0
+    account_error_market_ids: set[str] = field(default_factory=set)
+    account_error_series: set[str] = field(default_factory=set)
+    write_circuit_open: bool = False
 
     @property
     def locked_count(self) -> int:
@@ -4632,7 +4640,77 @@ class GuaranteedOrderPlan:
                 for slot in self.slots
             ],
             "retired_market_ids": sorted(self.retired_market_ids),
+            "account_error_market_ids": sorted(self.account_error_market_ids),
+            "account_error_series": sorted(self.account_error_series),
+            "write_circuit_open": self.write_circuit_open,
         }
+
+    def to_json(self) -> str:
+        payload = self.summary()
+        payload["slots"] = [
+            {
+                **{
+                    key: value
+                    for key, value in slot.__dict__.items()
+                    if key not in {"market", "decision"}
+                },
+                "market": slot.market.model_dump(mode="json"),
+                "decision": (
+                    slot.decision.model_dump(mode="json")
+                    if slot.decision is not None
+                    else None
+                ),
+            }
+            for slot in self.slots
+        ]
+        return json.dumps(payload, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "GuaranteedOrderPlan":
+        payload = json.loads(raw)
+        slots = []
+        for slot_payload in payload.get("slots") or []:
+            slot_data = dict(slot_payload)
+            slot_data["market"] = Market.model_validate(slot_data["market"])
+            if slot_data.get("decision") is not None:
+                slot_data["decision"] = TradeDecision.model_validate(
+                    slot_data["decision"]
+                )
+            slots.append(GuaranteedOrderSlot(**slot_data))
+        return cls(
+            target=int(payload["target"]),
+            run_id=str(payload["run_id"]),
+            slots=slots,
+            normal_execution_suppressed=int(
+                payload.get("normal_execution_suppressed") or 0
+            ),
+            retired_market_ids=set(payload.get("retired_market_ids") or []),
+            research_gap_replacements=int(
+                payload.get("research_gap_replacements") or 0
+            ),
+            reject_reason_counts=dict(payload.get("reject_reason_counts") or {}),
+            series_attempt_counts=dict(payload.get("series_attempt_counts") or {}),
+            deep_research_calls=int(payload.get("deep_research_calls") or 0),
+            skipped_deep_research_calls=int(
+                payload.get("skipped_deep_research_calls") or 0
+            ),
+            research_cost_usd=float(payload.get("research_cost_usd") or 0.0),
+            account_error_market_ids=set(
+                payload.get("account_error_market_ids") or []
+            ),
+            account_error_series=set(payload.get("account_error_series") or []),
+            write_circuit_open=bool(payload.get("write_circuit_open", False)),
+        )
+
+
+_GUARANTEED_PLAN_RUNTIME_FLAG = "active_guaranteed_order_plan_v1"
+
+
+def _persist_guaranteed_order_plan(
+    state_manager: MarketStateManager,
+    plan: GuaranteedOrderPlan,
+) -> None:
+    state_manager.set_runtime_flag(_GUARANTEED_PLAN_RUNTIME_FLAG, plan.to_json())
 
 
 def _guaranteed_run_outcome(plan: GuaranteedOrderPlan) -> str:
@@ -5268,6 +5346,7 @@ def _lock_guaranteed_order_markets(
         if market.id not in locked_ids
         and market.id not in excluded_market_ids
         and market.id not in plan.retired_market_ids
+        and str(market.series_ticker or "") not in plan.account_error_series
         and not _market_hits_jurisdiction_hold(market, normalized_excluded_families)
         and not _guaranteed_series_is_burned(market, series_outcomes, settings)
         and _is_guaranteed_order_market_candidate(market, settings)
@@ -5574,17 +5653,19 @@ def _forced_execution_decision(
     bet_size_pct = 1.0
     if max_bet_usdc > 0:
         bet_size_pct = max(0.0, min(1.0, amount_usdc / max_bet_usdc))
+    forced_marker = (
+        "[GuaranteedOrder forced after initial+deep research on a positive-EV "
+        "researched side; ordinary execution gates are audit-only for this slot]"
+    )
+    reasoning = str(decision.reasoning or "")
+    if not reasoning.startswith(forced_marker):
+        reasoning = f"{forced_marker} {reasoning}"
     updates: dict[str, Any] = {
         "should_trade": True,
         "abstain": False,
         "outcome": outcome,
         "bet_size_pct": bet_size_pct,
-        "reasoning": (
-            "[GuaranteedOrder forced after initial+deep research on a "
-            "positive-EV researched side; ordinary execution gates are "
-            "audit-only for this slot] "
-            f"{decision.reasoning}"
-        ),
+        "reasoning": reasoning,
     }
     if str(decision.edge_source or "").strip().lower() == "none":
         # Research cleared via proxy/direct+URL; stamp computed for Kelly audit.
@@ -5705,6 +5786,7 @@ def _attempt_guaranteed_order_slot(
                     search_config=search_config,
                     previous_analysis=None,
                     allow_self_consistency=False,
+                    usage_phase="guaranteed_initial",
                 )
                 _capture_usage(initial_decision)
             else:
@@ -5732,6 +5814,7 @@ def _attempt_guaranteed_order_slot(
                     research_market,
                     previous_analysis=initial_decision,
                     search_config=search_config,
+                    usage_phase="guaranteed_deep",
                 )
                 _capture_usage(deep_decision)
                 intense_research_performed = True
@@ -5743,6 +5826,15 @@ def _attempt_guaranteed_order_slot(
             slot.decision = decision
             slot.research_completed = True
             slot.last_error = None
+        except XAIBudgetExhaustedError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            slot.last_error = error
+            return GuaranteedOrderAttemptResult(
+                status="api_budget_exhausted",
+                intense_research_performed=intense_research_performed,
+                token_usage=token_usage,
+                error=error,
+            )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             slot.last_error = error
@@ -5888,6 +5980,8 @@ def _run_guaranteed_order_phase(
     seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
 ) -> GuaranteedOrderCycleResult:
     result = GuaranteedOrderCycleResult()
+    if plan.write_circuit_open:
+        return result
     excluded_market_families: set[str] = set()
     if not settings.DRY_RUN:
         excluded_market_families.update(_jurisdiction_blocked_families(state_manager))
@@ -6257,8 +6351,6 @@ def _run_guaranteed_order_phase(
             )
         pending_slots.extend(replacement_slots)
 
-    account_error_retried_slots: set[int] = set()
-
     while pending_slots:
         slot = pending_slots.pop(0)
         attempt = _attempt_guaranteed_order_slot(
@@ -6296,7 +6388,11 @@ def _run_guaranteed_order_phase(
             if attempt.status == "research_gap_replaceable"
             else attempt.status
         )
-        if reject_label and attempt.status not in {"submitted", "dry_run"}:
+        if reject_label and attempt.status not in {
+            "submitted",
+            "dry_run",
+            "api_budget_exhausted",
+        }:
             plan.reject_reason_counts[reject_label] = (
                 plan.reject_reason_counts.get(reject_label, 0) + 1
             )
@@ -6334,6 +6430,24 @@ def _run_guaranteed_order_phase(
             "market_family": market_family(slot.market),
             **(attempt.sizing_audit or {}),
         }
+        if attempt.status == "api_budget_exhausted":
+            result.failures.append(
+                {
+                    "slot_number": slot.slot_number,
+                    "market_id": slot.market_id,
+                    "status": attempt.status,
+                    "error": attempt.error,
+                }
+            )
+            logger.warning(
+                "Guaranteed-order research stopped at xAI budget: slot=%d market=%s",
+                slot.slot_number,
+                slot.market_id,
+                data={**audit, "market_id": slot.market_id, "error": attempt.error},
+            )
+            pending_slots.clear()
+            _persist_guaranteed_order_plan(state_manager, plan)
+            break
         if attempt.status in {"research_failed", "invalid_bet_size"}:
             result.failures.append(
                 {
@@ -6503,9 +6617,18 @@ def _run_guaranteed_order_phase(
                 replacement_slots = _lock_available_slots()
                 pending_slots.extend(replacement_slots)
             elif _is_account_submission_error(attempt.error):
-                # The ticker is fine, so the researched slot keeps its market
-                # and gets one more shot before the cycle ends.
-                retry_pending = slot.slot_number not in account_error_retried_slots
+                series_ticker = str(
+                    active_market.series_ticker
+                    or active_market.event_ticker
+                    or active_market.id
+                )
+                plan.account_error_market_ids.add(slot.market_id)
+                plan.account_error_series.add(series_ticker)
+                if len(plan.account_error_series) >= 2:
+                    plan.write_circuit_open = True
+                retry_pending = (
+                    slot.submission_attempts < 2 and not plan.write_circuit_open
+                )
                 logger.error(
                     "Guaranteed-order submission rejected at the account level: "
                     "slot=%d market=%s retrying=%s error=%s",
@@ -6520,6 +6643,8 @@ def _run_guaranteed_order_phase(
                         "submission_attempts": slot.submission_attempts,
                         "guaranteed_order_account_error": True,
                         "guaranteed_order_account_error_retrying": retry_pending,
+                        "guaranteed_order_account_error_series": series_ticker,
+                        "guaranteed_order_write_circuit_open": plan.write_circuit_open,
                         "error": attempt.error,
                     },
                 )
@@ -6538,8 +6663,19 @@ def _run_guaranteed_order_phase(
                     ),
                 )
                 if retry_pending:
-                    account_error_retried_slots.add(slot.slot_number)
                     pending_slots.append(slot)
+                else:
+                    plan.retired_market_ids.add(slot.market_id)
+                    _mark_guaranteed_order_slot_for_replacement(
+                        plan,
+                        slot,
+                        reason="guaranteed_order_account_submission_quarantined",
+                    )
+                    if plan.write_circuit_open:
+                        pending_slots.clear()
+                    else:
+                        pending_slots.extend(_lock_available_slots())
+                _persist_guaranteed_order_plan(state_manager, plan)
             elif _is_unexecutable_market_error(attempt.error):
                 error_text = str(attempt.error or "").lower()
                 replacement_reason = (
@@ -6586,6 +6722,7 @@ def _run_guaranteed_order_phase(
         slot.completed = True
         slot.last_error = None
         result.completed += 1
+        _persist_guaranteed_order_plan(state_manager, plan)
         _record_series_outcome(slot, filled=True)
         if attempt.status == "dry_run":
             result.usd_submitted += attempt.amount_usdc
@@ -6694,6 +6831,7 @@ def _run_guaranteed_order_phase(
             plan.target,
             data=plan.summary(),
         )
+    _persist_guaranteed_order_plan(state_manager, plan)
     return result
 
 
@@ -7725,6 +7863,7 @@ def _sync_settlements_from_exchange(
 class ExchangeFillSyncMetrics:
     reconciled_orders: int = 0
     new_fill_events: int = 0
+    orders_with_new_fills: int = 0
     filled_shares: float = 0.0
     filled_notional_usdc: float = 0.0
     external_order_count: int = 0
@@ -7848,6 +7987,7 @@ def _sync_exchange_fills(
     external_order_ids: set[str] = set()
     fill_aggregates: dict[str, dict[str, Any]] = {}
     inserted_fill_events = 0
+    inserted_fill_order_ids: set[str] = set()
     timestamps: list[datetime | None] = []
     for row in rows:
         order_id = _exchange_fill_order_id(row)
@@ -7881,6 +8021,7 @@ def _sync_exchange_fills(
             raw=row,
         ):
             inserted_fill_events += 1
+            inserted_fill_order_ids.add(order_id)
         if order_id not in known_order_ids:
             external_order_ids.add(order_id)
             continue
@@ -7953,6 +8094,7 @@ def _sync_exchange_fills(
     return ExchangeFillSyncMetrics(
         reconciled_orders=reconciled_orders,
         new_fill_events=inserted_fill_events,
+        orders_with_new_fills=len(inserted_fill_order_ids),
         filled_shares=round(filled_shares, 8),
         filled_notional_usdc=round(filled_notional_usdc, 8),
         external_order_count=len(external_order_ids),
@@ -8198,12 +8340,14 @@ def _estimate_api_cost_usd(
     completion_tokens: int,
     cached_tokens: int,
     settings: Settings,
+    server_tool_calls: int = 0,
 ) -> float:
-    input_rate = max(0.0, float(settings.API_COST_INPUT_PER_1K_TOKENS_USD))
-    output_rate = max(0.0, float(settings.API_COST_OUTPUT_PER_1K_TOKENS_USD))
-    billable_prompt_tokens = max(0, int(prompt_tokens) - max(0, int(cached_tokens)))
-    return ((billable_prompt_tokens / 1000.0) * input_rate) + (
-        (max(0, int(completion_tokens)) / 1000.0) * output_rate
+    return estimate_xai_cost_usd(
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        completion_tokens=completion_tokens,
+        server_tool_calls=server_tool_calls,
+        settings=settings,
     )
 
 
@@ -9627,6 +9771,8 @@ def _dry_streak_sleep_seconds(
 def _build_grok_client_for_worker(
     settings: Settings,
     provider: XAIProvider | None = None,
+    usage_recorder=None,
+    usage_admission=None,
 ) -> GrokClient:
     """Create a Grok client for threaded analysis workers.
 
@@ -9639,6 +9785,8 @@ def _build_grok_client_for_worker(
         model_deep=settings.GROK_MODEL_DEEP,
         settings=settings,
         provider=provider,
+        usage_recorder=usage_recorder,
+        usage_admission=usage_admission,
     )
 
 
@@ -9667,12 +9815,19 @@ def reset_worker_grok_client_cache() -> None:
 def _get_or_create_worker_grok_client(
     settings: Settings,
     provider: XAIProvider | None = None,
+    usage_recorder=None,
+    usage_admission=None,
 ) -> GrokClient:
     """Return the calling thread's GrokClient, building it lazily on first use."""
     storage = _worker_grok_client_storage
     client = getattr(storage, "client", None)
     if client is None:
-        client = _build_grok_client_for_worker(settings, provider=provider)
+        client = _build_grok_client_for_worker(
+            settings,
+            provider=provider,
+            usage_recorder=usage_recorder,
+            usage_admission=usage_admission,
+        )
         storage.client = client
     return client
 
@@ -9709,6 +9864,8 @@ def _analyze_market_candidate_via_thread_local_client(
     anchor_analysis: dict[str, Any] | None,
     settings: Settings,
     provider: XAIProvider | None,
+    usage_recorder=None,
+    usage_admission=None,
     historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
     correlation_id: str | None = None,
     force_extended_research: bool = False,
@@ -9719,7 +9876,12 @@ def _analyze_market_candidate_via_thread_local_client(
     max_bet_usdc: float = 0.0,
 ) -> dict[str, Any]:
     """Worker entry point that reuses one GrokClient per worker thread."""
-    grok_client = _get_or_create_worker_grok_client(settings, provider)
+    grok_client = _get_or_create_worker_grok_client(
+        settings,
+        provider,
+        usage_recorder,
+        usage_admission,
+    )
     # Bet bounds are bankroll-derived per cycle while worker clients are cached
     # per thread, so refresh the prompt bet range on every analysis.
     grok_client.min_bet_usdc = float(min_bet_usdc)
@@ -11107,6 +11269,7 @@ def _analyze_market_candidate(
                 previous_analysis=repair_previous,
                 search_config=repair_search_config,
                 family_is_profitable=family_is_profitable,
+                usage_phase="repair",
             )
             decision = repaired_decision
             was_refined = True
@@ -11514,6 +11677,55 @@ def main(max_cycles: int | None = None) -> None:
         settings.STATE_DB_PATH,
         research_queue_entry_ttl_hours=settings.RESEARCH_QUEUE_ENTRY_TTL_HOURS,
     )
+    guaranteed_order_plan: GuaranteedOrderPlan
+    persisted_guaranteed_plan = state_manager.get_runtime_flag(
+        _GUARANTEED_PLAN_RUNTIME_FLAG
+    )
+    try:
+        resumed_plan = (
+            GuaranteedOrderPlan.from_json(persisted_guaranteed_plan)
+            if persisted_guaranteed_plan
+            else None
+        )
+    except Exception as exc:
+        logger.error(
+            "Discarding invalid persisted guaranteed-order plan: %s",
+            exc,
+            data={"error": str(exc)},
+        )
+        resumed_plan = None
+    if (
+        settings.GUARANTEED_ORDERS_N > 0
+        and resumed_plan is not None
+        and resumed_plan.target == settings.GUARANTEED_ORDERS_N
+    ):
+        guaranteed_order_plan = resumed_plan
+        logger.warning(
+            "Resuming guaranteed-order plan run_id=%s completed=%d/%d cost=$%.4f",
+            resumed_plan.run_id,
+            resumed_plan.completed_count,
+            resumed_plan.target,
+            resumed_plan.research_cost_usd,
+        )
+    else:
+        guaranteed_order_plan = GuaranteedOrderPlan(
+            target=settings.GUARANTEED_ORDERS_N,
+        )
+        if guaranteed_order_plan.target > 0:
+            _persist_guaranteed_order_plan(state_manager, guaranteed_order_plan)
+        elif persisted_guaranteed_plan is not None:
+            state_manager.clear_runtime_flag(_GUARANTEED_PLAN_RUNTIME_FLAG)
+    run_id = guaranteed_order_plan.run_id
+    xai_usage_tracker = XAIUsageTracker(
+        state_manager=state_manager,
+        settings=settings,
+        run_id=run_id,
+    )
+    if guaranteed_order_plan.target > 0:
+        guaranteed_order_plan.research_cost_usd = float(
+            xai_usage_tracker.totals()["cost_usd"]
+        )
+        _persist_guaranteed_order_plan(state_manager, guaranteed_order_plan)
     backfilled = state_manager.backfill_outcomes_from_settlements()
     if backfilled:
         logger.info(
@@ -11550,6 +11762,8 @@ def main(max_cycles: int | None = None) -> None:
         model_deep=settings.GROK_MODEL_DEEP,
         settings=settings,
         provider=shared_xai_provider,
+        usage_recorder=xai_usage_tracker.record,
+        usage_admission=xai_usage_tracker.ensure_call_allowed,
     )
     logger.debug(
         "Grok client initialized with model=%s model_deep=%s",
@@ -11588,9 +11802,6 @@ def main(max_cycles: int | None = None) -> None:
         max_cycles if max_cycles is not None else "unlimited",
         settings.GUARANTEED_ORDERS_N,
     )
-    guaranteed_order_plan = GuaranteedOrderPlan(
-        target=settings.GUARANTEED_ORDERS_N,
-    )
     if guaranteed_order_plan.target > 0:
         logger.warning(
             "Guaranteed-order mode enabled: %d positive-EV forced order(s) after "
@@ -11623,7 +11834,9 @@ def main(max_cycles: int | None = None) -> None:
     last_observed_bankroll_usdc: float | None = None
     # Per-market daily cap on conviction-repair deep passes (Grok cost bound).
     conviction_repair_attempt_days: dict[str, date] = {}
-    cumulative_api_cost_estimate_usd = 0.0
+    cumulative_api_cost_estimate_usd = float(
+        xai_usage_tracker.totals()["cost_usd"]
+    )
     consecutive_zero_order_cycles = 0
     consecutive_zero_execution_yield_cycles = 0
     xai_quota_paused_until: datetime | None = None
@@ -11634,6 +11847,7 @@ def main(max_cycles: int | None = None) -> None:
     while True:
         cycle_count += 1
         cycle_id = set_correlation_id()
+        xai_usage_tracker.begin_cycle(cycle_id, cycle_count)
         cycle_start = time.monotonic()
         sleep_seconds = settings.POLL_INTERVAL_SEC
 
@@ -12105,6 +12319,7 @@ def main(max_cycles: int | None = None) -> None:
             total_usd_deployed = fill_sync_metrics.filled_notional_usdc
             trades_skipped_confidence = 0
             trades_skipped_balance = 0
+            trades_skipped_api_budget = 0
             trades_skipped_no_trade = 0
             trades_skipped_edge = 0
             trades_skipped_position = 0
@@ -12131,7 +12346,7 @@ def main(max_cycles: int | None = None) -> None:
             flip_guard_blocked = 0
             flip_precheck_skipped_refinement = 0
             outcome_mismatch_blocked = 0
-            analysis_only_mode = False  # Set True when balance is insufficient
+            analysis_only_mode = False
             price_bucket_stats = {
                 _PRICE_BUCKET_LOW: 0,
                 _PRICE_BUCKET_MID: 0,
@@ -12215,6 +12430,9 @@ def main(max_cycles: int | None = None) -> None:
             cycle_completion_tokens = 0
             cycle_reasoning_tokens = 0
             cycle_cached_tokens = 0
+            cycle_server_tool_calls = 0
+            cycle_xai_calls = 0
+            api_budget_exhausted_reason: str | None = None
             event_cycle_traded_market_ids: dict[str, set[str]] = {}
             event_cycle_traded_outcomes: dict[str, set[str]] = {}
             confidence_calibration_applied_count = 0
@@ -14333,6 +14551,15 @@ def main(max_cycles: int | None = None) -> None:
                 dynamic_max_markets_per_cycle,
                 parallel_analysis_enabled=bool(settings.PARALLEL_ANALYSIS_ENABLED),
             )
+            if guaranteed_order_plan.suppresses_normal_execution:
+                guaranteed_candidate_limit = max(
+                    2,
+                    2 * guaranteed_order_plan.remaining_count,
+                )
+                analysis_candidate_attempt_limit = min(
+                    analysis_candidate_attempt_limit,
+                    guaranteed_candidate_limit,
+                )
             sports_candidate_cap = (
                 settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
                 if settings.MAX_SPORTS_CANDIDATES_PER_CYCLE > 0
@@ -14738,6 +14965,49 @@ def main(max_cycles: int | None = None) -> None:
 
             analysis_results: dict[str, dict[str, Any]] = {}
             analysis_phase_start = time.monotonic()
+            if guaranteed_order_plan.is_complete and analysis_candidates:
+                analysis_candidates = []
+            if guaranteed_order_plan.write_circuit_open and analysis_candidates:
+                for circuit_candidate in analysis_candidates:
+                    circuit_market = circuit_candidate.get("market")
+                    if isinstance(circuit_market, Market):
+                        _record_terminal_outcome(
+                            state_manager,
+                            circuit_market.id,
+                            "guaranteed_order_write_circuit_open",
+                        )
+                logger.error(
+                    "Guaranteed-order write circuit is open; skipping all paid analysis",
+                    data={
+                        "guaranteed_order_write_circuit_open": True,
+                        "account_error_series": sorted(
+                            guaranteed_order_plan.account_error_series
+                        ),
+                    },
+                )
+                analysis_candidates = []
+            cost_budget_exhausted, cost_budget_reason = (
+                xai_usage_tracker.budget_exhausted()
+            )
+            if cost_budget_exhausted and analysis_candidates:
+                api_budget_exhausted_reason = cost_budget_reason
+                for budget_candidate in analysis_candidates:
+                    budget_market = budget_candidate.get("market")
+                    if isinstance(budget_market, Market):
+                        _record_terminal_outcome(
+                            state_manager,
+                            budget_market.id,
+                            "api_budget_exhausted",
+                        )
+                logger.error(
+                    "xAI cost budget already exhausted; not scheduling paid analysis",
+                    data={
+                        "final_action": "api_budget_exhausted",
+                        "api_budget_exhausted_reason": cost_budget_reason,
+                        "xai_usage": xai_usage_tracker.totals(),
+                    },
+                )
+                analysis_candidates = []
             analysis_candidates_count = len(analysis_candidates)
             parallel_analysis_requested = (
                 settings.PARALLEL_ANALYSIS_ENABLED
@@ -14817,14 +15087,20 @@ def main(max_cycles: int | None = None) -> None:
                                 candidate["anchor_analysis"],
                                 settings,
                                 shared_xai_provider,
+                                xai_usage_tracker.record,
+                                xai_usage_tracker.ensure_call_allowed,
                                 historical_confidence_buckets,
                                 cycle_id,
                                 bool(candidate.get("force_extended_research")),
                                 candidate.get("research_queue_drain_entry"),
                                 _family_context_from_candidate(candidate),
                                 allow_self_consistency=(
-                                    self_consistency_allowed_ids is None
-                                    or candidate["market"].id in self_consistency_allowed_ids
+                                    not guaranteed_order_plan.suppresses_normal_execution
+                                    and (
+                                        self_consistency_allowed_ids is None
+                                        or candidate["market"].id
+                                        in self_consistency_allowed_ids
+                                    )
                                 ),
                                 min_bet_usdc=cycle_min_bet_usdc,
                                 max_bet_usdc=cycle_max_bet_usdc,
@@ -14905,6 +15181,27 @@ def main(max_cycles: int | None = None) -> None:
                                         "analysis_error_retriable_xai": is_retriable,
                                     },
                                 )
+                    budget_failed_market_ids = [
+                        market_id
+                        for market_id, result in analysis_results.items()
+                        if result.get("analysis_failed")
+                        and "api_budget_exhausted:" in str(
+                            result.get("analysis_error") or ""
+                        )
+                    ]
+                    if budget_failed_market_ids:
+                        _budget_exhausted, api_budget_exhausted_reason = (
+                            xai_usage_tracker.budget_exhausted()
+                        )
+                        api_budget_exhausted_reason = (
+                            api_budget_exhausted_reason or "cost_cap"
+                        )
+                        for market_id in budget_failed_market_ids:
+                            _record_terminal_outcome(
+                                state_manager,
+                                market_id,
+                                "api_budget_exhausted",
+                            )
                     if parallel_analysis_used and settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES > 0:
                         xai_failure_count = sum(
                             1 for r in analysis_results.values()
@@ -14961,6 +15258,27 @@ def main(max_cycles: int | None = None) -> None:
                     analysis_candidates, settings
                 )
                 for candidate_index, candidate in enumerate(analysis_candidates):
+                    budget_exhausted, budget_reason = xai_usage_tracker.budget_exhausted()
+                    if budget_exhausted:
+                        api_budget_exhausted_reason = budget_reason
+                        for skipped_candidate in analysis_candidates[candidate_index:]:
+                            skipped_market = skipped_candidate.get("market")
+                            if isinstance(skipped_market, Market):
+                                _record_terminal_outcome(
+                                    state_manager,
+                                    skipped_market.id,
+                                    "api_budget_exhausted",
+                                )
+                        logger.error(
+                            "xAI cost budget exhausted; stopping paid analysis: reason=%s",
+                            budget_reason,
+                            data={
+                                "final_action": "api_budget_exhausted",
+                                "api_budget_exhausted_reason": budget_reason,
+                                "xai_usage": xai_usage_tracker.totals(),
+                            },
+                        )
+                        break
                     if successful_analysis_count >= settings.MAX_MARKETS_PER_CYCLE:
                         break
                     market = candidate["market"]
@@ -14980,8 +15298,11 @@ def main(max_cycles: int | None = None) -> None:
                             ),
                             family_context=_family_context_from_candidate(candidate),
                             allow_self_consistency=(
-                                self_consistency_allowed_ids is None
-                                or market.id in self_consistency_allowed_ids
+                                not guaranteed_order_plan.suppresses_normal_execution
+                                and (
+                                    self_consistency_allowed_ids is None
+                                    or market.id in self_consistency_allowed_ids
+                                )
                             ),
                         )
                         analysis_results[market.id] = result
@@ -15129,6 +15450,12 @@ def main(max_cycles: int | None = None) -> None:
                     "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
                 },
             )
+            spent_budget_exhausted, spent_budget_reason = (
+                xai_usage_tracker.budget_exhausted()
+            )
+            if spent_budget_exhausted:
+                api_budget_exhausted_reason = spent_budget_reason
+                analysis_only_mode = True
             for analysis_result in analysis_results.values():
                 if not isinstance(analysis_result, dict):
                     continue
@@ -16012,6 +16339,7 @@ def main(max_cycles: int | None = None) -> None:
                             repair_market,
                             previous_analysis=repair_previous,
                             search_config=repair_search_config,
+                            usage_phase="repair",
                         )
                         cycle_prompt_tokens += int(repaired_decision.prompt_tokens or 0)
                         cycle_completion_tokens += int(
@@ -18782,16 +19110,22 @@ def main(max_cycles: int | None = None) -> None:
                         "guaranteed_order_normal_execution_suppressed",
                     )
                     continue
-                # Skip order placement if in analysis-only mode (insufficient balance)
+                # Skip placement once a cycle has entered analysis-only mode.
                 if analysis_only_mode:
+                    analysis_only_reason = (
+                        "api_budget_exhausted"
+                        if api_budget_exhausted_reason is not None
+                        else "analysis_only_insufficient_balance"
+                    )
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
                     logger.info(
-                        "ANALYSIS_ONLY: [%s] '%s' -> %s @ $%.2f (conf=%.2f) - skipping order, balance insufficient",
+                        "ANALYSIS_ONLY: [%s] '%s' -> %s @ $%.2f (conf=%.2f) - skipping order (%s)",
                         market.id,
                         question_short,
                         decision.outcome,
                         bet_amount,
                         decision_for_edge.confidence,
+                        analysis_only_reason,
                         data={
                             "market_id": market.id,
                             "raw_bet_amount_usdc": raw_bet_amount,
@@ -18806,7 +19140,10 @@ def main(max_cycles: int | None = None) -> None:
                             ),
                         },
                     )
-                    trades_skipped_balance += 1
+                    if api_budget_exhausted_reason is not None:
+                        trades_skipped_api_budget += 1
+                    else:
+                        trades_skipped_balance += 1
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -18814,17 +19151,17 @@ def main(max_cycles: int | None = None) -> None:
                             update={"bet_size_pct": bet_pct}
                         ).model_dump(),
                         execution_audit=_build_execution_audit(
-                            decision_phase="analysis_only_balance_skip",
+                            decision_phase="analysis_only_skip",
                             decision_terminal=True,
                             final_action="skip",
-                            final_reason="analysis_only_insufficient_balance",
+                            final_reason=analysis_only_reason,
                             **order_audit_context,
                         ),
                     )
                     _record_terminal_outcome(
                         state_manager,
                         market.id,
-                        "analysis_only_insufficient_balance",
+                        analysis_only_reason,
                     )
                     continue
 
@@ -19863,30 +20200,38 @@ def main(max_cycles: int | None = None) -> None:
                 guaranteed_order_plan.target > 0
                 and not guaranteed_order_plan.is_resolved
                 and not reconciliation_live_blocked
+                and not guaranteed_order_plan.write_circuit_open
             ):
-                guaranteed_cycle_result = _run_guaranteed_order_phase(
-                    plan=guaranteed_order_plan,
-                    markets=markets,
-                    excluded_market_ids=traded_market_ids,
-                    cycle_number=cycle_count,
-                    settings=settings,
-                    grok_client=grok_client,
-                    kalshi_client=kalshi_client,
-                    state_manager=state_manager,
-                    log_decision=log_trade_decision,
-                    extended_research_market_ids=extended_research_market_ids,
-                    min_bet_usdc=cycle_min_bet_usdc,
-                    max_bet_usdc=cycle_max_bet_usdc,
-                    priority_by_market_id=_guaranteed_order_priority_scores(
-                        analysis_results,
-                        markets_by_id={
-                            market.id: market for market in markets if market.id
-                        },
-                    ),
-                    seed_decisions_by_market_id=_guaranteed_order_seed_decisions(
-                        analysis_results
-                    ),
+                guaranteed_budget_exhausted, guaranteed_budget_reason = (
+                    xai_usage_tracker.budget_exhausted()
                 )
+                if guaranteed_budget_exhausted:
+                    api_budget_exhausted_reason = guaranteed_budget_reason
+                    guaranteed_cycle_result = GuaranteedOrderCycleResult()
+                else:
+                    guaranteed_cycle_result = _run_guaranteed_order_phase(
+                        plan=guaranteed_order_plan,
+                        markets=markets,
+                        excluded_market_ids=traded_market_ids,
+                        cycle_number=cycle_count,
+                        settings=settings,
+                        grok_client=grok_client,
+                        kalshi_client=kalshi_client,
+                        state_manager=state_manager,
+                        log_decision=log_trade_decision,
+                        extended_research_market_ids=extended_research_market_ids,
+                        min_bet_usdc=cycle_min_bet_usdc,
+                        max_bet_usdc=cycle_max_bet_usdc,
+                        priority_by_market_id=_guaranteed_order_priority_scores(
+                            analysis_results,
+                            markets_by_id={
+                                market.id: market for market in markets if market.id
+                            },
+                        ),
+                        seed_decisions_by_market_id=_guaranteed_order_seed_decisions(
+                            analysis_results
+                        ),
+                    )
                 guaranteed_orders_locked_this_cycle = guaranteed_cycle_result.locked
                 guaranteed_orders_attempted_this_cycle = (
                     guaranteed_cycle_result.attempted
@@ -19973,14 +20318,30 @@ def main(max_cycles: int | None = None) -> None:
                         top_score = top_result.get("pre_execution_final_score")
                         if isinstance(top_score, (int, float)):
                             best_candidate_score = float(top_score)
-            api_tokens_consumed = cycle_prompt_tokens + cycle_completion_tokens
-            api_cost_estimate_usd = _estimate_api_cost_usd(
-                prompt_tokens=cycle_prompt_tokens,
-                completion_tokens=cycle_completion_tokens,
-                cached_tokens=cycle_cached_tokens,
-                settings=settings,
+            cycle_usage_totals = xai_usage_tracker.totals(cycle_id=cycle_id)
+            run_usage_totals = xai_usage_tracker.totals()
+            receipt_budget_exhausted, receipt_budget_reason = (
+                xai_usage_tracker.budget_exhausted()
             )
-            cumulative_api_cost_estimate_usd += api_cost_estimate_usd
+            if receipt_budget_exhausted:
+                api_budget_exhausted_reason = receipt_budget_reason
+            cycle_prompt_tokens = int(cycle_usage_totals["prompt_tokens"])
+            cycle_completion_tokens = int(cycle_usage_totals["completion_tokens"])
+            cycle_reasoning_tokens = int(cycle_usage_totals["reasoning_tokens"])
+            cycle_cached_tokens = int(cycle_usage_totals["cached_tokens"])
+            cycle_server_tool_calls = int(cycle_usage_totals["server_tool_calls"])
+            cycle_xai_calls = int(cycle_usage_totals["calls"])
+            api_tokens_consumed = cycle_prompt_tokens + cycle_completion_tokens
+            api_cost_estimate_usd = float(cycle_usage_totals["cost_usd"])
+            cumulative_api_cost_estimate_usd = float(run_usage_totals["cost_usd"])
+            if guaranteed_order_plan.target > 0:
+                guaranteed_order_plan.research_cost_usd = (
+                    cumulative_api_cost_estimate_usd
+                )
+                _persist_guaranteed_order_plan(
+                    state_manager,
+                    guaranteed_order_plan,
+                )
             execution_family_breakdown = {
                 family_name: {
                     "order_attempts": int(stats.get("order_attempts", 0)),
@@ -20005,7 +20366,7 @@ def main(max_cycles: int | None = None) -> None:
             orders_with_any_fill = (
                 trades_filled
                 + trades_partially_filled
-                + fill_sync_metrics.new_fill_events
+                + fill_sync_metrics.orders_with_new_fills
             )
             try:
                 pending_orders_open = len(state_manager.get_pending_orders())
@@ -20339,6 +20700,7 @@ def main(max_cycles: int | None = None) -> None:
                     "edge": trades_skipped_edge,
                     "position": trades_skipped_position,
                     "balance": trades_skipped_balance,
+                    "api_budget": trades_skipped_api_budget,
                     "kelly_sub_floor": trades_skipped_kelly_sub_floor,
                     "pre_analysis": pre_analysis_blocked,
                 },
@@ -20378,6 +20740,11 @@ def main(max_cycles: int | None = None) -> None:
                 "api_reasoning_tokens": cycle_reasoning_tokens,
                 "api_cached_tokens": cycle_cached_tokens,
                 "api_cost_estimate_usd": round(api_cost_estimate_usd, 6),
+                "api_xai_calls": cycle_xai_calls,
+                "api_server_tool_calls": cycle_server_tool_calls,
+                "api_pricing_version": settings.API_COST_PRICING_VERSION,
+                "api_budget_exhausted": api_budget_exhausted_reason is not None,
+                "api_budget_exhausted_reason": api_budget_exhausted_reason,
                 "cost_per_analyzed_market": cost_per_analyzed_market,
                 "cost_per_order_attempt": cost_per_order_attempt,
                 "api_cost_per_fill": api_cost_per_fill,
@@ -20853,6 +21220,7 @@ def main(max_cycles: int | None = None) -> None:
                     "skipped_edge": trades_skipped_edge,
                     "skipped_kelly_sub_floor": trades_skipped_kelly_sub_floor,
                     "skipped_balance": trades_skipped_balance,
+                    "skipped_api_budget": trades_skipped_api_budget,
                     "skipped_position": trades_skipped_position,
                     "analysis_only_mode": analysis_only_mode,
                     "price_buckets": price_bucket_stats,
@@ -21059,6 +21427,7 @@ def main(max_cycles: int | None = None) -> None:
                 cumulative_api_cost_estimate_usd,
                 data=guarantee_summary,
             )
+        state_manager.clear_runtime_flag(_GUARANTEED_PLAN_RUNTIME_FLAG)
 
 
 if __name__ == "__main__":
