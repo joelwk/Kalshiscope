@@ -127,7 +127,8 @@ _SLOW_REASONING_MODEL_MARKERS = ("grok-4.6", "grok-4-6")
 _SLOW_REASONING_MIN_STREAM_TIMEOUT_SECONDS = 300
 _SLOW_REASONING_MIN_CLIENT_TIMEOUT_SECONDS = 360
 _SLOW_REASONING_MIN_ANALYSIS_BUDGET_SECONDS = 780
-_TIMEOUT_RETRY_REASONING_EFFORT = "medium"
+# grok-4.3 accepts only ('low', 'high'), so a retry must not land on "medium".
+_TIMEOUT_RETRY_REASONING_EFFORT = "low"
 _DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS = 120
 _DEFAULT_STREAM_TIMEOUT_SECONDS = 120
 _EDGE_CONSISTENCY_TOLERANCE = 0.03
@@ -336,9 +337,9 @@ def _reasoning_effort_for_attempt(
     *,
     retry_attempt: int,
 ) -> str | None:
-    """Keep configured depth on the first try; drop high/xhigh after a timeout."""
+    """Keep configured depth on the first try; drop to the floor after a timeout."""
     effort = _normalize_reasoning_effort(setting)
-    if retry_attempt > 1 and effort in {"high", "xhigh"}:
+    if retry_attempt > 1 and effort in {"medium", "high", "xhigh"}:
         return _TIMEOUT_RETRY_REASONING_EFFORT
     return effort
 

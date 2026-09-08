@@ -18,13 +18,16 @@ class _GuaranteedGrok:
         self.decision = decision
         self.initial_calls: list[str] = []
         self.deep_calls: list[str] = []
+        self.usage_phases: list[str | None] = []
 
     def analyze_market(self, market, **kwargs):
         self.initial_calls.append(market.id)
+        self.usage_phases.append(kwargs.get("usage_phase"))
         return self.decision
 
     def analyze_market_deep(self, market, **kwargs):
         self.deep_calls.append(market.id)
+        self.usage_phases.append(kwargs.get("usage_phase"))
         return self.decision
 
 
@@ -420,6 +423,235 @@ def test_guaranteed_budget_exhaustion_is_not_a_research_failure(tmp_path) -> Non
     assert result.status == "api_budget_exhausted"
     assert "cycle_cost_cap" in str(result.error)
     assert slot.submission_attempts == 0
+    assert slot.decision is None
+
+
+def test_budget_stop_after_initial_banks_the_paid_first_pass(tmp_path) -> None:
+    """A cycle-cap stop between the passes must not re-pay the initial call."""
+    market = _market("banked-initial")
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-banked-001",
+    )
+    initial_decision = _decision()
+
+    class _DeepBudgetStoppedGrok:
+        def __init__(self) -> None:
+            self.initial_calls: list[str] = []
+            self.deep_calls: list[str] = []
+            self.deep_stopped_by_budget = True
+
+        def analyze_market(self, market, **kwargs):
+            self.initial_calls.append(market.id)
+            return initial_decision
+
+        def analyze_market_deep(self, market, **kwargs):
+            self.deep_calls.append(market.id)
+            if self.deep_stopped_by_budget:
+                raise main.XAIBudgetExhaustedError(
+                    "api_budget_exhausted:cycle_cost_cap"
+                )
+            return initial_decision
+
+    grok = _DeepBudgetStoppedGrok()
+    settings = main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1)
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        stopped = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            settings=settings,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+
+        assert stopped.status == "api_budget_exhausted"
+        assert slot.decision is initial_decision
+        assert slot.research_completed is False
+        # The interrupted call is still billed, so the plan must see its tokens.
+        assert stopped.token_usage["prompt_tokens"] == 10
+
+        plan = main.GuaranteedOrderPlan(target=1, slots=[slot])
+        restored = main.GuaranteedOrderPlan.from_json(plan.to_json())
+        assert restored.slots[0].decision is not None
+        assert restored.slots[0].research_completed is False
+
+        grok.deep_stopped_by_budget = False
+        resumed = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            settings=settings,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert resumed.status == "dry_run"
+    assert grok.initial_calls == [market.id]
+    # The banked first pass already clears the edge bar, so no second deep call.
+    assert grok.deep_calls == [market.id]
+
+
+def test_transient_research_failures_keep_the_slot() -> None:
+    assert main._guaranteed_research_failure_is_transient(
+        "_MultiThreadedRendezvous: StatusCode.INTERNAL Received RST_STREAM"
+    )
+    assert main._guaranteed_research_failure_is_transient(
+        "TimeoutError: Grok stream exceeded 180s"
+    )
+    assert main._guaranteed_research_failure_is_transient(
+        "RuntimeError: service temporarily unavailable"
+    )
+    assert main._guaranteed_research_failure_is_transient(
+        "RuntimeError: resource_exhausted"
+    )
+
+
+def test_deterministic_research_failures_do_not_keep_the_slot() -> None:
+    assert not main._guaranteed_research_failure_is_transient(
+        "ValueError: Invalid reasoning effort: medium. "
+        "Must be one of: ('low', 'high')"
+    )
+    assert not main._guaranteed_research_failure_is_transient(
+        "ValueError: Deep research returned unmappable outcome 'MAYBE'"
+    )
+    assert not main._guaranteed_research_failure_is_transient(None)
+
+
+def test_deterministic_research_failure_replaces_the_slot(tmp_path) -> None:
+    """A rejected request argument recurs forever; the slot must move on."""
+    broken = _market("broken-research", liquidity=900.0, series_ticker="BROKEN")
+    healthy = _market("healthy", liquidity=100.0, series_ticker="HEALTHY")
+
+    class _BrokenThenHealthyGrok:
+        def __init__(self) -> None:
+            self.initial_calls: list[str] = []
+
+        def analyze_market(self, market, **kwargs):
+            self.initial_calls.append(market.id)
+            if market.id == "broken-research":
+                raise ValueError(
+                    "Invalid reasoning effort: medium. "
+                    "Must be one of: ('low', 'high')"
+                )
+            return _decision()
+
+        def analyze_market_deep(self, market, **kwargs):
+            return _decision()
+
+    grok = _BrokenThenHealthyGrok()
+    kalshi = _LiveGuaranteedKalshi([broken, healthy])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="broken-research")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[broken, healthy],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert plan.slots[0].market_id == "healthy"
+    assert "broken-research" in plan.retired_market_ids
+    assert grok.initial_calls == ["broken-research", "healthy"]
+    assert kalshi.submitted_market_ids == ["healthy"]
+
+
+def test_transient_research_failure_holds_the_same_market(tmp_path) -> None:
+    """A stream reset is worth retrying, so the slot keeps its market."""
+    market = _market("rst-stream", liquidity=900.0, series_ticker="RST")
+    alternate = _market("alternate", liquidity=100.0, series_ticker="ALT")
+
+    class _StreamResetGrok:
+        def analyze_market(self, market, **kwargs):
+            raise RuntimeError(
+                "StatusCode.INTERNAL Received RST_STREAM with error code 2"
+            )
+
+        def analyze_market_deep(self, market, **kwargs):
+            raise AssertionError("deep research must not run after a failed initial")
+
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="rst-stream")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market, alternate],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=_StreamResetGrok(),
+            kalshi_client=_LiveGuaranteedKalshi([market, alternate]),
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.completed == 0
+    assert plan.slots[0].market_id == "rst-stream"
+    assert plan.slots[0].needs_replacement is False
+    assert plan.retired_market_ids == set()
+    assert plan.research_gap_replacements == 0
+
+
+def test_guaranteed_cycle_result_counts_research_calls_and_cost(tmp_path) -> None:
+    """The ordinary funnel reads zero in this mode, so these are the record."""
+    market = _market("counted", liquidity=500.0, series_ticker="COUNTED")
+    grok = _GuaranteedGrok(_decision())
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="counted")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+    finally:
+        state.close()
+
+    assert result.initial_research_calls == 1
+    assert result.deep_research_calls == 1
+    assert result.research_cost_usd > 0
+    assert result.research_cost_usd == pytest.approx(plan.research_cost_usd)
+    assert "initial=1 deep=1" in main._format_guaranteed_cycle_for_log(plan, result)
+    assert (
+        main._format_guaranteed_cycle_for_log(
+            main.GuaranteedOrderPlan(target=0), result
+        )
+        == "off"
+    )
 
 
 def test_guaranteed_absence_only_is_replaceable_not_forced(tmp_path) -> None:
@@ -636,7 +868,7 @@ def test_guaranteed_phase_replaces_weak_evidence_when_alternate_exists(tmp_path)
     assert grok.deep_calls == ["gap-high", "good-low"]
 
 
-def test_guaranteed_phase_defers_analyzed_gap_instead_of_unanalyzed_liquid(
+def test_guaranteed_phase_replaces_analyzed_gap_with_catalog_candidate(
     tmp_path,
 ) -> None:
     gap_market = _market("analyzed-gap", liquidity=50.0)
@@ -689,13 +921,13 @@ def test_guaranteed_phase_defers_analyzed_gap_instead_of_unanalyzed_liquid(
     finally:
         state.close()
 
-    assert result.completed == 0
+    assert result.completed == 1
     assert plan.abandoned_count == 0
-    assert plan.slots[0].needs_replacement is True
-    assert plan.slots[0].market_id == "analyzed-gap"
-    assert plan.is_resolved is False
-    assert kalshi.submitted_market_ids == []
-    assert grok.deep_calls == ["analyzed-gap"]
+    assert plan.slots[0].needs_replacement is False
+    assert plan.slots[0].market_id == "unanalyzed-liquid"
+    assert plan.is_complete is True
+    assert kalshi.submitted_market_ids == ["unanalyzed-liquid"]
+    assert grok.deep_calls == ["analyzed-gap", "unanalyzed-liquid"]
     assert "analyzed-gap" in plan.retired_market_ids
     assert "unanalyzed-liquid" not in plan.retired_market_ids
 
@@ -716,6 +948,123 @@ def test_lock_guaranteed_markets_prefers_analyzed_confidence() -> None:
     )
 
     assert [slot.market_id for slot in locked] == ["confident"]
+
+
+def test_lock_skips_a_series_retired_earlier_in_this_plan() -> None:
+    """One gas strike missing the floor must not hand its slot to the next."""
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    plan.retired_series_tickers.add("KXAAAGASD")
+    sibling_strike = _market(
+        "KXAAAGASD-4.1650", liquidity=900.0, series_ticker="KXAAAGASD"
+    )
+    unrelated = _market("KXRAIN-NOLA", liquidity=100.0, series_ticker="KXRAIN")
+
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [sibling_strike, unrelated],
+        excluded_market_ids=set(),
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert [slot.market_id for slot in locked] == ["KXRAIN-NOLA"]
+
+
+def test_research_gap_retires_the_whole_ladder_for_the_rest_of_the_plan(
+    tmp_path,
+) -> None:
+    """The live gas ladder burned four strikes at two paid calls each."""
+    strikes = [
+        _market(f"KXAAAGASD-4.{1750 - step}", liquidity=900.0, series_ticker="KXAAAGASD")
+        for step in (0, 100, 150)
+    ]
+    unrelated = _market("KXRAIN-NOLA", liquidity=100.0, series_ticker="KXRAIN")
+    gap_decision = _decision(
+        evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
+    )
+    good_decision = _decision(evidence_basis="proxy", evidence_quality=0.85)
+
+    class _LadderGrok:
+        def __init__(self) -> None:
+            self.initial_calls: list[str] = []
+            self.deep_calls: list[str] = []
+
+        def _decide(self, market):
+            return gap_decision if market.id.startswith("KXAAAGASD") else good_decision
+
+        def analyze_market(self, market, **kwargs):
+            self.initial_calls.append(market.id)
+            return self._decide(market)
+
+        def analyze_market_deep(self, market, **kwargs):
+            self.deep_calls.append(market.id)
+            return self._decide(market)
+
+    grok = _LadderGrok()
+    markets = [*strikes, unrelated]
+    kalshi = _LiveGuaranteedKalshi(markets)
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="ladder-churn")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=markets,
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+        series_outcomes = state.get_guaranteed_series_outcomes()
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert plan.slots[0].market_id == "KXRAIN-NOLA"
+    assert plan.retired_series_tickers == {"KXAAAGASD"}
+    # Exactly one strike of the ladder was researched, not all three.
+    assert grok.deep_calls == ["KXAAAGASD-4.1750", "KXRAIN-NOLA"]
+    assert series_outcomes["KXAAAGASD"]["consecutive_misses"] == 1
+    assert kalshi.submitted_market_ids == ["KXRAIN-NOLA"]
+
+
+def test_dry_run_completion_is_not_recorded_as_a_series_fill(tmp_path) -> None:
+    """A dry-run force must not grant permanent burn immunity to a series."""
+    market = _market("KXRAIN-NOLA", liquidity=500.0, series_ticker="KXRAIN")
+    grok = _GuaranteedGrok(_decision())
+    kalshi = _GuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="dry-series")
+    try:
+        result = main._run_guaranteed_order_phase(
+            plan=plan,
+            markets=[market],
+            excluded_market_ids=set(),
+            cycle_number=1,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+            log_decision=lambda **kwargs: None,
+            extended_research_market_ids=set(),
+        )
+        series_outcomes = state.get_guaranteed_series_outcomes()
+    finally:
+        state.close()
+
+    assert result.completed == 1
+    assert series_outcomes["KXRAIN"]["attempts"] == 1
+    assert series_outcomes["KXRAIN"]["fills"] == 0
+    assert series_outcomes["KXRAIN"]["consecutive_misses"] == 0
+    assert "KXRAIN" not in plan.retired_series_tickers
 
 
 def test_lock_analyzed_beats_unanalyzed_even_when_priority_negative() -> None:
@@ -1567,8 +1916,11 @@ def test_spent_replacement_budget_holds_the_slot_instead_of_abandoning_it(
     Abandoning here resolved the plan under target and idled every remaining
     cycle, which is how a five-order run finished with zero orders.
     """
+    # Distinct series, so the churn under test is the replacement budget and
+    # not the one-miss-retires-the-ladder rule.
     markets = [
-        _market(f"gap-{idx}", liquidity=1000.0 - idx) for idx in range(4)
+        _market(f"gap-{idx}", liquidity=1000.0 - idx, series_ticker=f"GAP{idx}")
+        for idx in range(4)
     ]
     gap_decision = _decision(
         evidence_basis="absence_only", edge_source="none", evidence_quality=0.1
@@ -1702,6 +2054,7 @@ def test_bounded_main_exits_early_when_guaranteed_target_complete(
     main.main(max_cycles=3)
 
     assert fetch_cycles["count"] == 1
+    assert grok.usage_phases == ["guaranteed_initial", "guaranteed_deep"]
 
 
 def test_bounded_main_does_not_complete_guaranteed_target_with_weak_evidence(

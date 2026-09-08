@@ -40,6 +40,7 @@ _PARTICIPATION_TIER_REPR_MAP = {
     "ParticipationTier.TERMINAL_REJECT": "terminal_reject",
 }
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
+_GUARANTEED_SERIES_OUTCOMES = frozenset({"filled", "cleared", "missed"})
 _ACTIVE_PENDING_ORDER_STATUSES = {
     "accepted",
     "open",
@@ -2558,7 +2559,7 @@ class MarketStateManager:
         self,
         series_ticker: str,
         *,
-        filled: bool,
+        outcome: str,
         reject_reason: str | None = None,
     ) -> None:
         """Track how a Kalshi series performs as a guaranteed-order candidate.
@@ -2567,12 +2568,24 @@ class MarketStateManager:
         observed behavior: every strike in a continuously repriced ladder
         clears or misses the guaranteed edge bar for the same reason, while
         ``market_family()`` lumps unrelated ladders into ``generic``.
+
+        ``outcome`` is ``filled`` for an order the exchange accepted,
+        ``cleared`` for a forceable +EV side that was never submitted, and
+        ``missed`` for a failed edge bar. Only a miss advances the burn
+        counter, and only a fill earns the permanent burn immunity that a
+        proven series deserves.
         """
+        if outcome not in _GUARANTEED_SERIES_OUTCOMES:
+            raise ValueError(
+                f"Unknown guaranteed series outcome {outcome!r}; "
+                f"expected one of {sorted(_GUARANTEED_SERIES_OUTCOMES)}"
+            )
         normalized_series = str(series_ticker or "").strip().upper()
         if not normalized_series:
             return
-        normalized_reason = None if filled else (
-            str(reject_reason or "").strip() or None
+        missed = outcome == "missed"
+        normalized_reason = (
+            (str(reject_reason or "").strip() or None) if missed else None
         )
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._conn:
@@ -2591,7 +2604,7 @@ class MarketStateManager:
                     attempts = attempts + 1,
                     fills = fills + excluded.fills,
                     consecutive_misses = CASE
-                        WHEN excluded.fills > 0 THEN 0
+                        WHEN excluded.consecutive_misses = 0 THEN 0
                         ELSE consecutive_misses + 1
                     END,
                     last_reject_reason = excluded.last_reject_reason,
@@ -2599,8 +2612,8 @@ class MarketStateManager:
                 """,
                 (
                     normalized_series,
-                    1 if filled else 0,
-                    0 if filled else 1,
+                    1 if outcome == "filled" else 0,
+                    1 if missed else 0,
                     normalized_reason,
                     timestamp,
                 ),

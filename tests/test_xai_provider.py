@@ -247,3 +247,44 @@ def test_create_chat_retries_without_reasoning_effort_on_unimplemented() -> None
     assert len(chat.calls) == 2
     assert chat.calls[0]["reasoning_effort"] == "high"
     assert "reasoning_effort" not in chat.calls[1]
+
+
+def test_create_chat_retries_without_reasoning_effort_on_invalid_value() -> None:
+    """grok-4.3 raises ValueError for any effort outside ('low', 'high')."""
+
+    class _InvalidEffortThenOk:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "reasoning_effort" in kwargs:
+                raise ValueError(
+                    "Invalid reasoning effort: medium. "
+                    "Must be one of: ('low', 'high')"
+                )
+            return {"ok": True, "kwargs": kwargs}
+
+    chat = _InvalidEffortThenOk()
+    with patch("xai_provider.Client", return_value=_FakeClient(chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=3,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-4.3-latest",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            reasoning_effort="medium",
+        )
+
+    assert response["ok"] is True
+    assert len(chat.calls) == 2
+    assert chat.calls[0]["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in chat.calls[1]

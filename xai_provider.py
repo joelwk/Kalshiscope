@@ -18,8 +18,15 @@ _MAX_CREATE_CHAT_BACKOFF_SECONDS = 4.0
 _INLINE_CITATIONS_INCLUDE = ["inline_citations"]
 
 
-def _is_unimplemented_error(exc: Exception) -> bool:
-    return "unimplemented" in str(exc).lower()
+def _is_reasoning_effort_rejected(exc: Exception) -> bool:
+    """True when xAI refused the requested reasoning_effort.
+
+    A model may reject it as unimplemented, or reject the specific value as an
+    invalid enum (grok-4.3 accepts only ``('low', 'high')``). Either way the
+    analysis must proceed on the model default instead of failing.
+    """
+    message = str(exc).lower()
+    return "unimplemented" in message or "invalid reasoning effort" in message
 
 
 class XAIProvider:
@@ -104,11 +111,14 @@ class XAIProvider:
             except Exception as exc:
                 if (
                     create_kwargs.get("reasoning_effort")
-                    and _is_unimplemented_error(exc)
+                    and _is_reasoning_effort_rejected(exc)
                 ):
                     logger.warning(
-                        "xAI reasoning_effort unimplemented; retrying without it: model=%s",
+                        "xAI rejected reasoning_effort=%s; retrying without it: "
+                        "model=%s error=%s",
+                        create_kwargs.get("reasoning_effort"),
                         model,
+                        exc,
                     )
                     create_kwargs.pop("reasoning_effort", None)
                     try:

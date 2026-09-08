@@ -261,14 +261,16 @@ class TestGrokClient(unittest.TestCase):
         self.assertFalse(_is_slow_reasoning_model("grok-4.5"))
         self.assertFalse(_is_slow_reasoning_model("grok-4-1-fast-reasoning"))
 
-    def test_reasoning_effort_drops_high_on_timeout_retry(self) -> None:
+    def test_reasoning_effort_drops_to_low_on_timeout_retry(self) -> None:
         self.assertEqual(_reasoning_effort_for_attempt("high", retry_attempt=1), "high")
         self.assertEqual(
-            _reasoning_effort_for_attempt("xhigh", retry_attempt=2), "medium"
+            _reasoning_effort_for_attempt("xhigh", retry_attempt=2), "low"
         )
+        # grok-4.3 rejects "medium" outright, so a retry must not land there.
         self.assertEqual(
-            _reasoning_effort_for_attempt("medium", retry_attempt=2), "medium"
+            _reasoning_effort_for_attempt("medium", retry_attempt=2), "low"
         )
+        self.assertEqual(_reasoning_effort_for_attempt("low", retry_attempt=2), "low")
 
     def test_grok_46_raises_timeout_floors_without_lowering_higher_settings(self) -> None:
         floored = GrokClient(
@@ -338,7 +340,7 @@ class TestGrokClient(unittest.TestCase):
         self.assertFalse(decision.should_trade)
         self.assertEqual(sequenced.chat.create_calls, 2)
         self.assertEqual(sequenced.chat.create_kwargs[0]["reasoning_effort"], "high")
-        self.assertEqual(sequenced.chat.create_kwargs[1]["reasoning_effort"], "medium")
+        self.assertEqual(sequenced.chat.create_kwargs[1]["reasoning_effort"], "low")
         first_tools = sequenced.chat.create_kwargs[0].get("tools") or []
         second_tools = sequenced.chat.create_kwargs[1].get("tools") or []
         self.assertGreater(len(first_tools), len(second_tools))

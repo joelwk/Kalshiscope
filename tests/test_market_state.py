@@ -694,13 +694,13 @@ def test_guaranteed_series_outcomes_persist_across_manager_instances(tmp_path) -
         assert manager.get_guaranteed_series_outcomes() == {}
         manager.record_guaranteed_series_attempt(
             "KXBTCD",
-            filled=False,
+            outcome="missed",
             reject_reason="guaranteed_order_non_positive_edge",
         )
         # Case is normalized so a lowercase ticker hits the same row.
         manager.record_guaranteed_series_attempt(
             "kxbtcd",
-            filled=False,
+            outcome="missed",
             reject_reason="guaranteed_order_edge_below_min",
         )
     finally:
@@ -727,14 +727,14 @@ def test_guaranteed_series_fill_resets_the_miss_streak(tmp_path) -> None:
         for _ in range(3):
             manager.record_guaranteed_series_attempt(
                 "KXHIGHNY",
-                filled=False,
+                outcome="missed",
                 reject_reason="guaranteed_order_non_positive_edge",
             )
         assert manager.get_guaranteed_series_outcomes()["KXHIGHNY"][
             "consecutive_misses"
         ] == 3
 
-        manager.record_guaranteed_series_attempt("KXHIGHNY", filled=True)
+        manager.record_guaranteed_series_attempt("KXHIGHNY", outcome="filled")
         outcome = manager.get_guaranteed_series_outcomes()["KXHIGHNY"]
         assert outcome["attempts"] == 4
         assert outcome["fills"] == 1
@@ -745,10 +745,43 @@ def test_guaranteed_series_fill_resets_the_miss_streak(tmp_path) -> None:
         manager.close()
 
 
+def test_guaranteed_series_cleared_resets_misses_without_earning_a_fill(
+    tmp_path,
+) -> None:
+    """A dry-run force clears the bar but never reached the exchange."""
+    manager = MarketStateManager(str(tmp_path / "series_cleared.db"))
+    try:
+        for _ in range(3):
+            manager.record_guaranteed_series_attempt(
+                "KXAAAGASD",
+                outcome="missed",
+                reject_reason="guaranteed_order_edge_below_min",
+            )
+        manager.record_guaranteed_series_attempt("KXAAAGASD", outcome="cleared")
+
+        outcome = manager.get_guaranteed_series_outcomes()["KXAAAGASD"]
+        assert outcome["attempts"] == 4
+        # No fill means no permanent immunity from the cross-run burn limit.
+        assert outcome["fills"] == 0
+        assert outcome["consecutive_misses"] == 0
+        assert outcome["last_reject_reason"] is None
+    finally:
+        manager.close()
+
+
+def test_guaranteed_series_attempt_rejects_an_unknown_outcome(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "series_bad_outcome.db"))
+    try:
+        with pytest.raises(ValueError, match="Unknown guaranteed series outcome"):
+            manager.record_guaranteed_series_attempt("KXBTCD", outcome="skipped")
+    finally:
+        manager.close()
+
+
 def test_guaranteed_series_attempt_ignores_a_blank_ticker(tmp_path) -> None:
     manager = MarketStateManager(str(tmp_path / "series_blank.db"))
     try:
-        manager.record_guaranteed_series_attempt("   ", filled=False)
+        manager.record_guaranteed_series_attempt("   ", outcome="missed")
         assert manager.get_guaranteed_series_outcomes() == {}
     finally:
         manager.close()
