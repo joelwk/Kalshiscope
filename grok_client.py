@@ -119,10 +119,10 @@ _EDGE_MECHANISM_VALUES = frozenset(
 _NUMERIC_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+", re.IGNORECASE)
 _NUMERIC_INITIAL_CODE_PROFILES = frozenset({"weather", "crypto", "commodity"})
 _ALLOWED_REASONING_EFFORT = frozenset({"low", "medium", "high", "xhigh"})
-_SLOW_REASONING_MODEL_MARKERS = ("grok-4.6", "grok-4-6")
-# grok-4.6 + high reasoning + tools routinely finishes at 110-170s and
-# DEADLINE_EXCEEDED at the 4.5-era 180s cap. Floor timeouts so a model
-# swap does not inherit that cap. xAI documents 3600s for reasoning models;
+_SLOW_REASONING_MODEL_MARKERS = ("grok-4.6", "grok-4-6", "grok-4.7", "grok-4-7")
+# grok-4.6 and grok-4.7 plus high reasoning and tools routinely finish at
+# 110-170s and DEADLINE_EXCEEDED at the 4.5-era 180s cap. Floor timeouts so a
+# model swap does not inherit that cap. xAI documents 3600s for reasoning models;
 # these floors are the practical bot-side minimum, not a ceiling.
 _SLOW_REASONING_MIN_STREAM_TIMEOUT_SECONDS = 300
 _SLOW_REASONING_MIN_CLIENT_TIMEOUT_SECONDS = 360
@@ -729,7 +729,7 @@ class GrokClient:
         )
 
     def _apply_slow_reasoning_timeout_floors(self) -> None:
-        """Raise 4.5-era caps when grok-4.6 needs more than 180s of tool+reason time."""
+        """Raise 4.5-era caps when grok-4.6 or grok-4.7 needs more than 180s."""
         if not (
             _is_slow_reasoning_model(self.model)
             or _is_slow_reasoning_model(self.model_deep)
@@ -761,7 +761,7 @@ class GrokClient:
         if after == before:
             return
         logger.warning(
-            "Raised Grok timeouts for grok-4.6-class model: "
+            "Raised Grok timeouts for grok-4.6/4.7-class model: "
             "stream %ds->%ds client %ds->%ds budget %ds->%ds",
             before[0],
             after[0],

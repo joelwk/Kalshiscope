@@ -255,9 +255,11 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(client._resolve_rpc_timeout_seconds(150.0), 120.0)
         self.assertEqual(client._resolve_rpc_timeout_seconds(0.25), 1.0)
 
-    def test_is_slow_reasoning_model_detects_grok_46(self) -> None:
+    def test_is_slow_reasoning_model_detects_grok_46_and_47(self) -> None:
         self.assertTrue(_is_slow_reasoning_model("grok-4.6"))
         self.assertTrue(_is_slow_reasoning_model("grok-4-6"))
+        self.assertTrue(_is_slow_reasoning_model("grok-4.7"))
+        self.assertTrue(_is_slow_reasoning_model("grok-4-7"))
         self.assertFalse(_is_slow_reasoning_model("grok-4.5"))
         self.assertFalse(_is_slow_reasoning_model("grok-4-1-fast-reasoning"))
 
@@ -298,6 +300,19 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(preserved.stream_timeout_seconds, 400)
         self.assertEqual(preserved.xai_client_timeout_seconds, 500)
         self.assertEqual(preserved.analysis_budget_seconds, 1200)
+
+        grok_47 = GrokClient(
+            api_key="x",
+            model="grok-4.7",
+            settings=Settings(
+                GROK_STREAM_TIMEOUT_SECONDS=180,
+                XAI_CLIENT_TIMEOUT_SECONDS=240,
+                GROK_ANALYSIS_MAX_BUDGET_SECONDS=420,
+            ),
+        )
+        self.assertEqual(grok_47.stream_timeout_seconds, 300)
+        self.assertEqual(grok_47.xai_client_timeout_seconds, 360)
+        self.assertEqual(grok_47.analysis_budget_seconds, 780)
 
         fast = GrokClient(
             api_key="x",
