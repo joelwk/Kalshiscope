@@ -1230,13 +1230,13 @@ def test_research_gap_reason_ignores_unlabeled_mechanism() -> None:
 
 def test_guaranteed_forces_computed_plus_ev_with_unlabeled_mechanism(tmp_path) -> None:
     """Live miss: TEMPMIAH-style computed +EV with edge_mechanism=none."""
-    market = _market("temp-mia", yes_price=0.67)
+    market = _market("generic-mia", yes_price=0.67)
     slot = main.GuaranteedOrderSlot(
         slot_number=1,
         market_id=market.id,
         market=market,
         locked_cycle=1,
-        client_order_id="BOT-GUAR-temp-001",
+        client_order_id="BOT-GUAR-generic-001",
     )
     grok = _GuaranteedGrok(
         _decision(
@@ -1384,7 +1384,26 @@ def test_unlabeled_weather_proxy_uses_min_edge_not_proxy_floor() -> None:
         edge_mechanism="none",
     )
     assert main._guaranteed_order_min_edge(decision, market, settings) == 0.12
-    assert main._guaranteed_order_reject_reason(decision, market, settings) is None
+    assert (
+        main._guaranteed_order_reject_reason(decision, market, settings)
+        == "weather_not_observed"
+    )
+
+
+def test_guaranteed_reject_blocks_cheap_chosen_side() -> None:
+    settings = main.Settings()
+    market = _market("KXMLBGAME-26SEP24-LAD", yes_price=0.06, category="sports")
+    decision = _decision(
+        outcome="YES",
+        confidence=0.30,
+        evidence_basis="proxy",
+        edge_source="computed",
+        evidence_quality=0.80,
+    )
+    assert (
+        main._guaranteed_order_reject_reason(decision, market, settings)
+        == "chosen_side_price_below_expectancy_floor"
+    )
 
 
 def test_lock_guaranteed_markets_rejects_same_event_prefix() -> None:
@@ -1640,20 +1659,20 @@ def test_guaranteed_phase_replaces_nevada_restricted_entertainment_slot(
         liquidity=900.0,
         category="entertainment",
     )
-    weather = _market(
-        "KXHIGHNY-26AUG17-T88",
+    replacement = _market(
+        "KXBTCD-26AUG17",
         liquidity=100.0,
-        category="weather",
+        category="crypto",
     )
     grok = _GuaranteedGrok(_decision())
-    kalshi = _NevadaRestrictedThenSuccessKalshi([entertainment, weather])
+    kalshi = _NevadaRestrictedThenSuccessKalshi([entertainment, replacement])
     state = MarketStateManager(str(tmp_path / "state.db"))
     plan = main.GuaranteedOrderPlan(target=1, run_id="nevada-replacement")
     decisions: list[dict] = []
     try:
         result = main._run_guaranteed_order_phase(
             plan=plan,
-            markets=[entertainment, weather],
+            markets=[entertainment, replacement],
             excluded_market_ids=set(),
             cycle_number=1,
             settings=main.Settings(
@@ -1674,12 +1693,12 @@ def test_guaranteed_phase_replaces_nevada_restricted_entertainment_slot(
 
     assert kalshi.submitted_market_ids == [
         "KXYTVIEWSW-TAY26AUG16-14.5M",
-        "KXHIGHNY-26AUG17-T88",
+        "KXBTCD-26AUG17",
     ]
     assert result.attempted == 2
     assert result.completed == 1
     assert plan.is_complete
-    assert plan.slots[0].market_id == "KXHIGHNY-26AUG17-T88"
+    assert plan.slots[0].market_id == "KXBTCD-26AUG17"
     assert "KXYTVIEWSW-TAY26AUG16-14.5M" in plan.retired_market_ids
     assert hold == {"sports", "politics", "entertainment", "music"}
     assert decisions[0]["execution_audit"]["final_reason"] == "jurisdiction_restricted"
@@ -2338,7 +2357,7 @@ def test_bounded_main_records_five_positive_ev_guaranteed_orders(
             f"g{idx}",
             liquidity=500.0 - idx,
             event_ticker=f"EVT{idx}",
-            category="politics" if idx < 3 else "weather",
+            category="politics" if idx < 3 else "crypto",
         )
         for idx in range(5)
     ]

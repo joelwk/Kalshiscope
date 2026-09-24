@@ -2672,7 +2672,7 @@ class TestMainUtils(unittest.TestCase):
             edge_external=0.13,
             evidence_basis="direct",
             evidence_quality=0.90,
-            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=30.3&lon=-97.7",
+            primary_source_url="https://forecast.weather.gov/product.php?site=ewx&product=CLI",
         )
         settings = Settings(
             MIN_EDGE=0.05,

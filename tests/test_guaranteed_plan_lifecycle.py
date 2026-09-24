@@ -18,6 +18,33 @@ def _seed_plan(state: MarketStateManager, *, run_id: str = "old-run") -> main.Gu
     return plan
 
 
+def test_zero_target_plan_does_not_skip_ordinary_analysis() -> None:
+    idle = main.GuaranteedOrderPlan(target=0)
+    assert idle.is_complete is True
+    assert idle.skips_ordinary_analysis() is False
+
+    finished = main.GuaranteedOrderPlan(target=2)
+    finished.slots = [
+        main.GuaranteedOrderSlot(
+            slot_number=1,
+            market_id="M1",
+            market=None,
+            locked_cycle=1,
+            client_order_id="c1",
+            completed=True,
+        ),
+        main.GuaranteedOrderSlot(
+            slot_number=2,
+            market_id="M2",
+            market=None,
+            locked_cycle=1,
+            client_order_id="c2",
+            completed=True,
+        ),
+    ]
+    assert finished.skips_ordinary_analysis() is True
+
+
 def test_plan_lifecycle_requires_an_active_plan(tmp_path) -> None:
     state = MarketStateManager(str(tmp_path / "state.db"))
     try:

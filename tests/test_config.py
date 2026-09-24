@@ -1029,7 +1029,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
         self.assertTrue(settings.RESEARCH_QUEUE_PRIORITY_ENABLED)
         self.assertEqual(settings.MARKET_TICKER_BLOCKLIST_PREFIXES, ())
-        self.assertFalse(settings.SKIP_WEATHER_BIN_MARKETS)
+        self.assertTrue(settings.SKIP_WEATHER_BIN_MARKETS)
         self.assertFalse(settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED)
         self.assertIn("billboard.com", settings.MUSIC_ALLOWED_DOMAINS)
         self.assertIn("SpotifyCharts", settings.MUSIC_ALLOWED_X_HANDLES)

@@ -157,7 +157,7 @@ class Settings:
     MARKET_CATEGORIES_BLOCKLIST: tuple[str, ...] = ()
     MARKET_FAMILY_BLOCKLIST: tuple[str, ...] = ()
     MARKET_TICKER_BLOCKLIST_PREFIXES: tuple[str, ...] = ()
-    SKIP_WEATHER_BIN_MARKETS: bool = False
+    SKIP_WEATHER_BIN_MARKETS: bool = True
     CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED: bool = False
     MIN_VOLUME_24H: float = 10.0
     MIN_OPEN_INTEREST: float = 25.0

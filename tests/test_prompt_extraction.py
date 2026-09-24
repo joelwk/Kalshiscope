@@ -7,14 +7,14 @@ from models import Market, MarketOutcome, TradeDecision
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
     # Re-pinned Aug 25 2026: guaranteed-quota honesty + bankroll-scaled bet_size_pct.
-    "analyze": "d580da339eae5743791453a9c700064e99680e70c840290ba5b672545920955f",
-    "deep": "447595d7487c060bd07539fc0327c185a955ce8c8dd4102ea12dcd4938c0bd14",
+    "analyze": "1466b9b331474ed2aeda21489b001cfd02cf1b29bb9859377ac280e53db1fa50",
+    "deep": "6b96e440959a6bd6ddec6456deb21b5a38708f977db13e48d06bd4124a95c90b",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
     # Re-pinned Aug 25 2026: constraints_base quota honesty + bankroll-scaled size.
-    "commodities:deep_false": "2a6671249c51a1017d0accae443ae75f42415b03fbf1807e7abc1dee375b4334",
-    "commodities:deep_true": "ffd8c0ade9b36fad8a836974e6198ef7762265987ec0a4a2e465c08ebb63c4d1",
+    "commodities:deep_false": "686906a239d32cfe65e5c2ac54d5f6bcf31412eb120c7a9ff8d470f598686b0a",
+    "commodities:deep_true": "25de5048ba0ceff9ed1b2c342e3fad7130a35442ee8d96f470154dff46e17c93",
     "crypto:deep_false": "b581c7914f3aa3d2523e6810e165785931679e8e880ef7d6b6f89d7d1b2f51e3",
     "crypto:deep_true": "4b5379e2fc7b1fce960af70b795fffdc3d07054703038b0ec3019b4bc7b33f15",
     "generic:deep_false": "cb12632c72b55ffda32bce93a17c5fad936d12728d6d0ee44597223a42ccaede",
@@ -213,8 +213,19 @@ def test_system_prompt_contains_edge_honesty_and_field_hygiene() -> None:
     assert "(10) Kalshi copy ban" in _SYSTEM_PROMPT_ANALYZE
     assert "(9) Weather/numeric field repair" in _SYSTEM_PROMPT_ANALYZE
     assert "implied_prob_external must not equal the Kalshi yes_price" in _SYSTEM_PROMPT_ANALYZE
-    assert "If chosen-side Kalshi implied >= 0.55, do not emit raw confidence >= 0.70 unless settlement_already_known" in _SYSTEM_PROMPT_ANALYZE
+    assert "YES at or above 0.55 and any side under 0.20 are should_trade=false unless settlement_already_known" in _SYSTEM_PROMPT_ANALYZE
     assert '"Not final yet" is remaining-session uncertainty, not edge_mechanism=none' in _SYSTEM_PROMPT_ANALYZE
+
+
+def test_analyze_market_prompt_loads_after_calibration_update() -> None:
+    from prompts.loader import load_prompt
+
+    system = load_prompt("system/analyze_market")
+    assert "win rate must beat the chosen-side Kalshi price" in system.lower() or (
+        "Win rate must beat the chosen-side Kalshi price" in system
+    )
+    commodities = load_prompt("user/category_hints/commodities")
+    assert "should_trade=false on YES" in commodities
 
 
 def test_weather_hint_blocks_mapclick_optimism() -> None:

@@ -154,6 +154,10 @@ _FAMILY_PROFITABLE_LIFETIME_MIN_SAMPLE = 40
 # deciding whether a short-window drawdown should be ignored.
 _FAMILY_LIFETIME_PNL_LOOKBACK = 5000
 _INDEX_MARKET_PREFIXES = ("KXNASDAQ100U-", "KXINXU-")
+# Chosen-side prices below this lose more than they win. Lifetime YES under
+# 0.20 won 0%. Distinct from ORDER_SUBMISSION_MIN_PRICE, which is the exchange band.
+_EXPECTANCY_MIN_CHOSEN_SIDE_PRICE = 0.20
+_OBSERVED_WEATHER_URL_MARKERS = ("product=cli", "metar", "asos", "/observations")
 _COMMODITY_MARKET_TOKENS = (
     "GOLD",
     "SILVER",
@@ -1402,6 +1406,28 @@ def _should_force_abstain_on_edge_repair_unresolved(
     return True
 
 
+def _stamp_quoted_edge_source(decision: TradeDecision, market: Market) -> TradeDecision:
+    """Fill a blank edge_source when the decision already cites a quote with positive edge.
+
+    Grok often pastes the settlement quote URL and a positive chosen-side edge
+    but leaves edge_source=none, which edge repair then force-abstains. A
+    missing URL or absence_only basis is left unchanged so it still blocks.
+    """
+    if str(decision.edge_source or "").strip().lower() not in {"", "none"}:
+        return decision
+    if not str(decision.primary_source_url or "").strip().lower().startswith("https://"):
+        return decision
+    if _decision_evidence_basis(decision) == "absence_only":
+        return decision
+    implied_prob = _get_implied_probability(market, decision.outcome)
+    if implied_prob is None or float(decision.confidence) - implied_prob <= 0.0:
+        return decision
+    has_probability = decision.my_prob is not None or decision.probability_yes is not None
+    return decision.model_copy(
+        update={"edge_source": "computed" if has_probability else "fallback"}
+    )
+
+
 def _edge_repair_reason(
     *,
     decision: TradeDecision,
@@ -1995,6 +2021,55 @@ def _is_nws_noaa_primary_source_url(url: str) -> bool:
     )
 
 
+def _is_observed_weather_settlement_url(url: str) -> bool:
+    """True for NWS/NOAA CLI, METAR, or ASOS pages. MapClick forecasts are not observed."""
+    normalized = str(url or "").strip().lower()
+    if not normalized or "mapclick" in normalized:
+        return False
+    if not _is_nws_noaa_primary_source_url(normalized):
+        return False
+    return any(marker in normalized for marker in _OBSERVED_WEATHER_URL_MARKERS)
+
+
+def _is_commodity_or_index_strike(market: Market) -> bool:
+    """Numeric commodity or index strikes. Live quotes hours ahead are not YES trades."""
+    market_id = str(market.id or "")
+    if not _PRICE_STRIKE_TICKER_PATTERN.search(market_id):
+        return False
+    upper_id = market_id.upper()
+    if any(upper_id.startswith(prefix) for prefix in _INDEX_MARKET_PREFIXES):
+        return True
+    return is_commodity_market(market)
+
+
+def _expectancy_block_reason(
+    decision: TradeDecision,
+    market: Market | None,
+    settings: Settings,
+    implied_prob: float | None,
+) -> str | None:
+    """Block contract shapes whose realized win rate sits below the entry price.
+
+    Definitive settlement reads are exempt. Weather may also pass on an observed
+    CLI/METAR/ASOS URL. Commodity and index YES stays blocked until that
+    definitive read exists; commodity NO is unchanged.
+    """
+    if market is None or implied_prob is None:
+        return None
+    if _is_definitive_validated(decision, settings, market=market):
+        return None
+    if float(implied_prob) < _EXPECTANCY_MIN_CHOSEN_SIDE_PRICE - 1e-9:
+        return "chosen_side_price_below_expectancy_floor"
+    outcome = str(getattr(decision, "outcome", "") or "").strip().upper()
+    if outcome == "YES" and _is_commodity_or_index_strike(market):
+        return "commodity_yes_blocked"
+    if market_family(market) == "weather" and not _is_observed_direct_weather_evidence(
+        decision, settings
+    ):
+        return "weather_not_observed"
+    return None
+
+
 def _jurisdiction_families_from_error(error_text: str) -> frozenset[str]:
     """Parse exchange 403 text into Prediscope families that cannot be opened.
 
@@ -2251,18 +2326,14 @@ def _is_observed_direct_weather_evidence(
 ) -> bool:
     """Direct weather evidence from an NWS/NOAA source at the weather EQ floor.
 
-    Distinguishes observed station/climate reads (evidence_basis=direct per
-    prompt rules) from forecast proxy (MapClick previews). Only the observed
-    class may bypass the weather underdog block: the ~32% lifetime underdog WR
-    that motivated the block came from forecast-proxy entries, while an
-    observed value that already contradicts the market price is
-    settlement-grade information.
+    Distinguishes observed station/climate reads (CLI, METAR, ASOS) from
+    forecast proxy (MapClick previews). Only the observed class may bypass
+    the weather underdog block and the expectancy weather block.
     """
     if _decision_evidence_basis(decision) != "direct":
         return False
-    if not _is_nws_noaa_primary_source_url(
-        str(getattr(decision, "primary_source_url", "") or "")
-    ):
+    primary_url = str(getattr(decision, "primary_source_url", "") or "")
+    if not _is_observed_weather_settlement_url(primary_url):
         return False
     try:
         evidence_quality = float(decision.evidence_quality)
@@ -2442,6 +2513,14 @@ def _passes_edge_threshold(
         and implied_prob < float(settings.LOW_PRICE_THRESHOLD)
     ):
         return False, edge, "weather_underdog_blocked"
+    expectancy_reason = _expectancy_block_reason(
+        decision,
+        market,
+        settings,
+        implied_prob,
+    )
+    if expectancy_reason is not None:
+        return False, edge, expectancy_reason
     min_edge = _edge_threshold_for_market(
         implied_prob,
         settings,
@@ -4615,6 +4694,15 @@ class GuaranteedOrderPlan:
     def suppresses_normal_execution(self) -> bool:
         return self.target > 0 and not self.is_resolved
 
+    def skips_ordinary_analysis(self) -> bool:
+        """A finished forced-order run stops paying for more analysis.
+
+        Target 0 is not a finished run. ``is_complete`` is true when
+        completed == target, which is also true for a 0-of-0 plan, and that
+        used to drop every ordinary candidate before Grok.
+        """
+        return self.target > 0 and self.is_complete
+
     def summary(self) -> dict[str, Any]:
         return {
             "target": self.target,
@@ -5237,6 +5325,17 @@ def _guaranteed_order_reject_reason(
     min_edge = _guaranteed_order_min_edge(decision, market, settings)
     if edge < min_edge - 1e-9:
         return "guaranteed_order_edge_below_min"
+    implied_prob = _get_implied_probability(
+        market, str(decision.outcome or "").strip().upper()
+    )
+    expectancy_reason = _expectancy_block_reason(
+        decision,
+        market,
+        settings,
+        implied_prob,
+    )
+    if expectancy_reason is not None:
+        return expectancy_reason
     return None
 
 
@@ -11503,6 +11602,7 @@ def _analyze_market_candidate(
     edge_repair_attempted = False
     edge_repair_reason_text: str | None = None
     edge_repair_unresolved_reason: str | None = None
+    decision = _stamp_quoted_edge_source(decision, market)
     repair_reason = _edge_repair_reason(
         decision=decision,
         market=market,
@@ -15317,7 +15417,16 @@ def main(
 
             analysis_results: dict[str, dict[str, Any]] = {}
             analysis_phase_start = time.monotonic()
-            if guaranteed_order_plan.is_complete and analysis_candidates:
+            if guaranteed_order_plan.skips_ordinary_analysis() and analysis_candidates:
+                logger.info(
+                    "Guaranteed-order target already complete; skipping %d ordinary analysis candidate(s)",
+                    len(analysis_candidates),
+                    data={
+                        "guaranteed_orders_target": guaranteed_order_plan.target,
+                        "guaranteed_orders_completed": guaranteed_order_plan.completed_count,
+                        "ordinary_analysis_candidates_skipped": len(analysis_candidates),
+                    },
+                )
                 analysis_candidates = []
             if guaranteed_order_plan.suppresses_normal_execution and analysis_candidates:
                 logger.info(

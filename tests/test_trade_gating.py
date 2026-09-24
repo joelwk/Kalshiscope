@@ -728,9 +728,19 @@ def test_weather_favorite_still_passes_edge_gate() -> None:
         my_prob=0.78,
     )
     ok, edge, reason = _passes_edge_threshold(0.62, decision, settings, market=market)
-    assert ok is True
-    assert reason == ""
+    assert ok is False
+    assert reason == "weather_not_observed"
     assert edge == pytest.approx(0.16)
+    observed = decision.model_copy(
+        update={
+            "primary_source_url": "https://forecast.weather.gov/product.php?site=lot&product=CLI"
+        }
+    )
+    ok_observed, _, reason_observed = _passes_edge_threshold(
+        0.62, observed, settings, market=market
+    )
+    assert ok_observed is True
+    assert reason_observed == ""
 
 
 def test_weather_underdog_exempt_for_observed_direct_nws() -> None:
@@ -796,6 +806,105 @@ def test_weather_underdog_exempt_for_observed_direct_nws() -> None:
     )
     assert ok_low_eq is False
     assert reason_low_eq == "weather_underdog_blocked"
+
+    mapclick = observed_direct.model_copy(
+        update={
+            "primary_source_url": "https://forecast.weather.gov/MapClick.php?lat=41.8&lon=-87.6"
+        }
+    )
+    ok_mapclick, _, reason_mapclick = _passes_edge_threshold(
+        0.32, mapclick, settings, market=market
+    )
+    assert ok_mapclick is False
+    assert reason_mapclick == "weather_underdog_blocked"
+
+
+def test_expectancy_blocks_cheap_entries_and_commodity_yes() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    settings = Settings(
+        MIN_EDGE=0.12,
+        COMMODITY_MIN_EDGE=0.22,
+        LOW_PRICE_THRESHOLD=0.50,
+        LOW_PRICE_MIN_EDGE=0.18,
+        MAX_REASONABLE_EDGE=0.40,
+        NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=True,
+        XAI_API_KEY="xai-key",
+        KALSHI_API_KEY_ID="kalshi-key-id",
+        KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+    )
+    hours_left = datetime.now(timezone.utc) + timedelta(hours=6)
+    yes_market = Market(
+        id="KXWTI-26SEP24-T70.00",
+        question="Will WTI settle above 70?",
+        category="finance",
+        close_time=hours_left,
+        outcomes=[
+            MarketOutcome(name="YES", price=0.62),
+            MarketOutcome(name="NO", price=0.38),
+        ],
+    )
+    yes_decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.80,
+        raw_confidence=0.80,
+        bet_size_pct=0.2,
+        reasoning="Quote is under the strike with hours left",
+        evidence_basis="direct",
+        evidence_quality=0.85,
+        edge_source="computed",
+        primary_source_url="https://www.cmegroup.com/markets/energy/crude-oil/light-sweet-crude.html",
+    )
+    ok_yes, _, reason_yes = _passes_edge_threshold(
+        0.62, yes_decision, settings, market=yes_market
+    )
+    assert ok_yes is False
+    assert reason_yes == "commodity_yes_blocked"
+
+    no_market = yes_market.model_copy(
+        update={
+            "outcomes": [
+                MarketOutcome(name="YES", price=0.30),
+                MarketOutcome(name="NO", price=0.70),
+            ]
+        }
+    )
+    no_decision = yes_decision.model_copy(
+        update={"outcome": "NO", "confidence": 0.95, "raw_confidence": 0.95}
+    )
+    ok_no, edge_no, reason_no = _passes_edge_threshold(
+        0.70, no_decision, settings, market=no_market
+    )
+    assert ok_no is True
+    assert reason_no == ""
+    assert edge_no == pytest.approx(0.25)
+
+    cheap = Market(
+        id="KXMLBGAME-26SEP24-LAD",
+        question="Will the Dodgers win?",
+        category="sports",
+        outcomes=[
+            MarketOutcome(name="YES", price=0.06),
+            MarketOutcome(name="NO", price=0.94),
+        ],
+    )
+    cheap_decision = TradeDecision(
+        should_trade=True,
+        outcome="YES",
+        confidence=0.30,
+        raw_confidence=0.30,
+        bet_size_pct=0.2,
+        reasoning="cheap longshot",
+        evidence_basis="proxy",
+        evidence_quality=0.80,
+        edge_source="computed",
+    )
+    ok_cheap, _, reason_cheap = _passes_edge_threshold(
+        0.06, cheap_decision, settings, market=cheap
+    )
+    assert ok_cheap is False
+    assert reason_cheap == "chosen_side_price_below_expectancy_floor"
 
 
 def test_commodity_min_edge_raises_threshold() -> None:
@@ -883,7 +992,8 @@ def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
     assert near_floor == pytest.approx(0.22 * 0.95)
     assert far_floor == pytest.approx(0.22)
 
-    # Logged Brent knife-edge: 0.2165 clears high-EQ floor (~0.209) near settlement.
+    # Commodity YES is blocked even when the edge floor would clear. The floor
+    # math above still documents the near-close multiplier.
     ok_near, edge_near, reason_near = _passes_edge_threshold(
         0.41,
         decision,
@@ -891,9 +1001,9 @@ def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
         market=near_close,
         effective_confidence_override=0.6265,
     )
-    assert ok_near is True
+    assert ok_near is False
     assert edge_near == pytest.approx(0.2165)
-    assert reason_near == ""
+    assert reason_near == "commodity_yes_blocked"
 
     ok_far, edge_far, reason_far = _passes_edge_threshold(
         0.41,
@@ -904,9 +1014,8 @@ def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
     )
     assert ok_far is False
     assert edge_far == pytest.approx(0.2165)
-    assert "below min" in reason_far
+    assert reason_far == "commodity_yes_blocked"
 
-    # Low-EQ / silver-like tiny edge still fails even near close.
     weak = decision.model_copy(update={"evidence_quality": 0.55, "confidence": 0.4325})
     ok_weak, _, reason_weak = _passes_edge_threshold(
         0.41,
@@ -916,7 +1025,7 @@ def test_commodity_high_eq_edge_multiplier_horizon_gated() -> None:
         effective_confidence_override=0.4325,
     )
     assert ok_weak is False
-    assert "below min" in reason_weak
+    assert reason_weak == "commodity_yes_blocked"
 
 
 def test_settled_direct_commodity_near_close_waives_commodity_premium() -> None:
@@ -1032,7 +1141,7 @@ def test_weather_high_eq_edge_multiplier_lowers_floor_for_nws_direct() -> None:
         evidence_basis="direct",
         evidence_quality=1.0,
         edge_source="computed",
-        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=47.6&lon=-122.3",
+        primary_source_url="https://forecast.weather.gov/product.php?site=sew&product=CLI",
     )
     low_eq = TradeDecision(
         should_trade=True,
@@ -1073,7 +1182,7 @@ def test_weather_high_eq_edge_multiplier_lowers_floor_for_nws_direct() -> None:
         market=market,
     )
     assert ok_low is False
-    assert "below min" in reason_low
+    assert reason_low == "weather_not_observed"
 
 
 def test_direct_posterior_floor_weather_proxy_without_nws_url_is_none() -> None:
@@ -1131,7 +1240,7 @@ def test_edge_gate_allows_weather_high_eq_edge_above_generic_max() -> None:
         edge_source="computed",
         evidence_basis="direct",
         evidence_quality=0.90,
-        primary_source_url="https://forecast.weather.gov/MapClick.php?lat=32.8&lon=-96.8",
+        primary_source_url="https://forecast.weather.gov/product.php?site=fwd&product=CLI",
     )
     ok, edge, reason = _passes_edge_threshold(
         0.55,
