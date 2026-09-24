@@ -12820,7 +12820,6 @@ def main(
             total_usd_deployed = fill_sync_metrics.filled_notional_usdc
             trades_skipped_confidence = 0
             trades_skipped_balance = 0
-            trades_skipped_api_budget = 0
             trades_skipped_no_trade = 0
             trades_skipped_edge = 0
             trades_skipped_position = 0
@@ -16038,9 +16037,10 @@ def main(
             spent_budget_exhausted, spent_budget_reason = (
                 xai_usage_tracker.budget_exhausted()
             )
+            # A spent xAI budget stops further paid analysis; it must not block
+            # placing orders on decisions this cycle already paid for.
             if spent_budget_exhausted:
                 api_budget_exhausted_reason = spent_budget_reason
-                analysis_only_mode = True
             for analysis_result in analysis_results.values():
                 if not isinstance(analysis_result, dict):
                     continue
@@ -19697,11 +19697,7 @@ def main(
                     continue
                 # Skip placement once a cycle has entered analysis-only mode.
                 if analysis_only_mode:
-                    analysis_only_reason = (
-                        "api_budget_exhausted"
-                        if api_budget_exhausted_reason is not None
-                        else "analysis_only_insufficient_balance"
-                    )
+                    analysis_only_reason = "analysis_only_insufficient_balance"
                     question_short = market.question[:50] + "..." if len(market.question) > 50 else market.question
                     logger.info(
                         "ANALYSIS_ONLY: [%s] '%s' -> %s @ $%.2f (conf=%.2f) - skipping order (%s)",
@@ -19725,10 +19721,7 @@ def main(
                             ),
                         },
                     )
-                    if api_budget_exhausted_reason is not None:
-                        trades_skipped_api_budget += 1
-                    else:
-                        trades_skipped_balance += 1
+                    trades_skipped_balance += 1
                     log_trade_decision(
                         market_id=market.id,
                         question=market.question,
@@ -21305,7 +21298,6 @@ def main(
                     "edge": trades_skipped_edge,
                     "position": trades_skipped_position,
                     "balance": trades_skipped_balance,
-                    "api_budget": trades_skipped_api_budget,
                     "kelly_sub_floor": trades_skipped_kelly_sub_floor,
                     "pre_analysis": pre_analysis_blocked,
                 },
@@ -21845,7 +21837,6 @@ def main(
                     "skipped_edge": trades_skipped_edge,
                     "skipped_kelly_sub_floor": trades_skipped_kelly_sub_floor,
                     "skipped_balance": trades_skipped_balance,
-                    "skipped_api_budget": trades_skipped_api_budget,
                     "skipped_position": trades_skipped_position,
                     "analysis_only_mode": analysis_only_mode,
                     "price_buckets": price_bucket_stats,

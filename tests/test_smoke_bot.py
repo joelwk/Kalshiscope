@@ -253,6 +253,58 @@ def test_bootstrap_logs_kalshi_auth_not_applicable_without_client(
     assert captured[0]["kalshi_auth"] == KALSHI_AUTH_NOT_APPLICABLE
 
 
+def test_budget_spent_during_analysis_does_not_block_order_placement(
+    monkeypatch, sample_market, sample_decision, dummy_settings
+) -> None:
+    from dataclasses import replace
+
+    from xai_usage import XAIUsageTracker
+
+    analyzed = {"done": False}
+
+    class _SpendingGrok(DummyGrok):
+        def analyze_market(self, market, search_config=None, previous_analysis=None, **kwargs):
+            analyzed["done"] = True
+            return self._decision
+
+    def _budget_exhausted(self):
+        return (True, "cycle_cost_cap") if analyzed["done"] else (False, None)
+
+    cycle_messages: list[str] = []
+    original_info = main.logger.info
+
+    def _capture_info(msg, *args, **kwargs):
+        if str(msg).startswith("Bot cycle #"):
+            cycle_messages.append(str(msg) % args)
+        return original_info(msg, *args, **kwargs)
+
+    monkeypatch.setattr(XAIUsageTracker, "budget_exhausted", _budget_exhausted)
+    monkeypatch.setattr(main.logger, "info", _capture_info)
+    tuned = replace(
+        dummy_settings,
+        PRE_ANALYSIS_OPPORTUNITY_ENABLED=False,
+        MIN_VOLUME_24H=0.0,
+        MIN_OPEN_INTEREST=0.0,
+        MARKET_MIN_CLOSE_DAYS=None,
+        MARKET_MAX_CLOSE_DAYS=None,
+    )
+    monkeypatch.setattr(main, "load_settings", lambda: tuned)
+    monkeypatch.setattr(main, "GrokClient", lambda *a, **kw: _SpendingGrok(sample_decision))
+    monkeypatch.setattr(main, "KalshiClient", lambda *a, **kw: DummyKalshi([sample_market]))
+
+    def _stop_sleep(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main.time, "sleep", _stop_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    assert analyzed["done"] is True
+    assert cycle_messages, "cycle completion should be logged"
+    assert "[ANALYSIS_ONLY]" not in cycle_messages[0]
+
+
 def test_cycle_receipt_contains_forensic_keys(
     monkeypatch, sample_market, sample_decision, dummy_settings
 ) -> None:
