@@ -6887,12 +6887,14 @@ class TestUnsourcedSeries(unittest.TestCase):
             bet_size_pct=0.0,
             reasoning="no quote found",
             evidence_basis="absence_only",
-        )
+        ).model_copy(update={"server_tool_calls": 4})
         sourced = unsourced.model_copy(
             update={"evidence_basis": "proxy", "primary_source_url": "https://www.cmegroup.com/"}
         )
+        never_searched = unsourced.model_copy(update={"server_tool_calls": 0})
         self.assertTrue(main_module._is_unsourced_decision(unsourced))
         self.assertFalse(main_module._is_unsourced_decision(sourced))
+        self.assertFalse(main_module._is_unsourced_decision(never_searched))
 
         first_strike = Market(id="KXINXU-26SEP24H1600-T7674.9999", question="S&P above?")
         second_strike = Market(id="KXINXU-26SEP24H1600-T7669.9999", question="S&P above?")

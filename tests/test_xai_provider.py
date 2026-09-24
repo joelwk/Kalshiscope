@@ -211,6 +211,7 @@ def test_create_chat_passes_include_and_reasoning_effort() -> None:
 
     assert response["kwargs"]["include"] == ["inline_citations"]
     assert response["kwargs"]["reasoning_effort"] == "high"
+    assert response["kwargs"]["tool_choice"] == "required"
 
 
 def test_create_chat_retries_without_reasoning_effort_on_unimplemented() -> None:

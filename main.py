@@ -8551,9 +8551,17 @@ def _unsourced_series_today(
 
 
 def _is_unsourced_decision(decision: TradeDecision) -> bool:
-    return _decision_evidence_basis(decision) == "absence_only" and not str(
-        decision.primary_source_url or ""
-    ).strip()
+    """absence_only with no URL after the model actually searched.
+
+    A zero-search answer says nothing about whether the series has a source,
+    so it must not retire the series.
+    """
+    searched = int(getattr(decision, "server_tool_calls", 0) or 0) > 0
+    return (
+        searched
+        and _decision_evidence_basis(decision) == "absence_only"
+        and not str(decision.primary_source_url or "").strip()
+    )
 
 
 def _record_unsourced_series(

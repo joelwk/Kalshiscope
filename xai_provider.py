@@ -16,6 +16,9 @@ _DEFAULT_CREATE_CHAT_MAX_ATTEMPTS = 3
 _DEFAULT_CREATE_CHAT_BACKOFF_SECONDS = 1.0
 _MAX_CREATE_CHAT_BACKOFF_SECONDS = 4.0
 _INLINE_CITATIONS_INCLUDE = ["inline_citations"]
+# grok-4.6 on "auto" answered ~85% of structured analyses with zero searches
+# and a "searching now" placeholder; every analysis needs at least one search.
+_ANALYSIS_TOOL_CHOICE = "required"
 
 
 def _is_reasoning_effort_rejected(exc: Exception) -> bool:
@@ -100,6 +103,7 @@ class XAIProvider:
             "response_format": response_format,
             "temperature": temperature,
             "tools": tools,
+            "tool_choice": _ANALYSIS_TOOL_CHOICE,
         }
         if include_inline_citations:
             create_kwargs["include"] = list(_INLINE_CITATIONS_INCLUDE)
