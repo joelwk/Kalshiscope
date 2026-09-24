@@ -2903,6 +2903,59 @@ class TestMainUtils(unittest.TestCase):
             )
         )
 
+    def test_quoted_positive_edge_stamps_edge_source_and_skips_repair(self) -> None:
+        from main import _edge_repair_reason, _stamp_quoted_edge_source
+
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXXRPD-26SEP2412-T1.4999",
+            question="Ripple price at Sep 24, 2026?",
+            category="crypto",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.54),
+                MarketOutcome(name="NO", price=0.46),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.55,
+            my_prob=0.35,
+            bet_size_pct=0.2,
+            reasoning="Binance XRP 1.4682 below strike",
+            edge_source="none",
+            evidence_basis="proxy",
+            evidence_quality=0.60,
+            source_match_class="settlement_aligned",
+            primary_source_url="https://www.binance.com/en-GB/trade/XRP_USDT",
+        )
+        self.assertEqual(
+            _edge_repair_reason(
+                decision=decision, market=market, settings=settings, implied_prob=0.46
+            ),
+            "edge_source_none",
+        )
+        stamped = _stamp_quoted_edge_source(decision, market)
+        self.assertEqual(stamped.edge_source, "computed")
+        self.assertNotEqual(
+            _edge_repair_reason(
+                decision=stamped, market=market, settings=settings, implied_prob=0.46
+            ),
+            "edge_source_none",
+        )
+
+        no_url = decision.model_copy(update={"primary_source_url": None})
+        self.assertEqual(_stamp_quoted_edge_source(no_url, market).edge_source, "none")
+        absence = decision.model_copy(update={"evidence_basis": "absence_only"})
+        self.assertEqual(_stamp_quoted_edge_source(absence, market).edge_source, "none")
+        negative = decision.model_copy(update={"confidence": 0.40})
+        self.assertEqual(_stamp_quoted_edge_source(negative, market).edge_source, "none")
+
     def test_order_exception_error_text_includes_kalshi_body(self) -> None:
         import requests
         from main import _order_exception_error_text
@@ -3824,6 +3877,36 @@ class TestMainUtils(unittest.TestCase):
         capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
 
         self.assertEqual([item["market"].id for item in capped], ["normal-high", "normal-mid"])
+
+    def test_cap_analysis_candidates_admits_one_jurisdiction_probe_per_held_family(self) -> None:
+        candidates = [
+            {
+                "market": Market(id="gen-high", question="Nasdaq ladder", category="business"),
+                "pre_analysis_score": 1.05,
+            },
+            {
+                "market": Market(id="gen-mid", question="Gold ladder", category="business"),
+                "pre_analysis_score": 0.90,
+            },
+            {
+                "market": Market(id="pol-low", question="Senate election winner", category="politics"),
+                "pre_analysis_score": 0.10,
+                "is_jurisdiction_probe": True,
+            },
+            {
+                "market": Market(id="pol-lower", question="House election winner", category="politics"),
+                "pre_analysis_score": 0.05,
+                "is_jurisdiction_probe": True,
+            },
+        ]
+
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=2,
+            extra_family_caps={"politics": 1},
+        )
+
+        self.assertEqual([item["market"].id for item in capped], ["pol-low", "gen-high"])
 
     def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
         candidates = [
@@ -6788,6 +6871,45 @@ class SelfConsistencyGatingTest(unittest.TestCase):
         self.assertIsNone(
             main_module._self_consistency_allowed_market_ids(candidates, _Settings())
         )
+
+
+class TestUnsourcedSeries(unittest.TestCase):
+    def test_absence_only_without_url_marks_series_for_the_day(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from market_state import MarketStateManager
+
+        unsourced = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.45,
+            bet_size_pct=0.0,
+            reasoning="no quote found",
+            evidence_basis="absence_only",
+        )
+        sourced = unsourced.model_copy(
+            update={"evidence_basis": "proxy", "primary_source_url": "https://www.cmegroup.com/"}
+        )
+        self.assertTrue(main_module._is_unsourced_decision(unsourced))
+        self.assertFalse(main_module._is_unsourced_decision(sourced))
+
+        first_strike = Market(id="KXINXU-26SEP24H1600-T7674.9999", question="S&P above?")
+        second_strike = Market(id="KXINXU-26SEP24H1600-T7669.9999", question="S&P above?")
+        today = date(2026, 9, 24)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = MarketStateManager(str(Path(tmp) / "state.db"))
+            try:
+                main_module._record_unsourced_series(
+                    state, {main_module._market_series_ticker(first_strike)}, today
+                )
+                marked = main_module._unsourced_series_today(state, today)
+                self.assertIn(main_module._market_series_ticker(second_strike), marked)
+                self.assertEqual(
+                    main_module._unsourced_series_today(state, date(2026, 9, 25)), set()
+                )
+            finally:
+                state.close()
 
 
 if __name__ == "__main__":

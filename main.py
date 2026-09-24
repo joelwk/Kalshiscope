@@ -8532,6 +8532,44 @@ def _market_series_ticker(market: Market) -> str:
     return market_id.split("-", maxsplit=1)[0]
 
 
+_UNSOURCED_SERIES_FLAG_KEY = "unsourced_series_today"
+
+
+def _unsourced_series_today(
+    state_manager: "MarketStateManager",
+    today: date,
+) -> set[str]:
+    """Series that already came back absence_only with no URL on this UTC day."""
+    try:
+        raw = state_manager.get_runtime_flag(_UNSOURCED_SERIES_FLAG_KEY) or ""
+    except Exception:
+        return set()
+    flag_day, _, series_csv = raw.partition("|")
+    if flag_day != today.isoformat():
+        return set()
+    return {item for item in series_csv.split(",") if item}
+
+
+def _is_unsourced_decision(decision: TradeDecision) -> bool:
+    return _decision_evidence_basis(decision) == "absence_only" and not str(
+        decision.primary_source_url or ""
+    ).strip()
+
+
+def _record_unsourced_series(
+    state_manager: "MarketStateManager",
+    series_tickers: set[str],
+    today: date,
+) -> None:
+    if not series_tickers:
+        return
+    updated = _unsourced_series_today(state_manager, today) | series_tickers
+    state_manager.set_runtime_flag(
+        _UNSOURCED_SERIES_FLAG_KEY,
+        f"{today.isoformat()}|{','.join(sorted(updated))}",
+    )
+
+
 def _event_ticker_prefix(market: Market) -> str:
     event_ticker = _canonical_event_prefix(market.event_ticker or "")
     if event_ticker:
@@ -10950,7 +10988,9 @@ def _cap_analysis_candidates(
         # queue entries already receive their research_queue_bump in the base
         # score and must compete with fresh candidates on quality; otherwise a
         # backlog of near misses can displace substantially stronger setups.
-        if candidate.get("is_research_queue_drain_probe"):
+        if candidate.get("is_research_queue_drain_probe") or candidate.get(
+            "is_jurisdiction_probe"
+        ):
             drain_probe_priority = 0
         else:
             drain_probe_priority = 1
@@ -11676,6 +11716,7 @@ def _analyze_market_candidate(
                     }
                 )
         if edge_repair_unresolved_reason is None:
+            decision = _stamp_quoted_edge_source(decision, market)
             edge_repair_unresolved_reason = _edge_repair_reason(
                 decision=decision,
                 market=market,
@@ -13346,6 +13387,10 @@ def main(
                 )
 
             analysis_candidates: list[dict[str, Any]] = []
+            unsourced_series_today = _unsourced_series_today(
+                state_manager, datetime.now(timezone.utc).date()
+            )
+            unsourced_series_skipped = 0
             fallback_family_rate_cache: dict[str, tuple[float, int]] = {}
             historical_family_outcome_snapshot: dict[str, dict[str, float | int]] = {}
             historical_family_lifetime_snapshot: dict[str, dict[str, float | int]] = {}
@@ -14005,6 +14050,14 @@ def main(
                 max(0, settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE) > 0
                 and "sports" in jurisdiction_blocked_families
             )
+            # A held family is only released by an accepted order, so each one
+            # needs a probe that bypasses the pre-score floor; the per-family
+            # probe caps in _cap_analysis_candidates keep it to one per family.
+            jurisdiction_probe_families = (
+                set(jurisdiction_blocked_families)
+                if max(0, settings.SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE) > 0
+                else set()
+            )
 
             for market in markets:
                 logger.debug(
@@ -14014,6 +14067,7 @@ def main(
                 )
                 drain_entry = drainable_research_entries.get(market.id)
                 is_drain_probe = drain_entry is not None
+                is_jurisdiction_probe = market_family(market) in jurisdiction_probe_families
                 try:
                     state = state_manager.get_market_state(market.id)
                 except Exception as exc:
@@ -14657,8 +14711,13 @@ def main(
                                 "zero_yield_promotion_bypassed_priority_floor"
                             )
                         )
+                    if is_jurisdiction_probe:
+                        if pre_analysis_breakdown is None:
+                            pre_analysis_breakdown = {}
+                        pre_analysis_breakdown["jurisdiction_hold_probe"] = True
                     if (
                         not is_drain_probe
+                        and not is_jurisdiction_probe
                         and not is_research_queue_score_promotion
                         and pre_analysis_score < settings.PRE_ANALYSIS_OPPORTUNITY_MIN_SCORE
                     ):
@@ -14910,6 +14969,12 @@ def main(
                                 },
                             )
                         continue
+                if (
+                    not traded_before
+                    and _market_series_ticker(market) in unsourced_series_today
+                ):
+                    unsourced_series_skipped += 1
+                    continue
                 _research_context = recent_research_entries.get(market.id)
                 analysis_candidates.append(
                     {
@@ -14917,6 +14982,7 @@ def main(
                         "state": state,
                         "anchor_analysis": anchor_analysis,
                         "market_family": market_family(market),
+                        "is_jurisdiction_probe": is_jurisdiction_probe,
                         "traded_before": traded_before,
                         "non_actionable_streak": int(
                             state.non_actionable_streak if state else 0
@@ -15927,6 +15993,40 @@ def main(
                     "analysis_candidate_attempt_limit": analysis_candidate_attempt_limit,
                 },
             )
+            newly_unsourced_series = {
+                _market_series_ticker(candidate["market"])
+                for candidate in analysis_candidates
+                if isinstance(
+                    (analysis_results.get(candidate["market"].id) or {}).get("decision"),
+                    TradeDecision,
+                )
+                and _is_unsourced_decision(
+                    analysis_results[candidate["market"].id]["decision"]
+                )
+            }
+            if newly_unsourced_series or unsourced_series_skipped:
+                try:
+                    _record_unsourced_series(
+                        state_manager,
+                        newly_unsourced_series,
+                        datetime.now(timezone.utc).date(),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to persist unsourced series: %s",
+                        exc,
+                        data={"error": str(exc)},
+                    )
+                logger.info(
+                    "Unsourced series: skipped=%d newly_marked=%s",
+                    unsourced_series_skipped,
+                    sorted(newly_unsourced_series),
+                    data={
+                        "unsourced_series_skipped_candidates": unsourced_series_skipped,
+                        "unsourced_series_newly_marked": sorted(newly_unsourced_series),
+                        "unsourced_series_today": sorted(unsourced_series_today),
+                    },
+                )
             spent_budget_exhausted, spent_budget_reason = (
                 xai_usage_tracker.budget_exhausted()
             )
