@@ -37,8 +37,8 @@ def main() -> None:
         "--new-guaranteed-run",
         action="store_true",
         help=(
-            "Replace the active guaranteed-order plan with a fresh plan using "
-            "GUARANTEED_ORDERS_N"
+            "Start a fresh guaranteed-order plan from GUARANTEED_ORDERS_N, "
+            "replacing the active plan when one exists"
         ),
     )
     args = parser.parse_args()

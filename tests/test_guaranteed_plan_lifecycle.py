@@ -45,7 +45,7 @@ def test_zero_target_plan_does_not_skip_ordinary_analysis() -> None:
     assert finished.skips_ordinary_analysis() is True
 
 
-def test_plan_lifecycle_requires_an_active_plan(tmp_path) -> None:
+def test_abandon_requires_an_active_plan(tmp_path) -> None:
     state = MarketStateManager(str(tmp_path / "state.db"))
     try:
         with pytest.raises(main.GuaranteedPlanLifecycleError, match="No active"):
@@ -53,8 +53,8 @@ def test_plan_lifecycle_requires_an_active_plan(tmp_path) -> None:
                 state_manager=state,
                 resumed_plan=None,
                 configured_target=2,
-                abandon_requested=False,
-                new_requested=True,
+                abandon_requested=True,
+                new_requested=False,
             )
         receipt_count = state._conn.execute(
             "SELECT COUNT(*) AS count FROM cycle_receipts"
@@ -63,6 +63,80 @@ def test_plan_lifecycle_requires_an_active_plan(tmp_path) -> None:
         state.close()
 
     assert receipt_count == 0
+
+
+def test_new_run_without_plan_still_requires_positive_target(tmp_path) -> None:
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        with pytest.raises(
+            main.GuaranteedPlanLifecycleError,
+            match="GUARANTEED_ORDERS_N",
+        ):
+            main._apply_guaranteed_plan_lifecycle_action(
+                state_manager=state,
+                resumed_plan=None,
+                configured_target=0,
+                abandon_requested=False,
+                new_requested=True,
+            )
+    finally:
+        state.close()
+
+
+def test_new_run_without_active_plan_continues(tmp_path) -> None:
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        resumed, exit_requested = main._apply_guaranteed_plan_lifecycle_action(
+            state_manager=state,
+            resumed_plan=None,
+            configured_target=5,
+            abandon_requested=False,
+            new_requested=True,
+        )
+        receipt_count = state._conn.execute(
+            "SELECT COUNT(*) AS count FROM cycle_receipts"
+        ).fetchone()["count"]
+        active = state.get_runtime_flag(main._GUARANTEED_PLAN_RUNTIME_FLAG)
+    finally:
+        state.close()
+
+    assert resumed is None
+    assert exit_requested is False
+    assert receipt_count == 0
+    assert active is None
+
+
+def test_main_new_run_creates_plan_when_none_exists(monkeypatch, tmp_path) -> None:
+    db_path = str(tmp_path / "state.db")
+    settings = Settings(
+        GUARANTEED_ORDERS_N=5,
+        DRY_RUN=True,
+        STATE_DB_PATH=db_path,
+        STATE_JSON_EXPORT_PATH=str(tmp_path / "state.json"),
+        EXPORT_STATE_JSON=False,
+        LOG_DIR=str(tmp_path / "logs"),
+        ENABLE_FILE_LOGGING=False,
+    )
+
+    def _stop_after_plan(*args, **kwargs):
+        raise RuntimeError("stop-after-plan")
+
+    monkeypatch.setattr(main, "load_settings", lambda: settings)
+    monkeypatch.setattr(main, "XAIProvider", _stop_after_plan)
+
+    with pytest.raises(RuntimeError, match="stop-after-plan"):
+        main.main(max_cycles=5, new_guaranteed_run=True)
+
+    verifier = MarketStateManager(db_path)
+    try:
+        raw = verifier.get_runtime_flag(main._GUARANTEED_PLAN_RUNTIME_FLAG)
+    finally:
+        verifier.close()
+
+    assert raw is not None
+    plan = main.GuaranteedOrderPlan.from_json(raw)
+    assert plan.target == 5
+    assert plan.completed_count == 0
 
 
 @pytest.mark.parametrize(

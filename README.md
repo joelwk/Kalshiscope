@@ -140,7 +140,7 @@ could submit more orders than the original target. Two ID-free lifecycle
 commands are available when an explicit reset is needed:
 
 ```bash
-# Replace the active plan and start a fresh plan.
+# Start a fresh plan. Replaces the active plan when one exists.
 poetry run kalshi --new-guaranteed-run --cycles 5
 
 # Clear the active plan and exit without initializing API clients.
@@ -378,9 +378,9 @@ poetry run kalshi --abandon-guaranteed-plan
 ```
 
 These switches are intentionally ID-free; the bot resolves the one active plan
-from SQLite. The replace command still requires `GUARANTEED_ORDERS_N` to be
-greater than zero. If no active plan exists, the command exits without changing
-state.
+from SQLite. `--new-guaranteed-run` still requires `GUARANTEED_ORDERS_N` to be
+greater than zero, and it starts that plan when none is active.
+`--abandon-guaranteed-plan` exits without changing state when no plan exists.
 
 ### Dependency issues
 

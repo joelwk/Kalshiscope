@@ -4870,15 +4870,21 @@ def _apply_guaranteed_plan_lifecycle_action(
         )
     if not abandon_requested and not new_requested:
         return resumed_plan, False
-    if resumed_plan is None:
-        raise GuaranteedPlanLifecycleError(
-            "No active guaranteed-order plan exists; nothing was changed"
-        )
     if new_requested and configured_target <= 0:
         raise GuaranteedPlanLifecycleError(
             "--new-guaranteed-run requires GUARANTEED_ORDERS_N to be greater than zero; "
             "nothing was changed"
         )
+    if resumed_plan is None:
+        if abandon_requested:
+            raise GuaranteedPlanLifecycleError(
+                "No active guaranteed-order plan exists; nothing was changed"
+            )
+        logger.info(
+            "No active guaranteed-order plan; starting a new run with target=%d",
+            configured_target,
+        )
+        return None, False
 
     action = "abandon_guaranteed_plan" if abandon_requested else "new_guaranteed_run"
     outcome = "abandoned_by_operator" if abandon_requested else "replaced_by_operator"
