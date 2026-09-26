@@ -1047,10 +1047,18 @@ class GrokClient:
         no_external_odds: bool,
         low_information: bool,
         market_id: str = "",
+        weather_market: bool = False,
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
         if low_information or (no_external_odds and not has_verifiable_signal):
             return "missing_or_absence_only"
+        # Weather reasoning names the stale forecast to explain why Kalshi is
+        # mispriced; a locked observation must win over that "forecast" keyword.
+        if weather_market and _weather_obs_locked_reasoning_ok(
+            market_id=market_id,
+            reasoning=reasoning or "",
+        ):
+            return "settlement_aligned"
         if _RE_PREVIEW_OR_PROXY_SOURCE.search(normalized_reasoning):
             return "preview_or_proxy"
         if has_definitive_outcome_signal or _weather_obs_locked_reasoning_ok(
@@ -1293,6 +1301,7 @@ class GrokClient:
             no_external_odds=no_external_odds,
             low_information=low_information,
             market_id=market.id or "",
+            weather_market=profile_name == "weather",
         )
         prob_component = 0.0
         if implied is not None and my_prob is not None:

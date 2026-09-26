@@ -2342,6 +2342,29 @@ def _is_observed_direct_weather_evidence(
     return evidence_quality >= float(settings.WEATHER_MIN_EVIDENCE_QUALITY) - 1e-9
 
 
+_OBSERVED_WEATHER_EDGE_MECHANISMS = frozenset({"observed_vs_strike", "settlement_already_known"})
+
+
+def _is_observed_weather_lock(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> bool:
+    """Weather call resting on an observed NWS/METAR/ASOS reading versus the strike.
+
+    Calibration shrinks toward the historical weather record, which was built
+    from forecast entries; an observed reading already past the strike is a
+    different class, so it keeps the model's confidence. The weather edge
+    floor still gates execution.
+    """
+    if market_family(market) != "weather":
+        return False
+    mechanism = str(getattr(decision, "edge_mechanism", "") or "").strip().lower()
+    if mechanism not in _OBSERVED_WEATHER_EDGE_MECHANISMS:
+        return False
+    return _is_observed_direct_weather_evidence(decision, settings)
+
+
 def _is_high_eq_weather_nws_edge(
     decision: TradeDecision,
     market: Market | None,
@@ -11906,6 +11929,7 @@ def _analyze_market_candidate(
 
     decision = _cap_confidence_for_category(decision, market, settings)
     confidence_before_calibration = decision.confidence
+    observed_weather_calibration_bypassed = _is_observed_weather_lock(decision, market, settings)
     evidence_basis_for_calibration = _decision_evidence_basis(decision)
     definitive_outcome_for_calibration = _is_definitive_outcome_eligible(
         decision,
@@ -11928,12 +11952,14 @@ def _analyze_market_candidate(
         ),
         direct_shrinkage_boost_factor=settings.CALIBRATION_DIRECT_SHRINKAGE_FACTOR_BOOST,
     )
+    if observed_weather_calibration_bypassed:
+        stage_one_confidence = confidence_before_calibration
     confidence_family = market_family(market)
     historical_win_rate_at_bucket = _historical_win_rate_at_bucket(confidence_before_calibration)
     historical_bucket_sample_size = 0
     historical_bucket_family = "none"
     confidence_history_gap_applied = 0.0
-    if settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED:
+    if settings.HISTORICAL_CONFIDENCE_SHRINK_ENABLED and not observed_weather_calibration_bypassed:
         historical_shrink = historical_confidence_shrink(
             stage_one_confidence,
             family=confidence_family,
@@ -12051,6 +12077,7 @@ def _analyze_market_candidate(
         "confidence_before_calibration": confidence_before_calibration,
         "confidence_after_calibration": decision.confidence,
         "confidence_calibration_applied": confidence_calibration_applied,
+        "observed_weather_calibration_bypassed": observed_weather_calibration_bypassed,
         "raw_vs_calibrated_delta": calibration_delta,
         "historical_win_rate_at_bucket": historical_win_rate_at_bucket,
         "historical_bucket_sample_size": historical_bucket_sample_size,

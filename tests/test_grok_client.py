@@ -2465,6 +2465,49 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertGreaterEqual(validated.evidence_quality, 0.75)
 
+    def test_weather_locked_observation_is_not_downgraded_by_stale_forecast_mention(self) -> None:
+        market = Market(
+            id="KXTEMPMIAH-26SEP2415-T88.99",
+            question="Will the Miami temperature be above 88.99 at 3pm?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.57), MarketOutcome(name="NO", price=0.43)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.68,
+            raw_confidence=0.68,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Edge is observed_vs_strike: NWS API KMIA 2:25pm EDT 89.6F and 1:53pm METAR "
+                "89.06F already above 88.99 with ~35 min to 3pm, while Kalshi still tracks "
+                "the stale MapClick 3pm forecast of 86F."
+            ),
+            my_prob=0.68,
+            edge_mechanism="observed_vs_strike",
+            evidence_basis="direct",
+            evidence_quality=0.75,
+            primary_source_url="https://api.weather.gov/stations/KMIA/observations/latest",
+        )
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertNotEqual(validated.evidence_floor_suppressed_reason, "preview_or_proxy_source")
+        self.assertGreaterEqual(validated.evidence_quality, 0.60)
+
+        forecast_only = decision.model_copy(
+            update={"reasoning": "NWS MapClick forecast shows 90F at 3pm vs 88.99 strike."}
+        )
+        still_proxy = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            forecast_only,
+            profile_name="weather",
+        )
+        self.assertEqual(still_proxy.source_match_class, "preview_or_proxy")
+
     def test_validate_and_enrich_skips_weather_observed_floor_for_lowt_without_daily_low(self) -> None:
         market = Market(
             id="KXLOWTOKC-26MAY24-T63",

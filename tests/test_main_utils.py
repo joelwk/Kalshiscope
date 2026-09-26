@@ -4982,6 +4982,58 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(_max_confidence_for_market(market, settings), 0.83)
 
+    def test_observed_weather_lock_keeps_confidence_through_calibration(self) -> None:
+        market = Market(
+            id="KXTEMPMIAH-26SEP2415-T88.99",
+            question="Will the Miami temperature be above 88.99 at 3pm?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.57), MarketOutcome(name="NO", price=0.43)],
+            liquidity_usdc=500.0,
+        )
+        observed = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.68,
+            bet_size_pct=0.2,
+            reasoning="KMIA observation already above 88.99 with 35 min left",
+            edge_mechanism="observed_vs_strike",
+            evidence_basis="direct",
+            evidence_quality=0.75,
+            primary_source_url="https://api.weather.gov/stations/KMIA/observations/latest",
+        )
+        settings = Settings(
+            CONFIDENCE_SHRINKAGE_FLOOR=0.50,
+            CONFIDENCE_SHRINKAGE_FACTOR=0.40,
+            MAX_WEATHER_CONFIDENCE=0.70,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(observed),
+        )
+        self.assertTrue(result["observed_weather_calibration_bypassed"])
+        self.assertAlmostEqual(result["confidence_after_calibration"], 0.68)
+
+        forecast = observed.model_copy(
+            update={
+                "primary_source_url": "https://forecast.weather.gov/MapClick.php?lat=25.8&lon=-80.3"
+            }
+        )
+        shrunk = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(forecast),
+        )
+        self.assertFalse(shrunk["observed_weather_calibration_bypassed"])
+        self.assertLess(shrunk["confidence_after_calibration"], 0.68)
+
     def test_analyze_market_candidate_applies_confidence_calibration(self) -> None:
         market = Market(
             id="KXBTCD-26APR1013-T72699.99",
