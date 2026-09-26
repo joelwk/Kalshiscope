@@ -38,6 +38,7 @@ def _build_dummy(  # noqa: ARG001 - signature parity
     provider=None,
     usage_recorder=None,
     usage_admission=None,
+    usage_release=None,
 ):
     return _DummyGrokClient()
 

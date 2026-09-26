@@ -493,6 +493,11 @@ def _is_quota_exhausted_grok_error(exc: Exception) -> bool:
     return any(marker in error_text for marker in _QUOTA_EXHAUSTED_MARKERS)
 
 
+def _is_usage_budget_exhausted_error(exc: Exception) -> bool:
+    """Detect an intentional local run/cycle cost admission stop."""
+    return str(exc).strip().lower().startswith("api_budget_exhausted:")
+
+
 def _is_model_unimplemented_grok_error(exc: Exception) -> bool:
     """Detect model/tooling 404s that should fall back to the fast model once."""
     error_text = str(exc).lower()
@@ -662,7 +667,8 @@ class GrokClient:
         settings: Settings | None = None,
         provider: XAIProvider | None = None,
         usage_recorder: Callable[[dict[str, Any]], None] | None = None,
-        usage_admission: Callable[[], None] | None = None,
+        usage_admission: Callable[[], str | None] | None = None,
+        usage_release: Callable[[str], None] | None = None,
     ) -> None:
         resolved_settings = settings or Settings()
         self.settings = resolved_settings
@@ -705,6 +711,7 @@ class GrokClient:
         )
         self.usage_recorder = usage_recorder
         self.usage_admission = usage_admission
+        self.usage_release = usage_release
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
         self.default_search_config = search_config or _default_search_config(settings)
@@ -2644,32 +2651,39 @@ class GrokClient:
         usage_phase: str = "initial",
     ) -> TradeDecision:
         start_time = time.monotonic()
-        if self.usage_admission is not None:
-            self.usage_admission()
+        reservation_id: str | None = None
+        content = ""
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
         model = model_override or (self.model_deep if deep else self.model)
         phase_label = "deep market analysis" if deep else "market analysis"
-        logger.debug(
-            "Starting %s: id=%s",
-            phase_label,
-            market.id,
-            data={
-                "market_id": market.id,
-                "question": market.question[:100],
-                "outcomes": [o.name for o in market.outcomes],
-                "liquidity_usdc": market.liquidity_usdc,
-                "previous_analysis": previous_summary if deep else None,
-                "search_profile": active_config.profile_name,
-                "lookback_hours": active_config.lookback_hours,
-                "model": model,
-                "temperature": temperature,
-                "self_consistency_variant": self_consistency_variant,
-            },
-        )
 
-        content = ""
+        def release_reservation() -> None:
+            nonlocal reservation_id
+            if reservation_id is not None and self.usage_release is not None:
+                self.usage_release(reservation_id)
+            reservation_id = None
+
         try:
+            if self.usage_admission is not None:
+                reservation_id = self.usage_admission()
+            logger.debug(
+                "Starting %s: id=%s",
+                phase_label,
+                market.id,
+                data={
+                    "market_id": market.id,
+                    "question": market.question[:100],
+                    "outcomes": [o.name for o in market.outcomes],
+                    "liquidity_usdc": market.liquidity_usdc,
+                    "previous_analysis": previous_summary if deep else None,
+                    "search_profile": active_config.profile_name,
+                    "lookback_hours": active_config.lookback_hours,
+                    "model": model,
+                    "temperature": temperature,
+                    "self_consistency_variant": self_consistency_variant,
+                },
+            )
             stream_deadline_seconds = self._resolve_stream_deadline_seconds(
                 budget_remaining_ms,
                 search_profile=getattr(active_config, "profile_name", None),
@@ -2736,19 +2750,21 @@ class GrokClient:
                 _extract_server_side_tool_usage(last_response)
             )
             if self.usage_recorder is not None:
-                self.usage_recorder(
-                    {
-                        "market_id": market.id,
-                        "phase": usage_phase,
-                        "model": model,
-                        "prompt_tokens": usage_metrics.get("prompt_tokens") or 0,
-                        "cached_tokens": usage_metrics.get("cached_tokens") or 0,
-                        "completion_tokens": usage_metrics.get("completion_tokens") or 0,
-                        "reasoning_tokens": usage_metrics.get("reasoning_tokens") or 0,
-                        "server_tool_calls": server_tool_calls,
-                        "server_side_tool_usage": server_side_tool_usage,
-                    }
-                )
+                usage_event = {
+                    "market_id": market.id,
+                    "phase": usage_phase,
+                    "model": model,
+                    "prompt_tokens": usage_metrics.get("prompt_tokens") or 0,
+                    "cached_tokens": usage_metrics.get("cached_tokens") or 0,
+                    "completion_tokens": usage_metrics.get("completion_tokens") or 0,
+                    "reasoning_tokens": usage_metrics.get("reasoning_tokens") or 0,
+                    "server_tool_calls": server_tool_calls,
+                    "server_side_tool_usage": server_side_tool_usage,
+                }
+                if reservation_id is not None:
+                    usage_event["_reservation_id"] = reservation_id
+                self.usage_recorder(usage_event)
+                release_reservation()
             citation_urls = _extract_citation_urls(last_response)
             structured_payload = _payload_from_stream_response(last_response)
             if not content and structured_payload is None:
@@ -2872,6 +2888,7 @@ class GrokClient:
             )
             return decision
         except Exception as exc:
+            release_reservation()
             duration = (time.monotonic() - start_time) * 1000
             retriable = _is_retriable_grok_error(exc, duration)
             budget_after_error_ms = max(0.0, budget_remaining_ms - duration)
@@ -2926,7 +2943,18 @@ class GrokClient:
                         "response_preview": _response_preview(content),
                     },
                 )
-            log_fn = logger.warning if (will_retry or self_consistency_variant) else logger.error
+            quota_exhausted = _is_quota_exhausted_grok_error(exc)
+            usage_budget_exhausted = _is_usage_budget_exhausted_error(exc)
+            log_fn = (
+                logger.warning
+                if (
+                    will_retry
+                    or self_consistency_variant
+                    or quota_exhausted
+                    or usage_budget_exhausted
+                )
+                else logger.error
+            )
             log_fn(
                 "%s failed: id=%s, error=%s, duration=%.2fms",
                 phase_label.capitalize(),
@@ -2940,7 +2968,8 @@ class GrokClient:
                     "duration_ms": round(duration, 2),
                     "retriable": retriable,
                     "will_retry": will_retry,
-                    "quota_exhausted": _is_quota_exhausted_grok_error(exc),
+                    "quota_exhausted": quota_exhausted,
+                    "usage_budget_exhausted": usage_budget_exhausted,
                     "retry_attempt": retry_attempt,
                     "max_attempts": max_attempts,
                     "budget_remaining_ms": round(budget_after_error_ms, 2),
@@ -2952,6 +2981,8 @@ class GrokClient:
             )
             setattr(exc, "_grok_duration_ms", duration)
             raise
+        finally:
+            release_reservation()
 
     def analyze_market(
         self,

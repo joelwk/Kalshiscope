@@ -393,6 +393,12 @@ def test_run_cost_cap_reached_in_cycle_stops_before_next_catalog_fetch(
         def ensure_call_allowed(self) -> None:
             pass
 
+        def reserve_call(self) -> str:
+            return "test-reservation"
+
+        def release_reservation(self, reservation_id: str) -> None:
+            pass
+
     class _Kalshi:
         last_fetch_pages = 1
         last_fetch_cap_hit = False

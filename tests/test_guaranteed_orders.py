@@ -1228,6 +1228,21 @@ def test_research_gap_reason_ignores_unlabeled_mechanism() -> None:
     assert main._guaranteed_order_research_gap_reason(decision, settings) is None
 
 
+def test_research_gap_reason_requires_structured_probability() -> None:
+    settings = main.Settings()
+    decision = _decision(
+        evidence_basis="direct",
+        edge_source="none",
+        evidence_quality=0.6,
+        confidence=0.5,
+        edge_mechanism="none",
+    ).model_copy(update={"my_prob": None, "probability_yes": None})
+    assert (
+        main._guaranteed_order_research_gap_reason(decision, settings)
+        == "guaranteed_order_missing_structured_probability"
+    )
+
+
 def test_guaranteed_forces_computed_plus_ev_with_unlabeled_mechanism(tmp_path) -> None:
     """Live miss: TEMPMIAH-style computed +EV with edge_mechanism=none."""
     market = _market("generic-mia", yes_price=0.67)

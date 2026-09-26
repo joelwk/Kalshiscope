@@ -5624,6 +5624,39 @@ class TestMainUtils(unittest.TestCase):
         self.assertTrue(result["analysis_error_retriable_xai"])
         self.assertFalse(result["was_refined"])
 
+    def test_analyze_market_candidate_logs_budget_stop_as_warning(self) -> None:
+        market = Market(
+            id="m-budget-stop",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=200.0,
+            category="sports",
+        )
+
+        class BudgetStoppedGrokClient:
+            def analyze_market(self, *args, **kwargs):
+                raise main_module.XAIBudgetExhaustedError(
+                    "api_budget_exhausted:cycle_cost_cap"
+                )
+
+        with (
+            patch.object(main_module.logger, "warning") as warning,
+            patch.object(main_module.logger, "error") as error,
+        ):
+            result = _analyze_market_candidate(
+                market=market,
+                state=None,
+                anchor_analysis=None,
+                settings=Settings(),
+                grok_client=BudgetStoppedGrokClient(),
+            )
+
+        self.assertTrue(result["analysis_failed"])
+        self.assertEqual(result["analysis_error_type"], "XAIBudgetExhaustedError")
+        warning.assert_called_once()
+        error.assert_not_called()
+        self.assertEqual(warning.call_args.args[1], "skipped")
+
     def test_build_order_request_from_market_uses_current_market_price(self) -> None:
         market = Market(
             id="m-order",

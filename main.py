@@ -5842,6 +5842,8 @@ def _guaranteed_order_research_gap_reason(
     basis = str(decision.evidence_basis or "").strip().lower()
     if basis == "absence_only":
         return "guaranteed_order_research_gap_absence_only"
+    if decision.my_prob is None and decision.probability_yes is None:
+        return "guaranteed_order_missing_structured_probability"
     return None
 
 
@@ -10204,6 +10206,7 @@ def _build_grok_client_for_worker(
     provider: XAIProvider | None = None,
     usage_recorder=None,
     usage_admission=None,
+    usage_release=None,
 ) -> GrokClient:
     """Create a Grok client for threaded analysis workers.
 
@@ -10218,6 +10221,7 @@ def _build_grok_client_for_worker(
         provider=provider,
         usage_recorder=usage_recorder,
         usage_admission=usage_admission,
+        usage_release=usage_release,
     )
 
 
@@ -10248,6 +10252,7 @@ def _get_or_create_worker_grok_client(
     provider: XAIProvider | None = None,
     usage_recorder=None,
     usage_admission=None,
+    usage_release=None,
 ) -> GrokClient:
     """Return the calling thread's GrokClient, building it lazily on first use."""
     storage = _worker_grok_client_storage
@@ -10258,6 +10263,7 @@ def _get_or_create_worker_grok_client(
             provider=provider,
             usage_recorder=usage_recorder,
             usage_admission=usage_admission,
+            usage_release=usage_release,
         )
         storage.client = client
     return client
@@ -10297,6 +10303,7 @@ def _analyze_market_candidate_via_thread_local_client(
     provider: XAIProvider | None,
     usage_recorder=None,
     usage_admission=None,
+    usage_release=None,
     historical_confidence_buckets: dict[str, dict[float, dict[str, float | int]]] | None = None,
     correlation_id: str | None = None,
     force_extended_research: bool = False,
@@ -10312,6 +10319,7 @@ def _analyze_market_candidate_via_thread_local_client(
         provider,
         usage_recorder,
         usage_admission,
+        usage_release,
     )
     # Bet bounds are bankroll-derived per cycle while worker clients are cached
     # per thread, so refresh the prompt bet range on every analysis.
@@ -11632,12 +11640,16 @@ def _analyze_market_candidate(
         )
     except Exception as exc:
         error_text = str(exc)
+        budget_exhausted = isinstance(exc, XAIBudgetExhaustedError)
         is_timeout = (
             isinstance(exc, TimeoutError)
             or "grok stream exceeded" in error_text.lower()
         )
-        logger.error(
-            "Initial market analysis failed for %s: %s",
+        log_fn = logger.warning if budget_exhausted else logger.error
+        outcome_label = "skipped" if budget_exhausted else "failed"
+        log_fn(
+            "Initial market analysis %s for %s: %s",
+            outcome_label,
             market.id,
             exc,
             data={
@@ -11646,6 +11658,7 @@ def _analyze_market_candidate(
                 "error_type": type(exc).__name__,
                 "analysis_phase": "initial",
                 "is_timeout": is_timeout,
+                "budget_exhausted": budget_exhausted,
             },
         )
         return {
@@ -12249,7 +12262,8 @@ def main(
         settings=settings,
         provider=shared_xai_provider,
         usage_recorder=xai_usage_tracker.record,
-        usage_admission=xai_usage_tracker.ensure_call_allowed,
+        usage_admission=xai_usage_tracker.reserve_call,
+        usage_release=xai_usage_tracker.release_reservation,
     )
     logger.debug(
         "Grok client initialized with model=%s model_deep=%s",
@@ -15665,7 +15679,8 @@ def main(
                                 settings,
                                 shared_xai_provider,
                                 xai_usage_tracker.record,
-                                xai_usage_tracker.ensure_call_allowed,
+                                xai_usage_tracker.reserve_call,
+                                xai_usage_tracker.release_reservation,
                                 historical_confidence_buckets,
                                 cycle_id,
                                 bool(candidate.get("force_extended_research")),

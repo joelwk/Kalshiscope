@@ -183,16 +183,24 @@ The shipped Grok 4.3 estimate is labeled
 - `API_COST_INPUT_PER_1K_TOKENS_USD=0.00125` for uncached input.
 - `API_COST_CACHED_INPUT_PER_1K_TOKENS_USD=0.00020` for cached input.
 - `API_COST_OUTPUT_PER_1K_TOKENS_USD=0.00250` for output.
+- Prompts at or above `API_COST_LONG_CONTEXT_THRESHOLD_TOKENS=200000` use
+  `API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD=0.00250`,
+  `API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD=0.00040`, and
+  `API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD=0.00500` instead.
 - `API_COST_SERVER_TOOL_PER_CALL_USD=0.005` for each reported server-side tool
   call.
+- `API_COST_RESERVATION_PER_CALL_USD=1.50` reserves projected spend atomically
+  before each provider call and reconciles it against actual usage afterward.
 
-`MAX_XAI_COST_PER_RUN_USD=10` and `MAX_XAI_COST_PER_CYCLE_USD=3` are hard
-admission controls for new calls. Set either value to `0` only when intentionally
-disabling that cap. Once a cap is reached, the bot records
-`api_budget_exhausted`, stops scheduling new Grok calls, and performs only
-reconciliation and final receipt work. Parallel requests already in flight can
-cause a small overshoot. A cycle-cap stop may continue on a later cycle; a
-run-cap stop is terminal for that guaranteed-plan run.
+`MAX_XAI_COST_PER_RUN_USD=10` and `MAX_XAI_COST_PER_CYCLE_USD=3` are admission
+controls for new calls. Set either value to `0` only when intentionally disabling
+that cap. Completed usage plus active reservations cannot admit more than the
+configured cap. Actual usage can still exceed a reservation for an individual
+call, but parallel calls no longer start against the same unreserved budget.
+Once a cap is reached, the bot records `api_budget_exhausted`, stops scheduling
+new Grok calls, and performs only reconciliation and final receipt work. A
+cycle-cap stop may continue on a later cycle; a run-cap stop is terminal for
+that guaranteed-plan run.
 
 Research volume is also bounded before the dollar caps are reached:
 
@@ -240,8 +248,13 @@ Common optional variables:
 - `MAX_XAI_COST_PER_RUN_USD`, `MAX_XAI_COST_PER_CYCLE_USD`
 - `API_COST_INPUT_PER_1K_TOKENS_USD`,
   `API_COST_CACHED_INPUT_PER_1K_TOKENS_USD`,
-  `API_COST_OUTPUT_PER_1K_TOKENS_USD`, and
+  `API_COST_OUTPUT_PER_1K_TOKENS_USD`,
+  `API_COST_LONG_CONTEXT_THRESHOLD_TOKENS`,
+  `API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD`,
+  `API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD`,
+  `API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD`, and
   `API_COST_SERVER_TOOL_PER_CALL_USD`
+- `API_COST_RESERVATION_PER_CALL_USD`
 - `API_COST_PRICING_VERSION` labels the configured rate card in receipts.
 
 See `.env.example` for the full set of runtime controls.

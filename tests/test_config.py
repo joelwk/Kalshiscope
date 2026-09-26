@@ -102,9 +102,42 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.API_COST_INPUT_PER_1K_TOKENS_USD, 0.00125)
         self.assertEqual(settings.API_COST_CACHED_INPUT_PER_1K_TOKENS_USD, 0.00020)
         self.assertEqual(settings.API_COST_OUTPUT_PER_1K_TOKENS_USD, 0.00250)
+        self.assertEqual(settings.API_COST_LONG_CONTEXT_THRESHOLD_TOKENS, 200_000)
+        self.assertEqual(
+            settings.API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD,
+            0.00250,
+        )
+        self.assertEqual(
+            settings.API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD,
+            0.00040,
+        )
+        self.assertEqual(
+            settings.API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD,
+            0.00500,
+        )
         self.assertEqual(settings.API_COST_SERVER_TOOL_PER_CALL_USD, 0.005)
+        self.assertEqual(settings.API_COST_RESERVATION_PER_CALL_USD, 1.50)
         self.assertEqual(settings.MAX_XAI_COST_PER_RUN_USD, 10.0)
         self.assertEqual(settings.MAX_XAI_COST_PER_CYCLE_USD, 3.0)
+
+        override_env = {
+            **self._required_env(),
+            "API_COST_RESERVATION_PER_CALL_USD": "0.75",
+        }
+        with patch.dict(os.environ, override_env, clear=True):
+            overridden = config.load_settings()
+        self.assertEqual(overridden.API_COST_RESERVATION_PER_CALL_USD, 0.75)
+
+        invalid_env = {
+            **self._required_env(),
+            "API_COST_RESERVATION_PER_CALL_USD": "-0.01",
+        }
+        with patch.dict(os.environ, invalid_env, clear=True):
+            with self.assertRaisesRegex(
+                ValueError,
+                "API_COST_RESERVATION_PER_CALL_USD",
+            ):
+                config.load_settings()
 
     def test_guaranteed_orders_defaults_disabled_and_parses_override(self) -> None:
         with patch.dict(os.environ, self._required_env(), clear=True):

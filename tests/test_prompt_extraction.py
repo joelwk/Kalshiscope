@@ -6,9 +6,9 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Aug 25 2026: guaranteed-quota honesty + bankroll-scaled bet_size_pct.
-    "analyze": "1466b9b331474ed2aeda21489b001cfd02cf1b29bb9859377ac280e53db1fa50",
-    "deep": "6b96e440959a6bd6ddec6456deb21b5a38708f977db13e48d06bd4124a95c90b",
+    # Re-pinned Sep 26 2026: directional decisions require structured probability.
+    "analyze": "84f12d0f9af83885dc26d77d225de777cd389e7a7e7902e4ab98945311b4499e",
+    "deep": "74606d3debcd4ce1d48521c1fdaa45e4110f71e8877ee6dbca4754f5b1e1c4e9",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
