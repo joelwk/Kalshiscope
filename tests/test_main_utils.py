@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import main as main_module
-from calibration_gates import PerformanceStats
+from calibration_gates import GateTier, PerformanceStats
 from config import Settings
 from participation import ParticipationTier
 from main import (
@@ -48,6 +48,10 @@ from main import (
     _effective_research_queue_drain_quota,
     _effective_sports_candidate_cap,
     _clear_sports_jurisdiction_block,
+    _jurisdiction_blocked_families,
+    _jurisdiction_families_from_error,
+    _market_hits_jurisdiction_hold,
+    _record_jurisdiction_block,
     _record_sports_jurisdiction_block,
     _sports_jurisdiction_hold_active,
     _edge_threshold_for_market,
@@ -62,6 +66,7 @@ from main import (
     _extract_order_fill_count,
     _fetch_markets_with_optional_server_filters,
     _filter_markets,
+    _is_tls_ca_bundle_error,
     _kelly_fraction_for_market_horizon,
     _load_execution_market_snapshot,
     _log_settings_summary,
@@ -380,6 +385,26 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(
             _event_ticker_prefix(market),
             "KXSAMPLEGAME-26APR121610TEAMA",
+        )
+
+    def test_event_ticker_prefix_strips_weather_bin_from_event_ticker(self) -> None:
+        high_a = Market(
+            id="KXHIGHTOKC-26AUG25-B103.5",
+            event_ticker="KXHIGHTOKC-26AUG25-B103.5",
+            question="OKC high",
+        )
+        high_b = Market(
+            id="KXHIGHTOKC-26AUG25-B101.5",
+            event_ticker="KXHIGHTOKC-26AUG25-B101.5",
+            question="OKC high",
+        )
+        self.assertEqual(
+            _event_ticker_prefix(high_a),
+            "KXHIGHTOKC-26AUG25",
+        )
+        self.assertEqual(
+            _event_ticker_prefix(high_a),
+            _event_ticker_prefix(high_b),
         )
 
     def test_event_ticker_prefix_falls_back_to_market_id_prefix(self) -> None:
@@ -1020,7 +1045,7 @@ class TestMainUtils(unittest.TestCase):
         """Hold overlay eases weather dominance and boosts crypto/generic."""
         self.assertAlmostEqual(
             _direct_evidence_family_affinity("weather"),
-            0.12,
+            0.04,
             places=4,
         )
         self.assertAlmostEqual(
@@ -1028,7 +1053,7 @@ class TestMainUtils(unittest.TestCase):
                 "weather",
                 sports_jurisdiction_hold_active=True,
             ),
-            0.06,
+            0.03,
             places=4,
         )
         self.assertAlmostEqual(
@@ -1048,8 +1073,25 @@ class TestMainUtils(unittest.TestCase):
             places=4,
         )
         self.assertEqual(
-            _direct_evidence_family_affinity("crypto"),
+            _direct_evidence_family_affinity(
+                "entertainment",
+                jurisdiction_blocked_families={"entertainment", "music", "sports"},
+            ),
             0.0,
+        )
+        # Hold overlay keeps weather below its base affinity and boosts crypto
+        # above it (base weather 0.04 / crypto 0.06 per the affinity tables).
+        self.assertLess(
+            _direct_evidence_family_affinity(
+                "weather", sports_jurisdiction_hold_active=True
+            ),
+            _direct_evidence_family_affinity("weather"),
+        )
+        self.assertGreater(
+            _direct_evidence_family_affinity(
+                "crypto", sports_jurisdiction_hold_active=True
+            ),
+            _direct_evidence_family_affinity("crypto"),
         )
 
         settings = Settings()
@@ -1100,7 +1142,7 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertAlmostEqual(
             weather_bd["pre_score_direct_evidence_family_affinity"],
-            0.06,
+            0.03,
             places=4,
         )
 
@@ -2431,6 +2473,108 @@ class TestMainUtils(unittest.TestCase):
             0.0,
         )
 
+    def test_pre_analysis_hard_deny_does_not_apply_score_penalty(self) -> None:
+        """HARD_DENY blocks execution, not Grok analysis. A leftover or
+        missing score-penalty key must not drop the market into the research
+        band via the soft-demote default.
+        """
+        market = Market(
+            id="KXHARDDENY-1234-T100",
+            question="Will the index settle above threshold?",
+            category="generic",
+            liquidity_usdc=400.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.0,
+        )
+        baseline, _ = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        leftover, leftover_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.HARD_DENY,
+                "historical_gate_score_penalty": 0.10,
+            },
+        )
+        missing, missing_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.HARD_DENY,
+            },
+        )
+        self.assertEqual(leftover_bd["pre_score_historical_gate_score_penalty"], 0.0)
+        self.assertEqual(missing_bd["pre_score_historical_gate_score_penalty"], 0.0)
+        self.assertAlmostEqual(leftover, baseline, places=6)
+        self.assertAlmostEqual(missing, baseline, places=6)
+
+    def test_pre_analysis_soft_demote_still_applies_score_penalty(self) -> None:
+        market = Market(
+            id="KXSOFTDEMOTE-1234-T100",
+            question="Will the index settle above threshold?",
+            category="generic",
+            liquidity_usdc=400.0,
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            close_time=datetime.now(timezone.utc) + timedelta(hours=20),
+            resolution_criteria="Official settlement source",
+        )
+        settings = Settings(
+            HISTORICAL_TICKER_PREFIX_SOFT_DEMOTE_SCORE_PENALTY=0.10,
+            PRE_ANALYSIS_STACKED_HISTORICAL_PENALTY_CAP=0.0,
+        )
+        baseline, _ = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+        )
+        explicit, explicit_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.SOFT_DEMOTE,
+                "historical_gate_score_penalty": 0.08,
+            },
+        )
+        defaulted, defaulted_bd = _pre_analysis_opportunity_score(
+            market,
+            None,
+            settings,
+            traded_before=False,
+            historical_gate_metrics={
+                "historical_gate_tier": GateTier.SOFT_DEMOTE,
+            },
+        )
+        self.assertAlmostEqual(
+            explicit_bd["pre_score_historical_gate_score_penalty"], 0.08, places=6
+        )
+        self.assertAlmostEqual(
+            defaulted_bd["pre_score_historical_gate_score_penalty"], 0.10, places=6
+        )
+        self.assertAlmostEqual(explicit, baseline - 0.08, places=6)
+        self.assertAlmostEqual(defaulted, baseline - 0.10, places=6)
+
     def test_pre_analysis_opportunity_score_does_not_credit_when_below_cap(
         self,
     ) -> None:
@@ -2528,7 +2672,7 @@ class TestMainUtils(unittest.TestCase):
             edge_external=0.13,
             evidence_basis="direct",
             evidence_quality=0.90,
-            primary_source_url="https://forecast.weather.gov/MapClick.php?lat=30.3&lon=-97.7",
+            primary_source_url="https://forecast.weather.gov/product.php?site=ewx&product=CLI",
         )
         settings = Settings(
             MIN_EDGE=0.05,
@@ -2593,15 +2737,32 @@ class TestMainUtils(unittest.TestCase):
         self.assertIn("repair_action=", text)
         self.assertIn("should_trade=true", text)
 
-    def test_is_michigan_sports_jurisdiction_error(self) -> None:
-        from main import _is_michigan_sports_jurisdiction_error
+    def test_jurisdiction_families_from_error_parses_state_categories(self) -> None:
+        from main import _jurisdiction_rejection_reason
 
-        self.assertTrue(
-            _is_michigan_sports_jurisdiction_error(
+        self.assertEqual(
+            _jurisdiction_families_from_error(
                 "403 body=Michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports"
-            )
+            ),
+            frozenset({"sports"}),
         )
-        self.assertFalse(_is_michigan_sports_jurisdiction_error("insufficient balance"))
+        nevada = _jurisdiction_families_from_error(
+            "Nevada residents are not currently allowed to open positions in "
+            "Sports, Elections and Entertainment. Check your email for more details."
+        )
+        self.assertEqual(
+            nevada,
+            frozenset({"sports", "politics", "entertainment", "music"}),
+        )
+        self.assertEqual(_jurisdiction_rejection_reason(nevada), "jurisdiction_restricted")
+        self.assertEqual(
+            _jurisdiction_rejection_reason({"sports"}),
+            "jurisdiction_sports_blocked",
+        )
+        self.assertEqual(
+            _jurisdiction_families_from_error("insufficient balance"),
+            frozenset(),
+        )
 
     def test_edge_repair_skips_sports_computed_odds_near_binary(self) -> None:
         from main import _edge_repair_reason
@@ -2742,6 +2903,59 @@ class TestMainUtils(unittest.TestCase):
             )
         )
 
+    def test_quoted_positive_edge_stamps_edge_source_and_skips_repair(self) -> None:
+        from main import _edge_repair_reason, _stamp_quoted_edge_source
+
+        settings = Settings(
+            EDGE_REPAIR_ENABLED=True,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        market = Market(
+            id="KXXRPD-26SEP2412-T1.4999",
+            question="Ripple price at Sep 24, 2026?",
+            category="crypto",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.54),
+                MarketOutcome(name="NO", price=0.46),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="NO",
+            confidence=0.55,
+            my_prob=0.35,
+            bet_size_pct=0.2,
+            reasoning="Binance XRP 1.4682 below strike",
+            edge_source="none",
+            evidence_basis="proxy",
+            evidence_quality=0.60,
+            source_match_class="settlement_aligned",
+            primary_source_url="https://www.binance.com/en-GB/trade/XRP_USDT",
+        )
+        self.assertEqual(
+            _edge_repair_reason(
+                decision=decision, market=market, settings=settings, implied_prob=0.46
+            ),
+            "edge_source_none",
+        )
+        stamped = _stamp_quoted_edge_source(decision, market)
+        self.assertEqual(stamped.edge_source, "computed")
+        self.assertNotEqual(
+            _edge_repair_reason(
+                decision=stamped, market=market, settings=settings, implied_prob=0.46
+            ),
+            "edge_source_none",
+        )
+
+        no_url = decision.model_copy(update={"primary_source_url": None})
+        self.assertEqual(_stamp_quoted_edge_source(no_url, market).edge_source, "none")
+        absence = decision.model_copy(update={"evidence_basis": "absence_only"})
+        self.assertEqual(_stamp_quoted_edge_source(absence, market).edge_source, "none")
+        negative = decision.model_copy(update={"confidence": 0.40})
+        self.assertEqual(_stamp_quoted_edge_source(negative, market).edge_source, "none")
+
     def test_order_exception_error_text_includes_kalshi_body(self) -> None:
         import requests
         from main import _order_exception_error_text
@@ -2764,9 +2978,12 @@ class TestMainUtils(unittest.TestCase):
         text = _order_exception_error_text(exc)
         self.assertIn("403 Client Error", text)
         self.assertIn("michigan_residents_are_not_currently_allowed_to_open_positions_in_Sports", text)
-        from main import _is_michigan_sports_jurisdiction_error
+        from main import _jurisdiction_families_from_error
 
-        self.assertTrue(_is_michigan_sports_jurisdiction_error(text))
+        self.assertEqual(
+            _jurisdiction_families_from_error(text),
+            frozenset({"sports"}),
+        )
 
     def test_kelly_fraction_shrinks_on_weather_calibration_gap(self) -> None:
         from kelly import kelly_bet_pct, kelly_fraction
@@ -3071,6 +3288,55 @@ class TestMainUtils(unittest.TestCase):
         self.assertEqual(_calculate_bet(100, -1), 0)
         self.assertEqual(_calculate_bet(100, 2), 100)
 
+    def test_effective_bet_bounds_scale_with_bankroll(self) -> None:
+        from main import _effective_bet_bounds_usdc
+
+        settings = Settings(
+            MIN_BET_PCT_OF_BANKROLL=0.04,
+            MAX_BET_PCT_OF_BANKROLL=0.16,
+        )
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 75.0)
+        self.assertAlmostEqual(min_bet, 3.0)
+        self.assertAlmostEqual(max_bet, 12.0)
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 150.0)
+        self.assertAlmostEqual(min_bet, 6.0)
+        self.assertAlmostEqual(max_bet, 24.0)
+
+    def test_effective_bet_bounds_floor_at_one_dollar(self) -> None:
+        from main import _effective_bet_bounds_usdc
+
+        settings = Settings(
+            MIN_BET_PCT_OF_BANKROLL=0.04,
+            MAX_BET_PCT_OF_BANKROLL=0.16,
+        )
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 10.0)
+        # 4% of $10 = $0.40 floors to $1; 16% of $10 = $1.60 stays.
+        self.assertAlmostEqual(min_bet, 1.0)
+        self.assertAlmostEqual(max_bet, 1.6)
+        # Min never exceeds max even when both hit the floor.
+        min_bet, max_bet = _effective_bet_bounds_usdc(settings, 3.0)
+        self.assertAlmostEqual(min_bet, 1.0)
+        self.assertAlmostEqual(max_bet, 1.0)
+
+    def test_effective_bet_bounds_zero_without_bankroll(self) -> None:
+        from main import _effective_bet_bounds_usdc
+
+        settings = Settings()
+        self.assertEqual(_effective_bet_bounds_usdc(settings, None), (0.0, 0.0))
+        self.assertEqual(_effective_bet_bounds_usdc(settings, 0.0), (0.0, 0.0))
+        self.assertEqual(_effective_bet_bounds_usdc(settings, -5.0), (0.0, 0.0))
+
+    def test_effective_daily_drawdown_cap_scales_and_disables(self) -> None:
+        from main import _effective_daily_drawdown_cap_usdc
+
+        settings = Settings(MAX_DAILY_DRAWDOWN_PCT=0.20)
+        self.assertAlmostEqual(
+            _effective_daily_drawdown_cap_usdc(settings, 75.0), 15.0
+        )
+        self.assertEqual(_effective_daily_drawdown_cap_usdc(settings, None), 0.0)
+        disabled = Settings(MAX_DAILY_DRAWDOWN_PCT=0.0)
+        self.assertEqual(_effective_daily_drawdown_cap_usdc(disabled, 75.0), 0.0)
+
     def test_filter_markets_captures_resolved_winners(self) -> None:
         now = datetime.now(timezone.utc)
         settled = Market(
@@ -3170,16 +3436,19 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(clamped_amount, 12.5)
 
     def test_satellite_cap_executable_above_min_bet_when_configured(self) -> None:
-        # Invariant: the recommended satellite cap (raised to 0.45) x MAX_BET
-        # must be >= MIN_BET so satellite trades are not structurally blocked.
+        # Invariant: the satellite cap x max-bet pct must be >= min-bet pct so
+        # satellite trades are not structurally blocked at any bankroll.
         settings = Settings(
-            MAX_BET_USDC=12.0,
-            MIN_BET_USDC=5.0,
+            MIN_BET_PCT_OF_BANKROLL=0.04,
+            MAX_BET_PCT_OF_BANKROLL=0.16,
             DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45,
         )
         _, cap = _daily_expectancy_role(settings=settings, daily_exposure_count=2)
         self.assertIsNotNone(cap)
-        self.assertGreaterEqual(cap * settings.MAX_BET_USDC, settings.MIN_BET_USDC)
+        self.assertGreaterEqual(
+            cap * settings.MAX_BET_PCT_OF_BANKROLL,
+            settings.MIN_BET_PCT_OF_BANKROLL,
+        )
 
     def test_daily_expectancy_ev_blocks_non_positive_primary_and_unfunded_satellite(self) -> None:
         self.assertEqual(
@@ -3609,6 +3878,36 @@ class TestMainUtils(unittest.TestCase):
 
         self.assertEqual([item["market"].id for item in capped], ["normal-high", "normal-mid"])
 
+    def test_cap_analysis_candidates_admits_one_jurisdiction_probe_per_held_family(self) -> None:
+        candidates = [
+            {
+                "market": Market(id="gen-high", question="Nasdaq ladder", category="business"),
+                "pre_analysis_score": 1.05,
+            },
+            {
+                "market": Market(id="gen-mid", question="Gold ladder", category="business"),
+                "pre_analysis_score": 0.90,
+            },
+            {
+                "market": Market(id="pol-low", question="Senate election winner", category="politics"),
+                "pre_analysis_score": 0.10,
+                "is_jurisdiction_probe": True,
+            },
+            {
+                "market": Market(id="pol-lower", question="House election winner", category="politics"),
+                "pre_analysis_score": 0.05,
+                "is_jurisdiction_probe": True,
+            },
+        ]
+
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=2,
+            extra_family_caps={"politics": 1},
+        )
+
+        self.assertEqual([item["market"].id for item in capped], ["pol-low", "gen-high"])
+
     def test_cap_analysis_candidates_limits_weather_candidates(self) -> None:
         candidates = [
             {"market": Market(id="w1", question="Weather 1", category="weather")},
@@ -3898,6 +4197,51 @@ class TestMainUtils(unittest.TestCase):
         assert components["historical_gate_penalty"] == 0.12
         assert components["risk_adjusted_score"] == 0.73  # 0.85 - 0.12
 
+    def test_cap_analysis_candidates_hard_deny_does_not_apply_score_penalty(self) -> None:
+        """HARD_DENY must not reuse a leftover soft-demote metric penalty
+        when ranking analysis candidates.
+        """
+        candidates = [
+            {
+                "market": Market(
+                    id="KXSPORTS-HARD-DENY",
+                    question="Will the NBA Lakers win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.65,
+                "historical_gate_allowed": False,
+                "historical_gate_metrics": {
+                    "historical_gate_tier": GateTier.HARD_DENY,
+                    "historical_gate_score_penalty": 0.08,
+                },
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-CLEAN-HARD-DENY",
+                    question="Will the NBA Celtics win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.50,
+                "historical_gate_allowed": True,
+            },
+            {
+                "market": Market(
+                    id="KXSPORTS-FILLER-HARD-DENY",
+                    question="Will the NBA Heat win tonight?",
+                    category="sports",
+                ),
+                "pre_analysis_score": 0.40,
+                "historical_gate_allowed": True,
+            },
+        ]
+        capped = _cap_analysis_candidates(candidates, max_markets_per_cycle=2)
+        blocked = next(
+            item for item in capped if item["market"].id == "KXSPORTS-HARD-DENY"
+        )
+        components = blocked["selection_rank_components"]
+        assert components["historical_gate_penalty"] == 0.0
+        assert components["risk_adjusted_score"] == 0.65
+
     def test_cap_analysis_candidates_limits_sports_candidates(self) -> None:
         """Cycle 4 recovery: sports props were monopolizing all analysis
         slots even when other families had eligible candidates. The sports
@@ -3964,6 +4308,41 @@ class TestMainUtils(unittest.TestCase):
         sports_ids = [mid for mid in capped_ids if mid.startswith("KXMLBHRR-")]
         self.assertEqual(len(sports_ids), 2)
         self.assertIn("KXBTCD-T70K", capped_ids)
+        self.assertIn("KXHIGHCHI-T50", capped_ids)
+
+    def test_cap_analysis_candidates_extra_family_caps_apply_under_global_cap(self) -> None:
+        """Jurisdiction probe caps must apply even when the global cycle cap
+        is larger than the candidate list (the early-return path)."""
+        candidates = [
+            {
+                "market": Market(
+                    id=f"KXYTVIEWSW-SHOW{idx}",
+                    question="Will this show clear 10M YouTube views?",
+                    category="entertainment",
+                ),
+                "pre_analysis_score": 0.90 - (idx * 0.01),
+            }
+            for idx in range(3)
+        ] + [
+            {
+                "market": Market(
+                    id="KXHIGHCHI-T50",
+                    question="Will Chicago high be below 50F?",
+                    category="weather",
+                ),
+                "pre_analysis_score": 0.40,
+            }
+        ]
+        capped = _cap_analysis_candidates(
+            candidates,
+            max_markets_per_cycle=8,
+            extra_family_caps={"entertainment": 1},
+        )
+        capped_ids = [item["market"].id for item in capped]
+        self.assertEqual(
+            len([mid for mid in capped_ids if mid.startswith("KXYTVIEWSW-")]),
+            1,
+        )
         self.assertIn("KXHIGHCHI-T50", capped_ids)
 
     def test_cap_analysis_candidates_sports_cap_none_keeps_legacy_behavior(self) -> None:
@@ -4072,6 +4451,33 @@ class TestMainUtils(unittest.TestCase):
                 _clear_sports_jurisdiction_block(manager)
                 _clear_sports_jurisdiction_block(manager)
                 self.assertFalse(_sports_jurisdiction_hold_active(manager))
+                _record_jurisdiction_block(
+                    manager, {"sports", "entertainment", "politics", "music"}
+                )
+                self.assertEqual(
+                    _jurisdiction_blocked_families(manager),
+                    {"sports", "entertainment", "politics", "music"},
+                )
+                self.assertTrue(
+                    _market_hits_jurisdiction_hold(
+                        Market(
+                            id="KXYTVIEWSW-TAY26AUG16-14.5M",
+                            question="Will Taylor have over 14.5M YouTube views?",
+                            category="entertainment",
+                        ),
+                        _jurisdiction_blocked_families(manager),
+                    )
+                )
+                self.assertFalse(
+                    _market_hits_jurisdiction_hold(
+                        Market(
+                            id="KXHIGHNY-26AUG17-T88",
+                            question="Will the high temperature in NYC be above 88F?",
+                            category="weather",
+                        ),
+                        _jurisdiction_blocked_families(manager),
+                    )
+                )
             finally:
                 manager.close()
 
@@ -4255,6 +4661,35 @@ class TestMainUtils(unittest.TestCase):
         # last call should be unfiltered fallback
         self.assertEqual(client.calls[-1], (None, None, None))
 
+    def test_is_tls_ca_bundle_error_detects_requests_message(self) -> None:
+        self.assertTrue(
+            _is_tls_ca_bundle_error(
+                OSError(
+                    "Could not find a suitable TLS CA certificate bundle, "
+                    "invalid path: /venv/lib/python3.10/site-packages/certifi/cacert.pem"
+                )
+            )
+        )
+        self.assertFalse(_is_tls_ca_bundle_error(RuntimeError("first filtered failure")))
+
+    def test_fetch_markets_does_not_retry_tls_ca_bundle_errors(self) -> None:
+        now = datetime.now(timezone.utc)
+        tls_error = OSError(
+            "Could not find a suitable TLS CA certificate bundle, "
+            "invalid path: /venv/lib/python3.10/site-packages/certifi/cacert.pem"
+        )
+        client = self._DummyKalshiClient([tls_error, [Market(id="m", question="Q")]])
+        with self.assertRaises(OSError) as raised:
+            _fetch_markets_with_optional_server_filters(
+                client,
+                use_server_side_filters=True,
+                fetch_window_start=now,
+                fetch_window_end=now + timedelta(days=1),
+            )
+        self.assertIs(raised.exception, tls_error)
+        self.assertEqual(client.reset_calls, 0)
+        self.assertEqual(len(client.calls), 1)
+
     def test_cap_effective_confidence_for_market_respects_category_caps(self) -> None:
         settings = Settings(
             MAX_GLOBAL_CONFIDENCE=0.85,
@@ -4301,6 +4736,7 @@ class TestMainUtils(unittest.TestCase):
         self.assertAlmostEqual(_edge_threshold_for_market(0.20, settings, "computed"), 0.2125)
         self.assertAlmostEqual(_edge_threshold_for_market(0.52, settings, "computed"), 0.068)
         self.assertAlmostEqual(_edge_threshold_for_market(0.60, settings, "fallback"), 0.072)
+        self.assertEqual(_edge_threshold_for_market(None, settings, "computed"), 0.05)
         weather_market = Market(
             id="w-edge",
             question="Will rainfall exceed 1 inch in Miami tomorrow?",
@@ -4546,6 +4982,58 @@ class TestMainUtils(unittest.TestCase):
         )
         self.assertEqual(_max_confidence_for_market(market, settings), 0.83)
 
+    def test_observed_weather_lock_keeps_confidence_through_calibration(self) -> None:
+        market = Market(
+            id="KXTEMPMIAH-26SEP2415-T88.99",
+            question="Will the Miami temperature be above 88.99 at 3pm?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.57), MarketOutcome(name="NO", price=0.43)],
+            liquidity_usdc=500.0,
+        )
+        observed = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.68,
+            bet_size_pct=0.2,
+            reasoning="KMIA observation already above 88.99 with 35 min left",
+            edge_mechanism="observed_vs_strike",
+            evidence_basis="direct",
+            evidence_quality=0.75,
+            primary_source_url="https://api.weather.gov/stations/KMIA/observations/latest",
+        )
+        settings = Settings(
+            CONFIDENCE_SHRINKAGE_FLOOR=0.50,
+            CONFIDENCE_SHRINKAGE_FACTOR=0.40,
+            MAX_WEATHER_CONFIDENCE=0.70,
+            XAI_API_KEY="xai-key",
+            KALSHI_API_KEY_ID="kalshi-key-id",
+            KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
+        )
+        result = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(observed),
+        )
+        self.assertTrue(result["observed_weather_calibration_bypassed"])
+        self.assertAlmostEqual(result["confidence_after_calibration"], 0.68)
+
+        forecast = observed.model_copy(
+            update={
+                "primary_source_url": "https://forecast.weather.gov/MapClick.php?lat=25.8&lon=-80.3"
+            }
+        )
+        shrunk = _analyze_market_candidate(
+            market=market,
+            state=None,
+            anchor_analysis=None,
+            settings=settings,
+            grok_client=DummyGrokClient(forecast),
+        )
+        self.assertFalse(shrunk["observed_weather_calibration_bypassed"])
+        self.assertLess(shrunk["confidence_after_calibration"], 0.68)
+
     def test_analyze_market_candidate_applies_confidence_calibration(self) -> None:
         market = Market(
             id="KXBTCD-26APR1013-T72699.99",
@@ -4776,7 +5264,6 @@ class TestMainUtils(unittest.TestCase):
         settings = Settings(
             MAX_POSITION_PER_MARKET_USDC=200.0,
             MAX_POSITION_PCT_OF_BANKROLL=0.15,
-            MAX_BET_USDC=50.0,
             XAI_API_KEY="xai-key",
             KALSHI_API_KEY_ID="kalshi-key-id",
             KALSHI_PRIVATE_KEY_PATH="kalshi-scope.txt",
@@ -4804,6 +5291,7 @@ class TestMainUtils(unittest.TestCase):
             state=None,
             settings=settings,
             cycle_bankroll=20.0,
+            max_bet_usdc=50.0,
         )
         self.assertTrue(allowed)
         self.assertEqual(reason, "confidence_increase_threshold_met")
@@ -5135,6 +5623,39 @@ class TestMainUtils(unittest.TestCase):
         self.assertIn("internal server error", result["analysis_error"].lower())
         self.assertTrue(result["analysis_error_retriable_xai"])
         self.assertFalse(result["was_refined"])
+
+    def test_analyze_market_candidate_logs_budget_stop_as_warning(self) -> None:
+        market = Market(
+            id="m-budget-stop",
+            question="Will Team A win?",
+            outcomes=[MarketOutcome(name="YES", price=0.55), MarketOutcome(name="NO", price=0.45)],
+            liquidity_usdc=200.0,
+            category="sports",
+        )
+
+        class BudgetStoppedGrokClient:
+            def analyze_market(self, *args, **kwargs):
+                raise main_module.XAIBudgetExhaustedError(
+                    "api_budget_exhausted:cycle_cost_cap"
+                )
+
+        with (
+            patch.object(main_module.logger, "warning") as warning,
+            patch.object(main_module.logger, "error") as error,
+        ):
+            result = _analyze_market_candidate(
+                market=market,
+                state=None,
+                anchor_analysis=None,
+                settings=Settings(),
+                grok_client=BudgetStoppedGrokClient(),
+            )
+
+        self.assertTrue(result["analysis_failed"])
+        self.assertEqual(result["analysis_error_type"], "XAIBudgetExhaustedError")
+        warning.assert_called_once()
+        error.assert_not_called()
+        self.assertEqual(warning.call_args.args[1], "skipped")
 
     def test_build_order_request_from_market_uses_current_market_price(self) -> None:
         market = Market(
@@ -5687,7 +6208,7 @@ class TestCounterfactualAuditFields(unittest.TestCase):
         self.assertEqual(fields["counterfactual_prefix_samples_short_by"], 13)
 
     def test_helper_emits_drawdown_counterfactual_for_drawdown_reason(self) -> None:
-        settings = Settings(MAX_DAILY_DRAWDOWN_USDC=25.0)
+        settings = Settings(MAX_DAILY_DRAWDOWN_PCT=0.25)
         fields = _build_counterfactual_audit_fields(
             reason="pre_analysis_daily_drawdown_blocked",
             settings=settings,
@@ -5696,7 +6217,7 @@ class TestCounterfactualAuditFields(unittest.TestCase):
             fields["counterfactual_required_for_drawdown_block"],
             "drawdown_reset_or_position_close",
         )
-        self.assertEqual(fields["counterfactual_max_daily_drawdown_usdc"], 25.0)
+        self.assertEqual(fields["counterfactual_max_daily_drawdown_pct"], 0.25)
 
 
 class TestSkipDueToForReason(unittest.TestCase):
@@ -6435,6 +6956,47 @@ class SelfConsistencyGatingTest(unittest.TestCase):
         self.assertIsNone(
             main_module._self_consistency_allowed_market_ids(candidates, _Settings())
         )
+
+
+class TestUnsourcedSeries(unittest.TestCase):
+    def test_absence_only_without_url_marks_series_for_the_day(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from market_state import MarketStateManager
+
+        unsourced = TradeDecision(
+            should_trade=False,
+            outcome="NO",
+            confidence=0.45,
+            bet_size_pct=0.0,
+            reasoning="no quote found",
+            evidence_basis="absence_only",
+        ).model_copy(update={"server_tool_calls": 4})
+        sourced = unsourced.model_copy(
+            update={"evidence_basis": "proxy", "primary_source_url": "https://www.cmegroup.com/"}
+        )
+        never_searched = unsourced.model_copy(update={"server_tool_calls": 0})
+        self.assertTrue(main_module._is_unsourced_decision(unsourced))
+        self.assertFalse(main_module._is_unsourced_decision(sourced))
+        self.assertFalse(main_module._is_unsourced_decision(never_searched))
+
+        first_strike = Market(id="KXINXU-26SEP24H1600-T7674.9999", question="S&P above?")
+        second_strike = Market(id="KXINXU-26SEP24H1600-T7669.9999", question="S&P above?")
+        today = date(2026, 9, 24)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = MarketStateManager(str(Path(tmp) / "state.db"))
+            try:
+                main_module._record_unsourced_series(
+                    state, {main_module._market_series_ticker(first_strike)}, today
+                )
+                marked = main_module._unsourced_series_today(state, today)
+                self.assertIn(main_module._market_series_ticker(second_strike), marked)
+                self.assertEqual(
+                    main_module._unsourced_series_today(state, date(2026, 9, 25)), set()
+                )
+            finally:
+                state.close()
 
 
 if __name__ == "__main__":

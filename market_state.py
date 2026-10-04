@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 from collections import defaultdict
@@ -38,6 +40,7 @@ _PARTICIPATION_TIER_REPR_MAP = {
     "ParticipationTier.TERMINAL_REJECT": "terminal_reject",
 }
 _RE_VALIDATED_PREFIX = re.compile(r"^\[Validated\b[^\]]*\]\s*")
+_GUARANTEED_SERIES_OUTCOMES = frozenset({"filled", "cleared", "missed"})
 _ACTIVE_PENDING_ORDER_STATUSES = {
     "accepted",
     "open",
@@ -268,6 +271,28 @@ class MarketStateManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS xai_usage_ledger (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    cycle_number INTEGER NOT NULL,
+                    market_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    server_tool_calls INTEGER NOT NULL DEFAULT 0,
+                    server_side_tool_usage_json TEXT NOT NULL,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    pricing_version TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS exchange_settlements (
                     settlement_id TEXT PRIMARY KEY,
                     market_id TEXT NOT NULL,
@@ -341,6 +366,9 @@ class MarketStateManager:
                 "CREATE INDEX IF NOT EXISTS idx_cycle_receipts_cycle_id ON cycle_receipts (cycle_id)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_xai_usage_run_cycle ON xai_usage_ledger (run_id, cycle_id)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_decision_receipts_market_id ON decision_receipts (market_id)"
             )
             self._conn.execute(
@@ -378,6 +406,18 @@ class MarketStateManager:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guaranteed_series_outcomes (
+                    series_ticker TEXT PRIMARY KEY,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    fills INTEGER NOT NULL DEFAULT 0,
+                    consecutive_misses INTEGER NOT NULL DEFAULT 0,
+                    last_reject_reason TEXT,
+                    last_attempt_at TEXT NOT NULL
                 )
                 """
             )
@@ -478,6 +518,14 @@ class MarketStateManager:
             fill_failure_count=fill_failure_count,
             next_eligible_cycle=next_eligible_cycle,
         )
+
+    def get_market_close_time(self, market_id: str) -> datetime | None:
+        """Return the last persisted close time for an exchange market."""
+        row = self._conn.execute(
+            "SELECT close_time FROM markets WHERE id = ?",
+            (str(market_id or "").strip(),),
+        ).fetchone()
+        return _parse_timestamp(row["close_time"] if row else None)
 
     def get_position(
         self,
@@ -2398,6 +2446,85 @@ class MarketStateManager:
             return None
         return str(row["value"])
 
+    def record_xai_usage(self, event: dict[str, Any]) -> None:
+        """Append one completed provider response using a dedicated connection.
+
+        Analysis workers call this concurrently. A short-lived connection keeps
+        the main state connection thread-confined while making each completed
+        response durable before parsing or later decision replacement.
+        """
+        payload = dict(event)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute(
+                """
+                INSERT INTO xai_usage_ledger (
+                    event_id, run_id, cycle_id, cycle_number, market_id, phase,
+                    model, prompt_tokens, cached_tokens, completion_tokens,
+                    reasoning_tokens, server_tool_calls,
+                    server_side_tool_usage_json, cost_usd, pricing_version,
+                    recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload["event_id"]),
+                    str(payload["run_id"]),
+                    str(payload["cycle_id"]),
+                    int(payload["cycle_number"]),
+                    str(payload["market_id"]),
+                    str(payload["phase"]),
+                    str(payload["model"]),
+                    int(payload.get("prompt_tokens") or 0),
+                    int(payload.get("cached_tokens") or 0),
+                    int(payload.get("completion_tokens") or 0),
+                    int(payload.get("reasoning_tokens") or 0),
+                    int(payload.get("server_tool_calls") or 0),
+                    json.dumps(
+                        payload.get("server_side_tool_usage") or {},
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    float(payload.get("cost_usd") or 0.0),
+                    str(payload["pricing_version"]),
+                    str(payload["recorded_at"]),
+                ),
+            )
+
+    def get_xai_usage_totals(
+        self,
+        *,
+        run_id: str,
+        cycle_id: str | None = None,
+    ) -> dict[str, int | float]:
+        where = "run_id = ?"
+        params: list[Any] = [run_id]
+        if cycle_id is not None:
+            where += " AND cycle_id = ?"
+            params.append(cycle_id)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                       COALESCE(SUM(server_tool_calls), 0) AS server_tool_calls,
+                       COALESCE(SUM(cost_usd), 0.0) AS cost_usd
+                FROM xai_usage_ledger WHERE {where}
+                """,
+                params,
+            ).fetchone()
+        return {
+            "calls": int(row["calls"] or 0),
+            "prompt_tokens": int(row["prompt_tokens"] or 0),
+            "cached_tokens": int(row["cached_tokens"] or 0),
+            "completion_tokens": int(row["completion_tokens"] or 0),
+            "reasoning_tokens": int(row["reasoning_tokens"] or 0),
+            "server_tool_calls": int(row["server_tool_calls"] or 0),
+            "cost_usd": float(row["cost_usd"] or 0.0),
+        }
+
     def set_runtime_flag(self, key: str, value: str) -> None:
         """Persist a runtime flag across bot restarts."""
         normalized_key = str(key or "").strip()
@@ -2427,6 +2554,98 @@ class MarketStateManager:
                 (normalized_key,),
             )
         return int(cursor.rowcount or 0) > 0
+
+    def record_guaranteed_series_attempt(
+        self,
+        series_ticker: str,
+        *,
+        outcome: str,
+        reject_reason: str | None = None,
+    ) -> None:
+        """Track how a Kalshi series performs as a guaranteed-order candidate.
+
+        Series (``KXBTCD``, ``KXHIGHNY``) is the granularity that matches
+        observed behavior: every strike in a continuously repriced ladder
+        clears or misses the guaranteed edge bar for the same reason, while
+        ``market_family()`` lumps unrelated ladders into ``generic``.
+
+        ``outcome`` is ``filled`` only after the exchange reports a fill,
+        ``cleared`` for a forceable +EV side that was never submitted, and
+        ``missed`` for a failed edge bar. Only a miss advances the burn
+        counter, and only a fill earns the permanent burn immunity that a
+        proven series deserves.
+        """
+        if outcome not in _GUARANTEED_SERIES_OUTCOMES:
+            raise ValueError(
+                f"Unknown guaranteed series outcome {outcome!r}; "
+                f"expected one of {sorted(_GUARANTEED_SERIES_OUTCOMES)}"
+            )
+        normalized_series = str(series_ticker or "").strip().upper()
+        if not normalized_series:
+            return
+        missed = outcome == "missed"
+        normalized_reason = (
+            (str(reject_reason or "").strip() or None) if missed else None
+        )
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO guaranteed_series_outcomes (
+                    series_ticker,
+                    attempts,
+                    fills,
+                    consecutive_misses,
+                    last_reject_reason,
+                    last_attempt_at
+                )
+                VALUES (?, 1, ?, ?, ?, ?)
+                ON CONFLICT(series_ticker) DO UPDATE SET
+                    attempts = attempts + 1,
+                    fills = fills + excluded.fills,
+                    consecutive_misses = CASE
+                        WHEN excluded.consecutive_misses = 0 THEN 0
+                        ELSE consecutive_misses + 1
+                    END,
+                    last_reject_reason = excluded.last_reject_reason,
+                    last_attempt_at = excluded.last_attempt_at
+                """,
+                (
+                    normalized_series,
+                    1 if outcome == "filled" else 0,
+                    1 if missed else 0,
+                    normalized_reason,
+                    timestamp,
+                ),
+            )
+
+    def get_guaranteed_series_outcomes(self) -> dict[str, dict[str, Any]]:
+        """Map series ticker -> guaranteed-order attempt history."""
+        rows = self._conn.execute(
+            """
+            SELECT
+                series_ticker,
+                attempts,
+                fills,
+                consecutive_misses,
+                last_reject_reason,
+                last_attempt_at
+            FROM guaranteed_series_outcomes
+            """
+        ).fetchall()
+        outcomes: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            attempts = int(row["attempts"] or 0)
+            fills = int(row["fills"] or 0)
+            outcomes[str(row["series_ticker"])] = {
+                "attempts": attempts,
+                "fills": fills,
+                "consecutive_misses": int(row["consecutive_misses"] or 0),
+                "fill_rate": (fills / attempts) if attempts > 0 else 0.0,
+                "last_reject_reason": row["last_reject_reason"],
+                "last_attempt_at": row["last_attempt_at"],
+            }
+        return outcomes
 
     def neutralize_pathological_online_calibration(
         self,
@@ -3845,7 +4064,10 @@ class MarketStateManager:
         recent_decisions_limit: int = 500,
     ) -> None:
         """Atomically export a bounded current-state snapshot (schema version 2)."""
-        export_path = Path(path)
+        export_path = Path(path).expanduser()
+        if not export_path.is_absolute():
+            export_path = Path.cwd() / export_path
+        export_path = export_path.resolve()
         export_path.parent.mkdir(parents=True, exist_ok=True)
 
         latest_cycle_row = self._conn.execute(
@@ -4025,7 +4247,15 @@ class MarketStateManager:
                 json.dump(payload, handle, indent=2, default=str)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, export_path)
+            try:
+                os.replace(temp_path, export_path)
+            except OSError as exc:
+                # WSL /mnt/c (drvfs) often raises EXDEV even for same-dir rename.
+                if getattr(exc, "errno", None) != errno.EXDEV:
+                    raise
+                shutil.copyfile(temp_path, export_path)
+                temp_path.unlink(missing_ok=True)
+                temp_path = None
         except Exception:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)

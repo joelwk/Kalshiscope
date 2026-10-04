@@ -57,6 +57,22 @@ def test_create_chat_retries_and_recovers() -> None:
     assert flaky_chat.calls == 3
 
 
+@pytest.mark.parametrize(("max_turns", "expected"), [(3, 3), (None, None), (0, None)])
+def test_create_chat_forwards_max_turns_only_when_set(max_turns, expected) -> None:
+    chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(chat)):
+        provider = XAIProvider(api_key="xai-key", timeout_seconds=5)
+    with patch("xai_provider.web_search", return_value={"tool": "web"}):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            max_turns=max_turns,
+        )
+    assert response["kwargs"].get("max_turns") == expected
+
+
 def test_create_chat_uses_request_specific_timeout_client() -> None:
     default_chat = _FlakyChat(fail_times=0)
     override_chat = _FlakyChat(fail_times=0)
@@ -142,7 +158,28 @@ def test_create_chat_passes_image_understanding_to_web_search() -> None:
         )
 
     assert captured["web"]["enable_image_understanding"] is True
-    assert captured["x"]["enable_image_understanding"] is True
+    assert "x" not in captured
+
+
+@pytest.mark.parametrize("profile_name", ["speech", "social", "live_news", "politics"])
+def test_create_chat_exposes_x_search_for_live_news_profiles(
+    profile_name: str,
+) -> None:
+    flaky_chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):
+        provider = XAIProvider(api_key="xai-key", timeout_seconds=5)
+    config = _search_config()
+    config.profile_name = profile_name
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ) as x_tool:
+        provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=config,
+            enable_multimedia=True,
+        )
+    x_tool.assert_called_once()
 
 
 def test_create_chat_passes_temperature_to_sdk() -> None:
@@ -166,3 +203,105 @@ def test_create_chat_passes_temperature_to_sdk() -> None:
         )
 
     assert response["kwargs"]["temperature"] == 0.7
+
+
+def test_create_chat_passes_include_and_reasoning_effort() -> None:
+    flaky_chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(flaky_chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            reasoning_effort="high",
+        )
+
+    assert response["kwargs"]["include"] == ["inline_citations"]
+    assert response["kwargs"]["reasoning_effort"] == "high"
+    assert response["kwargs"]["tool_choice"] == "required"
+
+
+def test_create_chat_retries_without_reasoning_effort_on_unimplemented() -> None:
+    class _UnimplementedThenOk:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "reasoning_effort" in kwargs:
+                raise RuntimeError("StatusCode.UNIMPLEMENTED: reasoning_effort")
+            return {"ok": True, "kwargs": kwargs}
+
+    chat = _UnimplementedThenOk()
+    with patch("xai_provider.Client", return_value=_FakeClient(chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=1,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            reasoning_effort="high",
+        )
+
+    assert response["ok"] is True
+    assert len(chat.calls) == 2
+    assert chat.calls[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in chat.calls[1]
+
+
+def test_create_chat_retries_without_reasoning_effort_on_invalid_value() -> None:
+    """grok-4.3 raises ValueError for any effort outside ('low', 'high')."""
+
+    class _InvalidEffortThenOk:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "reasoning_effort" in kwargs:
+                raise ValueError(
+                    "Invalid reasoning effort: medium. "
+                    "Must be one of: ('low', 'high')"
+                )
+            return {"ok": True, "kwargs": kwargs}
+
+    chat = _InvalidEffortThenOk()
+    with patch("xai_provider.Client", return_value=_FakeClient(chat)):
+        provider = XAIProvider(
+            api_key="xai-key",
+            timeout_seconds=5,
+            create_chat_max_attempts=3,
+            create_chat_backoff_seconds=0.0,
+        )
+    with patch("xai_provider.web_search", return_value={"tool": "web"}), patch(
+        "xai_provider.x_search", return_value={"tool": "x"}
+    ):
+        response = provider.create_chat(
+            model="grok-4.3-latest",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            reasoning_effort="medium",
+        )
+
+    assert response["ok"] is True
+    assert len(chat.calls) == 2
+    assert chat.calls[0]["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in chat.calls[1]

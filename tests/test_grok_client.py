@@ -4,7 +4,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import SearchConfig, Settings
-from grok_client import GrokClient, _category_research_hint, _extract_json, _is_timeout_class_error, _is_retriable_grok_error
+from grok_client import (
+    GrokClient,
+    _category_research_hint,
+    _extract_json,
+    _is_slow_reasoning_model,
+    _is_timeout_class_error,
+    _is_retriable_grok_error,
+    _reasoning_effort_for_attempt,
+    _should_enable_code_execution,
+)
 from models import Market, MarketOutcome, TradeDecision
 
 
@@ -245,6 +254,112 @@ class TestGrokClient(unittest.TestCase):
         self.assertEqual(client._resolve_rpc_timeout_seconds(100.0), 100.0)
         self.assertEqual(client._resolve_rpc_timeout_seconds(150.0), 120.0)
         self.assertEqual(client._resolve_rpc_timeout_seconds(0.25), 1.0)
+
+    def test_is_slow_reasoning_model_detects_grok_46_and_47(self) -> None:
+        self.assertTrue(_is_slow_reasoning_model("grok-4.6"))
+        self.assertTrue(_is_slow_reasoning_model("grok-4-6"))
+        self.assertTrue(_is_slow_reasoning_model("grok-4.7"))
+        self.assertTrue(_is_slow_reasoning_model("grok-4-7"))
+        self.assertFalse(_is_slow_reasoning_model("grok-4.5"))
+        self.assertFalse(_is_slow_reasoning_model("grok-4-1-fast-reasoning"))
+
+    def test_reasoning_effort_drops_to_low_on_timeout_retry(self) -> None:
+        self.assertEqual(_reasoning_effort_for_attempt("high", retry_attempt=1), "high")
+        self.assertEqual(
+            _reasoning_effort_for_attempt("xhigh", retry_attempt=2), "low"
+        )
+        # grok-4.3 rejects "medium" outright, so a retry must not land there.
+        self.assertEqual(
+            _reasoning_effort_for_attempt("medium", retry_attempt=2), "low"
+        )
+        self.assertEqual(_reasoning_effort_for_attempt("low", retry_attempt=2), "low")
+
+    def test_grok_46_raises_timeout_floors_without_lowering_higher_settings(self) -> None:
+        floored = GrokClient(
+            api_key="x",
+            model="grok-4.6",
+            settings=Settings(
+                GROK_STREAM_TIMEOUT_SECONDS=180,
+                XAI_CLIENT_TIMEOUT_SECONDS=240,
+                GROK_ANALYSIS_MAX_BUDGET_SECONDS=420,
+            ),
+        )
+        self.assertEqual(floored.stream_timeout_seconds, 300)
+        self.assertEqual(floored.xai_client_timeout_seconds, 360)
+        self.assertEqual(floored.analysis_budget_seconds, 780)
+
+        preserved = GrokClient(
+            api_key="x",
+            model="grok-4.6",
+            settings=Settings(
+                GROK_STREAM_TIMEOUT_SECONDS=400,
+                XAI_CLIENT_TIMEOUT_SECONDS=500,
+                GROK_ANALYSIS_MAX_BUDGET_SECONDS=1200,
+            ),
+        )
+        self.assertEqual(preserved.stream_timeout_seconds, 400)
+        self.assertEqual(preserved.xai_client_timeout_seconds, 500)
+        self.assertEqual(preserved.analysis_budget_seconds, 1200)
+
+        grok_47 = GrokClient(
+            api_key="x",
+            model="grok-4.7",
+            settings=Settings(
+                GROK_STREAM_TIMEOUT_SECONDS=180,
+                XAI_CLIENT_TIMEOUT_SECONDS=240,
+                GROK_ANALYSIS_MAX_BUDGET_SECONDS=420,
+            ),
+        )
+        self.assertEqual(grok_47.stream_timeout_seconds, 300)
+        self.assertEqual(grok_47.xai_client_timeout_seconds, 360)
+        self.assertEqual(grok_47.analysis_budget_seconds, 780)
+
+        fast = GrokClient(
+            api_key="x",
+            model="grok-4-1-fast-reasoning",
+            settings=Settings(
+                GROK_STREAM_TIMEOUT_SECONDS=180,
+                XAI_CLIENT_TIMEOUT_SECONDS=240,
+                GROK_ANALYSIS_MAX_BUDGET_SECONDS=420,
+            ),
+        )
+        self.assertEqual(fast.stream_timeout_seconds, 180)
+        self.assertEqual(fast.xai_client_timeout_seconds, 240)
+        self.assertEqual(fast.analysis_budget_seconds, 420)
+
+    def test_timeout_retry_degrades_reasoning_and_skips_code_execution(self) -> None:
+        market = Market(
+            id="KXGOLDD-26AUG1317-T4395",
+            question="Will gold close above 4395?",
+            outcomes=[MarketOutcome(name="YES"), MarketOutcome(name="NO")],
+            category="commodities",
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.5, '
+            '"bet_size_pct": 0.0, "reasoning": "No durable edge.", '
+            '"evidence_quality": 0.5, "edge_mechanism": "none"}'
+        )
+        client = GrokClient(api_key="x")
+        sequenced = SequencedClient(
+            [
+                RuntimeError(
+                    'StatusCode.DEADLINE_EXCEEDED details = "Deadline Exceeded"'
+                ),
+                content,
+            ]
+        )
+        client.client = sequenced
+
+        decision = client.analyze_market(market)
+
+        self.assertFalse(decision.should_trade)
+        self.assertEqual(sequenced.chat.create_calls, 2)
+        self.assertEqual(sequenced.chat.create_kwargs[0]["reasoning_effort"], "high")
+        self.assertEqual(sequenced.chat.create_kwargs[1]["reasoning_effort"], "low")
+        first_tools = sequenced.chat.create_kwargs[0].get("tools") or []
+        second_tools = sequenced.chat.create_kwargs[1].get("tools") or []
+        self.assertGreater(len(first_tools), len(second_tools))
+        self.assertEqual(len(second_tools), 1)
 
     def test_recovered_retriable_analysis_attempt_does_not_log_error(self) -> None:
         market = Market(
@@ -497,7 +612,7 @@ class TestGrokClient(unittest.TestCase):
             liquidity_usdc=150.0,
         )
         content = """
-        {"should_trade": true, "outcome": "YES", "confidence": 0.8, "bet_size_pct": 0.5, "reasoning": "Implied prob: 55%, My prob: 70%, Edge: 15%", "implied_prob_external": 0.55, "my_prob": 0.70, "edge_external": 0.15, "evidence_quality": 0.8}
+        {"should_trade": true, "outcome": "YES", "confidence": 0.8, "bet_size_pct": 0.5, "reasoning": "Implied prob: 55%, My prob: 70%, Edge: 15%", "implied_prob_external": 0.55, "my_prob": 0.70, "edge_external": 0.15, "evidence_quality": 0.8, "edge_mechanism": "observed_vs_strike", "primary_source_url": "https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43"}
         """
         client = GrokClient(api_key="x")
         client.client = DummyClient(content)
@@ -509,9 +624,11 @@ class TestGrokClient(unittest.TestCase):
 
         last_kwargs = client.client.chat.create_kwargs
         self.assertEqual(last_kwargs["model"], client.model)
-        self.assertEqual(len(last_kwargs["tools"]), 2)
+        self.assertEqual(len(last_kwargs["tools"]), 1)
         self.assertIs(last_kwargs["response_format"], TradeDecision)
         self.assertEqual(last_kwargs["temperature"], 0.7)
+        self.assertEqual(last_kwargs["include"], ["inline_citations"])
+        self.assertEqual(last_kwargs["reasoning_effort"], "high")
 
     def test_self_consistency_runs_second_pass_and_averages_yes_probability(self) -> None:
         market = Market(
@@ -528,14 +645,20 @@ class TestGrokClient(unittest.TestCase):
             '"probability_yes": 0.75, "bet_size_pct": 0.5, '
             '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
             '"evidence_quality": 0.8, "key_sources": ["source A"], '
-            '"base_rate_used": true}'
+            '"base_rate_used": true, "evidence_basis": "direct", '
+            '"edge_source": "computed", "edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": '
+            '"https://example.com/source"}'
         )
         second = (
             '{"should_trade": true, "outcome": "YES", "confidence": 0.65, '
             '"probability_yes": 0.65, "bet_size_pct": 0.5, '
             '"reasoning": "Implied prob: 55%, My prob: 65%, Edge: 10%. Counter-evidence lowers this.", '
             '"evidence_quality": 0.8, "key_sources": ["source B"], '
-            '"self_critique": "Recent base rate lowers probability."}'
+            '"self_critique": "Recent base rate lowers probability.", '
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": "https://example.com/source-b"}'
         )
         client = GrokClient(api_key="x")
         sequenced = SequencedClient([first, second])
@@ -566,7 +689,10 @@ class TestGrokClient(unittest.TestCase):
         first = (
             '{"should_trade": true, "outcome": "YES", "confidence": 0.78, '
             '"probability_yes": 0.78, "bet_size_pct": 0.5, '
-            '"reasoning": "YES edge", "evidence_quality": 0.8}'
+            '"reasoning": "YES edge", "evidence_quality": 0.8, '
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": "https://example.com/source"}'
         )
         second = (
             '{"should_trade": false, "outcome": "NO", "confidence": 0.62, '
@@ -606,7 +732,8 @@ class TestGrokClient(unittest.TestCase):
             '"reasoning": "NWS favors below bin. Implied YES 47%, my YES 22%.", '
             '"evidence_quality": 0.9, "primary_source_url": '
             '"https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43", '
-            '"evidence_basis": "direct", "edge_source": "computed"}'
+            '"evidence_basis": "direct", "edge_source": "computed", '
+            '"edge_mechanism": "observed_vs_strike"}'
         )
         second = (
             '{"should_trade": true, "outcome": "NO", "confidence": 0.82, '
@@ -660,6 +787,7 @@ class TestGrokClient(unittest.TestCase):
             evidence_basis="direct",
             evidence_quality=1.0,
             primary_source_url="https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43",
+            edge_mechanism="observed_vs_strike",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -711,7 +839,8 @@ class TestGrokClient(unittest.TestCase):
             '{"should_trade": true, "outcome": "YES", "confidence": 0.75, '
             '"probability_yes": 0.75, "bet_size_pct": 0.5, '
             '"reasoning": "Implied prob: 55%, My prob: 75%, Edge: 20%", '
-            '"evidence_quality": 0.8}'
+            '"evidence_quality": 0.8, "edge_mechanism": "observed_vs_strike", '
+            '"primary_source_url": "https://forecast.weather.gov/MapClick.php?lat=33.76&lon=-84.43"}'
         )
         timeout = RuntimeError('StatusCode.DEADLINE_EXCEEDED details = "Deadline Exceeded"')
         client = GrokClient(api_key="x")
@@ -769,11 +898,7 @@ class TestGrokClient(unittest.TestCase):
             client.analyze_market(market)
 
         self.assertEqual(captured["web"]["allowed_domains"], ["example.com"])
-        self.assertEqual(captured["x"]["from_date"], datetime(2026, 1, 13, 0, 0, tzinfo=timezone.utc))
-        self.assertEqual(captured["x"]["to_date"], datetime(2026, 1, 13, 12, 0, tzinfo=timezone.utc))
-        self.assertEqual(captured["x"]["allowed_x_handles"], ["Foo"])
-        self.assertFalse(captured["x"]["enable_image_understanding"])
-        self.assertFalse(captured["x"]["enable_video_understanding"])
+        self.assertNotIn("x", captured)
 
     def test_tools_respect_search_config_source_caps(self) -> None:
         market = Market(
@@ -815,7 +940,7 @@ class TestGrokClient(unittest.TestCase):
             captured["web"]["allowed_domains"],
             ["a.com", "b.com", "c.com"],
         )
-        self.assertEqual(captured["x"]["allowed_x_handles"], ["A", "B", "C", "D"])
+        self.assertNotIn("x", captured)
 
     def test_tools_clamp_search_sources_to_xai_caps(self) -> None:
         market = Market(
@@ -869,10 +994,7 @@ class TestGrokClient(unittest.TestCase):
             captured["web"]["allowed_domains"],
             ["a.com", "b.com", "c.com", "d.com", "e.com"],
         )
-        self.assertEqual(
-            captured["x"]["allowed_x_handles"],
-            ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
-        )
+        self.assertNotIn("x", captured)
 
     def test_analyze_market_deep_enables_multimedia_for_borderline(self) -> None:
         market = Market(
@@ -916,8 +1038,8 @@ class TestGrokClient(unittest.TestCase):
         ):
             client.analyze_market_deep(market, previous_analysis=previous)
 
-        self.assertTrue(captured["x"]["enable_image_understanding"])
-        self.assertTrue(captured["x"]["enable_video_understanding"])
+        self.assertFalse(captured["web"]["enable_image_understanding"])
+        self.assertNotIn("x", captured)
 
     def test_analyze_market_deep_merges_partial_payload(self) -> None:
         market = Market(
@@ -1086,7 +1208,7 @@ class TestGrokClient(unittest.TestCase):
             close_time=datetime.now(timezone.utc) + timedelta(hours=12),
         )
         client = GrokClient(api_key="x")
-        self.assertTrue(
+        self.assertFalse(
             client._should_enable_multimedia(
                 market,
                 decision=None,
@@ -1267,6 +1389,8 @@ class TestGrokClient(unittest.TestCase):
             edge_external=0.20,
             edge_source="fallback",
             evidence_quality=0.9,
+            edge_mechanism="odds_dislocation",
+            key_sources=["https://www.covers.com/sport/baseball/odds"],
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -1336,6 +1460,8 @@ class TestGrokClient(unittest.TestCase):
             edge_external=0.16,
             edge_source="fallback",
             evidence_quality=0.9,
+            edge_mechanism="catalyst",
+            primary_source_url="https://www.reuters.com/world/example",
         )
         client = GrokClient(api_key="x")
         # 0.16 clears the global 0.15 floor but not GENERIC_PROXY_HIGH_EDGE_MIN=0.18.
@@ -1404,6 +1530,8 @@ class TestGrokClient(unittest.TestCase):
             my_prob=0.66,
             edge_external=0.02,
             evidence_quality=0.9,
+            edge_mechanism="odds_dislocation",
+            key_sources=["https://www.covers.com/sport/baseball/odds"],
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -2233,6 +2361,7 @@ class TestGrokClient(unittest.TestCase):
             likelihood_ratio=25.0,
             evidence_quality=0.80,
             primary_source_url="https://www.reuters.com/sports/example",
+            edge_mechanism="settlement_already_known",
         )
         client = GrokClient(
             api_key="x",
@@ -2336,6 +2465,49 @@ class TestGrokClient(unittest.TestCase):
         )
         self.assertGreaterEqual(validated.evidence_quality, 0.75)
 
+    def test_weather_locked_observation_is_not_downgraded_by_stale_forecast_mention(self) -> None:
+        market = Market(
+            id="KXTEMPMIAH-26SEP2415-T88.99",
+            question="Will the Miami temperature be above 88.99 at 3pm?",
+            category="weather",
+            outcomes=[MarketOutcome(name="YES", price=0.57), MarketOutcome(name="NO", price=0.43)],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.68,
+            raw_confidence=0.68,
+            bet_size_pct=0.2,
+            reasoning=(
+                "Edge is observed_vs_strike: NWS API KMIA 2:25pm EDT 89.6F and 1:53pm METAR "
+                "89.06F already above 88.99 with ~35 min to 3pm, while Kalshi still tracks "
+                "the stale MapClick 3pm forecast of 86F."
+            ),
+            my_prob=0.68,
+            edge_mechanism="observed_vs_strike",
+            evidence_basis="direct",
+            evidence_quality=0.75,
+            primary_source_url="https://api.weather.gov/stations/KMIA/observations/latest",
+        )
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="weather",
+        )
+        self.assertEqual(validated.source_match_class, "settlement_aligned")
+        self.assertNotEqual(validated.evidence_floor_suppressed_reason, "preview_or_proxy_source")
+        self.assertGreaterEqual(validated.evidence_quality, 0.60)
+
+        forecast_only = decision.model_copy(
+            update={"reasoning": "NWS MapClick forecast shows 90F at 3pm vs 88.99 strike."}
+        )
+        still_proxy = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            forecast_only,
+            profile_name="weather",
+        )
+        self.assertEqual(still_proxy.source_match_class, "preview_or_proxy")
+
     def test_validate_and_enrich_skips_weather_observed_floor_for_lowt_without_daily_low(self) -> None:
         market = Market(
             id="KXLOWTOKC-26MAY24-T63",
@@ -2412,6 +2584,8 @@ class TestGrokClient(unittest.TestCase):
             my_prob=0.72,
             edge_external=0.27,
             evidence_quality=0.8,
+            edge_mechanism="odds_dislocation",
+            primary_source_url="https://www.covers.com/sport/baseball/odds",
         )
         client = GrokClient(api_key="x")
         validated = client._validate_and_enrich_decision(
@@ -2535,7 +2709,7 @@ class SelfConsistencyShouldRunTest(unittest.TestCase):
         return TradeDecision(
             should_trade=True,
             outcome="YES",
-            confidence=0.70,
+            confidence=0.71,
             bet_size_pct=0.3,
             reasoning="x",
             implied_prob_external=0.45,
@@ -2547,7 +2721,7 @@ class SelfConsistencyShouldRunTest(unittest.TestCase):
         client = GrokClient(api_key="x")
         market = self._market()
         decision = self._decision()
-        # High liquidity clears the threshold, so it runs when allowed.
+        # Positive execution-relevant edge clears the threshold when allowed.
         self.assertTrue(
             client._should_run_self_consistency(
                 market, decision, deep=False, allow_self_consistency=True
@@ -2559,6 +2733,203 @@ class SelfConsistencyShouldRunTest(unittest.TestCase):
                 market, decision, deep=False, allow_self_consistency=False
             )
         )
+
+
+class TestEdgeMechanismAndSdkWiring(unittest.TestCase):
+    def test_edge_mechanism_none_blocks_trade(self) -> None:
+        market = Market(
+            id="m-hunch",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 40%, My prob: 70%, Edge: 30% as of now",
+            implied_prob_external=0.40,
+            my_prob=0.70,
+            edge_external=0.30,
+            evidence_quality=0.8,
+            edge_mechanism="none",
+            primary_source_url="https://www.reuters.com/world/example",
+        )
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market, decision, profile_name="generic"
+        )
+        self.assertFalse(validated.should_trade)
+        self.assertIn("edge_mechanism_none", validated.reasoning)
+
+    def test_missing_url_blocks_non_sports_trade(self) -> None:
+        market = Market(
+            id="m-nourl",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 40%, My prob: 70%, Edge: 30% as of now",
+            implied_prob_external=0.40,
+            my_prob=0.70,
+            edge_external=0.30,
+            evidence_quality=0.8,
+            edge_mechanism="catalyst",
+        )
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market, decision, profile_name="generic"
+        )
+        self.assertFalse(validated.should_trade)
+        self.assertIn("missing_primary_source_url", validated.reasoning)
+
+    def test_sports_odds_url_in_key_sources_allows_trade(self) -> None:
+        market = Market(
+            id="m-sports-odds",
+            question="Will Team A win?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.66,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 55%, My prob: 66%, Edge: 11% as of now",
+            implied_prob_external=0.55,
+            my_prob=0.66,
+            edge_external=0.11,
+            evidence_quality=0.8,
+            edge_mechanism="odds_dislocation",
+            key_sources=["https://www.covers.com/sport/baseball/odds"],
+        )
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market, decision, profile_name="sports"
+        )
+        self.assertTrue(validated.should_trade)
+
+    def test_citation_urls_salvage_primary_source(self) -> None:
+        market = Market(
+            id="m-cite",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+        )
+        decision = TradeDecision(
+            should_trade=True,
+            outcome="YES",
+            confidence=0.70,
+            bet_size_pct=0.4,
+            reasoning="Implied prob: 40%, My prob: 70%, Edge: 30% as of now",
+            implied_prob_external=0.40,
+            my_prob=0.70,
+            edge_external=0.30,
+            evidence_quality=0.8,
+            edge_mechanism="catalyst",
+        )
+        validated = GrokClient(api_key="x")._validate_and_enrich_decision(
+            market,
+            decision,
+            profile_name="generic",
+            citation_urls=["https://www.reuters.com/world/salvaged"],
+        )
+        self.assertEqual(
+            validated.primary_source_url, "https://www.reuters.com/world/salvaged"
+        )
+        self.assertTrue(validated.should_trade)
+
+    def test_structured_stream_response_used_when_content_empty(self) -> None:
+        market = Market(
+            id="m-structured",
+            question="Will event happen?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.40),
+                MarketOutcome(name="NO", price=0.60),
+            ],
+            liquidity_usdc=50.0,
+        )
+        parsed = {
+            "should_trade": True,
+            "outcome": "YES",
+            "confidence": 0.70,
+            "bet_size_pct": 0.4,
+            "reasoning": "Implied prob: 40%, My prob: 70%, Edge: 30% as of now",
+            "implied_prob_external": 0.40,
+            "my_prob": 0.70,
+            "edge_external": 0.30,
+            "evidence_quality": 0.8,
+            "edge_mechanism": "catalyst",
+            "primary_source_url": "https://www.reuters.com/world/structured",
+        }
+
+        class StructuredSession:
+            def append(self, message):
+                return None
+
+            def stream(self):
+                yield SimpleNamespace(parsed=parsed, content=""), SimpleNamespace(
+                    content=""
+                )
+
+        class StructuredChat:
+            def create(self, **kwargs):
+                return StructuredSession()
+
+        class StructuredClient:
+            def __init__(self) -> None:
+                self.chat = StructuredChat()
+
+        client = GrokClient(api_key="x")
+        client.client = StructuredClient()
+        decision = client.analyze_market(market)
+        self.assertEqual(
+            decision.primary_source_url, "https://www.reuters.com/world/structured"
+        )
+        self.assertEqual(decision.edge_mechanism, "catalyst")
+
+    def test_initial_numeric_analysis_enables_code_execution(self) -> None:
+        market = Market(
+            id="KXHIGHTNY-26AUG12-T78",
+            question="Will the high exceed 78?",
+            outcomes=[
+                MarketOutcome(name="YES", price=0.55),
+                MarketOutcome(name="NO", price=0.45),
+            ],
+            liquidity_usdc=80.0,
+        )
+        self.assertTrue(
+            _should_enable_code_execution(
+                deep=False,
+                market=market,
+                profile_name="weather",
+                settings=Settings(),
+            )
+        )
+        content = (
+            '{"should_trade": false, "outcome": "YES", "confidence": 0.55, '
+            '"bet_size_pct": 0.0, "reasoning": "no edge"}'
+        )
+        client = GrokClient(
+            api_key="x",
+            search_config=SearchConfig(profile_name="weather", lookback_hours=24),
+        )
+        dummy = DummyClient(content)
+        client.client = dummy
+        client.analyze_market(market)
+        tools = dummy.chat.create_kwargs.get("tools") or []
+        self.assertEqual(len(tools), 2)
 
 
 if __name__ == "__main__":

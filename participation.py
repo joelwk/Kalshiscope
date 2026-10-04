@@ -668,3 +668,17 @@ def bayesian_shrunk_pnl(
     observed_pnl_per_trade = pnl / n
     weight = n / (n + prior_strength)
     return weight * observed_pnl_per_trade + (1.0 - weight) * prior_pnl_per_trade
+
+
+def bayesian_shrunk_win_rate(
+    wins: int,
+    n: int,
+    prior_win_rate: float = 0.50,
+    prior_strength: float = 10.0,
+) -> float:
+    """Shrink observed win rate toward a prior using sample-size weighting."""
+    if n <= 0:
+        return float(prior_win_rate)
+    observed_win_rate = wins / n
+    weight = n / (n + prior_strength)
+    return weight * observed_win_rate + (1.0 - weight) * float(prior_win_rate)

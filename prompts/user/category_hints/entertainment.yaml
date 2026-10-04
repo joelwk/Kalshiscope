@@ -6,3 +6,5 @@ content: >-
   Settlement sources: rankings resolve on the official published chart for the settlement period. Always populate the primary_source_url field with the exact official ranking page you relied on (for example a top10.netflix.com / netflix.com Top 10 page or a boxofficemojo.com gross/ranking page) showing the published values and the period they cover; these are settlement-grade and let the analysis count as direct evidence. Industry news, forecasts, reviews, and social chatter are proxy-tier and cannot satisfy direct evidence.
 
   Publish lag: official rankings are released on a delay (for example Netflix Top 10 publishes weekly on Tuesdays). If the official ranking covering the market's settlement period is not yet published, treat the market as proxy/absence_only and abstain rather than trading on a preview, projection, or partial-week estimate.
+
+  YouTube-views and ranking markets need the settlement chart for the exact period. Adjacent news (Variety, trade press, social posts) belongs in key_sources only; leave primary_source_url empty if the chart is missing and set should_trade=false.

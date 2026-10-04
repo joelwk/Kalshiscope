@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 
 
 def main() -> None:
@@ -41,8 +41,8 @@ def main() -> None:
                 "mid": d.get("market_id"),
                 "outcome": decision.get("outcome"),
                 "side": (d.get("order") or {}).get("side") or (d.get("order") or {}).get("raw", {}).get("order", {}).get("side"),
-                "amount": audit.get("bet_amount_usdc"),
-                "price": (d.get("order") or {}).get("client_price"),
+                "amount": audit.get("bet_amount_usdc") or audit.get("forced_bet_amount_usdc"),
+                "price": (d.get("order") or {}).get("client_price") or (d.get("order") or {}).get("raw", {}).get("client_price"),
                 "definitive": decision.get("definitive_outcome_detected"),
                 "src": decision.get("primary_source_url"),
                 "order_id": (d.get("order") or {}).get("id"),
@@ -66,8 +66,12 @@ def main() -> None:
 
     print(f"=== Orders placed in last 10 cycles: {len(orders)} ===")
     for o in orders:
+        timestamp = str(o.get("ts") or "-")[:19]
+        correlation_id = str(o.get("cid") or "-")
+        market_id = str(o.get("mid") or "-")[:50]
+        side = str(o.get("side") or o.get("outcome") or "-")
         print(
-            f"  {o['ts'][:19]} cid={o['cid']} mid={o['mid'][:50]:<50} side={o['side']:<5} "
+            f"  {timestamp} cid={correlation_id} mid={market_id:<50} side={side:<5} "
             f"price={o['price']} amount=${o['amount']} def={o['definitive']} status={o['status']}"
         )
     print()
@@ -81,8 +85,9 @@ def main() -> None:
 
     for b in blocks:
         bonus = b.get("definitive_bonus")
+        market_id = str(b.get("mid") or "-")[:50]
         print(
-            f"  cid={b['cid']} mid={b['mid'][:50]:<50} reason={b['final_reason']} "
+            f"  cid={b['cid']} mid={market_id:<50} reason={b['final_reason']} "
             f"def={b['definitive']} bonus={bonus} score_recomputed={b['score_final_recomputed']} "
             f"edge={b['edge_market']} conf={b['conf']} eq={b['eq']}"
         )

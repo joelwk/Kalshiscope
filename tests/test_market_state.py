@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import market_state as market_state_module
 from market_state import MarketStateManager
 from models import OrderResponse, TradeDecision
 
@@ -271,6 +273,25 @@ def test_export_to_json(tmp_path) -> None:
         assert payload["historical_counts"]["trade_outcomes"] == 1
         assert "analyses" not in payload
         assert "trade_log" not in payload
+    finally:
+        manager.close()
+
+
+def test_export_to_json_falls_back_on_cross_device_replace(tmp_path, monkeypatch) -> None:
+    manager = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        manager.record_analysis("m-exdev", _decision(0.7), is_refined=False)
+        export_path = tmp_path / "state.json"
+
+        def _exdev(src, dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(market_state_module.os, "replace", _exdev)
+        manager.export_to_json(str(export_path))
+
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == 2
+        assert payload["historical_counts"]["trade_log"] == 0
     finally:
         manager.close()
 
@@ -664,6 +685,106 @@ def test_runtime_flags_persist_across_manager_instances(tmp_path) -> None:
         assert restored.get_runtime_flag("sports_jurisdiction_blocked") is None
     finally:
         restored.close()
+
+
+def test_guaranteed_series_outcomes_persist_across_manager_instances(tmp_path) -> None:
+    db_path = str(tmp_path / "series.db")
+    manager = MarketStateManager(db_path)
+    try:
+        assert manager.get_guaranteed_series_outcomes() == {}
+        manager.record_guaranteed_series_attempt(
+            "KXBTCD",
+            outcome="missed",
+            reject_reason="guaranteed_order_non_positive_edge",
+        )
+        # Case is normalized so a lowercase ticker hits the same row.
+        manager.record_guaranteed_series_attempt(
+            "kxbtcd",
+            outcome="missed",
+            reject_reason="guaranteed_order_edge_below_min",
+        )
+    finally:
+        manager.close()
+
+    restored = MarketStateManager(db_path)
+    try:
+        outcomes = restored.get_guaranteed_series_outcomes()
+        assert outcomes["KXBTCD"]["attempts"] == 2
+        assert outcomes["KXBTCD"]["fills"] == 0
+        assert outcomes["KXBTCD"]["consecutive_misses"] == 2
+        assert outcomes["KXBTCD"]["fill_rate"] == 0.0
+        assert (
+            outcomes["KXBTCD"]["last_reject_reason"]
+            == "guaranteed_order_edge_below_min"
+        )
+    finally:
+        restored.close()
+
+
+def test_guaranteed_series_fill_resets_the_miss_streak(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "series_fill.db"))
+    try:
+        for _ in range(3):
+            manager.record_guaranteed_series_attempt(
+                "KXHIGHNY",
+                outcome="missed",
+                reject_reason="guaranteed_order_non_positive_edge",
+            )
+        assert manager.get_guaranteed_series_outcomes()["KXHIGHNY"][
+            "consecutive_misses"
+        ] == 3
+
+        manager.record_guaranteed_series_attempt("KXHIGHNY", outcome="filled")
+        outcome = manager.get_guaranteed_series_outcomes()["KXHIGHNY"]
+        assert outcome["attempts"] == 4
+        assert outcome["fills"] == 1
+        assert outcome["consecutive_misses"] == 0
+        assert outcome["fill_rate"] == 0.25
+        assert outcome["last_reject_reason"] is None
+    finally:
+        manager.close()
+
+
+def test_guaranteed_series_cleared_resets_misses_without_earning_a_fill(
+    tmp_path,
+) -> None:
+    """A dry-run force clears the bar but never reached the exchange."""
+    manager = MarketStateManager(str(tmp_path / "series_cleared.db"))
+    try:
+        for _ in range(3):
+            manager.record_guaranteed_series_attempt(
+                "KXAAAGASD",
+                outcome="missed",
+                reject_reason="guaranteed_order_edge_below_min",
+            )
+        manager.record_guaranteed_series_attempt("KXAAAGASD", outcome="cleared")
+
+        outcome = manager.get_guaranteed_series_outcomes()["KXAAAGASD"]
+        assert outcome["attempts"] == 4
+        # No fill means no permanent immunity from the cross-run burn limit.
+        assert outcome["fills"] == 0
+        assert outcome["consecutive_misses"] == 0
+        assert outcome["last_reject_reason"] is None
+    finally:
+        manager.close()
+
+
+def test_guaranteed_series_attempt_rejects_an_unknown_outcome(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "series_bad_outcome.db"))
+    try:
+        with pytest.raises(ValueError, match="Unknown guaranteed series outcome"):
+            manager.record_guaranteed_series_attempt("KXBTCD", outcome="skipped")
+    finally:
+        manager.close()
+
+
+def test_guaranteed_series_attempt_ignores_a_blank_ticker(tmp_path) -> None:
+    manager = MarketStateManager(str(tmp_path / "series_blank.db"))
+    try:
+        manager.record_guaranteed_series_attempt("   ", outcome="missed")
+        assert manager.get_guaranteed_series_outcomes() == {}
+    finally:
+        manager.close()
 
 
 def test_neutralize_pathological_online_calibration(tmp_path) -> None:

@@ -33,7 +33,13 @@ class _DummyGrokClient:
             self.id = _DummyGrokClient.instances
 
 
-def _build_dummy(_settings, provider=None):  # noqa: ARG001 - signature parity
+def _build_dummy(  # noqa: ARG001 - signature parity
+    _settings,
+    provider=None,
+    usage_recorder=None,
+    usage_admission=None,
+    usage_release=None,
+):
     return _DummyGrokClient()
 
 

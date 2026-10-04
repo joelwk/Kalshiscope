@@ -6,7 +6,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from config import (
@@ -107,6 +107,28 @@ _RE_SETTLEMENT_ALIGNED_SOURCE_SIGNAL = re.compile(
     re.IGNORECASE,
 )
 _REQUIRED_DECISION_FIELDS = {"should_trade", "outcome", "confidence", "bet_size_pct", "reasoning"}
+_EDGE_MECHANISM_VALUES = frozenset(
+    {
+        "observed_vs_strike",
+        "odds_dislocation",
+        "settlement_already_known",
+        "catalyst",
+        "none",
+    }
+)
+_NUMERIC_STRIKE_TICKER_PATTERN = re.compile(r"-T[-\d.]+", re.IGNORECASE)
+_NUMERIC_INITIAL_CODE_PROFILES = frozenset({"weather", "crypto", "commodity"})
+_ALLOWED_REASONING_EFFORT = frozenset({"low", "medium", "high", "xhigh"})
+_SLOW_REASONING_MODEL_MARKERS = ("grok-4.6", "grok-4-6", "grok-4.7", "grok-4-7")
+# grok-4.6 and grok-4.7 plus high reasoning and tools routinely finish at
+# 110-170s and DEADLINE_EXCEEDED at the 4.5-era 180s cap. Floor timeouts so a
+# model swap does not inherit that cap. xAI documents 3600s for reasoning models;
+# these floors are the practical bot-side minimum, not a ceiling.
+_SLOW_REASONING_MIN_STREAM_TIMEOUT_SECONDS = 300
+_SLOW_REASONING_MIN_CLIENT_TIMEOUT_SECONDS = 360
+_SLOW_REASONING_MIN_ANALYSIS_BUDGET_SECONDS = 780
+# grok-4.3 accepts only ('low', 'high'), so a retry must not land on "medium".
+_TIMEOUT_RETRY_REASONING_EFFORT = "low"
 _DEFAULT_XAI_CLIENT_TIMEOUT_SECONDS = 120
 _DEFAULT_STREAM_TIMEOUT_SECONDS = 120
 _EDGE_CONSISTENCY_TOLERANCE = 0.03
@@ -287,6 +309,110 @@ def _extract_first_url_from_text(text: str) -> str | None:
     return None
 
 
+def _normalize_edge_mechanism(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in _EDGE_MECHANISM_VALUES:
+        return normalized
+    return "none"
+
+
+def _normalize_reasoning_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "none", "off", "disable", "disabled"}:
+        return None
+    if normalized in _ALLOWED_REASONING_EFFORT:
+        return normalized
+    return None
+
+
+def _is_slow_reasoning_model(model: str | None) -> bool:
+    name = str(model or "").strip().lower()
+    return any(marker in name for marker in _SLOW_REASONING_MODEL_MARKERS)
+
+
+def _reasoning_effort_for_attempt(
+    setting: str | None,
+    *,
+    retry_attempt: int,
+) -> str | None:
+    """Keep configured depth on the first try; drop to the floor after a timeout."""
+    effort = _normalize_reasoning_effort(setting)
+    if retry_attempt > 1 and effort in {"medium", "high", "xhigh"}:
+        return _TIMEOUT_RETRY_REASONING_EFFORT
+    return effort
+
+
+def _should_enable_code_execution(
+    *,
+    deep: bool,
+    market: Market,
+    profile_name: str,
+    settings: Settings | None,
+) -> bool:
+    resolved = settings or Settings()
+    if deep:
+        return bool(getattr(resolved, "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED", True))
+    if not bool(getattr(resolved, "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED", True)):
+        return False
+    if (profile_name or "").strip().lower() in _NUMERIC_INITIAL_CODE_PROFILES:
+        return True
+    if is_commodity_market(market):
+        return True
+    ticker = str(getattr(market, "id", "") or "")
+    return bool(_NUMERIC_STRIKE_TICKER_PATTERN.search(ticker))
+
+
+def _extract_citation_urls(response: Any) -> list[str]:
+    if response is None:
+        return []
+    urls: list[str] = []
+    for attr in ("citations", "inline_citations"):
+        items = getattr(response, attr, None)
+        if items is None and isinstance(response, dict):
+            items = response.get(attr)
+        if not items:
+            continue
+        for item in items:
+            raw_url = ""
+            if isinstance(item, str):
+                raw_url = item
+            elif isinstance(item, dict):
+                raw_url = str(item.get("url") or "")
+            else:
+                raw_url = str(getattr(item, "url", "") or "")
+            cleaned = _clean_extracted_url(raw_url)
+            if cleaned and cleaned not in urls:
+                urls.append(cleaned)
+    return urls
+
+
+def _payload_from_stream_response(response: Any) -> dict[str, Any] | None:
+    if response is None:
+        return None
+    if isinstance(response, TradeDecision):
+        return response.model_dump()
+    parsed = getattr(response, "parsed", None)
+    if parsed is None and isinstance(response, dict):
+        parsed = response.get("parsed")
+    if isinstance(parsed, TradeDecision):
+        return parsed.model_dump()
+    if isinstance(parsed, dict) and "should_trade" in parsed:
+        return parsed
+    content = getattr(response, "content", None)
+    if content is None and isinstance(response, dict):
+        content = response.get("content")
+    if isinstance(content, str) and content.strip():
+        try:
+            data = json.loads(_normalize_model_response_text(content))
+        except json.JSONDecodeError:
+            return None
+        if isinstance(data, dict) and "should_trade" in data:
+            return data
+    return None
+
+
 _TRANSPORT_RESET_MARKERS: tuple[str, ...] = (
     "rst_stream",
     "stream removed",
@@ -367,6 +493,11 @@ def _is_quota_exhausted_grok_error(exc: Exception) -> bool:
     return any(marker in error_text for marker in _QUOTA_EXHAUSTED_MARKERS)
 
 
+def _is_usage_budget_exhausted_error(exc: Exception) -> bool:
+    """Detect an intentional local run/cycle cost admission stop."""
+    return str(exc).strip().lower().startswith("api_budget_exhausted:")
+
+
 def _is_model_unimplemented_grok_error(exc: Exception) -> bool:
     """Detect model/tooling 404s that should fall back to the fast model once."""
     error_text = str(exc).lower()
@@ -432,6 +563,35 @@ def _extract_usage_metrics(response: Any) -> dict[str, int | None]:
         "reasoning_tokens": _read(completion_details, "reasoning_tokens"),
         "cached_tokens": _read(prompt_details, "cached_tokens"),
     }
+
+
+def _extract_server_side_tool_usage(response: Any) -> tuple[dict[str, Any], int]:
+    usage = getattr(response, "server_side_tool_usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("server_side_tool_usage")
+    if usage is None:
+        return {}, 0
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump()
+    elif hasattr(usage, "to_dict"):
+        usage = usage.to_dict()
+    elif not isinstance(usage, dict) and hasattr(usage, "__dict__"):
+        usage = vars(usage)
+    if not isinstance(usage, dict):
+        return {"raw": str(usage)}, 0
+
+    def _count(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        if isinstance(value, dict):
+            return sum(_count(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(_count(item) for item in value)
+        return 0
+
+    return usage, _count(usage)
 
 
 def _format_previous_analysis(previous: TradeDecision | None) -> str:
@@ -506,9 +666,14 @@ class GrokClient:
         search_config: SearchConfig | None = None,
         settings: Settings | None = None,
         provider: XAIProvider | None = None,
+        usage_recorder: Callable[[dict[str, Any]], None] | None = None,
+        usage_admission: Callable[[], str | None] | None = None,
+        usage_release: Callable[[str], None] | None = None,
     ) -> None:
         resolved_settings = settings or Settings()
         self.settings = resolved_settings
+        self.model = model
+        self.model_deep = model_deep or model
         self.xai_client_timeout_seconds = max(
             1,
             int(
@@ -539,12 +704,14 @@ class GrokClient:
                 )
             ),
         )
+        self._apply_slow_reasoning_timeout_floors()
         self.provider = provider or XAIProvider(
             api_key=api_key,
             timeout_seconds=self.xai_client_timeout_seconds,
         )
-        self.model = model
-        self.model_deep = model_deep or model
+        self.usage_recorder = usage_recorder
+        self.usage_admission = usage_admission
+        self.usage_release = usage_release
         self.min_bet_usdc = min_bet_usdc
         self.max_bet_usdc = max_bet_usdc
         self.default_search_config = search_config or _default_search_config(settings)
@@ -563,6 +730,61 @@ class GrokClient:
                 "stream_timeout_seconds": self.stream_timeout_seconds,
                 "analysis_budget_seconds": self.analysis_budget_seconds,
                 "xai_client_timeout_seconds": self.xai_client_timeout_seconds,
+                "slow_reasoning_timeout_floors_applied": _is_slow_reasoning_model(self.model)
+                or _is_slow_reasoning_model(self.model_deep),
+            },
+        )
+
+    def _apply_slow_reasoning_timeout_floors(self) -> None:
+        """Raise 4.5-era caps when grok-4.6 or grok-4.7 needs more than 180s."""
+        if not (
+            _is_slow_reasoning_model(self.model)
+            or _is_slow_reasoning_model(self.model_deep)
+        ):
+            return
+        before = (
+            self.stream_timeout_seconds,
+            self.xai_client_timeout_seconds,
+            self.analysis_budget_seconds,
+        )
+        self.stream_timeout_seconds = max(
+            self.stream_timeout_seconds,
+            _SLOW_REASONING_MIN_STREAM_TIMEOUT_SECONDS,
+        )
+        self.xai_client_timeout_seconds = max(
+            self.xai_client_timeout_seconds,
+            self.stream_timeout_seconds,
+            _SLOW_REASONING_MIN_CLIENT_TIMEOUT_SECONDS,
+        )
+        self.analysis_budget_seconds = max(
+            self.analysis_budget_seconds,
+            _SLOW_REASONING_MIN_ANALYSIS_BUDGET_SECONDS,
+        )
+        after = (
+            self.stream_timeout_seconds,
+            self.xai_client_timeout_seconds,
+            self.analysis_budget_seconds,
+        )
+        if after == before:
+            return
+        logger.warning(
+            "Raised Grok timeouts for grok-4.6/4.7-class model: "
+            "stream %ds->%ds client %ds->%ds budget %ds->%ds",
+            before[0],
+            after[0],
+            before[1],
+            after[1],
+            before[2],
+            after[2],
+            data={
+                "model": self.model,
+                "model_deep": self.model_deep,
+                "stream_timeout_seconds_before": before[0],
+                "stream_timeout_seconds": after[0],
+                "xai_client_timeout_seconds_before": before[1],
+                "xai_client_timeout_seconds": after[1],
+                "analysis_budget_seconds_before": before[2],
+                "analysis_budget_seconds": after[2],
             },
         )
 
@@ -619,20 +841,8 @@ class GrokClient:
         decision: TradeDecision | None,
         config: SearchConfig,
     ) -> bool:
-        """Enable multimedia for borderline confidence or urgent markets."""
-        if config.profile_name == "speech":
-            return True
-        if decision:
-            lower, upper = config.multimedia_confidence_range
-            if lower <= decision.confidence <= upper:
-                return True
-        if market.close_time:
-            close_time = market.close_time
-            if close_time.tzinfo is None:
-                close_time = close_time.replace(tzinfo=timezone.utc)
-            if (close_time - datetime.now(timezone.utc)).total_seconds() <= 86400:
-                return True
-        return config.enable_multimedia
+        """Enable media inspection only for profiles whose evidence is media."""
+        return config.profile_name in {"speech", "social"}
 
     @staticmethod
     def _market_implied_probability(market: Market, outcome: str) -> float | None:
@@ -844,10 +1054,18 @@ class GrokClient:
         no_external_odds: bool,
         low_information: bool,
         market_id: str = "",
+        weather_market: bool = False,
     ) -> str:
         normalized_reasoning = (reasoning or "").lower()
         if low_information or (no_external_odds and not has_verifiable_signal):
             return "missing_or_absence_only"
+        # Weather reasoning names the stale forecast to explain why Kalshi is
+        # mispriced; a locked observation must win over that "forecast" keyword.
+        if weather_market and _weather_obs_locked_reasoning_ok(
+            market_id=market_id,
+            reasoning=reasoning or "",
+        ):
+            return "settlement_aligned"
         if _RE_PREVIEW_OR_PROXY_SOURCE.search(normalized_reasoning):
             return "preview_or_proxy"
         if has_definitive_outcome_signal or _weather_obs_locked_reasoning_ok(
@@ -917,7 +1135,10 @@ class GrokClient:
         return any(host == domain or host.endswith("." + domain) for domain in allowlist)
 
     @staticmethod
-    def _extract_primary_source_url(decision: TradeDecision) -> str | None:
+    def _extract_primary_source_url(
+        decision: TradeDecision,
+        extra_urls: list[str] | None = None,
+    ) -> str | None:
         existing = _clean_extracted_url(str(decision.primary_source_url or ""))
         if existing:
             return existing
@@ -931,7 +1152,30 @@ class GrokClient:
             extracted = _extract_first_url_from_text(str(key_sources))
             if extracted:
                 return extracted
-        return _extract_first_url_from_text(decision.reasoning or "")
+        from_reasoning = _extract_first_url_from_text(decision.reasoning or "")
+        if from_reasoning:
+            return from_reasoning
+        for extra in extra_urls or []:
+            cleaned = _clean_extracted_url(str(extra or ""))
+            if cleaned:
+                return cleaned
+        return None
+
+    @staticmethod
+    def _decision_has_tradeable_source_url(
+        *,
+        profile_name: str,
+        primary_source_url: str | None,
+        key_sources: list[str] | None,
+    ) -> bool:
+        if primary_source_url:
+            return True
+        if (profile_name or "").strip().lower() != "sports":
+            return False
+        for source in key_sources or []:
+            if _extract_first_url_from_text(str(source or "")):
+                return True
+        return False
 
     def _validate_and_enrich_decision(
         self,
@@ -941,6 +1185,7 @@ class GrokClient:
         *,
         self_consistency_passed: bool = False,
         family_is_profitable: bool = False,
+        citation_urls: list[str] | None = None,
     ) -> TradeDecision:
         canonical_outcome = self._canonical_outcome_for_market(market, decision.outcome)
         if canonical_outcome is None:
@@ -1032,7 +1277,10 @@ class GrokClient:
             prob_consistency_ok = False
 
         raw_evidence_quality = max(0.0, min(1.0, float(decision.evidence_quality or 0.0)))
-        primary_source_url = self._extract_primary_source_url(decision)
+        primary_source_url = self._extract_primary_source_url(
+            decision, extra_urls=citation_urls
+        )
+        edge_mechanism = _normalize_edge_mechanism(decision.edge_mechanism)
         explicit_evidence_basis = str(decision.evidence_basis or "").strip().lower()
         no_external_odds = bool(_RE_NO_EXTERNAL_ODDS.search(decision.reasoning or ""))
         low_information = bool(
@@ -1060,6 +1308,7 @@ class GrokClient:
             no_external_odds=no_external_odds,
             low_information=low_information,
             market_id=market.id or "",
+            weather_market=profile_name == "weather",
         )
         prob_component = 0.0
         if implied is not None and my_prob is not None:
@@ -1373,6 +1622,16 @@ class GrokClient:
             if evidence_basis_class == "absence_only":
                 should_trade = False
                 gate_reasons.append("absence_only_evidence")
+            if edge_mechanism == "none":
+                should_trade = False
+                gate_reasons.append("edge_mechanism_none")
+            if not self._decision_has_tradeable_source_url(
+                profile_name=profile_name,
+                primary_source_url=primary_source_url,
+                key_sources=list(decision.key_sources or []),
+            ):
+                should_trade = False
+                gate_reasons.append("missing_primary_source_url")
             if (
                 source_match_class == "preview_or_proxy"
                 and edge_source in {"fallback", "none"}
@@ -1467,6 +1726,7 @@ class GrokClient:
                 "my_prob": my_prob,
                 "edge_external": edge,
                 "edge_source": edge_source,
+                "edge_mechanism": edge_mechanism,
                 "evidence_basis": evidence_basis_class,
                 "evidence_quality": evidence_quality,
                 "raw_evidence_quality": raw_evidence_quality,
@@ -1698,6 +1958,8 @@ class GrokClient:
         timeout_seconds: float | None = None,
         temperature: float | None = None,
         enable_code_execution: bool = False,
+        reasoning_effort: str | None = None,
+        max_turns: int | None = None,
     ):
         return self.provider.create_chat(
             model=model or self.model,
@@ -1707,6 +1969,8 @@ class GrokClient:
             enable_code_execution=enable_code_execution,
             timeout_seconds=timeout_seconds,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            max_turns=max_turns,
         )
 
     def _build_market_prompt(
@@ -1814,17 +2078,17 @@ class GrokClient:
             return False
         if not allow_self_consistency:
             return False
-        liquidity = float(market.liquidity_usdc or 0.0)
-        liquidity_threshold = max(
-            0.0,
-            float(getattr(self.settings, "GROK_SELF_CONSISTENCY_LIQUIDITY_THRESHOLD", 300.0)),
-        )
         edge_threshold = max(
             0.0,
             float(getattr(self.settings, "GROK_SELF_CONSISTENCY_EDGE_THRESHOLD", 0.15)),
         )
         edge = self._decision_market_edge(market, decision)
-        return liquidity > liquidity_threshold or (edge is not None and edge >= edge_threshold)
+        return bool(
+            decision.should_trade
+            and edge is not None
+            and edge > 0.0
+            and edge >= edge_threshold
+        )
 
     def _merge_self_consistency_decisions(
         self,
@@ -2070,9 +2334,10 @@ class GrokClient:
         search_profile: str | None = None,
         deep: bool = False,
         deadline_seconds: float | None = None,
-    ) -> tuple[str, int, dict[str, int | None]]:
+    ) -> tuple[str, int, dict[str, int | None], Any]:
         content = ""
         chunk_count = 0
+        last_response: Any = None
         usage_metrics: dict[str, int | None] = {
             "prompt_tokens": None,
             "completion_tokens": None,
@@ -2088,6 +2353,7 @@ class GrokClient:
             )
         deadline = time.monotonic() + deadline_seconds
         for response, chunk in chat.stream():
+            last_response = response
             if time.monotonic() > deadline:
                 raise TimeoutError(
                     f"Grok stream exceeded {deadline_seconds:.1f}s for market {market_id}"
@@ -2098,10 +2364,8 @@ class GrokClient:
             if chunk.content:
                 content += chunk.content
                 chunk_count += 1
-        if not content:
-            raise ValueError("Empty response from Grok")
         usage_metrics["code_execution_used"] = int(code_execution_used)
-        return content, chunk_count, usage_metrics
+        return content, chunk_count, usage_metrics, last_response
 
     def _run_analysis(
         self,
@@ -2112,6 +2376,8 @@ class GrokClient:
         deep: bool,
         family_is_profitable: bool = False,
         allow_self_consistency: bool = True,
+        usage_phase: str = "initial",
+        max_turns: int | None = None,
     ) -> TradeDecision:
         self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
@@ -2174,6 +2440,8 @@ class GrokClient:
                     budget_remaining_ms=budget_remaining_ms,
                     max_attempts=max_attempts,
                     temperature=primary_temperature,
+                    usage_phase=usage_phase,
+                    max_turns=max_turns,
                 )
                 active_config_for_merge = self._active_search_config(search_config)
                 break
@@ -2268,6 +2536,7 @@ class GrokClient:
                         temperature=None,
                         model_override=_FAST_REASONING_FALLBACK_MODEL,
                         allow_model_fallback=False,
+                        usage_phase=usage_phase,
                     )
                     return fallback_decision.model_copy(
                         update={
@@ -2306,6 +2575,7 @@ class GrokClient:
                             )
                         ),
                         self_consistency_variant=True,
+                        usage_phase="self_consistency",
                     )
                     profile_name = (
                         active_config_for_merge.profile_name
@@ -2382,32 +2652,43 @@ class GrokClient:
         self_consistency_variant: bool = False,
         model_override: str | None = None,
         allow_model_fallback: bool = True,
+        usage_phase: str = "initial",
+        max_turns: int | None = None,
     ) -> TradeDecision:
         start_time = time.monotonic()
+        reservation_id: str | None = None
+        content = ""
         active_config = self._active_search_config(search_config)
         previous_summary = _format_previous_analysis(previous_analysis)
         model = model_override or (self.model_deep if deep else self.model)
         phase_label = "deep market analysis" if deep else "market analysis"
-        logger.debug(
-            "Starting %s: id=%s",
-            phase_label,
-            market.id,
-            data={
-                "market_id": market.id,
-                "question": market.question[:100],
-                "outcomes": [o.name for o in market.outcomes],
-                "liquidity_usdc": market.liquidity_usdc,
-                "previous_analysis": previous_summary if deep else None,
-                "search_profile": active_config.profile_name,
-                "lookback_hours": active_config.lookback_hours,
-                "model": model,
-                "temperature": temperature,
-                "self_consistency_variant": self_consistency_variant,
-            },
-        )
 
-        content = ""
+        def release_reservation() -> None:
+            nonlocal reservation_id
+            if reservation_id is not None and self.usage_release is not None:
+                self.usage_release(reservation_id)
+            reservation_id = None
+
         try:
+            if self.usage_admission is not None:
+                reservation_id = self.usage_admission()
+            logger.debug(
+                "Starting %s: id=%s",
+                phase_label,
+                market.id,
+                data={
+                    "market_id": market.id,
+                    "question": market.question[:100],
+                    "outcomes": [o.name for o in market.outcomes],
+                    "liquidity_usdc": market.liquidity_usdc,
+                    "previous_analysis": previous_summary if deep else None,
+                    "search_profile": active_config.profile_name,
+                    "lookback_hours": active_config.lookback_hours,
+                    "model": model,
+                    "temperature": temperature,
+                    "self_consistency_variant": self_consistency_variant,
+                },
+            )
             stream_deadline_seconds = self._resolve_stream_deadline_seconds(
                 budget_remaining_ms,
                 search_profile=getattr(active_config, "profile_name", None),
@@ -2418,14 +2699,23 @@ class GrokClient:
                 decision=previous_analysis,
                 config=active_config,
             )
-            enable_code_execution = bool(
-                deep
-                and getattr(
-                    self.settings,
-                    "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
-                    True,
-                )
+            enable_code_execution = _should_enable_code_execution(
+                deep=deep,
+                market=market,
+                profile_name=getattr(active_config, "profile_name", "") or "",
+                settings=self.settings,
             )
+            reasoning_effort_setting = (
+                getattr(self.settings, "GROK_REASONING_EFFORT_DEEP", "high")
+                if deep
+                else getattr(self.settings, "GROK_REASONING_EFFORT", "high")
+            )
+            reasoning_effort = _reasoning_effort_for_attempt(
+                reasoning_effort_setting,
+                retry_attempt=retry_attempt,
+            )
+            if retry_attempt > 1:
+                enable_code_execution = False
             chat = self._build_chat(
                 active_config,
                 enable_multimedia,
@@ -2435,6 +2725,8 @@ class GrokClient:
                 ),
                 temperature=temperature,
                 enable_code_execution=enable_code_execution,
+                reasoning_effort=reasoning_effort,
+                max_turns=max_turns,
             )
             chat.append(
                 self.provider.system_message(
@@ -2452,7 +2744,7 @@ class GrokClient:
                     )
                 )
             )
-            content, chunk_count, usage_metrics = self._stream_chat_content(
+            content, chunk_count, usage_metrics, last_response = self._stream_chat_content(
                 chat,
                 market.id,
                 budget_remaining_ms=budget_remaining_ms,
@@ -2460,7 +2752,33 @@ class GrokClient:
                 deep=deep,
                 deadline_seconds=stream_deadline_seconds,
             )
-            data = self._parse_response_payload(market.id, content, deep=deep)
+            server_side_tool_usage, server_tool_calls = (
+                _extract_server_side_tool_usage(last_response)
+            )
+            if self.usage_recorder is not None:
+                usage_event = {
+                    "market_id": market.id,
+                    "phase": usage_phase,
+                    "model": model,
+                    "prompt_tokens": usage_metrics.get("prompt_tokens") or 0,
+                    "cached_tokens": usage_metrics.get("cached_tokens") or 0,
+                    "completion_tokens": usage_metrics.get("completion_tokens") or 0,
+                    "reasoning_tokens": usage_metrics.get("reasoning_tokens") or 0,
+                    "server_tool_calls": server_tool_calls,
+                    "server_side_tool_usage": server_side_tool_usage,
+                }
+                if reservation_id is not None:
+                    usage_event["_reservation_id"] = reservation_id
+                self.usage_recorder(usage_event)
+                release_reservation()
+            citation_urls = _extract_citation_urls(last_response)
+            structured_payload = _payload_from_stream_response(last_response)
+            if not content and structured_payload is None:
+                raise ValueError("Empty response from Grok")
+            if structured_payload is not None:
+                data = structured_payload
+            else:
+                data = self._parse_response_payload(market.id, content, deep=deep)
             raw_payload = dict(data)
 
             deep_likelihood_ratio_provided = False
@@ -2477,6 +2795,7 @@ class GrokClient:
                 decision,
                 profile_name=active_config.profile_name,
                 family_is_profitable=getattr(self, "_current_family_is_profitable", False),
+                citation_urls=citation_urls,
             )
             code_execution_used = bool(usage_metrics.get("code_execution_used"))
             decision = decision.model_copy(
@@ -2516,6 +2835,8 @@ class GrokClient:
                     "completion_tokens": usage_metrics["completion_tokens"],
                     "reasoning_tokens": usage_metrics["reasoning_tokens"],
                     "cached_tokens": usage_metrics["cached_tokens"],
+                    "server_tool_calls": server_tool_calls,
+                    "server_side_tool_usage": server_side_tool_usage,
                 }
             )
 
@@ -2559,6 +2880,8 @@ class GrokClient:
                     "lookback_hours": active_config.lookback_hours,
                     "model": model,
                     "temperature": temperature,
+                    "reasoning_effort": reasoning_effort,
+                    "code_execution_used": code_execution_used,
                     "self_consistency_variant": self_consistency_variant,
                     "chunks": chunk_count,
                     "prompt_tokens": usage_metrics["prompt_tokens"],
@@ -2571,6 +2894,7 @@ class GrokClient:
             )
             return decision
         except Exception as exc:
+            release_reservation()
             duration = (time.monotonic() - start_time) * 1000
             retriable = _is_retriable_grok_error(exc, duration)
             budget_after_error_ms = max(0.0, budget_remaining_ms - duration)
@@ -2607,6 +2931,8 @@ class GrokClient:
                     self_consistency_variant=self_consistency_variant,
                     model_override=_FAST_REASONING_FALLBACK_MODEL,
                     allow_model_fallback=False,
+                    usage_phase=usage_phase,
+                    max_turns=max_turns,
                 )
             will_retry = (
                 retriable
@@ -2624,7 +2950,18 @@ class GrokClient:
                         "response_preview": _response_preview(content),
                     },
                 )
-            log_fn = logger.warning if (will_retry or self_consistency_variant) else logger.error
+            quota_exhausted = _is_quota_exhausted_grok_error(exc)
+            usage_budget_exhausted = _is_usage_budget_exhausted_error(exc)
+            log_fn = (
+                logger.warning
+                if (
+                    will_retry
+                    or self_consistency_variant
+                    or quota_exhausted
+                    or usage_budget_exhausted
+                )
+                else logger.error
+            )
             log_fn(
                 "%s failed: id=%s, error=%s, duration=%.2fms",
                 phase_label.capitalize(),
@@ -2638,7 +2975,8 @@ class GrokClient:
                     "duration_ms": round(duration, 2),
                     "retriable": retriable,
                     "will_retry": will_retry,
-                    "quota_exhausted": _is_quota_exhausted_grok_error(exc),
+                    "quota_exhausted": quota_exhausted,
+                    "usage_budget_exhausted": usage_budget_exhausted,
                     "retry_attempt": retry_attempt,
                     "max_attempts": max_attempts,
                     "budget_remaining_ms": round(budget_after_error_ms, 2),
@@ -2650,6 +2988,8 @@ class GrokClient:
             )
             setattr(exc, "_grok_duration_ms", duration)
             raise
+        finally:
+            release_reservation()
 
     def analyze_market(
         self,
@@ -2659,7 +2999,10 @@ class GrokClient:
         *,
         family_is_profitable: bool = False,
         allow_self_consistency: bool = True,
+        usage_phase: str = "initial",
+        max_turns: int | None = None,
     ) -> TradeDecision:
+        """``max_turns`` caps the agentic search loop; None leaves xAI's default."""
         return self._run_analysis(
             market=market,
             search_config=search_config,
@@ -2667,6 +3010,8 @@ class GrokClient:
             deep=False,
             family_is_profitable=family_is_profitable,
             allow_self_consistency=allow_self_consistency,
+            usage_phase=usage_phase,
+            max_turns=max_turns,
         )
 
     def analyze_market_deep(
@@ -2676,6 +3021,7 @@ class GrokClient:
         search_config: SearchConfig | None = None,
         *,
         family_is_profitable: bool = False,
+        usage_phase: str = "refinement",
     ) -> TradeDecision:
         return self._run_analysis(
             market=market,
@@ -2683,4 +3029,5 @@ class GrokClient:
             previous_analysis=previous_analysis,
             deep=True,
             family_is_profitable=family_is_profitable,
+            usage_phase=usage_phase,
         )

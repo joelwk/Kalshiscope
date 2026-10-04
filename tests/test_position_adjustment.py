@@ -19,13 +19,12 @@ def _decision(confidence: float, bet_size_pct: float = 0.5) -> TradeDecision:
 
 def test_should_adjust_new_position() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
     )
     decision = _decision(0.8, 0.4)
     should_add, bet_pct, reason = _should_adjust_position(
-        decision, None, None, None, settings
+        decision, None, None, None, settings, max_bet_usdc=50.0
     )
     assert should_add is True
     assert bet_pct == 0.4
@@ -34,7 +33,6 @@ def test_should_adjust_new_position() -> None:
 
 def test_should_adjust_blocked_at_max_position() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
     )
@@ -57,7 +55,6 @@ def test_should_adjust_blocked_at_max_position() -> None:
 
 def test_should_adjust_blocked_on_confidence_increase() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
     )
@@ -80,7 +77,6 @@ def test_should_adjust_blocked_on_confidence_increase() -> None:
 
 def test_should_adjust_allows_small_position_with_scaled_threshold() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
     )
@@ -94,7 +90,7 @@ def test_should_adjust_allows_small_position_with_scaled_threshold() -> None:
         last_trade=datetime.now(timezone.utc),
     )
     should_add, bet_pct, reason = _should_adjust_position(
-        _decision(0.70, 0.3), None, position, None, settings
+        _decision(0.70, 0.3), None, position, None, settings, max_bet_usdc=50.0
     )
     assert should_add is True
     assert bet_pct == 0.3
@@ -103,7 +99,6 @@ def test_should_adjust_allows_small_position_with_scaled_threshold() -> None:
 
 def test_should_adjust_caps_to_remaining_room() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
     )
@@ -118,7 +113,12 @@ def test_should_adjust_caps_to_remaining_room() -> None:
     )
     decision = _decision(0.85, 0.5)
     should_add, bet_pct, reason = _should_adjust_position(
-        decision, None, position, MarketState(market_id="m1"), settings
+        decision,
+        None,
+        position,
+        MarketState(market_id="m1"),
+        settings,
+        max_bet_usdc=50.0,
     )
     assert should_add is True
     assert round(bet_pct, 4) == 0.2
@@ -127,7 +127,6 @@ def test_should_adjust_caps_to_remaining_room() -> None:
 
 def test_position_override_respects_sports_cap() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.1,
         MAX_SPORTS_CONFIDENCE=0.80,
@@ -158,7 +157,6 @@ def test_position_override_respects_sports_cap() -> None:
 
 def test_should_adjust_blocks_when_price_move_too_small() -> None:
     settings = Settings(
-        MAX_BET_USDC=50.0,
         MAX_POSITION_PER_MARKET_USDC=200.0,
         MIN_CONFIDENCE_INCREASE_FOR_ADD=0.01,
         MIN_PRICE_MOVE_FOR_READD=0.05,

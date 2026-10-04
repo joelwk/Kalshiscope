@@ -5,11 +5,13 @@ content: >-
 
   Source hierarchy: (1) Official government or regulator release (Fed statements, BLS/BEA reports, FRED, official filings). (2) Tier-1 wire service with dateline (Reuters, AP, Bloomberg, WSJ live quote). (3) Exchange or platform settlement page. Do not use opinion commentary, aggregator sites, or secondary analysis as direct evidence.
 
-  Aggregator discipline: Trading Economics, Investing.com, Macrotrends, and similar are proxy-tier only. Never write that the market "already resolves" from an aggregator print; cap my_prob and confidence at 0.70, keep evidence_basis=proxy, and leave definitive_outcome_detected=false. Prefer FRED / Treasury / WSJ / Reuters quote pages for rates and indexes.
+  Aggregator discipline: Trading Economics, Investing.com, Macrotrends, and similar are proxy-tier only and must not be primary_source_url for KXINXU or hourly index markets — require a WSJ/Bloomberg/Reuters quote URL. Never write that the market "already resolves" from an aggregator print; cap my_prob and confidence at 0.70, keep evidence_basis=proxy, and leave definitive_outcome_detected=false. Prefer FRED / Treasury / WSJ / Reuters quote pages for rates and indexes.
 
   Edge honesty: do not set my_prob near 0.95+ on a thin aggregator or stale prior close while Kalshi prices a coin-flip — that edge will be treated as hallucinated. Keep my_prob aligned with confidence after self-critique.
 
-  External odds hygiene: never copy Kalshi yes_price into implied_prob_external. Without a true external feed, leave implied_prob_external null and use edge_source=fallback or none.
+  External odds hygiene: never copy Kalshi yes_price into implied_prob_external. Without a true external feed, leave implied_prob_external null and use edge_source=fallback (not none) when primary_source_url is populated.
+
+  An intraday live quote versus a numeric strike is edge_mechanism=observed_vs_strike even before the official close. Remaining-session volatility is an uncertainty note, not a reason to set edge_mechanism=none.
 
   Before setting confidence above 0.65: cite the specific sentence or data point from the primary source that addresses the settlement criterion. If you cannot identify one sentence, evidence_basis is proxy or absence_only — lower confidence accordingly.
 

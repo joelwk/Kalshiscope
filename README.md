@@ -66,26 +66,176 @@ python main.py
 
 ## Dry Run vs Live Trading
 
-`DRY_RUN=true` is the safety-first mode and prevents real order placement.
+`DRY_RUN=true` is the safety-first mode and prevents real order placement. It
+does **not** disable paid xAI research, so the xAI cycle and run budgets still
+apply.
 
 - `DRY_RUN=true`: analyze and log candidate trades only.
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
-continues its normal analysis loop but reserves exactly that many distinct
-markets (preferring confidence × evidence quality, with event/family diversity)
-for forced sized execution from the researched side. Cycle analysis is reused
-when available (deep-only); weak evidence prefers a diversified replacement
-before forcing. Ordinary gate-cleared submissions are suppressed in this mode
-so the run cannot exceed the target. Dry runs persist exactly that many
-attempted-order receipts; bounded live runs fail explicitly if Kalshi does not
-accept all target submissions and exit early once the target is complete. Live
-guarantee plans exclude sports while an exchange-confirmed jurisdiction hold is
-active. If that restriction is first discovered during forced submission, the
-rejected sports slot is retired and replaced with a non-sports market using a
-new idempotency key.
+pre-ranks the eligible batch, performs initial and deep research on the best
+slots, and orders the researched side only when its chosen-side edge is still
+positive. Slots never share an event, and no market
+family may hold more than three of them: demanding a distinct family per slot
+handed four of every five slots to families with no fills on record, because
+the one family that does fill was capped at a single slot. Absence-only, zero,
+or negative-EV slots are replaced with another analyzed +EV name the same
+cycle, or deferred to the next cycle — never forced. If the researched batch
+does not contain enough sourced positive-EV sides, the target remains incomplete.
+`GUARANTEED_MIN_EDGE` (default `0.12`) is the full-Kelly chosen-side floor for
+direct, computed-odds, named-mechanism, or weather sides; unlabeled non-weather
+proxy uses `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`). A sourced positive-EV
+side below its applicable floor is still entered in hard-N mode, but only at
+the cycle minimum bet. The same minimum-size treatment applies to sub-20¢
+chosen sides, forecast-only weather (`weather_not_observed`), and
+commodity/index YES (`commodity_yes_blocked`). This bounds exposure for shapes
+whose historical results do not justify a full Kelly stake.
+`GUARANTEED_FAMILY_MIN_EDGE` (default `crypto:0.06`) replaces both of those
+floors for the families it names. The default is calibrated on 857 resolved
+trades: crypto returned +7% below a 0.12 edge and −13% above it, because a
+large claimed edge on a continuously repriced ladder is overconfidence rather
+than mispricing. Weather is the family `0.12` actually fits (+3% above it,
+−16% below), so it stays on the default. Evidence strength is gated separately,
+so an override only moves the edge magnitude required for full Kelly sizing.
+Three guards keep the hunt from spending deep research where it cannot pay off.
+A first pass sitting more than 20 points below the floor skips the deep call
+outright, since deep research has historically moved confidence that far only
+5% of the time. Within one plan, a series that produces no positive-EV side is
+retired immediately, so an adjacent strike cannot claim the freed slot and
+spend another initial plus deep pass on the same reasoning. Across runs, a
+series that produces no forceable side `GUARANTEED_SERIES_MISS_LIMIT` times in
+a row (default `3`) without ever filling stops being locked at all; the tally
+persists, and a fill resets it. A dry-run force resets the streak but is not
+recorded as a fill, because it never reached the exchange and must not earn a
+proven series the permanent exemption from that limit. Together this is what
+stops continuously repriced ladders such as crypto strikes and index levels —
+the most liquid names on the exchange, and the ones least likely to be
+mispriced — from consuming every slot.
+`GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS` bounds churn across markets,
+not the run itself: once it is spent, a slot whose market is still tradeable
+holds its lock and re-prices on later cycles, and only a market that can never
+fill is abandoned. Ordinary gate-cleared submissions are
+suppressed in this mode so the run cannot exceed the target. Forced (and
+normal) stakes scale with live portfolio value:
+`clip(kelly_bet_pct × MAX_BET_PCT_OF_BANKROLL × portfolio, MIN_BET_PCT_OF_BANKROLL × portfolio, position/drawdown caps)`.
+Dry runs persist up to that many attempted-order receipts when enough +EV
+markets exist. In live mode, a slot completes only after the exchange reports
+at least one filled contract: an accepted but unfilled resting order remains
+attached to its slot, is reconciled on later cycles, and is never submitted a
+second time. A terminal unfilled order releases the slot for replacement.
+The final refreshed market price must also remain positive-EV before the order
+is submitted. Bounded live runs fail explicitly if all target positions are not
+opened and exit early once the filled-position target is complete. Live guarantee
+plans exclude families the exchange has rejected for this account (Sports, and
+when present Elections and Entertainment). If that restriction is first
+discovered during forced submission, the rejected slot is retired and replaced
+with an executable family using a new idempotency key. Set
+`GUARANTEED_ORDERS_N=5` for a five-cycle `poetry run kalshi --cycles 5` run.
+
+Guaranteed plans and their xAI spend resume across process restarts. In dry-run
+mode, an unfinished plan that has already reached `MAX_XAI_COST_PER_RUN_USD` is
+closed with a terminal lifecycle receipt and replaced, so the normal command
+continues to work:
+
+```bash
+poetry run kalshi --cycles 5
+```
+
+The old usage ledger is retained and the rollover is recorded in a terminal
+receipt. Live mode never rolls a plan over automatically, because doing so
+could submit more orders than the original target. Two ID-free lifecycle
+commands are available when an explicit reset is needed:
+
+```bash
+# Start a fresh plan. Replaces the active plan when one exists.
+poetry run kalshi --new-guaranteed-run --cycles 5
+
+# Clear the active plan and exit without initializing API clients.
+poetry run kalshi --abandon-guaranteed-plan
+```
+
+A fresh run still honors `DRY_RUN` and all risk and cost controls.
 
 Start in dry run and switch to live only after reviewing behavior in logs.
+
+### Guaranteed-Plan Reliability
+
+- The active plan, locked slots, accepted client order IDs, submission attempts,
+  account-error state, and accumulated xAI spend are persisted in SQLite. An
+  accepted order therefore counts exactly once after restart.
+- The bot reconciles exchange orders before resuming a live plan. An unresolved
+  order is considered terminal only when complete fills or a definitively closed
+  market prove it; ambiguous reconciliation stops the run before paid research.
+- A `user_not_found` account response is retried only once for that slot across
+  the persisted plan, using the same idempotency key. A repeated response
+  quarantines the market and selects a replacement. Responses from two distinct
+  series open a run-level write circuit and stop further paid analysis.
+- Forced-order reasoning annotations are idempotent. Receipt fill metrics count
+  unique orders with fills, while `reconciled_fill_events` reports fill-event
+  count separately.
+
+## xAI Cost Controls and Accounting
+
+Every completed Grok call is written immediately to the SQLite
+`xai_usage_ledger`. Each row identifies its run, cycle, market, and phase
+(`initial`, `self_consistency`, `refinement`, `repair`, `guaranteed_initial`, or
+`guaranteed_deep`) and records prompt, cached-input, completion, and reasoning
+tokens together with server-side tool usage. Cycle and run receipts are derived
+from this ledger, so refinement does not overwrite earlier usage and completed
+calls remain accounted for after an interrupted process.
+
+The shipped Grok 4.3 estimate is labeled
+`xai-grok-4.3-2026-09` and uses these configurable rates:
+
+- `API_COST_INPUT_PER_1K_TOKENS_USD=0.00125` for uncached input.
+- `API_COST_CACHED_INPUT_PER_1K_TOKENS_USD=0.00020` for cached input.
+- `API_COST_OUTPUT_PER_1K_TOKENS_USD=0.00250` for output.
+- Prompts at or above `API_COST_LONG_CONTEXT_THRESHOLD_TOKENS=200000` use
+  `API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD=0.00250`,
+  `API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD=0.00040`, and
+  `API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD=0.00500` instead.
+- `API_COST_SERVER_TOOL_PER_CALL_USD=0.005` for each reported server-side tool
+  call.
+- `API_COST_RESERVATION_PER_CALL_USD=1.50` reserves projected spend atomically
+  before each provider call and reconciles it against actual usage afterward.
+
+`MAX_XAI_COST_PER_RUN_USD=10` and `MAX_XAI_COST_PER_CYCLE_USD=3` are admission
+controls for new calls. Set either value to `0` only when intentionally disabling
+that cap. Completed usage plus active reservations cannot admit more than the
+configured cap. Actual usage can still exceed a reservation for an individual
+call, but parallel calls no longer start against the same unreserved budget.
+Once a cap is reached, the bot records `api_budget_exhausted`, stops scheduling
+new Grok calls, and performs only reconciliation and final receipt work. A
+cycle-cap stop may continue on a later cycle; a run-cap stop is terminal for
+that guaranteed-plan run.
+
+Research volume is also bounded before the dollar caps are reached:
+
+- While a guaranteed plan is incomplete, the bot skips the ordinary paid
+  analysis pipeline and reserves the xAI budget for guaranteed slots and their
+  replacements. Each catalog-selected slot receives its guaranteed initial and
+  deep review; a replacement does not depend on a separate ordinary-analysis
+  call. The ordinary self-consistency pass remains disabled because the
+  guaranteed deep pass already supplies the second review.
+- A slot banks its first pass as soon as that call returns, so a cost-cap stop
+  between the two passes resumes at the deep review instead of paying for the
+  initial one twice. A banked first pass that already clears the edge floor is
+  forced without a deep call, exactly as an ordinary-analysis seed is.
+- Because guaranteed mode bypasses the ordinary pipeline, the `Cycle funnel:`
+  line reports `analyzed=0`. Its `guaranteed=[...]` field carries the initial
+  and deep call counts, the cycle's research cost, and the replacement tally,
+  and the cycle receipt records the same values.
+- Outside guaranteed mode, self-consistency requires an execution-relevant,
+  positive edge above `GROK_SELF_CONSISTENCY_EDGE_THRESHOLD` and top-candidate
+  eligibility. Liquidity alone does not trigger it.
+- Web search is available for all research profiles. X search is limited to
+  speech, social, live-news, and politics profiles. Image/video understanding is
+  enabled only for speech and social profiles, where the evidence itself may be
+  audiovisual.
+- Guaranteed mode analyzes at most twice the remaining slot count, with a
+  minimum allowance of two candidates. Research-gap replacement churn defaults
+  to six attempts.
 
 ## Environment Variables
 
@@ -97,11 +247,23 @@ Required:
 
 Common optional variables:
 
-- `KALSHI_API_BASE_URL` (defaults to Kalshi v2 endpoint)
+- `KALSHI_API_BASE_URL` (defaults to
+  `https://external-api.kalshi.com/trade-api/v2`)
 - `KALSHI_SERVER_SIDE_FILTERS_ENABLED`
 - `POLL_INTERVAL_SEC`
 - `MIN_LIQUIDITY_USDC`
 - `MARKET_MIN_CLOSE_DAYS`, `MARKET_MAX_CLOSE_DAYS`
+- `MAX_XAI_COST_PER_RUN_USD`, `MAX_XAI_COST_PER_CYCLE_USD`
+- `API_COST_INPUT_PER_1K_TOKENS_USD`,
+  `API_COST_CACHED_INPUT_PER_1K_TOKENS_USD`,
+  `API_COST_OUTPUT_PER_1K_TOKENS_USD`,
+  `API_COST_LONG_CONTEXT_THRESHOLD_TOKENS`,
+  `API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD`,
+  `API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD`,
+  `API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD`, and
+  `API_COST_SERVER_TOOL_PER_CALL_USD`
+- `API_COST_RESERVATION_PER_CALL_USD`
+- `API_COST_PRICING_VERSION` labels the configured rate card in receipts.
 
 See `.env.example` for the full set of runtime controls.
 
@@ -109,8 +271,9 @@ See `.env.example` for the full set of runtime controls.
 
 - `MIN_EDGE`, `LOW_PRICE_MIN_EDGE`, `FALLBACK_EDGE_MIN_EDGE` for edge thresholds.
 - `SCORE_GATE_MODE` (`off`, `shadow`, `active`) for decision scoring rollout.
-- `BAYESIAN_ENABLED`, `LMSR_ENABLED`, `KELLY_SIZING_ENABLED` for optional advanced layers.
+- `BAYESIAN_ENABLED`, `LMSR_ENABLED`, `KELLY_SIZING_ENABLED` for optional advanced layers. Keep `KELLY_SIZING_ENABLED=true` for normal orders; guaranteed slots always Kelly-size against the cycle's bankroll-derived max bet.
 - `KELLY_MIN_BET_POLICY` controls handling when Kelly sizing is below minimum bet.
+- `MIN_BET_PCT_OF_BANKROLL`, `MAX_BET_PCT_OF_BANKROLL` scale dollar bets with portfolio value (cash + positions).
 - `MAX_POSITION_PCT_OF_BANKROLL`, `MAX_POSITION_PER_MARKET_USDC` cap exposure.
 - `OPPOSITE_OUTCOME_STRATEGY` and flip-guard settings reduce churn from side flips.
 - `MARKET_TICKER_BLOCKLIST_PREFIXES`, ladder collapse controls, and extreme-price filters reduce noisy candidates.
@@ -119,6 +282,13 @@ See `.env.example` for the full set of runtime controls.
 ## State and Logging
 
 - State persistence: `STATE_DB_PATH` (SQLite) remains the complete audit store.
+- Every completed provider call is committed to `xai_usage_ledger` before its
+  decision can be replaced by a later research phase. Usage receipts include the
+  configured pricing version, token classes, server-tool calls, and estimated
+  cycle/run cost.
+- The active guaranteed-order plan is stored as runtime state and restored on
+  startup until it completes, is safely rolled over in dry run, or is explicitly
+  replaced/abandoned.
 - `STATE_JSON_EXPORT_PATH` is an atomic, bounded schema-version-2 snapshot. It contains current-cycle markets, open positions, active orders, unresolved outcomes, recent settlements, calibration/research state, sync checkpoints, the current cycle receipt, and at most `STATE_JSON_RECENT_DECISIONS_LIMIT` decisions from that cycle. It intentionally excludes full receipt and trade history.
 - `STATE_JSON_EXPORT_INTERVAL_CYCLES` controls snapshot frequency (default `1`). A cycle receipt is committed before its snapshot is replaced.
 - Export complete history on demand without changing SQLite: `poetry run python scripts/export_state_audit.py --table decision_receipts --since 2026-07-01T00:00:00+00:00 --format ndjson --output decisions.ndjson`. Repeat `--table` to select multiple tables; omit it for every audit table.
@@ -194,6 +364,31 @@ If startup fails with `Missing required environment variables`, verify:
 - Confirm `DRY_RUN=false` for live placement.
 - Check gating thresholds (`MIN_CONFIDENCE`, `MIN_EDGE`, score gate mode).
 - Review liquidity, close-window, and category filters that may exclude candidates.
+
+### xAI cost cap reached before cycles run
+
+This is expected when a persisted guaranteed plan has already spent its run
+budget. With `DRY_RUN=true`, the normal command automatically closes that plan,
+records `replaced_after_dry_run_cost_cap`, creates a fresh run ID, and continues:
+
+```bash
+poetry run kalshi --cycles 5
+```
+
+With `DRY_RUN=false`, automatic rollover is intentionally blocked because a new
+plan could exceed the original live-order target. The CLI exits with a concise
+`PredictBot stopped:` message after reconciliation and does not print a traceback.
+Review orders and receipts, then explicitly replace or abandon the plan:
+
+```bash
+poetry run kalshi --new-guaranteed-run --cycles 5
+poetry run kalshi --abandon-guaranteed-plan
+```
+
+These switches are intentionally ID-free; the bot resolves the one active plan
+from SQLite. `--new-guaranteed-run` still requires `GUARANTEED_ORDERS_N` to be
+greater than zero, and it starts that plan when none is active.
+`--abandon-guaranteed-plan` exits without changing state when no plan exists.
 
 ### Dependency issues
 

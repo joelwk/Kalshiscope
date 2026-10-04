@@ -5,7 +5,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,7 @@ from models import (
     OrderRequest,
     OrderResponse,
 )
+from research_profiles import market_family
 
 logger = get_logger(__name__)
 
@@ -43,6 +44,21 @@ _ORDER_SUBMISSION_MAX_PRICE = 0.97
 # Create-Order-V2 endpoint: YES-book single-side orders (the legacy
 # ``/portfolio/orders`` POST is deprecated and now returns HTTP 410).
 _V2_ORDER_PATH = "/portfolio/events/orders"
+# Crypto and commodities events created after the 2026 shard split live on
+# shard 2. Orders there 404 with insufficient_shard_balance until collateral
+# is moved off shard 0. Centicents are Kalshi's transfer unit (1 dollar = 10000).
+_CRYPTO_COMMODITY_SHARD_INDEX = 2
+_CENTICENTS_PER_DOLLAR = 10_000
+_SHARD_TRANSFER_PATH = "/portfolio/intra_exchange_instance_transfer"
+_SHARD_TRANSFER_POLL_ATTEMPTS = 6
+_SHARD_TRANSFER_POLL_SECONDS = 0.5
+_SHARD_TRANSFER_DONE_STATUSES = frozenset(
+    {"applied", "completed", "complete", "success", "succeeded", "settled"}
+)
+_SHARD_TRANSFER_FAILED_STATUSES = frozenset(
+    {"failed", "rejected", "canceled", "cancelled", "error"}
+)
+_SHARD_FUNDED_FAMILIES = frozenset({"crypto", "commodities"})
 _BOOK_SIDE_BID = "bid"
 _BOOK_SIDE_ASK = "ask"
 _SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
@@ -108,9 +124,10 @@ class KalshiClient:
         self.timeout_sec = timeout_sec
         self.order_price_improvement_cents = max(0, int(order_price_improvement_cents))
         self.default_time_in_force = _normalize_time_in_force(default_time_in_force)
-        # MIN_BET_USDC eligibility is decided by the execution pipeline before an
-        # OrderRequest reaches this client. Keep the values for compatibility and
-        # enforce MAX_BET_USDC again at the final integer-contract boundary.
+        # Min-bet eligibility is decided by the execution pipeline before an
+        # OrderRequest reaches this client. The bot refreshes these values each
+        # cycle from the bankroll-derived bet bounds and the max is re-enforced
+        # at the final integer-contract boundary.
         self.min_bet_usdc = max(0.0, float(min_bet_usdc))
         self.max_bet_usdc = max(0.0, float(max_bet_usdc))
         self.max_fetch_pages = (
@@ -359,9 +376,20 @@ class KalshiClient:
         """Return available balance in dollars."""
         return self.get_portfolio_balance().available_balance
 
-    def get_portfolio_balance(self) -> PortfolioBalance:
-        """Return normalized cash/position/total portfolio balances in dollars."""
-        response = self._request("GET", "/portfolio/balance")
+    def get_portfolio_balance(
+        self,
+        *,
+        exchange_index: int | None = None,
+    ) -> PortfolioBalance:
+        """Return normalized cash/position/total portfolio balances in dollars.
+
+        Omit ``exchange_index`` for the all-shard aggregate. A specific index
+        is the cash that can collateralize an order on that matching engine.
+        """
+        params = None
+        if exchange_index is not None:
+            params = {"exchange_index": int(exchange_index)}
+        response = self._request("GET", "/portfolio/balance", params=params)
         payload = response.json()
         if not isinstance(payload, dict):
             return PortfolioBalance(
@@ -583,6 +611,98 @@ class KalshiClient:
             raise ValueError("Fills response is not a JSON object")
         return payload
 
+    def _ensure_exchange_shard_funded(
+        self,
+        exchange_index: int,
+        *,
+        required_usdc: float,
+    ) -> None:
+        """Move shard-0 cash onto the matching engine that will take the order.
+
+        Kalshi collateral is local to an exchange shard. A crypto order routed
+        to shard 2 is rejected with ``insufficient_shard_balance`` / ``Exchange
+        user not found`` while the account balance still sits on shard 0.
+        """
+        if exchange_index <= 0 or required_usdc <= 0:
+            return
+        destination_cash = self.get_portfolio_balance(
+            exchange_index=exchange_index
+        ).available_balance
+        shortfall = float(required_usdc) - destination_cash
+        if shortfall <= 0.01:
+            return
+        source_cash = self.get_portfolio_balance(exchange_index=0).available_balance
+        transfer_usdc = min(shortfall, max(0.0, source_cash))
+        if transfer_usdc < 0.01:
+            logger.warning(
+                "Exchange shard %d is short $%.2f and shard 0 has $%.2f available",
+                exchange_index,
+                shortfall,
+                source_cash,
+                data={
+                    "exchange_index": exchange_index,
+                    "shortfall_usdc": round(shortfall, 4),
+                    "shard_0_available_usdc": round(source_cash, 4),
+                },
+            )
+            return
+        amount_centicents = int(
+            (Decimal(str(round(transfer_usdc, 4))) * Decimal(_CENTICENTS_PER_DOLLAR))
+            .to_integral_value(rounding=ROUND_CEILING)
+        )
+        logger.warning(
+            "Funding exchange shard %d with $%.2f before order submission",
+            exchange_index,
+            transfer_usdc,
+            data={
+                "exchange_index": exchange_index,
+                "transfer_usdc": round(transfer_usdc, 4),
+                "shard_available_usdc": round(destination_cash, 4),
+                "required_usdc": round(float(required_usdc), 4),
+            },
+        )
+        response = self._request(
+            "POST",
+            _SHARD_TRANSFER_PATH,
+            json={
+                "source": "event_contract",
+                "destination": "event_contract",
+                "amount": amount_centicents,
+                "source_exchange_shard": 0,
+                "destination_exchange_shard": int(exchange_index),
+            },
+        )
+        payload = response.json() if response is not None else {}
+        transfer_id = ""
+        if isinstance(payload, dict):
+            transfer_id = str(payload.get("transfer_id") or "")
+        if transfer_id:
+            self._wait_for_shard_transfer(transfer_id)
+
+    def _wait_for_shard_transfer(self, transfer_id: str) -> None:
+        for attempt in range(_SHARD_TRANSFER_POLL_ATTEMPTS):
+            response = self._request(
+                "GET",
+                f"/portfolio/intra_exchange_instance_transfers/{transfer_id}",
+            )
+            payload = response.json() if response is not None else {}
+            status = ""
+            if isinstance(payload, dict):
+                status = str(payload.get("status") or "").strip().lower()
+            if status in _SHARD_TRANSFER_DONE_STATUSES:
+                return
+            if status in _SHARD_TRANSFER_FAILED_STATUSES:
+                raise RuntimeError(
+                    f"Exchange shard transfer {transfer_id} failed: status={status}"
+                )
+            if attempt + 1 < _SHARD_TRANSFER_POLL_ATTEMPTS:
+                time.sleep(_SHARD_TRANSFER_POLL_SECONDS)
+        logger.warning(
+            "Exchange shard transfer %s still pending; submitting the order anyway",
+            transfer_id,
+            data={"transfer_id": transfer_id},
+        )
+
     def create_order(self, order: OrderRequest, market: Market | None = None) -> OrderResponse:
         return self.submit_order(order, market=market)
 
@@ -663,6 +783,7 @@ class KalshiClient:
                 f"at ${chosen_outcome_limit_price:.2f}"
             )
         requested_notional_usdc = count * chosen_outcome_limit_price
+        exchange_index = _order_exchange_index(market)
 
         payload = {
             "ticker": order.market_id,
@@ -679,6 +800,12 @@ class KalshiClient:
             ),
             "self_trade_prevention_type": _SELF_TRADE_PREVENTION_TYPE,
         }
+        if exchange_index is not None:
+            payload["exchange_index"] = exchange_index
+            self._ensure_exchange_shard_funded(
+                exchange_index,
+                required_usdc=requested_notional_usdc,
+            )
 
         max_attempts = 1 + max(0, _ORDER_RATE_LIMIT_MAX_RETRIES)
         response = None
@@ -710,22 +837,28 @@ class KalshiClient:
                     continue
                 response_text = ""
                 if exc.response is not None:
-                    response_text = exc.response.text.lower()
+                    response_text = exc.response.text or ""
+                    setattr(exc, "_kalshi_response_body", response_text)
                     logger.error(
                         "Order rejected by Kalshi: market=%s status=%s payload=%s body=%s",
                         order.market_id,
                         exc.response.status_code,
                         payload,
-                        exc.response.text,
+                        response_text,
                         data={
                             "market_id": order.market_id,
                             "status_code": exc.response.status_code,
                             "payload": payload,
-                            "response_body": exc.response.text,
+                            "response_body": response_text,
                         },
                     )
+                    response_text = response_text.lower()
+                if _is_shard_collateral_error(response_text):
+                    raise
                 if "insufficient" in response_text and "balance" in response_text:
-                    raise InsufficientBalanceError("Insufficient balance on Kalshi account") from exc
+                    raise InsufficientBalanceError(
+                        "Insufficient balance on Kalshi account"
+                    ) from exc
                 if "market_closed" in response_text or "market closed" in response_text:
                     raise MarketClosedError("Market closed before order submission") from exc
                 # Preserve response body for order-scoped jurisdiction diagnostics.
@@ -856,6 +989,35 @@ def _normalize_time_in_force(value: str | None) -> str:
     return _DEFAULT_LIMIT_TIME_IN_FORCE
 
 
+def _coerce_exchange_index(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_exchange_index(market: Market | None) -> int | None:
+    """Shard that must be funded before this order, or None for shard 0."""
+    if market is None:
+        return None
+    explicit = _coerce_exchange_index(market.exchange_index)
+    if explicit is not None:
+        return explicit if explicit > 0 else None
+    if market_family(market) in _SHARD_FUNDED_FAMILIES:
+        return _CRYPTO_COMMODITY_SHARD_INDEX
+    return None
+
+
+def _is_shard_collateral_error(response_text: str) -> bool:
+    text = response_text.lower()
+    return (
+        "insufficient_shard_balance" in text
+        or "exchange user not found" in text
+    )
+
+
 def _parse_market(raw: dict[str, Any]) -> Market:
     ticker = str(raw.get("ticker") or raw.get("id") or "")
     title = _clean_text(raw.get("title"))
@@ -928,6 +1090,7 @@ def _parse_market(raw: dict[str, Any]) -> Market:
         "event_ticker",
         "series_ticker",
         "market_type",
+        "exchange_index",
     ):
         extra.pop(key, None)
 
@@ -942,6 +1105,7 @@ def _parse_market(raw: dict[str, Any]) -> Market:
         event_ticker=event_ticker,
         series_ticker=series_ticker,
         market_type=market_type,
+        exchange_index=_coerce_exchange_index(raw.get("exchange_index")),
         volume=volume_value,
         open_interest=open_interest_value,
         volume_24h=volume_24h,

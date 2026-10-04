@@ -19,8 +19,8 @@ class TestConfig(unittest.TestCase):
             **self._required_env(),
             "MARKET_CATEGORIES_ALLOWLIST": "sports, politics",
             "MARKET_CATEGORIES_BLOCKLIST": "crypto",
-            "MIN_BET_USDC": "10",
-            "MAX_BET_USDC": "75",
+            "MIN_BET_PCT_OF_BANKROLL": "0.05",
+            "MAX_BET_PCT_OF_BANKROLL": "0.25",
             "DRY_RUN": "false",
         }
         with patch.dict(os.environ, env, clear=True):
@@ -34,8 +34,8 @@ class TestConfig(unittest.TestCase):
         )
         self.assertEqual(settings.MARKET_CATEGORIES_ALLOWLIST, ("sports", "politics"))
         self.assertEqual(settings.MARKET_CATEGORIES_BLOCKLIST, ("crypto",))
-        self.assertEqual(settings.MIN_BET_USDC, 10.0)
-        self.assertEqual(settings.MAX_BET_USDC, 75.0)
+        self.assertEqual(settings.MIN_BET_PCT_OF_BANKROLL, 0.05)
+        self.assertEqual(settings.MAX_BET_PCT_OF_BANKROLL, 0.25)
         self.assertFalse(settings.DRY_RUN)
 
     def test_close_days_filter_settings(self) -> None:
@@ -92,21 +92,122 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.PRE_ORDER_MARKET_REFRESH)
         self.assertEqual(settings.MAX_MARKET_DATA_AGE_SECONDS, 120)
 
+    def test_current_api_origins_pricing_and_cost_caps(self) -> None:
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            settings = config.load_settings()
+        self.assertEqual(
+            settings.KALSHI_API_BASE_URL,
+            "https://external-api.kalshi.com/trade-api/v2",
+        )
+        self.assertEqual(settings.API_COST_INPUT_PER_1K_TOKENS_USD, 0.00125)
+        self.assertEqual(settings.API_COST_CACHED_INPUT_PER_1K_TOKENS_USD, 0.00020)
+        self.assertEqual(settings.API_COST_OUTPUT_PER_1K_TOKENS_USD, 0.00250)
+        self.assertEqual(settings.API_COST_LONG_CONTEXT_THRESHOLD_TOKENS, 200_000)
+        self.assertEqual(
+            settings.API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD,
+            0.00250,
+        )
+        self.assertEqual(
+            settings.API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD,
+            0.00040,
+        )
+        self.assertEqual(
+            settings.API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD,
+            0.00500,
+        )
+        self.assertEqual(settings.API_COST_SERVER_TOOL_PER_CALL_USD, 0.005)
+        self.assertEqual(settings.API_COST_RESERVATION_PER_CALL_USD, 1.50)
+        self.assertEqual(settings.MAX_XAI_COST_PER_RUN_USD, 10.0)
+        self.assertEqual(settings.MAX_XAI_COST_PER_CYCLE_USD, 3.0)
+
+        override_env = {
+            **self._required_env(),
+            "API_COST_RESERVATION_PER_CALL_USD": "0.75",
+        }
+        with patch.dict(os.environ, override_env, clear=True):
+            overridden = config.load_settings()
+        self.assertEqual(overridden.API_COST_RESERVATION_PER_CALL_USD, 0.75)
+
+        invalid_env = {
+            **self._required_env(),
+            "API_COST_RESERVATION_PER_CALL_USD": "-0.01",
+        }
+        with patch.dict(os.environ, invalid_env, clear=True):
+            with self.assertRaisesRegex(
+                ValueError,
+                "API_COST_RESERVATION_PER_CALL_USD",
+            ):
+                config.load_settings()
+
     def test_guaranteed_orders_defaults_disabled_and_parses_override(self) -> None:
         with patch.dict(os.environ, self._required_env(), clear=True):
             defaults = config.load_settings()
         self.assertEqual(defaults.GUARANTEED_ORDERS_N, 0)
         self.assertEqual(defaults.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
+        self.assertEqual(defaults.GUARANTEED_MIN_EDGE, 0.12)
+        self.assertEqual(defaults.GUARANTEED_PROXY_MIN_EDGE, 0.15)
+        self.assertEqual(defaults.GUARANTEED_SERIES_MISS_LIMIT, 3)
+        self.assertEqual(defaults.GUARANTEED_FAMILY_MIN_EDGE, (("crypto", 0.06),))
 
         env = {
             **self._required_env(),
             "GUARANTEED_ORDERS_N": "3",
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS": "2",
+            "GUARANTEED_MIN_EDGE": "0.10",
+            "GUARANTEED_PROXY_MIN_EDGE": "0.14",
+            "GUARANTEED_SERIES_MISS_LIMIT": "5",
+            "GUARANTEED_FAMILY_MIN_EDGE": "Generic:0.08, crypto:0.05",
         }
         with patch.dict(os.environ, env, clear=True):
             settings = config.load_settings()
         self.assertEqual(settings.GUARANTEED_ORDERS_N, 3)
         self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 2)
+        self.assertEqual(settings.GUARANTEED_MIN_EDGE, 0.10)
+        self.assertEqual(settings.GUARANTEED_PROXY_MIN_EDGE, 0.14)
+        self.assertEqual(settings.GUARANTEED_SERIES_MISS_LIMIT, 5)
+        self.assertEqual(
+            settings.GUARANTEED_FAMILY_MIN_EDGE,
+            (("crypto", 0.05), ("generic", 0.08)),
+        )
+
+    def test_guaranteed_family_min_edge_drops_unparsable_entries(self) -> None:
+        env = {
+            **self._required_env(),
+            "GUARANTEED_FAMILY_MIN_EDGE": "crypto:0.06,generic,speech:abc,:0.1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GUARANTEED_FAMILY_MIN_EDGE, (("crypto", 0.06),))
+
+    def test_guaranteed_family_min_edge_rejects_non_positive(self) -> None:
+        for value in ("crypto:0", "crypto:-0.02"):
+            env = {**self._required_env(), "GUARANTEED_FAMILY_MIN_EDGE": value}
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(
+                    ValueError, "GUARANTEED_FAMILY_MIN_EDGE"
+                ):
+                    config.load_settings()
+
+    def test_grok_reasoning_and_numeric_code_execution_settings(self) -> None:
+        with patch.dict(os.environ, self._required_env(), clear=True):
+            defaults = config.load_settings()
+        self.assertEqual(defaults.GROK_REASONING_EFFORT, "high")
+        self.assertEqual(defaults.GROK_REASONING_EFFORT_DEEP, "high")
+        self.assertTrue(defaults.CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED)
+        self.assertTrue(defaults.NON_SPORTS_REQUIRES_DIRECT_EVIDENCE)
+        self.assertTrue(defaults.NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL)
+
+        env = {
+            **self._required_env(),
+            "GROK_REASONING_EFFORT": "medium",
+            "GROK_REASONING_EFFORT_DEEP": "xhigh",
+            "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = config.load_settings()
+        self.assertEqual(settings.GROK_REASONING_EFFORT, "medium")
+        self.assertEqual(settings.GROK_REASONING_EFFORT_DEEP, "xhigh")
+        self.assertFalse(settings.CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED)
 
     def test_guaranteed_orders_rejects_negative_target(self) -> None:
         env = {**self._required_env(), "GUARANTEED_ORDERS_N": "-1"}
@@ -123,6 +224,31 @@ class TestConfig(unittest.TestCase):
             with self.assertRaisesRegex(
                 ValueError, "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS"
             ):
+                config.load_settings()
+
+    def test_guaranteed_min_edge_rejects_negative(self) -> None:
+        env = {**self._required_env(), "GUARANTEED_MIN_EDGE": "-0.01"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "GUARANTEED_MIN_EDGE"):
+                config.load_settings()
+
+    def test_guaranteed_series_miss_limit_rejects_non_positive(self) -> None:
+        for value in ("0", "-1"):
+            env = {**self._required_env(), "GUARANTEED_SERIES_MISS_LIMIT": value}
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(
+                    ValueError, "GUARANTEED_SERIES_MISS_LIMIT"
+                ):
+                    config.load_settings()
+
+    def test_guaranteed_proxy_min_edge_must_meet_min_edge(self) -> None:
+        env = {
+            **self._required_env(),
+            "GUARANTEED_MIN_EDGE": "0.12",
+            "GUARANTEED_PROXY_MIN_EDGE": "0.10",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "GUARANTEED_PROXY_MIN_EDGE"):
                 config.load_settings()
 
     def test_state_reconciliation_and_export_settings(self) -> None:
@@ -422,11 +548,16 @@ class TestConfig(unittest.TestCase):
             "SCORE_INEFFICIENCY_COMPONENT_WEIGHT=0.18",
             "SCORE_BAYESIAN_COMPONENT_WEIGHT=0.10",
             "HISTORICAL_CONFIDENCE_SHRINK_MAX_DELTA=0.05",
-            "MIN_BET_USDC=5.0",
-            "MAX_BET_USDC=12.0",
+            "MIN_BET_PCT_OF_BANKROLL=0.04",
+            "MAX_BET_PCT_OF_BANKROLL=0.16",
             "DRY_RUN=true",
             "GUARANTEED_ORDERS_N=0",
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=6",
+            "GUARANTEED_MIN_EDGE=0.12",
+            "GUARANTEED_PROXY_MIN_EDGE=0.15",
+            "GUARANTEED_SERIES_MISS_LIMIT=3",
+            "GUARANTEED_FAMILY_MIN_EDGE=crypto:0.06",
+            "MAX_POSITION_PER_MARKET_USDC=200.0",
             "MAX_POSITION_PCT_OF_BANKROLL=0.15",
             "MAX_MARKETS_PER_CYCLE=12",
             "MAX_WEATHER_CANDIDATES_PER_CYCLE=2",
@@ -441,7 +572,7 @@ class TestConfig(unittest.TestCase):
             "ENTRY_PRICE_FLOOR_MID_BAND_SIZE_MULTIPLIER=0.75",
             "MAX_TRADES_PER_CYCLE=4",
             "MAX_TRADES_PER_DAY=4",
-            "MAX_DAILY_DRAWDOWN_USDC=15.0",
+            "MAX_DAILY_DRAWDOWN_PCT=0.20",
             "KALSHI_MVE_FILTER=exclude",
             "KALSHI_ELIGIBLE_FLOOR=100",
             "KALSHI_FETCH_TOPUP_ENABLED=false",
@@ -479,6 +610,11 @@ class TestConfig(unittest.TestCase):
             "CONVICTION_REPAIR_SCORE_GAP_MAX=0.08",
             "CONVICTION_REPAIR_CONFIDENCE_SCORE_FLOOR=0.00",
             "DAILY_EXPECTANCY_SATELLITE_MAX_BET_PCT=0.45",
+            "GROK_REASONING_EFFORT=high",
+            "GROK_REASONING_EFFORT_DEEP=high",
+            "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED=true",
+            "NON_SPORTS_REQUIRES_DIRECT_EVIDENCE=true",
+            "NON_SPORTS_REQUIRES_PRIMARY_SOURCE_URL=true",
             "BAYESIAN_MIN_UPDATES_FOR_TRADE=3",
             "BAYESIAN_MIN_POSTERIOR_DIVERGENCE=0.05",
             "HISTORICAL_FAMILY_SIGNAL_ENABLED=true",
@@ -650,7 +786,7 @@ class TestConfig(unittest.TestCase):
             "MAX_TRADES_PER_CYCLE": "6",
             "MAX_BETS_PER_EVENT": "3",
             "MAX_TRADES_PER_DAY": "18",
-            "MAX_DAILY_DRAWDOWN_USDC": "22",
+            "MAX_DAILY_DRAWDOWN_PCT": "0.22",
             "XAI_CIRCUIT_BREAKER_MAX_FAILURES": "4",
             "KALSHI_MAX_FETCH_PAGES": "12",
             "XAI_CLIENT_TIMEOUT_SECONDS": "75",
@@ -700,7 +836,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 6)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 3)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 18)
-        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 22.0)
+        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_PCT, 0.22)
         self.assertEqual(settings.XAI_CIRCUIT_BREAKER_MAX_FAILURES, 4)
         self.assertEqual(settings.KALSHI_MAX_FETCH_PAGES, 12)
         self.assertEqual(settings.XAI_CLIENT_TIMEOUT_SECONDS, 75)
@@ -819,9 +955,13 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.MAX_TRADES_PER_CYCLE, 4)
         self.assertEqual(settings.MAX_BETS_PER_EVENT, 2)
         self.assertEqual(settings.MAX_TRADES_PER_DAY, 6)
-        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_USDC, 30.0)
+        self.assertEqual(settings.MAX_DAILY_DRAWDOWN_PCT, 0.20)
         self.assertEqual(settings.GUARANTEED_ORDERS_N, 0)
         self.assertEqual(settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS, 6)
+        self.assertEqual(settings.GUARANTEED_MIN_EDGE, 0.12)
+        self.assertEqual(settings.GUARANTEED_PROXY_MIN_EDGE, 0.15)
+        self.assertEqual(settings.GUARANTEED_SERIES_MISS_LIMIT, 3)
+        self.assertEqual(settings.GUARANTEED_FAMILY_MIN_EDGE, (("crypto", 0.06),))
         self.assertTrue(settings.POSITION_SYNC_ENABLED)
         self.assertEqual(settings.POSITION_SYNC_INTERVAL_CYCLES, 3)
         self.assertEqual(settings.ORDER_PRICE_IMPROVEMENT_CENTS, 1)
@@ -922,7 +1062,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(settings.RESEARCH_QUEUE_ENABLED)
         self.assertTrue(settings.RESEARCH_QUEUE_PRIORITY_ENABLED)
         self.assertEqual(settings.MARKET_TICKER_BLOCKLIST_PREFIXES, ())
-        self.assertFalse(settings.SKIP_WEATHER_BIN_MARKETS)
+        self.assertTrue(settings.SKIP_WEATHER_BIN_MARKETS)
         self.assertFalse(settings.CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED)
         self.assertIn("billboard.com", settings.MUSIC_ALLOWED_DOMAINS)
         self.assertIn("SpotifyCharts", settings.MUSIC_ALLOWED_X_HANDLES)

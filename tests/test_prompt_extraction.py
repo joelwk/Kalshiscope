@@ -6,49 +6,50 @@ from models import Market, MarketOutcome, TradeDecision
 
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
-    # Re-pinned Aug 4 2026: edge honesty, external-odds hygiene, aggregator/MapClick caps.
-    "analyze": "03d857e58c10a71f64b8da7c6ac49b84ee30fb1d7f0fd0577687960be1044c58",
-    "deep": "d04c2d3565b836fac6a8f42fb1bc2e992d1eac1aceba1e119857929910edfc9e",
+    # Re-pinned Sep 26 2026: directional decisions require structured probability.
+    "analyze": "e35e780fadcdc127b0552723460e3a73fa2e13e765c65eaf15e557a29606d012",
+    "deep": "74606d3debcd4ce1d48521c1fdaa45e4110f71e8877ee6dbca4754f5b1e1c4e9",
 }
 
 EXPECTED_MARKET_PROMPT_HASHES = {
-    # Re-pinned Aug 4 2026: category/constraint field-hygiene updates.
-    "commodities:deep_false": "49ff9f19b3a207180d690fb26bfacbe9710de56992d33f07fc89eaae1582e5d4",
-    "commodities:deep_true": "f2d19e7c8290ba76a36a3ad778c8acd94421d402804984ac6eba2be01e66cef8",
-    "crypto:deep_false": "7e6c1956a717c9f845cc80f44f48bf8120a33c851a78e4917587c210f7bbfbca",
-    "crypto:deep_true": "85d821b8e4c4f06f1d4adb6fc583913d67e18bcb09389072053df9c10dbefa58",
-    "generic:deep_false": "6849bff3192109e4bdb5cc79e64b796db8bc0cf7333030a6807d9ae4e78e09ed",
-    "generic:deep_true": "a98ff2d218e0beb6fb5cfd81eb08139a60feb117367e7fec3fd0f36d2302a18c",
-    "music:deep_false": "7303d1797ea93804fe6eb871789970967ccbc36b8cafe6a6463321130efc340a",
-    "music:deep_true": "d1e933d58c00c77d63e08e7217617fc8044f3f091467b24192c9303204699339",
-    "politics:deep_false": "82721d5546da9a9a4443eb6f6afcbbcf739e75dcae3a25b8a8cb577c6c65d59f",
-    "politics:deep_true": "c50baf88c2b94ab274e5c06fdb8d6e138435542b3291bba2e5d035e40e17a74d",
-    "speech:deep_false": "a2b9ac7999318002b4b51b71c74b5c92416107cce77d6ac6b131322f14dd81d1",
-    "speech:deep_true": "e7e0fc1dff8c7e6c3ba9dfbf857dffbd474738ff430a37a7375d8111eac55ebf",
-    "speech_mention:deep_false": "d46ab7b93a8010202e09129168c99394bed3ec1914d23847a9c7a9b7418934b6",
-    "speech_mention:deep_true": "a3bd7e3ffcdc91a03ea0016cd999be6f58c649add310be5dbeeba99416ee8552",
-    "sports:deep_false": "66bf19af75717e70c6e9914848d155c2314e684220c024efe47a42faec910d91",
-    "sports:deep_true": "b5664f285b1390718ad1cd7d5b2ebb6e434bd87ec23922f155d0b5103961d54c",
-    "weather:deep_false": "cf722d0988eb77f560b3bac1a13cc39c4952584e0030519fe5bd37417b06a997",
-    "weather:deep_true": "770f9b1214b7ef8f0051181cfaf9ffa707763f098c731697814a5cacf163c4d1",
+    # Re-pinned Aug 25 2026: constraints_base quota honesty + bankroll-scaled size.
+    "commodities:deep_false": "686906a239d32cfe65e5c2ac54d5f6bcf31412eb120c7a9ff8d470f598686b0a",
+    "commodities:deep_true": "25de5048ba0ceff9ed1b2c342e3fad7130a35442ee8d96f470154dff46e17c93",
+    "crypto:deep_false": "b581c7914f3aa3d2523e6810e165785931679e8e880ef7d6b6f89d7d1b2f51e3",
+    "crypto:deep_true": "4b5379e2fc7b1fce960af70b795fffdc3d07054703038b0ec3019b4bc7b33f15",
+    "generic:deep_false": "cb12632c72b55ffda32bce93a17c5fad936d12728d6d0ee44597223a42ccaede",
+    "generic:deep_true": "4fc48a94146057488badeebd5ddd702584f86f411108f14250b4ecf0ce8f29b6",
+    "music:deep_false": "89133cd3004e6e1c342f792370d56f7cbd372d2392dc52653f32919b2d4ae9ff",
+    "music:deep_true": "7ebc882290785a720d0fc016bb937c7ad4baef924adcc9b9dd80b748b4c0515e",
+    "politics:deep_false": "51acb2f73c32c9a579430d785df943f4e66635ee5174e8382903a3ac2d770329",
+    "politics:deep_true": "27a56ea208a54b3b7330a6e72211a3954b81e1d34306071d343597379afa0200",
+    "speech:deep_false": "dea50ec2e4dddd89c7e7926f1c6d567d6075f2f10aa06ff8aa851ad39491e35b",
+    "speech:deep_true": "d35755400a3c96bcc835f27e5e04e4d34d0b9ec45a11c74932cbf36727c70314",
+    "speech_mention:deep_false": "4a4d6db8e88e623068fa3c38ec7ebe75a709232f5c718d42cd7623e69f200d76",
+    "speech_mention:deep_true": "06d8a2e4518371a7e0c6eee8a1ba493d8037cadbcd1253e64d02fec0fc8636a9",
+    "sports:deep_false": "4fd086a2e374bc136b44589525a889706b8b3d732949b16a63a5f9dfee056b20",
+    "sports:deep_true": "c12ff1783020c7f23336d2096b449fe7750275400bdb97a748f4cc54880cbdb7",
+    "weather:deep_false": "df865f49c2069bb3006b9c8481d09a331d08c40e10704cf80983dc52a49ec0a5",
+    "weather:deep_true": "e9f2bbac993322e383fa51a730e825e539da52f154e5ab6e7e94eb6cbcb3bac1",
 }
 
 EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "abstain": "139411c8d6a39816135c7602c019ef257a8bc4cbe6de148d6accbf5ac05de84b",
     "base_rate_used": "37af25f50be73dbfece673e830b4583f4c3efeaca815fd0fffeeae0b1f68ac5a",
-    "bet_size_pct": "641a0cd6d5347f4b1e64447cfe665638765238c6505b67697d4b2e2750d80dc4",
+    "bet_size_pct": "877a104afcbf5c06877e2aaec867289d3c7f0b5ce65dab11f5efda2da8f12705",
     "cached_tokens": "17c3feb94f70c94185ca5932f3717f8808124cb104f6a59ca433d72b6970a180",
     "code_execution_used": "01fa8db002c20f439e072fdc6edbb98dd81754b999e3cd1ae3e763ddb84956a0",
     "completion_tokens": "787a3235dae3e9a5d93be988eef22495d944c55cda92b20ce5ac21669f97524a",
     "confidence": "04b522eca80f69fed0bcb20dfee763f111f267ef6693886f4e9f91f80405271c",
     "definitive_outcome_detected": "d5b6ac13a07ebfbbb084577dbf0de381318ac0ce8020bcdec550804cd5ddc51e",
     "edge_external": "f282db8b1f7a551cd97b4d59c60a19c4b081c6dc016a6a302b347376897862b6",
-    "edge_source": "b9776d71fbfe07f42694983863a13414ab896d3e57b689559af48d367499daee",
+    "edge_mechanism": "7e41188d8cee5efee2937ec4614d8e2cf301f1da7318db73014c2ba3dee98561",
+    "edge_source": "71c6ba27fd276fa50f55c8d27ff8852a0e92e85be1adddccff783cc7d67e3b4b",
     "evidence_basis": "f95084f2b5778968536af2848391348a95eac3b52869a7b065975a69dcbe5d0b",
     "evidence_floor_suppressed_reason": "68e10d20cd67474640a8ee43d46ff0c38013d9eb0de86e1b4deb395cc0aa1b9f",
     "evidence_quality": "476f825d5b7a15e377c7e8f53749beb0a39db6c6f965065a801ece51ff07b0b6",
     "evidence_quality_floor_applied": "6435a1f1d466bcbb12a753b06e319e98d3f3eef7812cf48a155eb5bb3f43427a",
-    "implied_prob_external": "bcee52dd7b4d7128147948661abcf9b8c71f040a12bfb61123b5f147ce544cdd",
+    "implied_prob_external": "14cb90cd70f2f2a0d60a5e505ff85fe32ab7577305891ea680c75eaf9372b8c4",
     "key_sources": "3aa0cc5c44f0f8a2ee451eeb25844c11c7d34426c2a2627651c814e5a4f38747",
     "likelihood_ratio": "665e8eb8c191397f65c92dc151a02aca85b7638f3c2c640751da9d89c69917d8",
     "my_prob": "fe7f5f44a678d62caa666e93054cf80e20cbf465c650ed67984deab8209f5a2f",
@@ -65,7 +66,7 @@ EXPECTED_SCHEMA_DESCRIPTION_HASHES = {
     "reasoning": "247e17a3b1e2943c08f8ca99cfe0422652a66c814b0b29443d3d57dd21639b7f",
     "reasoning_tokens": "6b47f605e7844debc22ecbf3b199a6f581dd2a72a1ebdaaca8c06f282f7122b9",
     "self_critique": "ab2d939c15dcfe7ab68bd6af225432bdedfd4596e126f76a74ac6afde5bb7bbe",
-    "should_trade": "215fad0b1f319687dc14c538d174d5c12dccdfb0dac72b7af305004f73f8c82c",
+    "should_trade": "bf0c9e7de6bf47aa43bda0103abf9462462438e8ce3b89ae93e503f1011a108e",
     "source_match_class": "8bca00a6b3b1f3d3edc79c9a23303957f8c3971dc39208283368c5b6c1f07efc",
     "uncertainty_note": "0c8956f9b9c3e8e792696a9e4f2ab4c901795cd01e5d9b963b1ae33093f7539f",
 }
@@ -185,6 +186,7 @@ def test_trade_decision_schema_includes_primary_source_url() -> None:
     assert "primary_source_url" in properties
     assert "probability_yes" in properties
     assert "self_critique" in properties
+    assert "edge_mechanism" in properties
 
 
 def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> None:
@@ -196,6 +198,9 @@ def test_system_prompt_contains_hallucination_and_direct_evidence_rules() -> Non
     assert "primary_source_url must be a real https:// link" in _SYSTEM_PROMPT_ANALYZE
     assert "Side consistency:" in _SYSTEM_PROMPT_ANALYZE
     assert "Fallback/no-external-odds trades must clear the configured fallback edge threshold" in _SYSTEM_PROMPT_ANALYZE
+    assert "never invent edge to fill a quota" in _SYSTEM_PROMPT_ANALYZE
+    assert "Scale bet_size_pct with edge magnitude" in _SYSTEM_PROMPT_ANALYZE
+    assert "A hunch, \"form,\" vibe, or unexplained directional view is edge_mechanism=none" in _SYSTEM_PROMPT_ANALYZE
 
 
 def test_system_prompt_contains_edge_honesty_and_field_hygiene() -> None:
@@ -205,6 +210,24 @@ def test_system_prompt_contains_edge_honesty_and_field_hygiene() -> None:
     assert "Absence vs quote" in _SYSTEM_PROMPT_ANALYZE
     assert "Aggregator discipline" in _SYSTEM_PROMPT_ANALYZE
     assert "Prefer null over a reflexive 1.0" in _SYSTEM_PROMPT_ANALYZE
+    assert "(10) Kalshi copy ban" in _SYSTEM_PROMPT_ANALYZE
+    assert "(9) Weather/numeric field repair" in _SYSTEM_PROMPT_ANALYZE
+    assert "implied_prob_external must not equal the Kalshi yes_price" in _SYSTEM_PROMPT_ANALYZE
+    assert "YES at or above 0.55 and any side under 0.20 are should_trade=false unless settlement_already_known" in _SYSTEM_PROMPT_ANALYZE
+    assert '"Not final yet" is remaining-session uncertainty, not edge_mechanism=none' in _SYSTEM_PROMPT_ANALYZE
+
+
+def test_analyze_market_prompt_loads_after_calibration_update() -> None:
+    from prompts.loader import load_prompt
+
+    system = load_prompt("system/analyze_market")
+    assert "win rate must beat the chosen-side Kalshi price" in system.lower() or (
+        "Win rate must beat the chosen-side Kalshi price" in system
+    )
+    assert "set my_prob to the Kalshi YES price" in system
+    assert "0.50 means no information advantage" not in system
+    commodities = load_prompt("user/category_hints/commodities")
+    assert "should_trade=false on YES" in commodities
 
 
 def test_weather_hint_blocks_mapclick_optimism() -> None:
@@ -214,6 +237,12 @@ def test_weather_hint_blocks_mapclick_optimism() -> None:
     assert "MapClick edge honesty" in weather
     assert "Same-day KXHIGHT" in weather
     assert "never invent my_prob far from the Kalshi price" in weather or "do not invent my_prob far from the Kalshi price" in weather
+    assert "PoP is implied_prob_external" in weather
+    assert "implied_prob_external" in weather
+    assert "morning-dry" in weather
+    assert "Never edge_source=none when an NWS URL is cited" in weather
+    assert "Current page is not CLI" in weather
+    assert "WFO hygiene" in weather
 
 
 def test_crypto_hint_blocks_absence_with_quote_url() -> None:
@@ -234,3 +263,29 @@ def test_deep_constraints_prefer_repair_before_abstain() -> None:
     assert "paste the real https primary_source_url" in joined
     assert "Only abstain after repair attempts" in joined
     assert "Edge honesty on deep pass" in joined
+    assert "this pass is field repair" in joined
+    assert "do not abstain solely because the prior pass stamped none" in joined
+
+
+def test_schema_edge_source_forbids_none_when_nws_or_quote_cited() -> None:
+    properties = TradeDecision.model_json_schema().get("properties", {})
+    edge_source = properties["edge_source"]["description"]
+    implied = properties["implied_prob_external"]["description"]
+    mechanism = properties["edge_mechanism"]["description"]
+    assert "NWS PoP and exchange/Tier-1 quotes are never none" in edge_source
+    assert "NWS PoP for rain markets is a valid implied_prob_external" in implied
+    assert "Do not use none when a live quote, CLI, or PoP URL is in the reasoning" in mechanism
+
+
+def test_entertainment_and_politics_hints_block_adjacent_news() -> None:
+    from prompts.loader import load_prompt
+
+    entertainment = load_prompt("user/category_hints/entertainment")
+    politics = load_prompt("user/category_hints/politics")
+    generic = load_prompt("user/category_hints/generic")
+    assert "settlement chart for the exact period" in entertainment
+    assert "leave primary_source_url empty if the chart is missing" in entertainment
+    assert "Exact RCP/poll bin markets" in politics
+    assert "Trading Economics" in generic
+    assert "must not be primary_source_url for KXINXU" in generic
+    assert "edge_mechanism=observed_vs_strike even before the official close" in generic

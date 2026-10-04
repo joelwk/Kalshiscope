@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Iterable
 
 from dotenv import load_dotenv
@@ -13,12 +14,21 @@ load_dotenv(override=True)
 XAI_WEB_SEARCH_ALLOWED_DOMAINS_LIMIT = 5
 XAI_X_SEARCH_ALLOWED_HANDLES_LIMIT = 10
 
+# Hard dollar floor applied to the bankroll-derived bet bounds so orders stay
+# above Kalshi's one-contract minimum and per-order fee rounding stays
+# efficient even at very small bankrolls.
+BET_ABSOLUTE_FLOOR_USDC = 1.0
+
 
 @dataclass(frozen=True)
 class Settings:
     # Risk controls - Conservative defaults for value betting
-    MIN_BET_USDC: float = 1.0
-    MAX_BET_USDC: float = 50.0
+    # Bet bounds are percentages of the live portfolio value (cash + positions)
+    # so per-trade sizing scales with the bankroll instead of requiring manual
+    # re-tuning of dollar limits. Effective dollars are derived once per cycle
+    # in main.py from the fetched balance (floored at BET_ABSOLUTE_FLOOR_USDC).
+    MIN_BET_PCT_OF_BANKROLL: float = 0.04
+    MAX_BET_PCT_OF_BANKROLL: float = 0.16
     MIN_CONFIDENCE: float = 0.62  # Raised to avoid low-confidence churn and improve calibration
     CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED: bool = True
     CONFIDENCE_GATE_MIN_EDGE: float = 0.08
@@ -147,7 +157,7 @@ class Settings:
     MARKET_CATEGORIES_BLOCKLIST: tuple[str, ...] = ()
     MARKET_FAMILY_BLOCKLIST: tuple[str, ...] = ()
     MARKET_TICKER_BLOCKLIST_PREFIXES: tuple[str, ...] = ()
-    SKIP_WEATHER_BIN_MARKETS: bool = False
+    SKIP_WEATHER_BIN_MARKETS: bool = True
     CRYPTO_BIN_MARKET_BLOCKLIST_ENABLED: bool = False
     MIN_VOLUME_24H: float = 10.0
     MIN_OPEN_INTEREST: float = 25.0
@@ -166,6 +176,8 @@ class Settings:
     XAI_API_KEY: str = ""
     GROK_MODEL: str = "grok-4-1-fast-reasoning"
     GROK_MODEL_DEEP: str = "grok-4.20-beta-0309-reasoning"
+    GROK_REASONING_EFFORT: str = "high"
+    GROK_REASONING_EFFORT_DEEP: str = "high"
     SEARCH_LOOKBACK_HOURS: int = 24
     SEARCH_ALLOWED_DOMAINS: tuple[str, ...] = (
         "espn.com",
@@ -469,7 +481,7 @@ class Settings:
     )
 
     # Kalshi
-    KALSHI_API_BASE_URL: str = "https://api.elections.kalshi.com/trade-api/v2"
+    KALSHI_API_BASE_URL: str = "https://external-api.kalshi.com/trade-api/v2"
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = "kalshi-scope.txt"
     KALSHI_SERVER_SIDE_FILTERS_ENABLED: bool = True
@@ -502,20 +514,43 @@ class Settings:
 
     # Execution
     DRY_RUN: bool = True
-    # Opt-in run-level forced-order target. When positive, ordinary submissions
-    # are suppressed until the plan completes: lock N distinct markets (prefer
-    # conf×EQ with event/family diversity; reuse cycle analysis when present),
-    # deep-research each slot, prefer replacing weak evidence, then force a
-    # sized order from the researched side. Ordinary score/edge/EQ gates are
-    # audit-only for these slots. Unexecutable markets (closed, price band,
-    # jurisdiction) and weak-evidence slots may be replaced up to
-    # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. A bounded run that never
-    # locks/completes the target fails loudly; a bounded run exits early once
-    # the target is complete.
+    # Opt-in run-level forced-order target. When positive, lock this cycle's
+    # highest positive-EV analyzed names (chosen-side edge × EQ × confidence,
+    # event/family diversity among +EV only), deep-research those slots, and
+    # order a sourced positive-EV side. Edges below GUARANTEED_MIN_EDGE (or
+    # GUARANTEED_PROXY_MIN_EDGE) receive only the bankroll-derived minimum bet;
+    # edges at or above the floor are Kelly-sized. Missing-research and non-+EV
+    # slots are replaced or abandoned, never forced. Ordinary score/edge/EQ
+    # gates are audit-only for forceable slots. Unexecutable markets (closed, price
+    # band, jurisdiction) may still be replaced from the catalog up to
+    # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. The refreshed submission
+    # price must remain positive-EV. In live mode a slot completes only after
+    # at least one contract fills; a resting order is reconciled without a
+    # duplicate submission. A bounded run that never opens every target
+    # position fails loudly; it exits early once the target is complete.
     GUARANTEED_ORDERS_N: int = 0
     # Cap on slot replacements per run (weak evidence + unexecutable markets).
     # Prevents infinite thrash when GUARANTEED_ORDERS_N > 0.
     GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS: int = 6
+    # Full-Kelly chosen-side edge floor (confidence − Kalshi implied) after
+    # calibration. A sourced positive edge below the applicable floor receives
+    # only the bankroll-derived minimum bet. Direct / settlement-aligned /
+    # weather / sports computed-odds / named-mechanism use this floor; unlabeled
+    # non-weather proxy uses GUARANTEED_PROXY_MIN_EDGE.
+    GUARANTEED_MIN_EDGE: float = 0.12
+    GUARANTEED_PROXY_MIN_EDGE: float = 0.15
+    # Per-family chosen-side edge floors, which replace both floors above for
+    # the families listed. Calibrated on 857 resolved trades: crypto returned
+    # +7% below a 0.12 edge and -13% above it, because a large claimed edge on
+    # a continuously repriced ladder is overconfidence rather than mispricing.
+    # Weather is the family the 0.12 default actually fits (+3% above, -16%
+    # below), so it stays on the default.
+    GUARANTEED_FAMILY_MIN_EDGE: tuple[tuple[str, float], ...] = (("crypto", 0.06),)
+    # Consecutive guaranteed-slot misses before a Kalshi series stops being
+    # locked at all. Continuously repriced ladders that repeatedly produce no
+    # forceable positive-EV side otherwise burn a deep dive per strike. A series
+    # that has ever filled is never excluded.
+    GUARANTEED_SERIES_MISS_LIMIT: int = 3
     ORDER_RECONCILIATION_ENABLED: bool = True
     POSITION_SYNC_ENABLED: bool = True
     POSITION_SYNC_INTERVAL_CYCLES: int = 3
@@ -585,13 +620,13 @@ class Settings:
     # value caps sports candidates per cycle to reserve room for other
     # families. 0 (default) preserves legacy behavior (no sports-specific cap).
     MAX_SPORTS_CANDIDATES_PER_CYCLE: int = 0
-    # While the exchange-confirmed sports jurisdiction hold flag is set (order
-    # 403 with the Michigan sports message), throttle sports analysis slots to
-    # this probe cadence so freed slots flow to executable families. Jul 2026
-    # evidence: 657 sports analyses in 5 days produced 8 orders, all
-    # jurisdiction-rejected. Probes keep sports analysis-eligible and the flag
-    # auto-clears when the exchange accepts a sports order. 0 disables the
-    # throttle entirely (legacy behavior).
+    # While an exchange-confirmed jurisdiction hold is set (order 403 with a
+    # residents-are-not-allowed message covering Sports and/or Elections and
+    # Entertainment), throttle each held family's analysis slots to this probe
+    # cadence so freed slots flow to executable families. The hold is parsed
+    # from the Kalshi body (Michigan sports-only, Nevada sports+elections+
+    # entertainment, etc.) and auto-clears per family when the exchange accepts
+    # an order in that family. 0 disables the throttle entirely.
     SPORTS_JURISDICTION_PROBE_CANDIDATES_PER_CYCLE: int = 1
     # Generic is the catch-all family (speech/album/photo-count/macro/etc). A
     # 15-cycle review found it dominated analysis (~48% of slots) yet was
@@ -606,7 +641,10 @@ class Settings:
     MAX_TRADES_PER_CYCLE: int = 4
     MAX_BETS_PER_EVENT: int = 2
     MAX_TRADES_PER_DAY: int = 6
-    MAX_DAILY_DRAWDOWN_USDC: float = 30.0
+    # Daily drawdown cap as a fraction of the day's starting portfolio value,
+    # so the protective stop scales with the bankroll. The dollar cap is
+    # derived per cycle in main.py; 0 disables the guard.
+    MAX_DAILY_DRAWDOWN_PCT: float = 0.20
     # When the daily drawdown cap is already exceeded, skip Grok analysis for
     # the remainder of the day and route candidates to research_queue with
     # tier=MONITOR_ONLY so we capture the conviction signal without spending
@@ -822,6 +860,9 @@ class Settings:
     HISTORICAL_SHORT_PREFIX_SCORE_PENALTY: float = 0.10
     HISTORICAL_TICKER_PREFIX_HARD_BLOCK_MIN_SAMPLES: int = 20
     HISTORICAL_TICKER_PREFIX_SHRINKAGE_ENABLED: bool = True
+    # Win-rate prior for prefix Bayesian shrinkage. When shrinkage is on,
+    # hard-deny / soft-demote compare the shrunk win rate (not the raw rate)
+    # against HISTORICAL_TICKER_PREFIX_WIN_RATE_CUTOFF.
     HISTORICAL_TICKER_PREFIX_PRIOR_WIN_RATE: float = 0.50
     HISTORICAL_TICKER_PREFIX_PRIOR_STRENGTH: float = 10.0
     HISTORICAL_TICKER_PREFIX_SHRUNK_PNL_CUTOFF: float = -0.50
@@ -1011,6 +1052,7 @@ class Settings:
     BORDERLINE_CRITIQUE_REFINEMENT_ENABLED: bool = True
     BORDERLINE_CRITIQUE_REFINEMENT_SCORE_BAND: float = 0.10
     CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED: bool = True
+    CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED: bool = True
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -1019,8 +1061,18 @@ class Settings:
     ENABLE_FILE_LOGGING: bool = True
     ENABLE_JSON_LOGGING: bool = True
     ENABLE_COLORED_LOGGING: bool = True
-    API_COST_INPUT_PER_1K_TOKENS_USD: float = 0.0
-    API_COST_OUTPUT_PER_1K_TOKENS_USD: float = 0.0
+    API_COST_INPUT_PER_1K_TOKENS_USD: float = 0.00125
+    API_COST_CACHED_INPUT_PER_1K_TOKENS_USD: float = 0.00020
+    API_COST_OUTPUT_PER_1K_TOKENS_USD: float = 0.00250
+    API_COST_LONG_CONTEXT_THRESHOLD_TOKENS: int = 200_000
+    API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD: float = 0.00250
+    API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD: float = 0.00040
+    API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD: float = 0.00500
+    API_COST_SERVER_TOOL_PER_CALL_USD: float = 0.005
+    API_COST_RESERVATION_PER_CALL_USD: float = 1.50
+    API_COST_PRICING_VERSION: str = "xai-grok-4.3-2026-09"
+    MAX_XAI_COST_PER_RUN_USD: float = 10.0
+    MAX_XAI_COST_PER_CYCLE_USD: float = 3.0
 
 
 BASE_REQUIRED_ENV_VARS = (
@@ -1092,6 +1144,29 @@ def _read_env_float_pair(
         return default
 
 
+def _read_env_family_float_map(
+    name: str,
+    default: tuple[tuple[str, float], ...],
+) -> tuple[tuple[str, float], ...]:
+    """Parse `family:value,family:value` into sorted, lower-cased pairs."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    parsed: dict[str, float] = {}
+    for entry in _split_csv(raw):
+        family, separator, value = entry.partition(":")
+        if not separator:
+            continue
+        family = family.strip().lower()
+        if not family:
+            continue
+        try:
+            parsed[family] = float(value.strip())
+        except ValueError:
+            continue
+    return tuple(sorted(parsed.items()))
+
+
 def _read_env_int_optional(name: str, default: int | None) -> int | None:
     raw = os.getenv(name)
     if not raw or raw.strip().lower() in {"", "none", "null"}:
@@ -1120,8 +1195,12 @@ def load_settings() -> Settings:
     )
 
     settings = Settings(
-        MIN_BET_USDC=_read_env_float("MIN_BET_USDC", Settings.MIN_BET_USDC),
-        MAX_BET_USDC=_read_env_float("MAX_BET_USDC", Settings.MAX_BET_USDC),
+        MIN_BET_PCT_OF_BANKROLL=_read_env_float(
+            "MIN_BET_PCT_OF_BANKROLL", Settings.MIN_BET_PCT_OF_BANKROLL
+        ),
+        MAX_BET_PCT_OF_BANKROLL=_read_env_float(
+            "MAX_BET_PCT_OF_BANKROLL", Settings.MAX_BET_PCT_OF_BANKROLL
+        ),
         MIN_CONFIDENCE=_read_env_float("MIN_CONFIDENCE", Settings.MIN_CONFIDENCE),
         CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED=_read_env_bool(
             "CONFIDENCE_GATE_EDGE_OVERRIDE_ENABLED",
@@ -1397,6 +1476,12 @@ def load_settings() -> Settings:
         XAI_API_KEY=_read_env_str("XAI_API_KEY", Settings.XAI_API_KEY),
         GROK_MODEL=normalized_model_initial,
         GROK_MODEL_DEEP=normalized_model_deep,
+        GROK_REASONING_EFFORT=_read_env_str(
+            "GROK_REASONING_EFFORT", Settings.GROK_REASONING_EFFORT
+        ),
+        GROK_REASONING_EFFORT_DEEP=_read_env_str(
+            "GROK_REASONING_EFFORT_DEEP", Settings.GROK_REASONING_EFFORT_DEEP
+        ),
         SEARCH_LOOKBACK_HOURS=_read_env_int(
             "SEARCH_LOOKBACK_HOURS", Settings.SEARCH_LOOKBACK_HOURS
         ),
@@ -1543,6 +1628,18 @@ def load_settings() -> Settings:
         GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS=_read_env_int(
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS",
             Settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS,
+        ),
+        GUARANTEED_MIN_EDGE=_read_env_float(
+            "GUARANTEED_MIN_EDGE", Settings.GUARANTEED_MIN_EDGE
+        ),
+        GUARANTEED_PROXY_MIN_EDGE=_read_env_float(
+            "GUARANTEED_PROXY_MIN_EDGE", Settings.GUARANTEED_PROXY_MIN_EDGE
+        ),
+        GUARANTEED_FAMILY_MIN_EDGE=_read_env_family_float_map(
+            "GUARANTEED_FAMILY_MIN_EDGE", Settings.GUARANTEED_FAMILY_MIN_EDGE
+        ),
+        GUARANTEED_SERIES_MISS_LIMIT=_read_env_int(
+            "GUARANTEED_SERIES_MISS_LIMIT", Settings.GUARANTEED_SERIES_MISS_LIMIT
         ),
         ORDER_RECONCILIATION_ENABLED=_read_env_bool(
             "ORDER_RECONCILIATION_ENABLED",
@@ -1703,9 +1800,9 @@ def load_settings() -> Settings:
             "MAX_TRADES_PER_DAY",
             Settings.MAX_TRADES_PER_DAY,
         ),
-        MAX_DAILY_DRAWDOWN_USDC=_read_env_float(
-            "MAX_DAILY_DRAWDOWN_USDC",
-            Settings.MAX_DAILY_DRAWDOWN_USDC,
+        MAX_DAILY_DRAWDOWN_PCT=_read_env_float(
+            "MAX_DAILY_DRAWDOWN_PCT",
+            Settings.MAX_DAILY_DRAWDOWN_PCT,
         ),
         DAILY_DRAWDOWN_PREFLIGHT_ENABLED=_read_env_bool(
             "DAILY_DRAWDOWN_PREFLIGHT_ENABLED",
@@ -2682,6 +2779,10 @@ def load_settings() -> Settings:
             "CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED",
             Settings.CODE_EXECUTION_FOR_DEEP_ANALYSIS_ENABLED,
         ),
+        CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED=_read_env_bool(
+            "CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED",
+            Settings.CODE_EXECUTION_FOR_INITIAL_NUMERIC_ENABLED,
+        ),
         LOG_LEVEL=_read_env_str("LOG_LEVEL", Settings.LOG_LEVEL),
         LOG_FILE_LEVEL=_read_env_str("LOG_FILE_LEVEL", Settings.LOG_FILE_LEVEL),
         LOG_DIR=_read_env_str("LOG_DIR", Settings.LOG_DIR),
@@ -2698,9 +2799,49 @@ def load_settings() -> Settings:
             "API_COST_INPUT_PER_1K_TOKENS_USD",
             Settings.API_COST_INPUT_PER_1K_TOKENS_USD,
         ),
+        API_COST_CACHED_INPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_CACHED_INPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_CACHED_INPUT_PER_1K_TOKENS_USD,
+        ),
         API_COST_OUTPUT_PER_1K_TOKENS_USD=_read_env_float(
             "API_COST_OUTPUT_PER_1K_TOKENS_USD",
             Settings.API_COST_OUTPUT_PER_1K_TOKENS_USD,
+        ),
+        API_COST_LONG_CONTEXT_THRESHOLD_TOKENS=_read_env_int(
+            "API_COST_LONG_CONTEXT_THRESHOLD_TOKENS",
+            Settings.API_COST_LONG_CONTEXT_THRESHOLD_TOKENS,
+        ),
+        API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD,
+        ),
+        API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD,
+        ),
+        API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD=_read_env_float(
+            "API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD",
+            Settings.API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD,
+        ),
+        API_COST_SERVER_TOOL_PER_CALL_USD=_read_env_float(
+            "API_COST_SERVER_TOOL_PER_CALL_USD",
+            Settings.API_COST_SERVER_TOOL_PER_CALL_USD,
+        ),
+        API_COST_RESERVATION_PER_CALL_USD=_read_env_float(
+            "API_COST_RESERVATION_PER_CALL_USD",
+            Settings.API_COST_RESERVATION_PER_CALL_USD,
+        ),
+        API_COST_PRICING_VERSION=_read_env_str(
+            "API_COST_PRICING_VERSION",
+            Settings.API_COST_PRICING_VERSION,
+        ),
+        MAX_XAI_COST_PER_RUN_USD=_read_env_float(
+            "MAX_XAI_COST_PER_RUN_USD",
+            Settings.MAX_XAI_COST_PER_RUN_USD,
+        ),
+        MAX_XAI_COST_PER_CYCLE_USD=_read_env_float(
+            "MAX_XAI_COST_PER_CYCLE_USD",
+            Settings.MAX_XAI_COST_PER_CYCLE_USD,
         ),
     )
     strategy = settings.OPPOSITE_OUTCOME_STRATEGY.strip().lower()
@@ -2735,6 +2876,40 @@ def load_settings() -> Settings:
             "GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS must be greater "
             "than or equal to zero"
         )
+    for cost_field in (
+        "API_COST_INPUT_PER_1K_TOKENS_USD",
+        "API_COST_CACHED_INPUT_PER_1K_TOKENS_USD",
+        "API_COST_OUTPUT_PER_1K_TOKENS_USD",
+        "API_COST_LONG_CONTEXT_THRESHOLD_TOKENS",
+        "API_COST_LONG_CONTEXT_INPUT_PER_1K_TOKENS_USD",
+        "API_COST_LONG_CONTEXT_CACHED_INPUT_PER_1K_TOKENS_USD",
+        "API_COST_LONG_CONTEXT_OUTPUT_PER_1K_TOKENS_USD",
+        "API_COST_SERVER_TOOL_PER_CALL_USD",
+        "API_COST_RESERVATION_PER_CALL_USD",
+        "MAX_XAI_COST_PER_RUN_USD",
+        "MAX_XAI_COST_PER_CYCLE_USD",
+    ):
+        if float(getattr(settings, cost_field)) < 0:
+            raise ValueError(f"{cost_field} must be greater than or equal to zero")
+    if settings.GUARANTEED_MIN_EDGE < 0:
+        raise ValueError("GUARANTEED_MIN_EDGE must be greater than or equal to zero")
+    if settings.GUARANTEED_PROXY_MIN_EDGE < 0:
+        raise ValueError(
+            "GUARANTEED_PROXY_MIN_EDGE must be greater than or equal to zero"
+        )
+    if settings.GUARANTEED_PROXY_MIN_EDGE < settings.GUARANTEED_MIN_EDGE:
+        raise ValueError(
+            "GUARANTEED_PROXY_MIN_EDGE must be greater than or equal to "
+            "GUARANTEED_MIN_EDGE"
+        )
+    for family, min_edge in settings.GUARANTEED_FAMILY_MIN_EDGE:
+        if min_edge <= 0:
+            raise ValueError(
+                "GUARANTEED_FAMILY_MIN_EDGE floors must be greater than zero "
+                f"(got {min_edge} for {family!r})"
+            )
+    if settings.GUARANTEED_SERIES_MISS_LIMIT <= 0:
+        raise ValueError("GUARANTEED_SERIES_MISS_LIMIT must be greater than zero")
     if settings.POSITION_SYNC_INTERVAL_CYCLES < 0:
         raise ValueError(
             "POSITION_SYNC_INTERVAL_CYCLES must be greater than or equal to zero"

@@ -15,6 +15,21 @@ logger = get_logger(__name__)
 _DEFAULT_CREATE_CHAT_MAX_ATTEMPTS = 3
 _DEFAULT_CREATE_CHAT_BACKOFF_SECONDS = 1.0
 _MAX_CREATE_CHAT_BACKOFF_SECONDS = 4.0
+_INLINE_CITATIONS_INCLUDE = ["inline_citations"]
+# grok-4.6 on "auto" answered ~85% of structured analyses with zero searches
+# and a "searching now" placeholder; every analysis needs at least one search.
+_ANALYSIS_TOOL_CHOICE = "required"
+
+
+def _is_reasoning_effort_rejected(exc: Exception) -> bool:
+    """True when xAI refused the requested reasoning_effort.
+
+    A model may reject it as unimplemented, or reject the specific value as an
+    invalid enum (grok-4.3 accepts only ``('low', 'high')``). Either way the
+    analysis must proceed on the model default instead of failing.
+    """
+    message = str(exc).lower()
+    return "unimplemented" in message or "invalid reasoning effort" in message
 
 
 class XAIProvider:
@@ -58,6 +73,9 @@ class XAIProvider:
         enable_code_execution: bool = False,
         timeout_seconds: float | None = None,
         temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        include_inline_citations: bool = True,
+        max_turns: int | None = None,
     ):
         client = self._client_for_timeout(timeout_seconds)
         # Agent Tools API: the model drives web/x search via these tools. xAI's
@@ -67,28 +85,55 @@ class XAIProvider:
             web_search(
                 allowed_domains=config.allowed_domains,
                 enable_image_understanding=enable_multimedia,
-            ),
-            x_search(
-                from_date=config.from_date,
-                to_date=config.to_date,
-                allowed_x_handles=config.allowed_x_handles,
-                enable_image_understanding=enable_multimedia,
-                enable_video_understanding=enable_multimedia,
-            ),
+            )
         ]
+        if config.profile_name in {"speech", "social", "live_news", "politics"}:
+            tools.append(
+                x_search(
+                    from_date=config.from_date,
+                    to_date=config.to_date,
+                    allowed_x_handles=config.allowed_x_handles,
+                    enable_image_understanding=enable_multimedia,
+                    enable_video_understanding=enable_multimedia,
+                )
+            )
         if enable_code_execution:
             tools.append(code_execution())
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "response_format": response_format,
+            "temperature": temperature,
+            "tools": tools,
+            "tool_choice": _ANALYSIS_TOOL_CHOICE,
+        }
+        if include_inline_citations:
+            create_kwargs["include"] = list(_INLINE_CITATIONS_INCLUDE)
+        if reasoning_effort:
+            create_kwargs["reasoning_effort"] = reasoning_effort
+        if max_turns is not None and max_turns > 0:
+            create_kwargs["max_turns"] = int(max_turns)
         for attempt in range(1, self.create_chat_max_attempts + 1):
             try:
-                return client.chat.create(
-                    model=model,
-                    response_format=response_format,
-                    temperature=temperature,
-                    tools=tools,
-                )
-            except Exception:
+                return client.chat.create(**create_kwargs)
+            except Exception as exc:
+                if (
+                    create_kwargs.get("reasoning_effort")
+                    and _is_reasoning_effort_rejected(exc)
+                ):
+                    logger.warning(
+                        "xAI rejected reasoning_effort=%s; retrying without it: "
+                        "model=%s error=%s",
+                        create_kwargs.get("reasoning_effort"),
+                        model,
+                        exc,
+                    )
+                    create_kwargs.pop("reasoning_effort", None)
+                    try:
+                        return client.chat.create(**create_kwargs)
+                    except Exception as retry_exc:
+                        exc = retry_exc
                 if attempt >= self.create_chat_max_attempts:
-                    raise
+                    raise exc
                 backoff_seconds = min(
                     self.create_chat_backoff_seconds * (2 ** (attempt - 1)),
                     _MAX_CREATE_CHAT_BACKOFF_SECONDS,
