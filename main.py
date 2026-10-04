@@ -147,11 +147,16 @@ _GUARANTEED_SCREEN_CANDIDATES_PER_SLOT = 4
 # Uncapped, it ran ~17 search calls and ~390k prompt tokens, costing more than
 # the deep dive itself and limiting a $25 run to about seven markets.
 _GUARANTEED_SCREEN_MAX_TURNS = 3
-# Normal-mode evidence rules that a guaranteed slot may override, but only at
-# the cycle minimum bet: forecast-only weather lost ~$90 over 86 trades in
-# Sep 2026 (28% win). The sub-20c chosen-side price floor stays a hard block.
+# Ordinary edge/expectancy rules that a guaranteed slot may override, but only
+# at the cycle minimum bet. Absence-only and non-positive-EV decisions remain
+# hard blocks.
 _GUARANTEED_MIN_SIZE_GATE_REASONS = frozenset(
-    {"weather_not_observed", "commodity_yes_blocked"}
+    {
+        "chosen_side_price_below_expectancy_floor",
+        "commodity_yes_blocked",
+        "guaranteed_order_edge_below_min",
+        "weather_not_observed",
+    }
 )
 # One market family may hold at most this many guaranteed slots. Requiring a
 # distinct family per slot spent four of every five slots on families that have
@@ -4656,6 +4661,8 @@ class GuaranteedOrderSlot:
     submission_attempts: int = 0
     last_error: str | None = None
     order_id: str | None = None
+    order_status: str | None = None
+    filled_shares: float = 0.0
     needs_replacement: bool = False
     replacement_count: int = 0
     replacement_reason: str | None = None
@@ -4786,6 +4793,8 @@ class GuaranteedOrderPlan:
                     "submission_attempts": slot.submission_attempts,
                     "last_error": slot.last_error,
                     "order_id": slot.order_id,
+                    "order_status": slot.order_status,
+                    "filled_shares": slot.filled_shares,
                     "needs_replacement": slot.needs_replacement,
                     "replacement_count": slot.replacement_count,
                     "replacement_reason": slot.replacement_reason,
@@ -4953,6 +4962,11 @@ def _apply_guaranteed_plan_lifecycle_action(
 def _guaranteed_run_outcome(plan: GuaranteedOrderPlan) -> str:
     if plan.is_complete:
         return "completed"
+    if any(
+        slot.order_id and not slot.completed
+        for slot in plan.slots
+    ):
+        return "awaiting_fill"
     if any(
         slot.submission_attempts > 0 and not slot.completed
         for slot in plan.slots
@@ -5358,7 +5372,12 @@ def _guaranteed_order_reject_reason(
     market: Market,
     settings: Settings,
 ) -> str | None:
-    """Audit label when a slot must not be forced (gap, non-positive, or thin edge)."""
+    """Audit label when a slot cannot safely satisfy the hard-N contract.
+
+    Missing research and non-positive chosen-side EV remain hard blocks. A
+    positive edge below the configured full-Kelly floor is handled by
+    `_guaranteed_min_size_reason` instead of discarding the researched slot.
+    """
     gap_reason = _guaranteed_order_research_gap_reason(decision, settings)
     if gap_reason is not None:
         return gap_reason
@@ -5367,9 +5386,6 @@ def _guaranteed_order_reject_reason(
         return "guaranteed_order_missing_implied_probability"
     if edge <= 0.0:
         return "guaranteed_order_non_positive_edge"
-    min_edge = _guaranteed_order_min_edge(decision, market, settings)
-    if edge < min_edge - 1e-9:
-        return "guaranteed_order_edge_below_min"
     expectancy_reason = _guaranteed_expectancy_reason(decision, market, settings)
     if expectancy_reason not in (None, *_GUARANTEED_MIN_SIZE_GATE_REASONS):
         return expectancy_reason
@@ -5392,7 +5408,12 @@ def _guaranteed_min_size_reason(
     market: Market,
     settings: Settings,
 ) -> str | None:
-    """Normal-mode evidence rule that caps a forceable slot at the minimum bet."""
+    """Return why a positive-EV guaranteed slot receives only the minimum bet."""
+    edge = _guaranteed_chosen_side_edge(decision, market)
+    if edge is not None:
+        min_edge = _guaranteed_order_min_edge(decision, market, settings)
+        if 0.0 < edge < min_edge - 1e-9:
+            return "guaranteed_order_edge_below_min"
     reason = _guaranteed_expectancy_reason(decision, market, settings)
     return reason if reason in _GUARANTEED_MIN_SIZE_GATE_REASONS else None
 
@@ -5859,6 +5880,8 @@ def _lock_guaranteed_order_markets(
         slot.submission_attempts = 0
         slot.last_error = None
         slot.order_id = None
+        slot.order_status = None
+        slot.filled_shares = 0.0
         slot.needs_replacement = False
         slot.replacement_reason = None
         slot.force_despite_research_gap = False
@@ -5926,6 +5949,135 @@ def _abandon_guaranteed_order_slot(
     slot.last_error = reason
 
 
+def _record_guaranteed_series_outcome(
+    *,
+    plan: GuaranteedOrderPlan,
+    slot: GuaranteedOrderSlot,
+    state_manager: MarketStateManager,
+    outcome: str,
+    reject_reason: str | None = None,
+    series_outcomes: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Persist one terminal verdict for a guaranteed-order series."""
+    series_ticker = _market_series_ticker(slot.market)
+    if not series_ticker:
+        return
+    plan.series_attempt_counts[series_ticker] = (
+        plan.series_attempt_counts.get(series_ticker, 0) + 1
+    )
+    if outcome == "missed":
+        plan.retired_series_tickers.add(series_ticker)
+    try:
+        state_manager.record_guaranteed_series_attempt(
+            series_ticker,
+            outcome=outcome,
+            reject_reason=reject_reason,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist guaranteed-order series outcome: series=%s error=%s",
+            series_ticker,
+            exc,
+            data={"series_ticker": series_ticker, "error": str(exc)},
+        )
+        return
+    if series_outcomes is None:
+        return
+    record = series_outcomes.setdefault(
+        series_ticker,
+        {"attempts": 0, "fills": 0, "consecutive_misses": 0, "fill_rate": 0.0},
+    )
+    record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+    if outcome == "filled":
+        record["fills"] = int(record.get("fills", 0) or 0) + 1
+    if outcome == "missed":
+        record["consecutive_misses"] = (
+            int(record.get("consecutive_misses", 0) or 0) + 1
+        )
+        record["last_reject_reason"] = reject_reason
+    else:
+        record["consecutive_misses"] = 0
+    record["fill_rate"] = record["fills"] / record["attempts"]
+
+
+def _reconcile_guaranteed_order_plan_positions(
+    *,
+    plan: GuaranteedOrderPlan,
+    state_manager: MarketStateManager,
+) -> dict[str, int]:
+    """Make live plan completion follow fills instead of accepted submissions."""
+    metrics = {
+        "newly_completed": 0,
+        "awaiting_fill": 0,
+        "terminal_unfilled": 0,
+        "legacy_submissions_reopened": 0,
+        "missing_order_state": 0,
+    }
+    active_statuses = {
+        "accepted",
+        "open",
+        "partially_filled",
+        "partial",
+        "pending",
+        "resting",
+    }
+    terminal_statuses = {
+        "canceled",
+        "cancelled",
+        "expired",
+        "filled",
+        "rejected",
+    }
+    changed = False
+    for slot in plan.slots:
+        if slot.abandoned or not slot.order_id:
+            continue
+        order = state_manager.get_pending_order(slot.order_id)
+        if order is None:
+            metrics["missing_order_state"] += 1
+            continue
+        status = str(order.get("status") or "unknown").strip().lower()
+        filled_shares = max(0.0, float(order.get("filled_shares") or 0.0))
+        if slot.order_status != status or abs(slot.filled_shares - filled_shares) > 1e-9:
+            slot.order_status = status
+            slot.filled_shares = filled_shares
+            changed = True
+        if filled_shares > 0.0:
+            if not slot.completed:
+                slot.completed = True
+                slot.last_error = None
+                metrics["newly_completed"] += 1
+                changed = True
+                _record_guaranteed_series_outcome(
+                    plan=plan,
+                    slot=slot,
+                    state_manager=state_manager,
+                    outcome="filled",
+                )
+            continue
+        if status in active_statuses:
+            metrics["awaiting_fill"] += 1
+            if slot.completed:
+                slot.completed = False
+                metrics["legacy_submissions_reopened"] += 1
+                changed = True
+            continue
+        if status in terminal_statuses or status == "canceled_partially_filled":
+            if slot.completed:
+                slot.completed = False
+                metrics["legacy_submissions_reopened"] += 1
+            _mark_guaranteed_order_slot_for_replacement(
+                plan,
+                slot,
+                reason=f"guaranteed_order_{status}_unfilled",
+            )
+            metrics["terminal_unfilled"] += 1
+            changed = True
+    if changed:
+        _persist_guaranteed_order_plan(state_manager, plan)
+    return metrics
+
+
 def _guaranteed_order_research_gap_reason(
     decision: TradeDecision,
     settings: Settings,
@@ -5956,8 +6108,9 @@ def _guaranteed_order_sized_amount_usdc(
 
     Stake = clip(max_bet * kelly_bet_pct, min_bet, max_bet) when Kelly > 0.
     min_bet / max_bet are already portfolio * MIN/MAX_BET_PCT_OF_BANKROLL for
-    the cycle (floored at BET_ABSOLUTE_FLOOR_USDC). Always uses fractional
-    Kelly on this path; zero Kelly is not replaced with min_bet to fill a quota.
+    the cycle (floored at BET_ABSOLUTE_FLOOR_USDC). Positive-EV slots below the
+    configured edge floor are promoted to the minimum bet by the caller; this
+    helper retains the configured floor so they cannot receive full Kelly size.
     """
     min_bet = max(0.0, float(min_bet_usdc))
     max_bet = max(0.0, float(max_bet_usdc))
@@ -6089,13 +6242,13 @@ def _attempt_guaranteed_order_slot(
 ) -> GuaranteedOrderAttemptResult:
     """Research a locked slot intensely and force only a positive-EV researched side.
 
-    When deep research is a research gap or fails the chosen-side edge bar,
-    return status=research_gap_replaceable so the phase can swap, defer to
-    the next cycle, or abandon on replace cap. Never force a non-positive-EV
-    slot to fill the quota. Seeded first-pass decisions that already clear
-    the +EV bar skip a redundant deep call, and a first pass sitting further
-    than a plausible revision below the bar skips it too. Catalog fills
-    otherwise do initial (no self-consistency) plus deep.
+    When deep research has no usable side or has non-positive chosen-side EV,
+    return status=research_gap_replaceable so the phase can swap, defer to the
+    next cycle, or abandon on replace cap. A sourced positive-EV side below an
+    ordinary edge/expectancy floor is submitted at the cycle minimum bet rather
+    than discarded. Seeded first-pass decisions that already clear the full
+    edge bar skip a redundant deep call; catalog fills otherwise do initial
+    (no self-consistency) plus deep.
     """
     intense_research_performed = False
     sizing_audit: dict[str, Any] = {}
@@ -6152,22 +6305,25 @@ def _attempt_guaranteed_order_slot(
             min_bet_usdc=min_bet_usdc,
             max_bet_usdc=max_bet_usdc,
         )
-        if amount_usdc <= 0:
-            return _replaceable_result(
-                researched,
-                "guaranteed_order_kelly_zero",
-                research_done=intense_research_performed,
-            )
         overridden_rule = _guaranteed_min_size_reason(
             researched, research_market, settings
         )
         if overridden_rule is not None:
-            amount_usdc = min(amount_usdc, max(0.0, float(min_bet_usdc)))
+            amount_usdc = min(
+                max(0.0, float(min_bet_usdc)),
+                max(0.0, float(max_bet_usdc)),
+            )
             sizing_audit.update(
                 {
                     "guaranteed_order_sizing_mode": "min_size_normal_gate_override",
                     "guaranteed_order_normal_gate_overridden": overridden_rule,
                 }
+            )
+        if amount_usdc <= 0:
+            return _replaceable_result(
+                researched,
+                "guaranteed_order_kelly_zero",
+                research_done=intense_research_performed,
             )
         return _forced_execution_decision(
             researched,
@@ -6218,6 +6374,10 @@ def _attempt_guaranteed_order_slot(
             seed_clears_bar = (
                 decision is not None
                 and _guaranteed_order_reject_reason(
+                    initial_decision, research_market, settings
+                )
+                is None
+                and _guaranteed_min_size_reason(
                     initial_decision, research_market, settings
                 )
                 is None
@@ -6274,6 +6434,7 @@ def _attempt_guaranteed_order_slot(
         decision = forced
         slot.decision = decision
 
+    researched_entry_price = _get_outcome_entry_price(slot.market, decision.outcome)
     try:
         execution_snapshot = _load_execution_market_snapshot(
             market=slot.market,
@@ -6289,7 +6450,40 @@ def _attempt_guaranteed_order_slot(
             raise execution_snapshot.refresh_error
         if _is_market_resolved_or_closed(active_market):
             raise MarketClosedError(f"Guaranteed market {active_market.id} is closed")
+        refreshed_reject_reason = _guaranteed_order_reject_reason(
+            decision,
+            active_market,
+            settings,
+        )
+        if refreshed_reject_reason is not None:
+            refreshed_reject = _replaceable_result(
+                decision,
+                "guaranteed_order_refresh_"
+                f"{refreshed_reject_reason.removeprefix('guaranteed_order_')}",
+                research_done=intense_research_performed,
+            )
+            refreshed_reject.sizing_audit.update(
+                {
+                    "guaranteed_order_research_entry_price": researched_entry_price,
+                    "guaranteed_order_refreshed_entry_price": (
+                        _get_outcome_entry_price(active_market, decision.outcome)
+                    ),
+                }
+            )
+            return refreshed_reject
+        refreshed_forced = _force_from_research(decision, active_market)
+        if isinstance(refreshed_forced, GuaranteedOrderAttemptResult):
+            return refreshed_forced
+        decision = refreshed_forced
+        slot.decision = decision
+        slot.market = active_market
         entry_price = _get_outcome_entry_price(active_market, decision.outcome)
+        sizing_audit.update(
+            {
+                "guaranteed_order_research_entry_price": researched_entry_price,
+                "guaranteed_order_refreshed_entry_price": entry_price,
+            }
+        )
         if entry_price is None or not (
             settings.ORDER_SUBMISSION_MIN_PRICE
             <= entry_price
@@ -6403,6 +6597,12 @@ def _run_guaranteed_order_phase(
     seed_decisions_by_market_id: dict[str, TradeDecision] | None = None,
 ) -> GuaranteedOrderCycleResult:
     result = GuaranteedOrderCycleResult()
+    if not settings.DRY_RUN:
+        plan_reconciliation = _reconcile_guaranteed_order_plan_positions(
+            plan=plan,
+            state_manager=state_manager,
+        )
+        result.completed += plan_reconciliation["newly_completed"]
     if plan.write_circuit_open:
         return result
     excluded_market_families: set[str] = set()
@@ -6415,6 +6615,7 @@ def _run_guaranteed_order_phase(
             if (
                 not slot.completed
                 and not slot.needs_replacement
+                and not slot.order_id
                 and _market_hits_jurisdiction_hold(slot.market, excluded_market_families)
             ):
                 slots_retired_for_hold.append(slot.slot_number)
@@ -6547,9 +6748,31 @@ def _run_guaranteed_order_phase(
     pending_slots = [
         slot
         for slot in plan.slots
-        if not slot.completed and not slot.abandoned and not slot.needs_replacement
+        if (
+            not slot.completed
+            and not slot.abandoned
+            and not slot.needs_replacement
+            and not slot.order_id
+        )
     ]
     if not pending_slots:
+        awaiting_fill = sum(
+            1
+            for slot in plan.slots
+            if not slot.completed and not slot.abandoned and slot.order_id
+        )
+        if awaiting_fill:
+            logger.info(
+                "Guaranteed-order plan awaiting exchange fills: positions=%d/%d "
+                "resting_slots=%d",
+                plan.completed_count,
+                plan.target,
+                awaiting_fill,
+                data={
+                    **plan.summary(),
+                    "guaranteed_orders_awaiting_fill": awaiting_fill,
+                },
+            )
         if not plan.is_fully_locked:
             logger.error(
                 "Guaranteed-order plan is waiting for enough eligible markets: "
@@ -6579,55 +6802,6 @@ def _run_guaranteed_order_phase(
     max_gap_replacements = int(
         settings.GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS
     )
-
-    def _record_series_outcome(
-        slot: GuaranteedOrderSlot,
-        *,
-        outcome: str,
-        reject_reason: str | None = None,
-    ) -> None:
-        """Persist the series verdict and reflect it in this cycle's ranking.
-
-        A miss also retires the series for the rest of this plan, so the next
-        strike of the same ladder cannot consume another pair of paid calls.
-        """
-        series_ticker = _market_series_ticker(slot.market)
-        if not series_ticker:
-            return
-        plan.series_attempt_counts[series_ticker] = (
-            plan.series_attempt_counts.get(series_ticker, 0) + 1
-        )
-        if outcome == "missed":
-            plan.retired_series_tickers.add(series_ticker)
-        try:
-            state_manager.record_guaranteed_series_attempt(
-                series_ticker,
-                outcome=outcome,
-                reject_reason=reject_reason,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to persist guaranteed-order series outcome: series=%s error=%s",
-                series_ticker,
-                exc,
-                data={"series_ticker": series_ticker, "error": str(exc)},
-            )
-            return
-        record = series_outcomes.setdefault(
-            series_ticker,
-            {"attempts": 0, "fills": 0, "consecutive_misses": 0, "fill_rate": 0.0},
-        )
-        record["attempts"] = int(record.get("attempts", 0) or 0) + 1
-        if outcome == "filled":
-            record["fills"] = int(record.get("fills", 0) or 0) + 1
-        if outcome == "missed":
-            record["consecutive_misses"] = (
-                int(record.get("consecutive_misses", 0) or 0) + 1
-            )
-            record["last_reject_reason"] = reject_reason
-        else:
-            record["consecutive_misses"] = 0
-        record["fill_rate"] = record["fills"] / record["attempts"]
 
     def _replace_or_defer_slot(
         slot: GuaranteedOrderSlot,
@@ -6949,10 +7123,13 @@ def _run_guaranteed_order_phase(
             replacement_reason = (
                 str(attempt.error or "").strip() or "guaranteed_order_research_gap"
             )
-            _record_series_outcome(
-                slot,
+            _record_guaranteed_series_outcome(
+                plan=plan,
+                slot=slot,
+                state_manager=state_manager,
                 outcome="missed",
                 reject_reason=replacement_reason,
+                series_outcomes=series_outcomes,
             )
             _replace_or_defer_slot(
                 slot,
@@ -7061,6 +7238,7 @@ def _run_guaranteed_order_phase(
                         pending_slot is not slot
                         and not pending_slot.completed
                         and not pending_slot.needs_replacement
+                        and not pending_slot.order_id
                         and _market_hits_jurisdiction_hold(
                             pending_slot.market, excluded_market_families
                         )
@@ -7191,17 +7369,20 @@ def _run_guaranteed_order_phase(
                 )
             continue
 
-        slot.completed = True
-        slot.last_error = None
-        result.completed += 1
-        _persist_guaranteed_order_plan(state_manager, plan)
         # A dry run proves the series can produce a forceable +EV side, but it
         # never reached the exchange, so it must not earn a proven-fill record.
-        _record_series_outcome(
-            slot,
-            outcome="cleared" if attempt.status == "dry_run" else "filled",
-        )
         if attempt.status == "dry_run":
+            slot.completed = True
+            slot.last_error = None
+            result.completed += 1
+            _record_guaranteed_series_outcome(
+                plan=plan,
+                slot=slot,
+                state_manager=state_manager,
+                outcome="cleared",
+                series_outcomes=series_outcomes,
+            )
+            _persist_guaranteed_order_plan(state_manager, plan)
             result.usd_submitted += attempt.amount_usdc
             _record_family_attempt(
                 family,
@@ -7236,11 +7417,23 @@ def _run_guaranteed_order_phase(
         response = attempt.order_response
         lifecycle = attempt.order_lifecycle
         if response is None or lifecycle is None:
-            slot.completed = False
-            result.completed -= 1
             slot.last_error = "missing submitted-order response"
             continue
         slot.order_id = response.id
+        slot.order_status = lifecycle.status
+        slot.filled_shares = lifecycle.fill_count
+        position_opened = lifecycle.fill_count > 0.0
+        slot.completed = position_opened
+        slot.last_error = None
+        if position_opened:
+            result.completed += 1
+            _record_guaranteed_series_outcome(
+                plan=plan,
+                slot=slot,
+                state_manager=state_manager,
+                outcome="filled",
+                series_outcomes=series_outcomes,
+            )
         result.usd_submitted += attempt.amount_usdc
         deployed_usdc = float(
             (attempt.order_persistence or {}).get("recorded_fill_notional_usdc", 0.0)
@@ -7254,6 +7447,11 @@ def _run_guaranteed_order_phase(
             result.resting_unfilled += 1
         elif lifecycle.status in {"cancelled", "canceled"} and lifecycle.fill_count <= 0:
             result.canceled_unfilled += 1
+            _mark_guaranteed_order_slot_for_replacement(
+                plan,
+                slot,
+                reason="guaranteed_order_canceled_unfilled",
+            )
         result.usd_deployed += deployed_usdc
         _record_family_attempt(
             family,
@@ -7269,10 +7467,15 @@ def _run_guaranteed_order_phase(
             order=_order_response_receipt(response),
             execution_audit=_build_execution_audit(
                 decision_phase="guaranteed_order_submission",
-                decision_terminal=True,
+                decision_terminal=position_opened,
                 final_action="order_attempt",
-                final_reason="order_submitted",
-                guaranteed_order_completed=True,
+                final_reason=(
+                    "guaranteed_order_position_opened"
+                    if position_opened
+                    else "guaranteed_order_awaiting_fill"
+                ),
+                guaranteed_order_completed=position_opened,
+                guaranteed_order_retry_pending=not position_opened,
                 order_id=response.id,
                 order_status=response.status,
                 order_fully_filled=lifecycle.fully_filled,
@@ -7283,10 +7486,17 @@ def _run_guaranteed_order_phase(
                 **audit,
             ),
         )
-        _record_terminal_outcome(state_manager, slot.market_id, "order_submitted")
+        if position_opened:
+            _record_terminal_outcome(
+                state_manager,
+                slot.market_id,
+                "guaranteed_order_position_opened",
+            )
         excluded_market_ids.add(slot.market_id)
+        _persist_guaranteed_order_plan(state_manager, plan)
         logger.warning(
-            "GUARANTEED ORDER SUBMITTED: slot=%d/%d market=%s outcome=%s order_id=%s",
+            "GUARANTEED ORDER %s: slot=%d/%d market=%s outcome=%s order_id=%s",
+            "POSITION OPENED" if position_opened else "AWAITING FILL",
             slot.slot_number,
             plan.target,
             slot.market_id,
@@ -7298,8 +7508,12 @@ def _run_guaranteed_order_phase(
                 "outcome": decision.outcome,
                 "order_id": response.id,
                 "order_status": response.status,
+                "filled_shares": lifecycle.fill_count,
+                "guaranteed_order_completed": position_opened,
             },
         )
+        if slot.needs_replacement:
+            pending_slots.extend(_lock_available_slots())
 
     if plan.is_complete:
         logger.warning(
@@ -12803,6 +13017,34 @@ def main(
                     )
             elif not settings.ORDER_RECONCILIATION_ENABLED:
                 order_reconciliation_ready = False
+
+            if (
+                guaranteed_order_plan.target > 0
+                and not settings.DRY_RUN
+                and order_sync_metrics.complete
+            ):
+                guaranteed_plan_fill_sync = (
+                    _reconcile_guaranteed_order_plan_positions(
+                        plan=guaranteed_order_plan,
+                        state_manager=state_manager,
+                    )
+                )
+                logger.info(
+                    "Guaranteed-order fill reconciliation: positions=%d/%d "
+                    "new=%d awaiting=%d terminal_unfilled=%d",
+                    guaranteed_order_plan.completed_count,
+                    guaranteed_order_plan.target,
+                    guaranteed_plan_fill_sync["newly_completed"],
+                    guaranteed_plan_fill_sync["awaiting_fill"],
+                    guaranteed_plan_fill_sync["terminal_unfilled"],
+                    data={
+                        **guaranteed_plan_fill_sync,
+                        "guaranteed_orders_completed": (
+                            guaranteed_order_plan.completed_count
+                        ),
+                        "guaranteed_orders_target": guaranteed_order_plan.target,
+                    },
+                )
 
             position_sync_metrics = PositionSyncMetrics()
             position_sync_due = (

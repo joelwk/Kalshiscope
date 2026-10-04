@@ -517,23 +517,26 @@ class Settings:
     # Opt-in run-level forced-order target. When positive, lock this cycle's
     # highest positive-EV analyzed names (chosen-side edge × EQ × confidence,
     # event/family diversity among +EV only), deep-research those slots, and
-    # Kelly-size a forced order from the researched side only when that side
-    # still clears GUARANTEED_MIN_EDGE (or GUARANTEED_PROXY_MIN_EDGE). Weak or
-    # non-+EV slots are replaced from the analyzed +EV set or abandoned —
-    # never forced to fill the quota. Ordinary score/edge/EQ gates are
-    # audit-only for forceable slots. Unexecutable markets (closed, price
+    # order a sourced positive-EV side. Edges below GUARANTEED_MIN_EDGE (or
+    # GUARANTEED_PROXY_MIN_EDGE) receive only the bankroll-derived minimum bet;
+    # edges at or above the floor are Kelly-sized. Missing-research and non-+EV
+    # slots are replaced or abandoned, never forced. Ordinary score/edge/EQ
+    # gates are audit-only for forceable slots. Unexecutable markets (closed, price
     # band, jurisdiction) may still be replaced from the catalog up to
-    # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. A bounded run that never
-    # locks/completes the target fails loudly; a bounded run exits early once
-    # the target is complete.
+    # GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS. The refreshed submission
+    # price must remain positive-EV. In live mode a slot completes only after
+    # at least one contract fills; a resting order is reconciled without a
+    # duplicate submission. A bounded run that never opens every target
+    # position fails loudly; it exits early once the target is complete.
     GUARANTEED_ORDERS_N: int = 0
     # Cap on slot replacements per run (weak evidence + unexecutable markets).
     # Prevents infinite thrash when GUARANTEED_ORDERS_N > 0.
     GUARANTEED_ORDER_MAX_RESEARCH_GAP_REPLACEMENTS: int = 6
-    # Hard chosen-side edge floor (confidence − Kalshi implied) for a forced
-    # slot after calibration. Direct / settlement-aligned / weather / sports
-    # computed-odds / named-mechanism use this floor; unlabeled non-weather
-    # proxy uses GUARANTEED_PROXY_MIN_EDGE.
+    # Full-Kelly chosen-side edge floor (confidence − Kalshi implied) after
+    # calibration. A sourced positive edge below the applicable floor receives
+    # only the bankroll-derived minimum bet. Direct / settlement-aligned /
+    # weather / sports computed-odds / named-mechanism use this floor; unlabeled
+    # non-weather proxy uses GUARANTEED_PROXY_MIN_EDGE.
     GUARANTEED_MIN_EDGE: float = 0.12
     GUARANTEED_PROXY_MIN_EDGE: float = 0.15
     # Per-family chosen-side edge floors, which replace both floors above for
@@ -544,9 +547,9 @@ class Settings:
     # below), so it stays on the default.
     GUARANTEED_FAMILY_MIN_EDGE: tuple[tuple[str, float], ...] = (("crypto", 0.06),)
     # Consecutive guaranteed-slot misses before a Kalshi series stops being
-    # locked at all. Continuously repriced ladders (crypto strikes, index
-    # levels) never clear the edge floor, so every strike in the series burns
-    # a deep dive for nothing. A series that has ever filled is never excluded.
+    # locked at all. Continuously repriced ladders that repeatedly produce no
+    # forceable positive-EV side otherwise burn a deep dive per strike. A series
+    # that has ever filled is never excluded.
     GUARANTEED_SERIES_MISS_LIMIT: int = 3
     ORDER_RECONCILIATION_ENABLED: bool = True
     POSITION_SYNC_ENABLED: bool = True

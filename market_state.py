@@ -2569,7 +2569,7 @@ class MarketStateManager:
         clears or misses the guaranteed edge bar for the same reason, while
         ``market_family()`` lumps unrelated ladders into ``generic``.
 
-        ``outcome`` is ``filled`` for an order the exchange accepted,
+        ``outcome`` is ``filled`` only after the exchange reports a fill,
         ``cleared`` for a forceable +EV side that was never submitted, and
         ``missed`` for a failed edge bar. Only a miss advances the burn
         counter, and only a fill earns the permanent burn immunity that a

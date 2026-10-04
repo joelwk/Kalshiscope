@@ -74,40 +74,38 @@ apply.
 - `DRY_RUN=false`: place live Kalshi orders when all trade gates pass.
 
 `GUARANTEED_ORDERS_N` defaults to `0`. When set to a positive integer, the bot
-locks this cycle's highest positive-EV analyzed names (chosen-side edge after
-calibration × evidence quality × confidence), dives deeper on those slots, and
-forces a Kelly-sized order from the researched side only when that side still
-has clear positive chosen-side edge. Slots never share an event, and no market
+pre-ranks the eligible batch, performs initial and deep research on the best
+slots, and orders the researched side only when its chosen-side edge is still
+positive. Slots never share an event, and no market
 family may hold more than three of them: demanding a distinct family per slot
 handed four of every five slots to families with no fills on record, because
 the one family that does fill was capped at a single slot. Absence-only, zero,
 or negative-EV slots are replaced with another analyzed +EV name the same
-cycle, or deferred to the next cycle — never forced to fill the quota.
-Unlabeled `edge_mechanism` or proxy evidence quality below the ordinary trade
-floor is not a hard skip when chosen-side edge still clears the floor.
-Two normal-mode evidence rules — forecast-only weather (`weather_not_observed`)
-and commodity/index YES (`commodity_yes_blocked`) — do not block a guaranteed
-slot that clears its edge floor; that slot is placed at the cycle minimum bet
-instead of its Kelly size, because forecast-only weather lost about $90 over
-86 trades in September 2026. The sub-20¢ chosen-side price floor still blocks.
-`GUARANTEED_MIN_EDGE` (default `0.12`) is the hard chosen-side floor for
-direct, computed-odds, named-mechanism, or weather sides; unlabeled
-non-weather proxy must also clear `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`).
+cycle, or deferred to the next cycle — never forced. If the researched batch
+does not contain enough sourced positive-EV sides, the target remains incomplete.
+`GUARANTEED_MIN_EDGE` (default `0.12`) is the full-Kelly chosen-side floor for
+direct, computed-odds, named-mechanism, or weather sides; unlabeled non-weather
+proxy uses `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`). A sourced positive-EV
+side below its applicable floor is still entered in hard-N mode, but only at
+the cycle minimum bet. The same minimum-size treatment applies to sub-20¢
+chosen sides, forecast-only weather (`weather_not_observed`), and
+commodity/index YES (`commodity_yes_blocked`). This bounds exposure for shapes
+whose historical results do not justify a full Kelly stake.
 `GUARANTEED_FAMILY_MIN_EDGE` (default `crypto:0.06`) replaces both of those
 floors for the families it names. The default is calibrated on 857 resolved
 trades: crypto returned +7% below a 0.12 edge and −13% above it, because a
 large claimed edge on a continuously repriced ladder is overconfidence rather
 than mispricing. Weather is the family `0.12` actually fits (+3% above it,
 −16% below), so it stays on the default. Evidence strength is gated separately,
-so an override only moves the edge magnitude a family has to clear.
+so an override only moves the edge magnitude required for full Kelly sizing.
 Three guards keep the hunt from spending deep research where it cannot pay off.
 A first pass sitting more than 20 points below the floor skips the deep call
 outright, since deep research has historically moved confidence that far only
-5% of the time. Within one plan, a series that misses the floor is retired
-immediately, so the adjacent strike of the same ladder cannot claim the freed
-slot and spend another initial plus deep pass on the same reasoning. Across
-runs, a series that misses the floor `GUARANTEED_SERIES_MISS_LIMIT` times in a
-row (default `3`) without ever filling stops being locked at all; the tally
+5% of the time. Within one plan, a series that produces no positive-EV side is
+retired immediately, so an adjacent strike cannot claim the freed slot and
+spend another initial plus deep pass on the same reasoning. Across runs, a
+series that produces no forceable side `GUARANTEED_SERIES_MISS_LIMIT` times in
+a row (default `3`) without ever filling stops being locked at all; the tally
 persists, and a fill resets it. A dry-run force resets the streak but is not
 recorded as a fill, because it never reached the exchange and must not earn a
 proven series the permanent exemption from that limit. Together this is what
@@ -122,8 +120,13 @@ suppressed in this mode so the run cannot exceed the target. Forced (and
 normal) stakes scale with live portfolio value:
 `clip(kelly_bet_pct × MAX_BET_PCT_OF_BANKROLL × portfolio, MIN_BET_PCT_OF_BANKROLL × portfolio, position/drawdown caps)`.
 Dry runs persist up to that many attempted-order receipts when enough +EV
-markets exist; bounded live runs fail explicitly if Kalshi does not accept all
-target submissions and exit early once the target is complete. Live guarantee
+markets exist. In live mode, a slot completes only after the exchange reports
+at least one filled contract: an accepted but unfilled resting order remains
+attached to its slot, is reconciled on later cycles, and is never submitted a
+second time. A terminal unfilled order releases the slot for replacement.
+The final refreshed market price must also remain positive-EV before the order
+is submitted. Bounded live runs fail explicitly if all target positions are not
+opened and exit early once the filled-position target is complete. Live guarantee
 plans exclude families the exchange has rejected for this account (Sports, and
 when present Elections and Entertainment). If that restriction is first
 discovered during forced submission, the rejected slot is retired and replaced

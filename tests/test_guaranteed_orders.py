@@ -82,7 +82,22 @@ class _LiveGuaranteedKalshi(_GuaranteedKalshi):
         self.client_order_ids.append(kwargs.get("client_order_id"))
         return OrderResponse(
             id=f"order-{order.market_id}",
-            status="open",
+            status="executed",
+            raw={
+                "client_qty_shares": 9,
+                "client_price": 0.56,
+                "fill_count": 9,
+            },
+        )
+
+
+class _RestingGuaranteedKalshi(_LiveGuaranteedKalshi):
+    def submit_order(self, order, **kwargs):
+        self.submitted_market_ids.append(order.market_id)
+        self.client_order_ids.append(kwargs.get("client_order_id"))
+        return OrderResponse(
+            id=f"order-{order.market_id}",
+            status="resting",
             raw={
                 "client_qty_shares": 9,
                 "client_price": 0.56,
@@ -102,11 +117,11 @@ class _JurisdictionThenSuccessKalshi(_LiveGuaranteedKalshi):
             )
         return OrderResponse(
             id=f"order-{order.market_id}",
-            status="open",
+            status="executed",
             raw={
                 "client_qty_shares": 9,
                 "client_price": 0.56,
-                "fill_count": 0,
+                "fill_count": 9,
             },
         )
 
@@ -130,11 +145,11 @@ class _NevadaRestrictedThenSuccessKalshi(_LiveGuaranteedKalshi):
             )
         return OrderResponse(
             id=f"order-{order.market_id}",
-            status="open",
+            status="executed",
             raw={
                 "client_qty_shares": 9,
                 "client_price": 0.56,
-                "fill_count": 0,
+                "fill_count": 9,
             },
         )
 
@@ -1443,7 +1458,7 @@ def test_named_mechanism_uses_guaranteed_min_edge_not_proxy_floor(tmp_path) -> N
     assert result.amount_usdc > 0
 
 
-def test_unlabeled_proxy_still_requires_proxy_min_edge() -> None:
+def test_unlabeled_proxy_below_floor_is_forceable_at_minimum_size() -> None:
     settings = main.Settings()
     market = _market("thin-proxy", yes_price=0.60)
     decision = _decision(
@@ -1454,9 +1469,53 @@ def test_unlabeled_proxy_still_requires_proxy_min_edge() -> None:
         evidence_quality=0.60,
         edge_mechanism="none",
     )
+    assert main._guaranteed_order_reject_reason(decision, market, settings) is None
     assert (
-        main._guaranteed_order_reject_reason(decision, market, settings)
+        main._guaranteed_min_size_reason(decision, market, settings)
         == "guaranteed_order_edge_below_min"
+    )
+
+
+def test_thin_positive_edge_slot_is_submitted_at_minimum_size(tmp_path) -> None:
+    market = _market("thin-positive", yes_price=0.60)
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-thin-positive-001",
+    )
+    grok = _GuaranteedGrok(
+        _decision(
+            outcome="YES",
+            confidence=0.62,
+            evidence_basis="proxy",
+            edge_source="computed",
+            evidence_quality=0.60,
+            edge_mechanism="observed_vs_strike",
+        )
+    )
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=1.5,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.amount_usdc == 1.5
+    assert result.sizing_audit["guaranteed_order_sizing_mode"] == (
+        "min_size_normal_gate_override"
+    )
+    assert result.sizing_audit["guaranteed_order_normal_gate_overridden"] == (
+        "guaranteed_order_edge_below_min"
     )
 
 
@@ -1532,7 +1591,7 @@ def test_forecast_weather_slot_is_forced_at_minimum_bet(tmp_path) -> None:
     )
 
 
-def test_guaranteed_reject_blocks_cheap_chosen_side() -> None:
+def test_guaranteed_cheap_positive_ev_side_is_forceable_at_minimum_size() -> None:
     settings = main.Settings()
     market = _market("KXMLBGAME-26SEP24-LAD", yes_price=0.06, category="sports")
     decision = _decision(
@@ -1542,8 +1601,9 @@ def test_guaranteed_reject_blocks_cheap_chosen_side() -> None:
         edge_source="computed",
         evidence_quality=0.80,
     )
+    assert main._guaranteed_order_reject_reason(decision, market, settings) is None
     assert (
-        main._guaranteed_order_reject_reason(decision, market, settings)
+        main._guaranteed_min_size_reason(decision, market, settings)
         == "chosen_side_price_below_expectancy_floor"
     )
 
@@ -1669,6 +1729,39 @@ def test_seeded_guaranteed_slot_skips_initial_analysis(tmp_path) -> None:
     assert grok.deep_calls == []
 
 
+def test_seeded_thin_positive_edge_still_gets_deep_research(tmp_path) -> None:
+    market = _market("seeded-thin", yes_price=0.60)
+    seeded = _decision(confidence=0.62, evidence_quality=0.7)
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-seed-thin-001",
+        decision=seeded,
+        research_completed=False,
+    )
+    grok = _GuaranteedGrok(seeded)
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=1.5,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.amount_usdc == 1.5
+    assert grok.initial_calls == []
+    assert grok.deep_calls == [market.id]
+
+
 def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> None:
     market = _market("live-forced")
     slot = main.GuaranteedOrderSlot(
@@ -1679,7 +1772,7 @@ def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> No
         client_order_id="BOT-GUAR-test-001",
     )
     grok = _GuaranteedGrok(_decision())
-    kalshi = _LiveGuaranteedKalshi([market])
+    kalshi = _RestingGuaranteedKalshi([market])
     state = MarketStateManager(str(tmp_path / "state.db"))
     try:
         result = main._attempt_guaranteed_order_slot(
@@ -1706,6 +1799,82 @@ def test_guaranteed_live_slot_submits_and_persists_pending_order(tmp_path) -> No
     assert kalshi.client_order_ids == ["BOT-GUAR-test-001"]
     assert slot.submission_attempts == 1
     assert [row["order_id"] for row in pending] == ["order-live-forced"]
+    assert result.order_lifecycle is not None
+    assert result.order_lifecycle.resting_unfilled is True
+
+
+def test_guaranteed_phase_waits_for_a_fill_without_duplicate_submission(tmp_path) -> None:
+    market = _market("resting-position")
+    grok = _GuaranteedGrok(_decision())
+    kalshi = _RestingGuaranteedKalshi([market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    plan = main.GuaranteedOrderPlan(target=1, run_id="resting-position")
+    kwargs = {
+        "plan": plan,
+        "markets": [market],
+        "excluded_market_ids": set(),
+        "settings": main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+        "grok_client": grok,
+        "kalshi_client": kalshi,
+        "state_manager": state,
+        "min_bet_usdc": 5.0,
+        "max_bet_usdc": 12.0,
+        "log_decision": lambda **kwargs: None,
+        "extended_research_market_ids": set(),
+    }
+    try:
+        submitted = main._run_guaranteed_order_phase(cycle_number=1, **kwargs)
+        waiting = main._run_guaranteed_order_phase(cycle_number=2, **kwargs)
+        state.apply_pending_order_fill(
+            order_id="order-resting-position",
+            cumulative_filled_shares=1.0,
+            fill_price=0.56,
+            status="partially_filled",
+        )
+        filled = main._run_guaranteed_order_phase(cycle_number=3, **kwargs)
+    finally:
+        state.close()
+
+    assert submitted.attempted == 1
+    assert submitted.completed == 0
+    assert waiting.attempted == 0
+    assert filled.completed == 1
+    assert kalshi.submitted_market_ids == [market.id]
+    assert plan.is_complete is True
+    assert plan.slots[0].filled_shares == 1.0
+
+
+def test_guaranteed_refresh_rejects_edge_that_turns_negative(tmp_path) -> None:
+    researched_market = _market("repriced", yes_price=0.55)
+    refreshed_market = _market("repriced", yes_price=0.75)
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=researched_market.id,
+        market=researched_market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-repriced-001",
+    )
+    grok = _GuaranteedGrok(_decision(confidence=0.72))
+    kalshi = _LiveGuaranteedKalshi([refreshed_market])
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=kalshi,
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=False, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=5.0,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "research_gap_replaceable"
+    assert result.error == "guaranteed_order_refresh_non_positive_edge"
+    assert result.sizing_audit["guaranteed_order_research_entry_price"] == 0.55
+    assert result.sizing_audit["guaranteed_order_refreshed_entry_price"] == 0.75
+    assert kalshi.submitted_market_ids == []
 
 
 def test_guaranteed_phase_replaces_market_not_found_same_cycle(tmp_path) -> None:
@@ -1790,7 +1959,10 @@ def test_guaranteed_phase_replaces_jurisdiction_blocked_sports_slot_same_cycle(
     assert decisions[0]["execution_audit"]["final_reason"] == (
         "jurisdiction_sports_blocked"
     )
-    assert decisions[-1]["execution_audit"]["final_reason"] == "order_submitted"
+    assert (
+        decisions[-1]["execution_audit"]["final_reason"]
+        == "guaranteed_order_position_opened"
+    )
 
 
 def test_guaranteed_phase_replaces_nevada_restricted_entertainment_slot(
@@ -1844,7 +2016,10 @@ def test_guaranteed_phase_replaces_nevada_restricted_entertainment_slot(
     assert "KXYTVIEWSW-TAY26AUG16-14.5M" in plan.retired_market_ids
     assert hold == {"sports", "politics", "entertainment", "music"}
     assert decisions[0]["execution_audit"]["final_reason"] == "jurisdiction_restricted"
-    assert decisions[-1]["execution_audit"]["final_reason"] == "order_submitted"
+    assert (
+        decisions[-1]["execution_audit"]["final_reason"]
+        == "guaranteed_order_position_opened"
+    )
 
 
 def test_guaranteed_phase_honors_existing_sports_jurisdiction_hold(tmp_path) -> None:
@@ -2406,7 +2581,7 @@ def test_guaranteed_phase_replaces_negative_edge_when_alternate_exists(tmp_path)
     assert grok.deep_calls == ["weak-high", "good-low"]
 
 
-def test_guaranteed_reject_reason_flags_non_positive_edge() -> None:
+def test_guaranteed_rejects_non_positive_edge_but_min_sizes_thin_positive_edge() -> None:
     settings = main.Settings()
     market = _market("flat")
     decision = _decision(confidence=0.50)
@@ -2415,8 +2590,9 @@ def test_guaranteed_reject_reason_flags_non_positive_edge() -> None:
         == "guaranteed_order_non_positive_edge"
     )
     below = _decision(confidence=0.62)
+    assert main._guaranteed_order_reject_reason(below, market, settings) is None
     assert (
-        main._guaranteed_order_reject_reason(below, market, settings)
+        main._guaranteed_min_size_reason(below, market, settings)
         == "guaranteed_order_edge_below_min"
     )
 
@@ -2435,6 +2611,8 @@ def test_guaranteed_run_outcome_distinguishes_terminal_failure_modes() -> None:
     assert main._guaranteed_run_outcome(plan) == "insufficient_positive_ev"
     slot.submission_attempts = 1
     assert main._guaranteed_run_outcome(plan) == "submission_failed"
+    slot.order_id = "resting-order"
+    assert main._guaranteed_run_outcome(plan) == "awaiting_fill"
     slot.completed = True
     assert main._guaranteed_run_outcome(plan) == "completed"
 
@@ -2706,7 +2884,7 @@ def test_families_without_an_override_keep_the_default_floors() -> None:
     assert main._guaranteed_order_min_edge(proxy, generic, settings) == 0.15
 
 
-def test_crypto_edge_between_the_two_floors_is_no_longer_rejected() -> None:
+def test_crypto_override_controls_full_kelly_vs_minimum_size() -> None:
     crypto = _market("KXBTCD-T79", category="crypto", yes_price=0.55)
     # Chosen-side edge of 0.63 - 0.55 = 0.08: under the 0.12 default, over 0.06.
     decision = _decision(
@@ -2722,14 +2900,16 @@ def test_crypto_edge_between_the_two_floors_is_no_longer_rejected() -> None:
         GUARANTEED_FAMILY_MIN_EDGE=(("crypto", 0.06),),
     )
 
+    assert main._guaranteed_order_reject_reason(decision, crypto, default_floor) is None
     assert (
-        main._guaranteed_order_reject_reason(decision, crypto, default_floor)
+        main._guaranteed_min_size_reason(decision, crypto, default_floor)
         == "guaranteed_order_edge_below_min"
     )
     assert (
         main._guaranteed_order_reject_reason(decision, crypto, with_override)
         is None
     )
+    assert main._guaranteed_min_size_reason(decision, crypto, with_override) is None
 
 
 def _family_of_locked(locked) -> list[str]:
