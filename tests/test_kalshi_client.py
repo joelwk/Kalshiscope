@@ -6,7 +6,7 @@ from unittest.mock import patch
 import requests
 
 from kalshi_client import KalshiClient, _normalize_time_in_force, _parse_market
-from models import Market, MarketClosedError, OrderRequest
+from models import InsufficientBalanceError, Market, MarketClosedError, OrderRequest
 
 
 class _DummyPrivateKey:
@@ -865,6 +865,149 @@ class TestKalshiClient(unittest.TestCase):
                     client.submit_order(order, market=market)
 
         self.assertEqual(req_mock.call_count, 3)
+
+    def test_parse_market_keeps_exchange_index(self) -> None:
+        market = _parse_market(
+            {
+                "ticker": "KXSOLD-26SEP2617-T120.9999",
+                "title": "SOL price?",
+                "yes_bid": 50,
+                "yes_ask": 52,
+                "exchange_index": 2,
+            }
+        )
+        self.assertEqual(market.exchange_index, 2)
+
+    def test_submit_order_funds_crypto_shard_before_create(self) -> None:
+        client = self._client()
+        market = Market(
+            id="KXSOLD-26SEP2617-T120.9999",
+            question="SOL price?",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id=market.id,
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        calls: list[tuple[str, str]] = []
+
+        def _request(method, path, params=None, json=None):  # noqa: ARG001
+            calls.append((method, path))
+            if path == "/portfolio/balance" and (params or {}).get("exchange_index") == 2:
+                return _DummyResponse({"balance": 0})
+            if path == "/portfolio/balance":
+                return _DummyResponse({"balance": 10000})
+            if path == "/portfolio/intra_exchange_instance_transfer":
+                self.assertEqual(json["destination_exchange_shard"], 2)
+                self.assertEqual(json["source_exchange_shard"], 0)
+                self.assertEqual(json["amount"], 50000)
+                return _DummyResponse({"transfer_id": "tr-1"})
+            if path == "/portfolio/intra_exchange_instance_transfers/tr-1":
+                return _DummyResponse({"status": "completed"})
+            return _DummyResponse(
+                {"order_id": "ord-sol", "fill_count": "0.00", "remaining_count": "10.00"}
+            )
+
+        with patch.object(client, "_request", side_effect=_request) as req_mock:
+            response = client.submit_order(order, market=market)
+
+        self.assertEqual(response.id, "ord-sol")
+        order_call = req_mock.call_args
+        self.assertEqual(order_call.kwargs["json"]["exchange_index"], 2)
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "/portfolio/balance"),
+                ("GET", "/portfolio/balance"),
+                ("POST", "/portfolio/intra_exchange_instance_transfer"),
+                ("GET", "/portfolio/intra_exchange_instance_transfers/tr-1"),
+                ("POST", "/portfolio/events/orders"),
+            ],
+        )
+
+    def test_submit_order_skips_transfer_when_shard_is_funded(self) -> None:
+        client = self._client()
+        market = Market(
+            id="KXSOLD-26SEP2617-T120.9999",
+            question="SOL price?",
+            exchange_index=2,
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id=market.id,
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+
+        def _request(method, path, params=None, json=None):  # noqa: ARG001
+            if path == "/portfolio/balance":
+                return _DummyResponse({"balance": 10000})
+            return _DummyResponse(
+                {"order_id": "ord-sol", "fill_count": "0.00", "remaining_count": "10.00"}
+            )
+
+        with patch.object(client, "_request", side_effect=_request) as req_mock:
+            client.submit_order(order, market=market)
+
+        self.assertEqual(req_mock.call_count, 2)
+        self.assertEqual(req_mock.call_args.kwargs["json"]["exchange_index"], 2)
+
+    def test_shard_collateral_error_is_not_an_empty_account(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-SHARD",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-SHARD",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        body = (
+            '{"error":{"code":"insufficient_shard_balance",'
+            '"message":"insufficient shard balance",'
+            '"details":"Exchange user not found."}}'
+        )
+        http_error = requests.exceptions.HTTPError(
+            "404 Client Error: Not Found",
+            response=_DummyHttpResponse(body, status_code=404),
+        )
+
+        with patch.object(client, "_request", side_effect=http_error):
+            with self.assertRaises(requests.exceptions.HTTPError) as raised:
+                client.submit_order(order, market=market)
+
+        self.assertIn("insufficient_shard_balance", raised.exception._kalshi_response_body)
+
+    def test_submit_order_still_maps_cash_shortage(self) -> None:
+        client = self._client()
+        market = Market(
+            id="MKT-CASH",
+            question="Question",
+            outcomes=[{"name": "YES", "price": 0.50}, {"name": "NO", "price": 0.50}],
+        )
+        order = OrderRequest(
+            market_id="MKT-CASH",
+            outcome="YES",
+            amount_usdc=5.0,
+            side="BUY",
+        )
+        http_error = requests.exceptions.HTTPError(
+            "400 insufficient balance",
+            response=_DummyHttpResponse(
+                '{"error":{"message":"insufficient balance"}}',
+                status_code=400,
+            ),
+        )
+
+        with patch.object(client, "_request", side_effect=http_error):
+            with self.assertRaises(InsufficientBalanceError):
+                client.submit_order(order, market=market)
 
 
 if __name__ == "__main__":

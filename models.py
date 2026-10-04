@@ -41,6 +41,9 @@ class Market(BaseModel):
     url: Optional[str] = None
     status: int | str | None = None
     winning_option_raw: str | int | None = None
+    # Kalshi matching-engine shard. Collateral is per shard; an order for a
+    # market on shard 2 fails until that shard is funded.
+    exchange_index: int | None = None
 
     @model_validator(mode="after")
     def _normalize_identifiers(self) -> "Market":

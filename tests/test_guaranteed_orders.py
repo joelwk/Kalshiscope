@@ -19,15 +19,19 @@ class _GuaranteedGrok:
         self.initial_calls: list[str] = []
         self.deep_calls: list[str] = []
         self.usage_phases: list[str | None] = []
+        self.initial_kwargs: list[dict] = []
+        self.deep_kwargs: list[dict] = []
 
     def analyze_market(self, market, **kwargs):
         self.initial_calls.append(market.id)
         self.usage_phases.append(kwargs.get("usage_phase"))
+        self.initial_kwargs.append(kwargs)
         return self.decision
 
     def analyze_market_deep(self, market, **kwargs):
         self.deep_calls.append(market.id)
         self.usage_phases.append(kwargs.get("usage_phase"))
+        self.deep_kwargs.append(kwargs)
         return self.decision
 
 
@@ -379,6 +383,14 @@ def test_guaranteed_dry_run_forces_deep_side_and_counts_one_attempt(tmp_path) ->
     assert result.amount_usdc == 5.0
     assert grok.initial_calls == [market.id]
     assert grok.deep_calls == [market.id]
+    screen_kwargs = grok.initial_kwargs[0]
+    deep_kwargs = grok.deep_kwargs[0]
+    assert screen_kwargs["max_turns"] == main._GUARANTEED_SCREEN_MAX_TURNS
+    assert "max_turns" not in deep_kwargs
+    assert (
+        deep_kwargs["search_config"].lookback_hours
+        > screen_kwargs["search_config"].lookback_hours
+    )
     assert slot.research_completed is True
     assert slot.submission_attempts == 1
     assert kalshi.submitted_market_ids == []
@@ -1168,6 +1180,73 @@ def test_research_gap_replacement_skips_unanalyzed_when_none_analyzed_remain() -
     assert plan.slots[0].market_id == "gap"
 
 
+def test_guaranteed_screen_prefers_pre_score_over_liquidity() -> None:
+    liquid = _market("liquid-ladder", liquidity=5000.0, category="weather")
+    screened = _market("screened", liquidity=20.0, category="generic")
+    blocked = _market(
+        "KXMLBGAME-26SEP24-LAD",
+        liquidity=50.0,
+        category="sports",
+    )
+    priorities = main._guaranteed_screen_priority_scores(
+        [
+            {"market": liquid, "pre_analysis_score": 0.15},
+            {"market": screened, "pre_analysis_score": 1.1},
+            {"market": blocked, "pre_analysis_score": 1.2},
+        ],
+        pre_scores=None,
+        blocked_families={"sports"},
+        limit=2,
+    )
+    settings = main.Settings(GUARANTEED_ORDERS_N=1)
+    plan = main.GuaranteedOrderPlan(target=1)
+    locked = main._lock_guaranteed_order_markets(
+        plan,
+        [liquid, screened, blocked],
+        excluded_market_ids=set(),
+        excluded_market_families={"sports"},
+        priority_by_market_id=priorities,
+        settings=settings,
+        cycle_number=1,
+    )
+
+    assert list(priorities) == ["screened", "liquid-ladder"]
+    assert [slot.market_id for slot in locked] == ["screened"]
+
+
+def test_pending_guaranteed_slot_resumes_paid_initial_first() -> None:
+    paid = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id="paid",
+        market=_market("paid", liquidity=10.0),
+        locked_cycle=1,
+        client_order_id="c1",
+        decision=_decision(confidence=0.6),
+        research_completed=False,
+    )
+    fresh = main.GuaranteedOrderSlot(
+        slot_number=2,
+        market_id="fresh",
+        market=_market("fresh", liquidity=5000.0),
+        locked_cycle=1,
+        client_order_id="c2",
+    )
+    paid_rank = main._guaranteed_pending_slot_rank(
+        paid,
+        priority_by_market_id={"fresh": 5.0},
+        analyzed_market_ids={"fresh"},
+        series_outcomes=None,
+    )
+    fresh_rank = main._guaranteed_pending_slot_rank(
+        fresh,
+        priority_by_market_id={"fresh": 5.0},
+        analyzed_market_ids={"fresh"},
+        series_outcomes=None,
+    )
+
+    assert paid_rank > fresh_rank
+
+
 def test_guaranteed_priority_prefers_high_eq_over_absence_only() -> None:
     scores = main._guaranteed_order_priority_scores(
         {
@@ -1399,9 +1478,57 @@ def test_unlabeled_weather_proxy_uses_min_edge_not_proxy_floor() -> None:
         edge_mechanism="none",
     )
     assert main._guaranteed_order_min_edge(decision, market, settings) == 0.12
+    assert main._guaranteed_order_reject_reason(decision, market, settings) is None
     assert (
-        main._guaranteed_order_reject_reason(decision, market, settings)
+        main._guaranteed_min_size_reason(decision, market, settings)
         == "weather_not_observed"
+    )
+
+
+def test_forecast_weather_slot_is_forced_at_minimum_bet(tmp_path) -> None:
+    """Live miss: KXRAIN-26SEP28-DEN NO 0.55 vs 0.36 (+19pp) blocked outright."""
+    market = _market(
+        "KXRAIN-26SEP28-DEN",
+        yes_price=0.64,
+        category="weather",
+    )
+    slot = main.GuaranteedOrderSlot(
+        slot_number=1,
+        market_id=market.id,
+        market=market,
+        locked_cycle=1,
+        client_order_id="BOT-GUAR-weather-001",
+    )
+    forecast = _decision(
+        outcome="NO",
+        confidence=0.55,
+        evidence_basis="proxy",
+        edge_source="computed",
+        evidence_quality=0.6,
+        edge_mechanism="none",
+    )
+    grok = _GuaranteedGrok(forecast)
+    state = MarketStateManager(str(tmp_path / "state.db"))
+    try:
+        result = main._attempt_guaranteed_order_slot(
+            slot,
+            grok_client=grok,
+            kalshi_client=_GuaranteedKalshi([market]),
+            state_manager=state,
+            settings=main.Settings(DRY_RUN=True, GUARANTEED_ORDERS_N=1),
+            min_bet_usdc=1.5,
+            max_bet_usdc=12.0,
+        )
+    finally:
+        state.close()
+
+    assert result.status == "dry_run"
+    assert result.amount_usdc == 1.5
+    assert result.sizing_audit["guaranteed_order_sizing_mode"] == (
+        "min_size_normal_gate_override"
+    )
+    assert result.sizing_audit["guaranteed_order_normal_gate_overridden"] == (
+        "weather_not_observed"
     )
 
 
@@ -2534,6 +2661,37 @@ def test_family_floor_override_replaces_both_default_floors() -> None:
     assert main._guaranteed_order_min_edge(direct, crypto, settings) == 0.06
 
 
+def test_guaranteed_sizing_uses_the_family_floor_the_gate_passed() -> None:
+    crypto = _market("KXSOLD-26SEP2717-T121.9999", category="crypto", yes_price=0.57)
+    # NO at 0.51 vs NO price 0.43: +0.08, over the 0.06 crypto floor.
+    decision = _decision(
+        outcome="NO",
+        confidence=0.51,
+        my_prob=0.49,
+        evidence_quality=0.75,
+        evidence_basis="proxy",
+        edge_mechanism="observed_vs_strike",
+    )
+    settings = main.Settings(
+        GUARANTEED_ORDERS_N=1,
+        GUARANTEED_MIN_EDGE=0.12,
+        GUARANTEED_FAMILY_MIN_EDGE=(("crypto", 0.06),),
+    )
+
+    assert main._guaranteed_order_reject_reason(decision, crypto, settings) is None
+    amount, audit = main._guaranteed_order_sized_amount_usdc(
+        decision=decision,
+        market=crypto,
+        settings=settings,
+        min_bet_usdc=1.0,
+        max_bet_usdc=10.0,
+    )
+
+    assert amount > 0
+    assert audit["min_edge_for_kelly"] == 0.06
+    assert audit["guaranteed_order_sizing_mode"] == "kelly"
+
+
 def test_families_without_an_override_keep_the_default_floors() -> None:
     weather = _market("KXHIGHNY-T80", category="weather")
     generic = _market("gen-1", category="generic")
@@ -2853,6 +3011,9 @@ def test_account_error_is_not_classified_as_a_market_error() -> None:
     market_text = main._order_exception_error_text(_http_market_not_found())
 
     assert main._is_account_submission_error(account_text) is True
+    assert main._is_account_submission_error(
+        "insufficient_shard_balance Exchange user not found"
+    ) is True
     assert main._is_unexecutable_market_error(account_text) is False
     assert main._is_account_submission_error(market_text) is False
     assert main._is_unexecutable_market_error(market_text) is True

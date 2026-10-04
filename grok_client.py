@@ -1959,6 +1959,7 @@ class GrokClient:
         temperature: float | None = None,
         enable_code_execution: bool = False,
         reasoning_effort: str | None = None,
+        max_turns: int | None = None,
     ):
         return self.provider.create_chat(
             model=model or self.model,
@@ -1969,6 +1970,7 @@ class GrokClient:
             timeout_seconds=timeout_seconds,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
+            max_turns=max_turns,
         )
 
     def _build_market_prompt(
@@ -2375,6 +2377,7 @@ class GrokClient:
         family_is_profitable: bool = False,
         allow_self_consistency: bool = True,
         usage_phase: str = "initial",
+        max_turns: int | None = None,
     ) -> TradeDecision:
         self._current_family_is_profitable = bool(family_is_profitable)
         budget_deadline = time.monotonic() + self.analysis_budget_seconds
@@ -2438,6 +2441,7 @@ class GrokClient:
                     max_attempts=max_attempts,
                     temperature=primary_temperature,
                     usage_phase=usage_phase,
+                    max_turns=max_turns,
                 )
                 active_config_for_merge = self._active_search_config(search_config)
                 break
@@ -2649,6 +2653,7 @@ class GrokClient:
         model_override: str | None = None,
         allow_model_fallback: bool = True,
         usage_phase: str = "initial",
+        max_turns: int | None = None,
     ) -> TradeDecision:
         start_time = time.monotonic()
         reservation_id: str | None = None
@@ -2721,6 +2726,7 @@ class GrokClient:
                 temperature=temperature,
                 enable_code_execution=enable_code_execution,
                 reasoning_effort=reasoning_effort,
+                max_turns=max_turns,
             )
             chat.append(
                 self.provider.system_message(
@@ -2926,6 +2932,7 @@ class GrokClient:
                     model_override=_FAST_REASONING_FALLBACK_MODEL,
                     allow_model_fallback=False,
                     usage_phase=usage_phase,
+                    max_turns=max_turns,
                 )
             will_retry = (
                 retriable
@@ -2993,7 +3000,9 @@ class GrokClient:
         family_is_profitable: bool = False,
         allow_self_consistency: bool = True,
         usage_phase: str = "initial",
+        max_turns: int | None = None,
     ) -> TradeDecision:
+        """``max_turns`` caps the agentic search loop; None leaves xAI's default."""
         return self._run_analysis(
             market=market,
             search_config=search_config,
@@ -3002,6 +3011,7 @@ class GrokClient:
             family_is_profitable=family_is_profitable,
             allow_self_consistency=allow_self_consistency,
             usage_phase=usage_phase,
+            max_turns=max_turns,
         )
 
     def analyze_market_deep(

@@ -7,7 +7,7 @@ from models import Market, MarketOutcome, TradeDecision
 
 EXPECTED_SYSTEM_PROMPT_HASHES = {
     # Re-pinned Sep 26 2026: directional decisions require structured probability.
-    "analyze": "84f12d0f9af83885dc26d77d225de777cd389e7a7e7902e4ab98945311b4499e",
+    "analyze": "e35e780fadcdc127b0552723460e3a73fa2e13e765c65eaf15e557a29606d012",
     "deep": "74606d3debcd4ce1d48521c1fdaa45e4110f71e8877ee6dbca4754f5b1e1c4e9",
 }
 
@@ -224,6 +224,8 @@ def test_analyze_market_prompt_loads_after_calibration_update() -> None:
     assert "win rate must beat the chosen-side Kalshi price" in system.lower() or (
         "Win rate must beat the chosen-side Kalshi price" in system
     )
+    assert "set my_prob to the Kalshi YES price" in system
+    assert "0.50 means no information advantage" not in system
     commodities = load_prompt("user/category_hints/commodities")
     assert "should_trade=false on YES" in commodities
 

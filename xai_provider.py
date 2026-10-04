@@ -75,6 +75,7 @@ class XAIProvider:
         temperature: float | None = None,
         reasoning_effort: str | None = None,
         include_inline_citations: bool = True,
+        max_turns: int | None = None,
     ):
         client = self._client_for_timeout(timeout_seconds)
         # Agent Tools API: the model drives web/x search via these tools. xAI's
@@ -109,6 +110,8 @@ class XAIProvider:
             create_kwargs["include"] = list(_INLINE_CITATIONS_INCLUDE)
         if reasoning_effort:
             create_kwargs["reasoning_effort"] = reasoning_effort
+        if max_turns is not None and max_turns > 0:
+            create_kwargs["max_turns"] = int(max_turns)
         for attempt in range(1, self.create_chat_max_attempts + 1):
             try:
                 return client.chat.create(**create_kwargs)

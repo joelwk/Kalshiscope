@@ -57,6 +57,22 @@ def test_create_chat_retries_and_recovers() -> None:
     assert flaky_chat.calls == 3
 
 
+@pytest.mark.parametrize(("max_turns", "expected"), [(3, 3), (None, None), (0, None)])
+def test_create_chat_forwards_max_turns_only_when_set(max_turns, expected) -> None:
+    chat = _FlakyChat(fail_times=0)
+    with patch("xai_provider.Client", return_value=_FakeClient(chat)):
+        provider = XAIProvider(api_key="xai-key", timeout_seconds=5)
+    with patch("xai_provider.web_search", return_value={"tool": "web"}):
+        response = provider.create_chat(
+            model="grok-test",
+            response_format=dict,
+            config=_search_config(),
+            enable_multimedia=False,
+            max_turns=max_turns,
+        )
+    assert response["kwargs"].get("max_turns") == expected
+
+
 def test_create_chat_uses_request_specific_timeout_client() -> None:
     default_chat = _FlakyChat(fail_times=0)
     override_chat = _FlakyChat(fail_times=0)

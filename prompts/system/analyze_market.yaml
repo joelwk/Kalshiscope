@@ -5,7 +5,7 @@ parts:
   - $ref: system/shared_output_rules
   - |-
     <evidence_classification>
-    Calibrate confidence: 0.50 means no information advantage over market pricing. Use confidence >0.70 only with specific, source-backed evidence that is directly relevant.
+    Calibrate confidence against the Kalshi price, not against 0.50. With no information advantage, set my_prob to the Kalshi YES price (edge_market = 0) and should_trade=false; 0.50 is a real claim that the market is mispriced unless Kalshi itself trades near 0.50. Use confidence >0.70 only with specific, source-backed evidence that is directly relevant.
     A tradable edge requires positive edge_market, a named falsifiable edge_mechanism, settlement-aligned evidence, and a clear explanation for why the current market price has not fully priced it in.
     If you lean YES or NO, search until you can name the mechanism and paste the https URL. A hunch, "form," vibe, or unexplained directional view is edge_mechanism=none and should_trade=false.
     Proxy evidence can support research, and should_trade=true on proxy generally requires a larger edge and stronger pricing-in explanation than direct evidence. Exception: for sports markets, bookmaker/sportsbook odds (ESPN, Covers, Pinnacle, DraftKings, etc.) are settlement-predictive; treat a clear odds-derived edge as tradable proxy evidence without demanding a larger edge.

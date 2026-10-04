@@ -132,11 +132,27 @@ _UNEXECUTABLE_MARKET_ERROR_MARKERS = (
 _ACCOUNT_SUBMISSION_ERROR_MARKERS = (
     "user_not_found",
     "user not found",
+    "exchange user not found",
+    "insufficient_shard_balance",
 )
 # Deep research moves confidence by more than 0.19 in only 5% of the 2054
 # initial->deep revisions on record, so a first pass further than this below
 # the guaranteed edge floor cannot realistically be rescued by a second call.
 _GUARANTEED_DEEP_DIVE_MAX_EDGE_GAP = 0.20
+# Bench of pre-analysis names kept per open slot. A miss must be replaced
+# from this ranking; the raw liquidity sort locks ladders that miss the edge
+# floor and exhaust the run budget before any order.
+_GUARANTEED_SCREEN_CANDIDATES_PER_SLOT = 4
+# The guaranteed first pass only decides whether a market earns a deep dive.
+# Uncapped, it ran ~17 search calls and ~390k prompt tokens, costing more than
+# the deep dive itself and limiting a $25 run to about seven markets.
+_GUARANTEED_SCREEN_MAX_TURNS = 3
+# Normal-mode evidence rules that a guaranteed slot may override, but only at
+# the cycle minimum bet: forecast-only weather lost ~$90 over 86 trades in
+# Sep 2026 (28% win). The sub-20c chosen-side price floor stays a hard block.
+_GUARANTEED_MIN_SIZE_GATE_REASONS = frozenset(
+    {"weather_not_observed", "commodity_yes_blocked"}
+)
 # One market family may hold at most this many guaranteed slots. Requiring a
 # distinct family per slot spent four of every five slots on families that have
 # never cleared the edge floor, because the only family that fills was capped at
@@ -5354,18 +5370,31 @@ def _guaranteed_order_reject_reason(
     min_edge = _guaranteed_order_min_edge(decision, market, settings)
     if edge < min_edge - 1e-9:
         return "guaranteed_order_edge_below_min"
+    expectancy_reason = _guaranteed_expectancy_reason(decision, market, settings)
+    if expectancy_reason not in (None, *_GUARANTEED_MIN_SIZE_GATE_REASONS):
+        return expectancy_reason
+    return None
+
+
+def _guaranteed_expectancy_reason(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> str | None:
     implied_prob = _get_implied_probability(
         market, str(decision.outcome or "").strip().upper()
     )
-    expectancy_reason = _expectancy_block_reason(
-        decision,
-        market,
-        settings,
-        implied_prob,
-    )
-    if expectancy_reason is not None:
-        return expectancy_reason
-    return None
+    return _expectancy_block_reason(decision, market, settings, implied_prob)
+
+
+def _guaranteed_min_size_reason(
+    decision: TradeDecision,
+    market: Market,
+    settings: Settings,
+) -> str | None:
+    """Normal-mode evidence rule that caps a forceable slot at the minimum bet."""
+    reason = _guaranteed_expectancy_reason(decision, market, settings)
+    return reason if reason in _GUARANTEED_MIN_SIZE_GATE_REASONS else None
 
 
 def _guaranteed_series_fill_rate(
@@ -5482,6 +5511,48 @@ def _guaranteed_order_priority_scores(
     return priorities
 
 
+def _guaranteed_screen_priority_scores(
+    candidates: list[dict[str, Any]],
+    *,
+    pre_scores: dict[str, float] | None,
+    blocked_families: set[str] | frozenset[str] | None,
+    limit: int,
+) -> dict[str, float]:
+    """Rank lock candidates by pre-analysis score when this cycle has no Grok pass.
+
+    Guaranteed mode researches its locks itself and skips the ordinary analysis
+    pass. Without this screen the lock falls through to raw liquidity, which
+    selects continuously repriced ladders that miss the edge floor.
+    """
+    if limit <= 0:
+        return {}
+    blocked = {
+        str(family or "").strip().lower()
+        for family in (blocked_families or set())
+        if str(family or "").strip()
+    }
+    ranked: list[tuple[float, str]] = []
+    for candidate in candidates:
+        market = candidate.get("market")
+        if not isinstance(market, Market) or not market.id:
+            continue
+        if blocked and market_family(market) in blocked:
+            continue
+        try:
+            score = float(
+                (pre_scores or {}).get(
+                    market.id,
+                    candidate.get("pre_analysis_score") or 0.0,
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            score = 0.0
+        ranked.append((score, str(market.id)))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return {market_id: score for score, market_id in ranked[:limit]}
+
+
 def _guaranteed_order_analyzed_market_ids(
     *,
     priority_by_market_id: dict[str, float] | None,
@@ -5577,6 +5648,26 @@ def _guaranteed_order_market_rank(
         price_quality,
         str(market.id),
     )
+
+
+def _guaranteed_pending_slot_rank(
+    slot: GuaranteedOrderSlot,
+    *,
+    priority_by_market_id: dict[str, float] | None,
+    analyzed_market_ids: set[str],
+    series_outcomes: dict[str, dict[str, Any]] | None,
+) -> tuple[int, int, float, float, float, float, float, str]:
+    """Finish a paid first pass before opening another locked market."""
+    resume_paid_initial = (
+        1 if slot.decision is not None and not slot.research_completed else 0
+    )
+    market_rank = _guaranteed_order_market_rank(
+        slot.market,
+        priority_by_market_id=priority_by_market_id,
+        analyzed_market_ids=analyzed_market_ids,
+        series_outcomes=series_outcomes,
+    )
+    return (resume_paid_initial, *market_rank)
 
 
 def _lock_guaranteed_order_markets(
@@ -5872,12 +5963,13 @@ def _guaranteed_order_sized_amount_usdc(
     max_bet = max(0.0, float(max_bet_usdc))
     if max_bet > 0:
         min_bet = min(min_bet, max_bet)
+    min_edge = _guaranteed_order_min_edge(decision, market, settings)
     sizing_audit: dict[str, Any] = {
         "guaranteed_order_sizing_mode": "kelly",
         "kelly_raw": None,
         "kelly_fraction_value": None,
         "extreme_edge_size_dampener": 1.0,
-        "guaranteed_min_edge": float(settings.GUARANTEED_MIN_EDGE),
+        "guaranteed_min_edge": min_edge,
     }
     outcome = str(decision.outcome or "").strip().upper()
     implied_prob = _get_implied_probability(market, outcome)
@@ -5906,7 +5998,6 @@ def _guaranteed_order_sized_amount_usdc(
         decision,
         float(posterior),
     )
-    min_edge = float(settings.GUARANTEED_MIN_EDGE)
     kelly_raw_value = kelly_fraction(
         posterior=float(posterior),
         market_price=float(implied_prob),
@@ -6067,6 +6158,17 @@ def _attempt_guaranteed_order_slot(
                 "guaranteed_order_kelly_zero",
                 research_done=intense_research_performed,
             )
+        overridden_rule = _guaranteed_min_size_reason(
+            researched, research_market, settings
+        )
+        if overridden_rule is not None:
+            amount_usdc = min(amount_usdc, max(0.0, float(min_bet_usdc)))
+            sizing_audit.update(
+                {
+                    "guaranteed_order_sizing_mode": "min_size_normal_gate_override",
+                    "guaranteed_order_normal_gate_overridden": overridden_rule,
+                }
+            )
         return _forced_execution_decision(
             researched,
             research_market,
@@ -6089,17 +6191,21 @@ def _attempt_guaranteed_order_slot(
     if decision is None or not slot.research_completed:
         try:
             research_market = slot.market
+            screen_search_config = build_market_search_config(
+                settings, research_market
+            )
             search_config = _build_extended_reanalysis_search_config(
-                build_market_search_config(settings, research_market),
+                screen_search_config,
                 settings,
             )
             if decision is None:
                 initial_decision = grok_client.analyze_market(
                     research_market,
-                    search_config=search_config,
+                    search_config=screen_search_config,
                     previous_analysis=None,
                     allow_self_consistency=False,
                     usage_phase="guaranteed_initial",
+                    max_turns=_GUARANTEED_SCREEN_MAX_TURNS,
                 )
                 _capture_usage(initial_decision)
                 # Bank the paid first pass before the deep call can be stopped
@@ -6462,8 +6568,8 @@ def _run_guaranteed_order_phase(
             data=plan.summary(),
         )
     pending_slots.sort(
-        key=lambda slot: _guaranteed_order_market_rank(
-            slot.market,
+        key=lambda slot: _guaranteed_pending_slot_rank(
+            slot,
             priority_by_market_id=priority_by_market_id,
             analyzed_market_ids=analyzed_market_ids,
             series_outcomes=series_outcomes,
@@ -12399,6 +12505,7 @@ def main(
         sleep_seconds = settings.POLL_INTERVAL_SEC
 
         logger.info("Starting bot cycle #%d", cycle_count)
+        guaranteed_screen_priorities: dict[str, float] = {}
 
         try:
             fetch_window_start, fetch_window_end = _build_kalshi_market_fetch_window(
@@ -15131,6 +15238,33 @@ def main(
                 analysis_candidate_attempt_limit = min(
                     analysis_candidate_attempt_limit,
                     guaranteed_candidate_limit,
+                )
+                guaranteed_screen_priorities = _guaranteed_screen_priority_scores(
+                    analysis_candidates,
+                    pre_scores=pre_analysis_scores,
+                    blocked_families=(
+                        jurisdiction_blocked_families
+                        if not settings.DRY_RUN
+                        else set()
+                    ),
+                    limit=max(
+                        guaranteed_candidate_limit,
+                        _GUARANTEED_SCREEN_CANDIDATES_PER_SLOT
+                        * guaranteed_order_plan.remaining_count,
+                    ),
+                )
+                logger.info(
+                    "Guaranteed-order screen ranked %d pre-analysis candidate(s) "
+                    "ahead of catalog liquidity",
+                    len(guaranteed_screen_priorities),
+                    data={
+                        "guaranteed_screen_candidates": len(
+                            guaranteed_screen_priorities
+                        ),
+                        "guaranteed_orders_remaining": (
+                            guaranteed_order_plan.remaining_count
+                        ),
+                    },
                 )
             sports_candidate_cap = (
                 settings.MAX_SPORTS_CANDIDATES_PER_CYCLE
@@ -20848,11 +20982,16 @@ def main(
                         extended_research_market_ids=extended_research_market_ids,
                         min_bet_usdc=cycle_min_bet_usdc,
                         max_bet_usdc=cycle_max_bet_usdc,
-                        priority_by_market_id=_guaranteed_order_priority_scores(
-                            analysis_results,
-                            markets_by_id={
-                                market.id: market for market in markets if market.id
-                            },
+                        priority_by_market_id=(
+                            _guaranteed_order_priority_scores(
+                                analysis_results,
+                                markets_by_id={
+                                    market.id: market
+                                    for market in markets
+                                    if market.id
+                                },
+                            )
+                            or guaranteed_screen_priorities
                         ),
                         seed_decisions_by_market_id=_guaranteed_order_seed_decisions(
                             analysis_results

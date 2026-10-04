@@ -85,6 +85,11 @@ or negative-EV slots are replaced with another analyzed +EV name the same
 cycle, or deferred to the next cycle — never forced to fill the quota.
 Unlabeled `edge_mechanism` or proxy evidence quality below the ordinary trade
 floor is not a hard skip when chosen-side edge still clears the floor.
+Two normal-mode evidence rules — forecast-only weather (`weather_not_observed`)
+and commodity/index YES (`commodity_yes_blocked`) — do not block a guaranteed
+slot that clears its edge floor; that slot is placed at the cycle minimum bet
+instead of its Kelly size, because forecast-only weather lost about $90 over
+86 trades in September 2026. The sub-20¢ chosen-side price floor still blocks.
 `GUARANTEED_MIN_EDGE` (default `0.12`) is the hard chosen-side floor for
 direct, computed-odds, named-mechanism, or weather sides; unlabeled
 non-weather proxy must also clear `GUARANTEED_PROXY_MIN_EDGE` (default `0.15`).
